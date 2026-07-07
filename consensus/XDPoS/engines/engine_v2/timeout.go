@@ -343,13 +343,27 @@ func (x *XDPoS_v2) verifyTC(chain consensus.ChainReader, timeoutCert *types.Time
 		return errors.New("empty masternode list")
 	}
 
-	// A.98: Dedupe by signature bytes (matches canonical XDPoSChain timeout.go:143).
-	// See issue #926 for full parity analysis.
+	// #1074 fix: dedupe by recovered ADDRESS and reject high-S (ECDSA
+	// malleability) signatures, matching canonical XDPoSChain
+	// (engines/engine_v2/timeout.go:177) and native eth2030 #136. Byte-level
+	// dedup (the old UniqueSignatures call previously here) is unsafe: a
+	// malleated (high-S) counterpart of a valid low-S signature is a
+	// byte-distinct encoding of the SAME signer's timeout vote, so
+	// byte-dedup lets one masternode key inflate the counted total toward
+	// the 2/3 threshold — a BFT safety violation.
 	signedTimeoutObj := types.TimeoutSigHash(&types.TimeoutForSign{
 		Round:     timeoutCert.Round,
 		GapNumber: timeoutCert.GapNumber,
 	})
-	signatures, duplicates := UniqueSignatures(timeoutCert.Signatures)
+	signatures, duplicates, err := RecoverUniqueSigners(signedTimeoutObj, timeoutCert.Signatures)
+	if err != nil {
+		log.Error("[verifyTC] Error while recovering unique signers from TC",
+			"tcRound", timeoutCert.Round,
+			"tcGapNumber", timeoutCert.GapNumber,
+			"tcSignLen", len(timeoutCert.Signatures),
+			"error", err)
+		return utils.ErrInvalidTCSignatures
+	}
 	if len(duplicates) > 0 {
 		for _, d := range duplicates {
 			log.Warn("[verifyTC] Duplicate signature in TC",
