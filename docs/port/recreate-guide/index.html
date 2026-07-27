@@ -1,0 +1,1596 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Recreating XDC Consensus on Any go-ethereum Version</title>
+<style>
+:root{
+  --accent:#2b50d6; --accent2:#0fb5a6; --ink:#1b2230; --muted:#5b6678;
+  --bg:#ffffff; --bg2:#f6f8fc; --line:#e3e8f0;
+  --sidebar:#0f1729; --sidebar-ink:#aeb8cc; --sidebar-active:#8fd6ff;
+  --code-bg:#0d1320; --code-ink:#e6edf7;
+  --hi:#fff6d6; --hi-line:#f1c40f;
+}
+*{box-sizing:border-box}
+html{scroll-behavior:smooth}
+body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  color:var(--ink);background:var(--bg);line-height:1.62;font-size:16px;-webkit-font-smoothing:antialiased}
+a{color:var(--accent);text-decoration:none}
+a:hover{text-decoration:underline}
+
+/* layout */
+.wrap{display:flex;min-height:100vh}
+.sidebar{width:300px;flex:0 0 300px;background:var(--sidebar);color:var(--sidebar-ink);
+  position:sticky;top:0;height:100vh;overflow-y:auto;padding:22px 16px 40px}
+.sidebar .brand{font-weight:700;color:#fff;font-size:15px;letter-spacing:.2px;margin:4px 8px 4px}
+.sidebar .brand small{display:block;font-weight:400;color:#7f8aa3;font-size:12px;margin-top:3px;letter-spacing:0}
+.sidebar nav{margin-top:14px;display:flex;flex-direction:column}
+.sidebar a{display:block;color:var(--sidebar-ink);font-size:13px;padding:4px 8px;border-radius:6px;
+  border-left:2px solid transparent;line-height:1.35}
+.sidebar a:hover{background:#16213a;color:#fff;text-decoration:none}
+.sidebar a.toc-h3{padding-left:20px;font-size:12px;color:#8893aa}
+.sidebar a.active{color:var(--sidebar-active);border-left-color:var(--accent2);background:#16213a}
+
+.content{flex:1 1 auto;max-width:920px;margin:0 auto;padding:42px 46px 120px;min-width:0}
+
+/* hero */
+.hero{border-bottom:1px solid var(--line);margin-bottom:8px;padding-bottom:8px}
+.pill{display:inline-block;background:linear-gradient(90deg,var(--accent),var(--accent2));color:#fff;
+  font-size:12px;font-weight:600;padding:3px 11px;border-radius:999px;letter-spacing:.3px}
+
+/* headings */
+h1{font-size:31px;line-height:1.2;margin:.5em 0 .3em;letter-spacing:-.4px}
+h2{font-size:23px;margin:2.1em 0 .5em;padding-top:.5em;border-top:1px solid var(--line);letter-spacing:-.2px}
+h2:first-of-type{border-top:none}
+h3{font-size:17.5px;margin:1.6em 0 .4em;color:#26324a}
+h4{font-size:15px;margin:1.3em 0 .3em;color:var(--muted);text-transform:uppercase;letter-spacing:.04em}
+h1 .header-section-number,h2 .header-section-number,h3 .header-section-number{color:var(--accent);font-weight:700}
+
+/* code */
+code{font-family:"SF Mono", "JetBrains Mono",Menlo,Consolas,monospace;font-size:.88em;
+  background:#eef1f7;color:#1c2742;padding:.12em .38em;border-radius:5px}
+pre{background:var(--code-bg);color:var(--code-ink);padding:16px 18px;border-radius:10px;overflow-x:auto;
+  font-size:13px;line-height:1.5;border:1px solid #1b2740}
+pre code{background:none;color:inherit;padding:0;font-size:13px}
+
+/* tables */
+table{border-collapse:collapse;width:100%;margin:1.1em 0;font-size:14px;display:block;overflow-x:auto}
+th,td{border:1px solid var(--line);padding:8px 11px;text-align:left;vertical-align:top}
+th{background:var(--bg2);font-weight:600}
+tr:nth-child(even) td{background:#fafbfe}
+
+/* blockquote */
+blockquote{margin:1.1em 0;padding:.6em 1.1em;background:var(--hi);border-left:4px solid var(--hi-line);
+  border-radius:0 8px 8px 0;color:#5b4a06}
+blockquote p{margin:.4em 0}
+blockquote code{background:#fbeeb8}
+
+/* lists */
+ul,ol{padding-left:1.4em}
+li{margin:.22em 0}
+li::marker{color:var(--accent)}
+
+hr{border:none;border-top:1px solid var(--line);margin:2.4em 0}
+
+/* fragility badge auto-styling done via JS below */
+.frag{font-weight:700;padding:0 6px;border-radius:5px;font-size:.92em}
+.frag-high{background:#fde2e1;color:#b3261e}
+.frag-med{background:#fdeccb;color:#9a6700}
+.frag-low{background:#d8f3e3;color:#1a7f4b}
+
+.top-link{position:fixed;right:18px;bottom:18px;background:var(--accent);color:#fff;border-radius:50%;
+  width:42px;height:42px;display:flex;align-items:center;justify-content:center;font-size:20px;
+  box-shadow:0 4px 14px rgba(43,80,214,.4);opacity:.0;transition:opacity .2s;z-index:50}
+.top-link.show{opacity:.92}
+
+.mobile-bar{display:none}
+@media(max-width:1000px){
+  .sidebar{position:fixed;left:0;top:0;transform:translateX(-100%);transition:transform .25s;z-index:100;box-shadow:2px 0 18px rgba(0,0,0,.3)}
+  .sidebar.open{transform:translateX(0)}
+  .content{padding:64px 20px 100px}
+  .mobile-bar{display:flex;align-items:center;gap:10px;position:fixed;top:0;left:0;right:0;height:50px;
+    background:var(--sidebar);color:#fff;z-index:90;padding:0 14px;font-weight:600;font-size:14px}
+  .mobile-bar button{background:#16213a;color:#fff;border:none;border-radius:7px;padding:7px 11px;font-size:16px}
+}
+</style>
+</head>
+<body>
+<div class="mobile-bar"><button id="menuBtn">☰</button><span>XDC → geth Port Guide</span></div>
+<div class="wrap">
+  <aside class="sidebar" id="sidebar">
+    <div class="brand">XDC × go-ethereum<small>Consensus port — reproduction guide</small></div>
+    <nav>
+<a class="toc-h2" href="#1-what-this-is-and-how-to-read-it">1. What this is, and how to
+read it</a>
+<a class="toc-h2" href="#2-the-mental-model-xdc-as-an-overlay">2. The mental model: XDC
+as an overlay</a>
+<a class="toc-h3" href="#a-self-contained-packages--copy-verbatim">A. Self-contained
+packages — copy verbatim</a>
+<a class="toc-h3" href="#b-surgical-seams--re-cut-by-hand">B. Surgical seams — re-cut by
+hand</a>
+<a class="toc-h2" href="#3-the-methodology-that-worked-reset-and-replay-in-bundles">3.
+The methodology that worked: Reset-and-Replay in bundles</a>
+<a class="toc-h3" href="#31-the-situation">3.1 The situation</a>
+<a class="toc-h3" href="#32-why-not-a-linear-rebase">3.2 Why not a linear rebase?</a>
+<a class="toc-h3" href="#33-the-bundle-catalogue">3.3 The bundle catalogue</a>
+<a class="toc-h3" href="#34-the-crucial-ordering-insight">3.4 The crucial ordering
+insight</a>
+<a class="toc-h3" href="#35-the-conflict-resolution-policy">3.5 The conflict-resolution
+policy</a>
+<a class="toc-h3" href="#36-the-per-bundle-gate">3.6 The per-bundle gate</a>
+<a class="toc-h2" href="#4-prerequisites--knowledge--skills-required">4. Prerequisites —
+knowledge &amp; skills required</a>
+<a class="toc-h3" href="#domain-knowledge">Domain knowledge</a>
+<a class="toc-h3" href="#tooling-skills">Tooling skills</a>
+<a class="toc-h3" href="#if-you-are-an-ai-agent">If you are an AI agent</a>
+<a class="toc-h2" href="#5-the-four-marker-conventions-find-xdc-code-in-any-tree">5. The
+four marker conventions (find XDC code in any tree)</a>
+<a class="toc-h2" href="#6-the-reproduction-process--phase-by-phase">6. The reproduction
+process — phase by phase</a>
+<a class="toc-h3" href="#phase-0--establish-the-baseline-and-the-oracle">Phase 0 —
+Establish the baseline and the oracle</a>
+<a class="toc-h3" href="#phase-1--copy-the-self-contained-packages-verbatim">Phase 1 —
+Copy the self-contained packages verbatim</a>
+<a class="toc-h3" href="#phase-2--cut-the-surgical-seams-in-dependency-order">Phase 2 —
+Cut the surgical seams, in dependency order</a>
+<a class="toc-h3" href="#phase-3--build--wire">Phase 3 — Build &amp; wire</a>
+<a class="toc-h3" href="#phase-4--validate">Phase 4 — Validate</a>
+<a class="toc-h2" href="#7-subsystem-reference-the-six-seams">7. Subsystem reference (the
+six seams)</a>
+<a class="toc-h3" href="#71-chain-config-params--genesis">7.1 Chain config, params &amp;
+genesis</a>
+<a class="toc-h3" href="#72-core-types--rlp-consensus-critical">7.2 Core types &amp; RLP
+(consensus-critical)</a>
+<a class="toc-h3" href="#73-consensus-engine--wiring">7.3 Consensus engine &amp;
+wiring</a>
+<a class="toc-h3" href="#74-evm-precompiles-gas--state-transition">7.4 EVM, precompiles,
+gas &amp; state transition</a>
+<a class="toc-h3" href="#75-eth-wire-protocol-p2p--sync">7.5 eth wire protocol, P2P &amp;
+sync</a>
+<a class="toc-h3" href="#76-rpc--api-surface">7.6 RPC / API surface</a>
+<a class="toc-h2" href="#8-consensus-parity-invariants--what-must-be-bit-exact">8.
+Consensus-parity invariants — what MUST be bit-exact</a>
+<a class="toc-h2" href="#9-the-fork-activation-timeline-the-inertness-window">9. The
+fork-activation timeline (the &quot;inertness window&quot;)</a>
+<a class="toc-h2" href="#10-validation--the-parity-harness">10. Validation &amp; the
+parity harness</a>
+<a class="toc-h2" href="#11-gotchas-traps--war-stories">11. Gotchas, traps &amp; war
+stories</a>
+<a class="toc-h2" href="#12-known-gaps-in-the-current-port">12. Known gaps in the current
+port</a>
+<a class="toc-h2" href="#13-the-re-port-checklist-copy-paste">13. The re-port checklist
+(copy-paste)</a>
+<a class="toc-h2" href="#14-for-an-ai-agent-executing-this-port">14. For an AI agent
+executing this port</a>
+<a class="toc-h2" href="#15-references--tooling">15. References &amp; tooling</a>
+<a class="toc-h3" href="#sibling-docs-in-this-repo">Sibling docs (in this repo)</a>
+<a class="toc-h3" href="#scripts">Scripts</a>
+<a class="toc-h3" href="#canonical-reference-clients-read-only--the-spec">Canonical
+reference clients (read-only — the spec)</a>
+<a class="toc-h3" href="#external">External</a>
+    </nav>
+  </aside>
+  <main class="content"><span id="top"></span>
+<h1 id="recreating-xdc-consensus-on-any-go-ethereum-version">Recreating
+XDC Consensus on Any go-ethereum Version</h1>
+<p><strong>The definitive, version-agnostic reproduction guide for
+layering XDC Network (XDPoS) consensus on top of upstream
+go-ethereum.</strong></p>
+<blockquote>
+<p>Reviewed range: pristine geth <strong>v1.17.3</strong>
+(<code>117e067f0f0bae1a17082321f224dedb6765b10f</code>) →
+<code>origin/reset/integration-1.17.3</code> HEAD
+(<code>e9898e81</code>, 2026-05-30). Scope of the overlay: <strong>262
+files changed — 204 new, 58 modified, +69,413 / −412 lines.</strong></p>
+<p>This document tells you <em>how the port was done</em>, <em>why each
+change exists</em>, and <em>how to redo it on any future geth
+version</em> — in enough detail that a developer <strong>or an AI
+agent</strong> can execute it from scratch. Every claim below is
+grounded in the actual diff and cites <code>file:line</code> on the XDC
+branch.</p>
+</blockquote>
+<hr />
+
+<hr />
+<h2 id="1-what-this-is-and-how-to-read-it">1. What this is, and how to
+read it</h2>
+<p>XDC Network is an EVM chain that runs <strong>XDPoS</strong> (XinFin
+Delegated Proof-of-Stake) consensus instead of Ethereum's PoW/PoS. The
+canonical XDC client (<code>XDPoSChain</code>, and its geth-based
+sibling at <code>XDCIndia/go-ethereum</code>) is a <em>fork</em> of
+go-ethereum. Keeping that fork close to modern geth means periodically
+re-applying the XDC changes on top of a newer geth base.</p>
+<p>This guide is the distilled "how to re-apply" knowledge. It is
+organised so you can read it three ways:</p>
+<ul>
+<li><strong>Top to bottom</strong> — to understand the whole shape of
+the port.</li>
+<li><strong>Section 7 as a reference</strong> — when you're elbow-deep
+in a specific subsystem.</li>
+<li><strong>Section 13 as a checklist</strong> — when you're actually
+doing the work.</li>
+</ul>
+<p><strong>Two sources of truth you will consult
+constantly:</strong></p>
+<table>
+<thead>
+<tr>
+<th>You want to know…</th>
+<th>Look in…</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>"How does <strong>XDC</strong> do X?" (the behaviour you must
+reproduce)</td>
+<td><code>XDPoSChain/</code> and <code>XDCIndia/go-ethereum</code> (the
+canonical clients)</td>
+</tr>
+<tr>
+<td>"How does <strong>geth</strong> do Y now?" (the base you're porting
+onto)</td>
+<td>the target upstream geth tag</td>
+</tr>
+</tbody>
+</table>
+<p>The golden rule of this whole exercise: <strong>the XDC behaviour is
+the specification; the new geth is just the host.</strong> When they
+disagree, XDC wins, and you document why.</p>
+<hr />
+<h2 id="2-the-mental-model-xdc-as-an-overlay">2. The mental model: XDC
+as an overlay</h2>
+<p>The single most important realisation, confirmed by the file
+breakdown (<strong>204 new files vs 58 modified</strong>, only 412
+deleted lines):</p>
+<blockquote>
+<p><strong>XDC is overwhelmingly <em>additive</em>. ~78% of the change
+is new files that upstream never touches. The hard 22% is a small set of
+<em>surgical seams</em> cut into core geth files.</strong></p>
+</blockquote>
+<p>So the port decomposes cleanly into two kinds of work:</p>
+<h3 id="a-self-contained-packages--copy-verbatim">A. Self-contained
+packages — copy verbatim</h3>
+<p>These are pure-XDC packages that import only stable geth surfaces
+(<code>consensus</code>, <code>core/types</code>,
+<code>core/state</code>, <code>params</code>, <code>common</code>,
+<code>ethdb</code>, <code>rlp</code>, <code>crypto</code>,
+<code>log</code>). They move between geth versions with little or no
+change:</p>
+<ul>
+<li><code>consensus/XDPoS/**</code> — the entire consensus engine (43
+files, ~12k LOC; <code>xdpos.go</code> 2049 lines,
+<code>engines/engine_v2/engine.go</code> 2361 lines,
+<code>engines/engine_v1/engine.go</code> 981 lines).</li>
+<li><code>contracts/**</code> — generated bindings for the system
+contracts (validator <code>0x88</code>, blocksigner <code>0x89</code>,
+randomize <code>0x90</code>, XDCx DEX, TRC21 issuer, multisig).</li>
+<li><code>eth/hooks/**</code> — the reward/penalty/validator
+closures.</li>
+<li><code>eth/bft/**</code>, <code>eth/handler_xdc.go</code>,
+<code>eth/sync_xdc.go</code> — XDC's sync driver and BFT plumbing.</li>
+<li><code>core/xdc_genesis/*.json</code> +
+<code>core/genesis_xdc.go</code> — embedded genesis specs.</li>
+<li><code>params/xdc_features.go</code>,
+<code>node/config_xdc.go</code>, <code>node/health.go</code>,
+<code>common/xdc_contracts.go</code>,
+<code>core/xdc_sync_opts.go</code>.</li>
+</ul>
+<h3 id="b-surgical-seams--re-cut-by-hand">B. Surgical seams — re-cut by
+hand</h3>
+<p>These are the <strong>58 modified geth files</strong> where XDC code
+is woven into upstream logic. These are where all the difficulty lives,
+because <em>the surrounding upstream code drifts between versions</em>.
+The seam is stable in <em>intent</em>; its exact location moves.</p>
+<p>The rest of this guide is mostly about category B.</p>
+<pre><code>         ┌──────────────────────────────────────────────────────────┐
+         │                  UPSTREAM GO-ETHEREUM                      │
+         │  (the host — drifts every release)                        │
+         │                                                            │
+         │   params/   core/   eth/   internal/   p2p/   cmd/         │
+         │      ▲        ▲       ▲         ▲        ▲      ▲           │
+         │      │        │       │         │        │      │  58       │
+         │   ───┼────────┼───────┼─────────┼────────┼──────┼── surgical│
+         │      │        │       │         │        │      │  seams    │
+         └──────┼────────┼───────┼─────────┼────────┼──────┼──────────┘
+                │        │       │         │        │      │
+         ┌──────┴────────┴───────┴─────────┴────────┴──────┴──────────┐
+         │              204 PURE-XDC FILES (copy verbatim)            │
+         │  consensus/XDPoS · contracts · eth/hooks · eth/bft ·       │
+         │  core/xdc_genesis · eth/sync_xdc.go · params/xdc_features  │
+         └────────────────────────────────────────────────────────────┘</code></pre>
+<hr />
+<h2 id="3-the-methodology-that-worked-reset-and-replay-in-bundles">3.
+The methodology that worked: Reset-and-Replay in bundles</h2>
+<p>This is <em>the process</em> the team actually used — and the process
+you should repeat. It is documented in
+<code>docs/RESET_BUNDLES.md</code>, <code>docs/PORT_LOG.md</code>, and
+<code>docs/port/HANDOFF.md</code>.</p>
+<h3 id="31-the-situation">3.1 The situation</h3>
+<p>The <code>xdc-network</code> branch carried <strong>677
+commits</strong> of XDC overlay on top of a <em>pre-1.17.0</em> geth
+base (commit <code>54a91b3a</code>). That base had rotted —
+state-divergence bugs accumulated, and the overlay was too far behind
+upstream to merge cleanly. The decision (issue #740): <strong>reset onto
+pristine geth v1.17.3 and replay the overlay as logical
+bundles.</strong></p>
+<h3 id="32-why-not-a-linear-rebase">3.2 Why not a linear rebase?</h3>
+<p>Rebasing 677 commits one-by-one across a major-version gap is a
+nightmare: every commit conflicts, and you can't tell a real semantic
+conflict from a context-line shift. Instead, the overlay was
+<strong>grouped into ~11 logical bundles</strong> (B0–B11), each
+cherry-picked onto a clean baseline branch, built, tested, and merged as
+a single <code>--no-ff</code> merge commit. Original commit SHAs stay
+reachable via <code>git log --all</code>.</p>
+<h3 id="33-the-bundle-catalogue">3.3 The bundle catalogue</h3>
+<table>
+<thead>
+<tr>
+<th>ID</th>
+<th>Title</th>
+<th>Key paths</th>
+<th>Conflict risk</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>B0</strong></td>
+<td>Chain config + genesis + validator/blocksigner contracts</td>
+<td><code>params/</code>, <code>core/genesis*.go</code>,
+<code>contracts/</code></td>
+<td>low</td>
+</tr>
+<tr>
+<td><strong>B1</strong></td>
+<td>XDPoS <strong>V1</strong> engine</td>
+<td><code>consensus/XDPoS/engines/engine_v1/</code></td>
+<td>low</td>
+</tr>
+<tr>
+<td><strong>B2</strong></td>
+<td>XDPoS <strong>V2</strong> engine + epoch/masternode wiring</td>
+<td><code>consensus/XDPoS/engines/engine_v2/</code>,
+<code>utils/</code></td>
+<td>medium</td>
+</tr>
+<tr>
+<td><strong>B3</strong></td>
+<td>TIPSigning + BlockSigners precompiles + signer state</td>
+<td><code>core/vm/</code>, signer state</td>
+<td>low</td>
+</tr>
+<tr>
+<td><strong>B4</strong></td>
+<td>Header/finality plumbing + <code>XDC:</code> marker family</td>
+<td><code>core/blockchain.go</code>,
+<code>core/state_processor.go</code>, <code>core/types/</code>,
+<code>eth/handler.go</code></td>
+<td><strong>HIGH</strong></td>
+</tr>
+<tr>
+<td><strong>B5</strong></td>
+<td>P1 bulk-sync + checkpoint trie commit</td>
+<td><code>eth/downloader/</code>, <code>core/blockchain.go</code>,
+<code>core/state/</code></td>
+<td><strong>HIGH</strong></td>
+</tr>
+<tr>
+<td><strong>B6</strong></td>
+<td>Snap-sync XDC adaptations (path scheme, pivot stability)</td>
+<td><code>eth/downloader/</code>, <code>core/rawdb/</code>,
+<code>triedb/pathdb/</code></td>
+<td>medium</td>
+</tr>
+<tr>
+<td><strong>B7</strong></td>
+<td>Bypass cleanup / state-divergence guards</td>
+<td><code>core/blockchain.go</code>,
+<code>core/state_processor.go</code></td>
+<td><strong>HIGH</strong></td>
+</tr>
+<tr>
+<td><strong>B8</strong></td>
+<td>sync-test scripts + canonical parity validator</td>
+<td><code>scripts/</code></td>
+<td>none</td>
+</tr>
+<tr>
+<td><strong>B9</strong></td>
+<td>Recent fix PRs + one-off bug fixes</td>
+<td>mixed</td>
+<td>low–medium</td>
+</tr>
+<tr>
+<td><strong>B10</strong></td>
+<td>Docs / port log / ADRs</td>
+<td><code>docs/</code></td>
+<td>none</td>
+</tr>
+<tr>
+<td><strong>B11</strong></td>
+<td>Build, CI, devops leftovers</td>
+<td>various</td>
+<td>low</td>
+</tr>
+</tbody>
+</table>
+<h3 id="34-the-crucial-ordering-insight">3.4 The crucial ordering
+insight</h3>
+<p>The bundles were <strong>not</strong> merged in numerical order. The
+actual order (after escalating the decision to an architectural planner)
+was:</p>
+<pre><code>B0 → B1 → B3 → B4 → B5 → B7 → B2 → B6 → B8 → B9 → B10 → B11</code></pre>
+<p><strong>Why move B2 (the V2 engine) to 7th?</strong> Because V2
+consensus depends on header plumbing (B4), P1 bulk-sync (B5), and the
+bypass cleanup (B7). If you land V2 first, its tests fail <em>for
+plumbing reasons</em> and you can't tell whether V2 itself was ported
+correctly. <strong>Land the foundation, then the thing that sits on
+it.</strong> This generalises: <em>sequence bundles so that when
+something breaks, only one layer could be responsible.</em></p>
+<h3 id="35-the-conflict-resolution-policy">3.5 The conflict-resolution
+policy</h3>
+<p>Every bundle was governed by one rule:</p>
+<blockquote>
+<p><strong>On any conflict where the <code>XDC:</code> marker is present
+on either side, XDC behaviour wins. Document each such resolution as one
+line in <code>docs/RESET_CONFLICT_LOG.md</code>: file path +
+before/after + a one-line "why".</strong></p>
+</blockquote>
+<p>For "pure refactor" conflicts (upstream moved code with no semantic
+change), take the upstream skeleton and re-apply the XDC additions on
+top — don't take the XDC version verbatim, or you lose the upstream
+improvement.</p>
+<h3 id="36-the-per-bundle-gate">3.6 The per-bundle gate</h3>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="fu">git</span> checkout <span class="at">-b</span> bundle/Bn reset/baseline-<span class="op">&lt;</span>ver<span class="op">&gt;</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="fu">git</span> cherry-pick <span class="op">&lt;</span>bundle commits<span class="op">&gt;</span>          <span class="co"># resolve conflicts per the policy above</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span class="ex">go</span> build ./... <span class="kw">&amp;&amp;</span> <span class="ex">go</span> vet ./... <span class="kw">&amp;&amp;</span> <span class="ex">go</span> test ./<span class="op">&lt;</span>touched-packages<span class="op">&gt;</span>/...</span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a><span class="co"># For F-bucket-collision bundles (B4, B5, B7) ONLY — run the full sync gate:</span></span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a><span class="ex">scripts/local-sync-test.sh</span> wipe-stateful <span class="kw">&amp;&amp;</span> <span class="ex">scripts/local-sync-test.sh</span> start all</span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a><span class="co"># Then grep the logs — these strings MUST return zero hits:</span></span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a><span class="co">#   &quot;BAD BLOCK&quot; | &quot;invalid merkle root&quot; | &quot;state-root bypass&quot; | &quot;forced trie commit&quot;</span></span>
+<span id="cb3-9"><a href="#cb3-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-10"><a href="#cb3-10" aria-hidden="true" tabindex="-1"></a><span class="fu">git</span> checkout reset/baseline-<span class="op">&lt;</span>ver<span class="op">&gt;</span></span>
+<span id="cb3-11"><a href="#cb3-11" aria-hidden="true" tabindex="-1"></a><span class="fu">git</span> merge <span class="at">--no-ff</span> bundle/Bn <span class="at">-m</span> <span class="st">&quot;merge: &lt;title&gt; — absorbs XDC PRs #x,#y,#z&quot;</span></span></code></pre></div>
+<p>The high-risk bundles (B4/B5/B7 — the ones touching
+<code>core/blockchain.go</code> and <code>eth/downloader/</code>) get
+the <strong>full sync test</strong>, not just unit tests. Everything
+else needs only build + vet + touched-package tests.</p>
+<hr />
+<h2 id="4-prerequisites--knowledge--skills-required">4. Prerequisites —
+knowledge &amp; skills required</h2>
+<p>Before you start, you (human or agent) need working command of:</p>
+<h3 id="domain-knowledge">Domain knowledge</h3>
+<ul>
+<li><strong>EVM execution model</strong> — gas accounting, intrinsic
+gas, refunds, precompiles, the fork/EIP system
+(Berlin/London/Shanghai/Cancun and the EIPs each bundles).</li>
+<li><strong>RLP encoding</strong> — how block headers, transactions, and
+state accounts serialise; <em>why field order and presence change the
+hash</em>.</li>
+<li><strong>State trie / world state</strong> —
+<code>IntermediateRoot</code>, <code>Finalise</code>, account leaves,
+how a single dirty-empty account can delete a leaf and shift the
+root.</li>
+<li><strong>geth architecture</strong> — <code>consensus.Engine</code>
+interface, <code>core.StateProcessor</code>,
+<code>core.BlockChain</code>, the <code>eth</code> package wiring
+(<code>eth/backend.go</code>), the downloader/skeleton/beaconsync sync
+pipeline, the devp2p <code>eth</code> wire protocol.</li>
+<li><strong>XDPoS consensus</strong> — V1 (round-robin, snapshot-based)
+vs V2 (HotStuff-style BFT with QC/TC, rounds, epochs); masternode
+selection; epoch-boundary rewards; penalties; the system contracts at
+<code>0x88/0x89/0x90</code>.</li>
+</ul>
+<h3 id="tooling-skills">Tooling skills</h3>
+<ul>
+<li><strong><code>git</code></strong> — cherry-pick,
+<code>--no-ff</code> merges, <code>merge-base</code>,
+<code>rev-list</code>, range diffs, worktrees.</li>
+<li><strong><code>rlpgen</code> / <code>gencodec</code></strong>
+(<code>go:generate</code>) — regenerating <code>gen_header_rlp.go</code>
+/ <code>gen_header_json.go</code> / <code>gen_account_rlp.go</code>
+after changing a struct. <strong>This is the single most important
+mechanical skill</strong> — get it wrong and every block hash is
+wrong.</li>
+<li><strong><code>go build</code> / <code>go vet</code> /
+<code>go test</code></strong>, the race detector (<code>-race</code>),
+<code>GOMAXPROCS=1</code> for ruling out concurrency bugs.</li>
+<li><strong><code>abigen</code></strong> — regenerating
+<code>contracts/**</code> bindings from Solidity if the system contracts
+change.</li>
+<li>A <strong>parity oracle</strong> — a synced canonical XDC node (or
+block/state dumps from one) to diff against.</li>
+</ul>
+<h3 id="if-you-are-an-ai-agent">If you are an AI agent</h3>
+<p>See <a href="#14-for-an-ai-agent-executing-this-port">§14</a>. In
+short: use parallel sub-agents to analyse subsystems,
+<strong>adversarially verify every consensus-critical claim against the
+actual code</strong>, and escalate irreversible architectural calls
+rather than guessing.</p>
+<hr />
+<h2 id="5-the-four-marker-conventions-find-xdc-code-in-any-tree">5. The
+four marker conventions (find XDC code in any tree)</h2>
+<p>XDC code is discoverable. When you land on an unfamiliar XDC fork and
+need to know "what did they change here?", these four conventions
+surface it:</p>
+<ol type="1">
+<li><strong>The <code>XDC:</code> / <code>xdpos:</code> log &amp;
+comment prefix.</strong> Grep <code>XDC:</code> and <code>xdpos:</code>
+— nearly every surgical edit is tagged.
+<div class="sourceCode" id="cb4"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="fu">grep</span> <span class="at">-rIn</span> <span class="st">&quot;XDC:&quot;</span> <span class="at">--include</span><span class="op">=</span><span class="pp">*</span>.go <span class="kw">|</span> <span class="fu">grep</span> <span class="at">-v</span> _test.go</span></code></pre></div></li>
+<li><strong>The <code>IsXDC()</code> predicate.</strong>
+<code>IsXDC()</code> is <code>c.XDPoS != nil</code>
+(<code>params/config.go</code>). Every conditional that forks behaviour
+for XDC chains gates on it (or on <code>config.XDPoS != nil</code>).
+Grep it to find every behavioural fork:
+<div class="sourceCode" id="cb5"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="fu">grep</span> <span class="at">-rIn</span> <span class="st">&quot;IsXDC()\|XDPoS != nil\|config.XDPoS&quot;</span> <span class="at">--include</span><span class="op">=</span><span class="pp">*</span>.go</span></code></pre></div></li>
+<li><strong><code>xdc_*</code> filenames.</strong> New files added
+beside upstream files carry an <code>xdc_</code> or <code>_xdc</code>
+infix: <code>genesis_xdc.go</code>, <code>sync_xdc.go</code>,
+<code>handler_xdc.go</code>, <code>config_xdc.go</code>,
+<code>xdc_sync_opts.go</code>, <code>api_xdc.go</code>. List them:
+<div class="sourceCode" id="cb6"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="fu">git</span> ls-files <span class="kw">|</span> <span class="fu">grep</span> <span class="at">-iE</span> <span class="st">&quot;xdc|xdpos&quot;</span></span></code></pre></div></li>
+<li><strong>The diff against the fork base.</strong> The ground truth.
+If you know the geth tag the fork was built on:
+<div class="sourceCode" id="cb7"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="fu">git</span> diff <span class="op">&lt;</span>geth-base-tag<span class="op">&gt;</span>..HEAD <span class="at">--stat</span></span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a><span class="fu">git</span> diff <span class="op">&lt;</span>geth-base-tag<span class="op">&gt;</span>..HEAD <span class="at">--name-status</span> <span class="kw">|</span> <span class="fu">grep</span> <span class="st">&#39;^M&#39;</span>   <span class="co"># the surgical seams</span></span></code></pre></div></li>
+</ol>
+<p>The "find the smoking gun" workflow when parity breaks at block N:
+<code>git diff &lt;base&gt;..HEAD -- &lt;suspect file&gt;</code> on the
+file in the failing code path, then grep that diff for
+<code>IsXDC</code>/<code>XDC:</code> to isolate the XDC-specific
+branch.</p>
+<hr />
+<h2 id="6-the-reproduction-process--phase-by-phase">6. The reproduction
+process — phase by phase</h2>
+<h3 id="phase-0--establish-the-baseline-and-the-oracle">Phase 0 —
+Establish the baseline and the oracle</h3>
+<ol type="1">
+<li><strong>Pin the geth base.</strong> Check out the exact upstream tag
+you're porting onto. Tag it (<code>v&lt;ver&gt;-pristine</code>) and
+confirm it builds clean on your toolchain. This is your
+<code>reset/baseline-&lt;ver&gt;</code> branch.</li>
+<li><strong>Enumerate the overlay.</strong> Diff the current XDC branch
+against its <em>old</em> geth base to get the full list of XDC
+commits/files. This is your work-list.</li>
+<li><strong>Stand up a parity oracle.</strong> You need something to
+compare against: either a synced canonical XDC node exposing RPC, or
+block + pre-state dumps for a range of blocks (including fork-boundary
+blocks). Without this you are flying blind — <em>do not skip
+it.</em></li>
+<li><strong>Create the conflict log.</strong> An empty
+<code>docs/RESET_CONFLICT_LOG.md</code> ready for one line per resolved
+conflict.</li>
+</ol>
+<h3 id="phase-1--copy-the-self-contained-packages-verbatim">Phase 1 —
+Copy the self-contained packages verbatim</h3>
+<p>Bring across category-A packages (see <a
+href="#2-the-mental-model-xdc-as-an-overlay">§2</a>) unchanged. They
+won't <em>compile</em> yet (they reference seams that don't exist), but
+getting the files in place first lets the compiler tell you exactly
+which seams are missing.</p>
+<p>Order: <code>consensus/XDPoS/**</code>, <code>contracts/**</code>,
+<code>eth/hooks/**</code>, <code>core/xdc_genesis/**</code>,
+<code>params/xdc_features.go</code>,
+<code>common/xdc_contracts.go</code>,
+<code>core/xdc_sync_opts.go</code>, <code>node/config_xdc.go</code>,
+<code>node/health.go</code>.</p>
+<h3 id="phase-2--cut-the-surgical-seams-in-dependency-order">Phase 2 —
+Cut the surgical seams, in dependency order</h3>
+<p>This is the bundle order from <a
+href="#34-the-crucial-ordering-insight">§3.4</a>, expressed as
+subsystems. Do them in this sequence — each depends on the previous:</p>
+<ol type="1">
+<li><strong><code>params/</code> + <code>common/</code></strong> — chain
+configs, the <code>ChainConfig</code> struct fields,
+<code>XDPoSConfig</code>/<code>V2</code>, <code>XDCBaseFee</code>, the
+TIP constants. (Nothing downstream works until <code>XDPoS != nil</code>
+is reachable.) → <a
+href="#71-chain-config-params--genesis">§7.1</a></li>
+<li><strong><code>core/types/</code></strong> — the three header fields
++ RLP regeneration + <code>StateAccount.BigBalance</code>.
+(Consensus-critical; everything hashes through here.) → <a
+href="#72-core-types--rlp-consensus-critical">§7.2</a></li>
+<li><strong><code>core/genesis.go</code></strong> — the SetupGenesis
+patch logic + genesis header field init. <em>Assert the genesis hashes
+immediately.</em> → <a
+href="#71-chain-config-params--genesis">§7.1</a></li>
+<li><strong><code>core/vm/</code> +
+<code>core/state_transition.go</code> +
+<code>core/state_processor.go</code> + <code>core/evm.go</code> +
+<code>eip1559</code></strong> — the execution-layer seams. → <a
+href="#74-evm-precompiles-gas--state-transition">§7.4</a></li>
+<li><strong><code>eth/ethconfig</code> +
+<code>eth/backend.go</code></strong> — engine construction and the V2
+wiring sequence. → <a href="#73-consensus-engine--wiring">§7.3</a></li>
+<li><strong><code>eth/protocols/eth/</code> +
+<code>eth/handler*.go</code> + <code>eth/sync_xdc.go</code> +
+<code>p2p/discover/v4wire</code></strong> — the wire protocol and sync
+driver. → <a href="#75-eth-wire-protocol-p2p--sync">§7.5</a></li>
+<li><strong><code>internal/ethapi/</code> +
+<code>internal/web3ext/</code> +
+<code>eth/api_backend.go</code></strong> — the RPC surface. → <a
+href="#76-rpc--api-surface">§7.6</a></li>
+<li><strong><code>cmd/utils/flags.go</code> +
+<code>params/bootnodes.go</code></strong> — CLI flags and bootnodes
+(non-consensus, do last).</li>
+</ol>
+<h3 id="phase-3--build--wire">Phase 3 — Build &amp; wire</h3>
+<p><code>go build ./...</code> then <code>go vet ./...</code>. The
+compiler walks you through every still-missing seam. Resolve them
+against the canonical client, logging conflicts.</p>
+<h3 id="phase-4--validate">Phase 4 — Validate</h3>
+<p>The three tiers from <a
+href="#10-validation--the-parity-harness">§10</a>. <strong>Do not
+declare done until the parity harness is green across the fork
+boundaries</strong>, not just genesis.</p>
+<hr />
+<h2 id="7-subsystem-reference-the-six-seams">7. Subsystem reference (the
+six seams)</h2>
+<p>Each subsystem below is documented as: <strong>what XDC changes · the
+upstream seam · the re-port recipe · fragility.</strong> All
+<code>file:line</code> references are on
+<code>reset/integration-1.17.3</code>.</p>
+<h3 id="71-chain-config-params--genesis">7.1 Chain config, params &amp;
+genesis</h3>
+<p><strong>What XDC adds</strong></p>
+<ul>
+<li><strong>Two chain configs</strong> in <code>params/config.go</code>:
+<ul>
+<li><code>XDCMainnetChainConfig</code> — ChainID <strong>50</strong>.
+Homestead=1, EIP150=2, EIP155=3, EIP158=3, Byzantium=4;
+Constantinople=Petersburg=Istanbul=Berlin=London=<strong>76321000</strong>;
+<code>Eip1559Block</code>=<strong>98800200</strong>,
+<code>CancunBlock</code>=<strong>98802000</strong>. XDPoS:
+<code>Period</code>=2, <code>Epoch</code>=900, <code>Reward</code>=5000,
+<code>RewardCheckpoint</code>=900, <code>Gap</code>=450,
+<code>FoudationWalletAddr</code>=<code>0x92a289fe…ac65</code>. V2:
+<code>SwitchBlock</code>=<strong>80370000</strong>,
+<code>SwitchEpoch</code>=89300.</li>
+<li><code>XDCApothemChainConfig</code> — ChainID <strong>51</strong>.
+Same pre-Byzantium; Constantinople…London=<strong>61290000</strong>;
+<code>Eip1559Block</code>=<strong>71550000</strong>,
+<code>CancunBlock</code>=<strong>71551800</strong>.
+<code>FoudationWalletAddr</code>=<code>0x746249…cd5c</code>. V2:
+<code>SwitchBlock</code>=<strong>56828700</strong>,
+<code>SwitchEpoch</code>=63143.</li>
+</ul></li>
+<li><strong>New structs</strong>:
+<code>XDPoSConfig{Period, Epoch, Reward, RewardCheckpoint, Gap, FoudationWalletAddr, V2}</code>,
+<code>V2{SwitchBlock, CurrentConfig (json:"config"), AllConfigs, SwitchEpoch, …}</code>,
+<code>V2Config</code>, <code>ExpTimeoutConfig</code>,
+<code>TrustedSyncCheckpoint{Number, Hash, Root, Masternodes, Penalties}</code>.</li>
+<li><strong><code>ChainConfig</code> field additions</strong>:
+<code>Eip1559Block</code>, <code>CancunBlock</code>,
+<code>XDPoS *XDPoSConfig</code>, <code>XDCFeatures</code>,
+<code>TrustedSyncCheckpoints</code>.</li>
+<li><strong>Genesis hash constants</strong>: Mainnet
+<code>0x4a9d748b…d6b1</code>, Apothem <code>0xbdea512b…0075</code>.</li>
+<li><strong>Fork-predicate overrides</strong>: <code>IsIstanbul</code> =
+<code>TIPXDCXCancellationFee OR IstanbulBlock</code> (activates Istanbul
+early via the TIP constant); <code>IsEIP1559</code> = forks on
+<code>Eip1559Block</code>, <strong>decoupled from
+<code>IsLondon</code></strong>; <code>IsCancunBlock</code> (block-number
+Cancun gate); <code>IsXDC()</code> = <code>XDPoS != nil</code>.</li>
+<li><strong><code>params/protocol_params.go</code></strong>:
+<code>XDCBaseFee = 12500000000</code> (12.5 gwei).</li>
+<li><strong><code>params/xdc_features.go</code></strong> (NEW):
+<code>IsXDPoSV2</code>, <code>IsXDPoSV2SwitchBlock</code>,
+<code>SkipV2FirstEpochPenalty</code>.</li>
+<li><strong>Genesis</strong> (<code>core/genesis_xdc.go</code> +
+<code>core/xdc_genesis/*.json</code>): <code>//go:embed</code>-ed
+minimal genesis specs;
+<code>DefaultXDC{Mainnet,Apothem}GenesisBlock()</code>. Addresses use
+the <strong><code>xdc</code> hex prefix</strong>. <code>extraData</code>
+encodes the genesis masternode set (V1 layout: 32-byte vanity +
+N×20-byte signers + 65-byte seal).</li>
+</ul>
+<p><strong>The upstream seam</strong></p>
+<ul>
+<li>The new structs/configs sit beside <code>MainnetChainConfig</code>
+etc. The <code>Is*</code> methods <em>override</em> the stock fork
+predicates one-for-one.</li>
+<li><strong>The critical workaround (ADR-001):</strong>
+<code>chainConfigOrDefault</code> returns <code>g.Config</code> verbatim
+when a genesis is supplied (always, for
+<code>--apothem</code>/<code>--xdcmainnet</code>) — it never maps the
+XDC genesis hash to the <em>rich</em>
+<code>params.XDC*ChainConfig</code>. So the rich config (V2, late forks,
+checkpoints) must be <strong>merged back in post-hoc</strong> inside
+<code>SetupGenesisBlock</code> and <code>LoadChainConfig</code>, via
+<code>patchMissingForkBlocks()</code>. Without this,
+<code>CheckConfigForkOrder</code> fails and — worse — the <strong>forkID
+hash diverges from canonical, so production peers reject the wire
+handshake.</strong></li>
+<li>Genesis header gets <code>Validators/Validator/Penalties</code> set
+to <strong>empty slices</strong> (<code>[]byte{}</code>, not nil) in
+<code>toBlockWithRoot</code> — required for the genesis hash to be
+correct.</li>
+</ul>
+<p><strong>Re-port recipe</strong></p>
+<ol type="1">
+<li>Port the structs verbatim. <strong>JSON tags are
+load-bearing</strong>: <code>foudationWalletAddr</code> (yes, misspelled
+— match canonical), <code>config</code> (for
+<code>V2.CurrentConfig</code>), <code>certificateThreshold</code>. A
+mismatched tag silently drops the field on unmarshal.</li>
+<li>Copy every numeric value (chain IDs, fork blocks, XDPoS fields,
+V2Configs maps) <strong>exactly</strong> from
+<code>XDPoSChain/params/config.go</code>. These are
+consensus-critical.</li>
+<li>Re-implement the <code>Is*</code> overrides. <strong>First check
+whether upstream renamed or deleted the predicate</strong> — modern geth
+is actively removing pre-Merge block forks. If
+<code>IsIstanbul</code>/<code>IsPetersburg</code> are gone, the
+early-Istanbul behaviour needs a new home (likely the EVM rules
+selection).</li>
+<li>Port <code>patchMissingForkBlocks</code> into both
+<code>SetupGenesisBlock</code> and <code>LoadChainConfig</code>. The
+insertion <em>point</em> moves every time upstream refactors genesis
+setup — re-locate it (it goes immediately after the effective config is
+resolved).</li>
+<li>Copy <code>core/xdc_genesis/*.json</code>
+<strong>byte-for-byte</strong> (do not reformat). Then
+<strong>assert</strong>
+<code>DefaultXDCMainnetGenesisBlock().ToBlock().Hash() == 0x4a9d748b…</code>
+and Apothem <code>== 0xbdea512b…</code> before doing anything else.</li>
+</ol>
+<p><strong>Fragility: HIGH</strong> — this is the most fragile file in
+the port. Upstream is deleting block-fork plumbing; the <code>Is*</code>
+override seam and the <code>Constantinople=…=Berlin</code> collapse
+depend on <code>CheckConfigForkOrder</code> and the EVM still consulting
+these predicates. The <code>V2</code> struct's embedded
+<code>sync.RWMutex</code> also makes <code>ChainConfig</code>
+non-copyable by value (any upstream <code>cfg := *someConfig</code>
+trips <code>go vet</code>).</p>
+<h3 id="72-core-types--rlp-consensus-critical">7.2 Core types &amp; RLP
+(consensus-critical)</h3>
+<p><strong>What XDC adds</strong> — three byte-slice fields on
+<code>Header</code>, inserted <strong>after <code>Nonce</code>, before
+<code>BaseFee</code></strong> (<code>core/types/block.go:85-87</code>,
+verified):</p>
+<div class="sourceCode" id="cb8"><pre class="sourceCode go"><code class="sourceCode go"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a>Validators <span class="op">[]</span><span class="dt">byte</span> <span class="st">`json:&quot;validators&quot;`</span>   <span class="co">// next epoch&#39;s masternode set (epoch-boundary blocks only)</span></span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a>Validator  <span class="op">[]</span><span class="dt">byte</span> <span class="st">`json:&quot;validator&quot;`</span>    <span class="co">// creator&#39;s seal over HashNoValidator()</span></span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a>Penalties  <span class="op">[]</span><span class="dt">byte</span> <span class="st">`json:&quot;penalties&quot;`</span>    <span class="co">// masternodes penalised this epoch</span></span></code></pre></div>
+<p>They carry <strong>no <code>rlp</code> tag</strong> → they are
+<em>always encoded</em> (empty = <code>0x80</code>). Verified RLP order
+in <code>gen_header_rlp.go:39-44</code>:</p>
+<pre><code>w.WriteBytes(obj.Nonce[:])    // index 15
+w.WriteBytes(obj.Validators)  // index 16  ← XDC
+w.WriteBytes(obj.Validator)   // index 17  ← XDC
+w.WriteBytes(obj.Penalties)   // index 18  ← XDC
+_tmp1 := obj.BaseFee != nil   // index 19+ optional cascade (unchanged)</code></pre>
+<p>Real XDC headers serialise as an <strong>18-element list</strong>
+(indices 0–17; the optional tail stays nil). Also:
+<code>HashNoValidator()</code> (an 18-element hash with the
+<code>Validator</code> slot forced empty, for seal verification),
+<code>Header.Time</code> kept as <code>uint64</code> (RLP-identical to
+XDPoSChain's <code>*big.Int</code> for all real values — proven by
+<code>header_rlp_compat_test.go</code>), and the two newest upstream
+optionals (<code>BlockAccessListHash</code> EIP-7928,
+<code>SlotNumber</code> EIP-7843) <strong>stripped from the generated
+encoder</strong>.</p>
+<p>Plus
+<strong><code>StateAccount.BigBalance *big.Int rlp:"-"</code></strong>
+(<code>state_account.go</code>): XDC genesis accounts hold
+<code>2^256-1</code> and rewards push beyond uint256. The hand-written
+<code>EncodeRLP</code>/<code>DecodeRLP</code> encodes via
+<code>WriteBigInt</code> only when <code>BigBalance != nil</code>; for
+any balance ≤ 2^256-1 it is <strong>byte-identical to upstream</strong>.
+Mirrored in <code>SlimAccount</code> for snap-sync.</p>
+<p><strong>The upstream seam</strong> — the rlpgen-generated
+<code>Header.EncodeRLP</code> and the account-trie leaf encoder. XDC's
+fields slot between <code>Nonce</code> and the optional cascade; the
+account overflow path is invisible for normal balances.</p>
+<p><strong>Re-port recipe</strong></p>
+<ol type="1">
+<li>Insert the three fields after <code>Nonce</code>, before
+<code>BaseFee</code>, <strong>in that order</strong>, no
+<code>rlp</code> tag. Add matching <code>hexutil.Bytes</code> entries to
+<code>headerMarshaling</code>.</li>
+<li><strong>Regenerate</strong> via the two <code>go:generate</code>
+directives in <code>block.go</code>:
+<div class="sourceCode" id="cb10"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb10-1"><a href="#cb10-1" aria-hidden="true" tabindex="-1"></a><span class="bu">cd</span> core/types</span>
+<span id="cb10-2"><a href="#cb10-2" aria-hidden="true" tabindex="-1"></a><span class="ex">go</span> run github.com/fjl/gencodec <span class="at">-type</span> Header <span class="at">-field-override</span> headerMarshaling <span class="at">-out</span> gen_header_json.go</span>
+<span id="cb10-3"><a href="#cb10-3" aria-hidden="true" tabindex="-1"></a><span class="ex">go</span> run ../../rlp/rlpgen <span class="at">-type</span> Header <span class="at">-out</span> gen_header_rlp.go</span></code></pre></div>
+Then verify rlpgen emitted the three fields as plain
+<code>w.WriteBytes(...)</code> between <code>Nonce</code> and the
+<code>obj.BaseFee != nil</code> cascade.</li>
+<li><strong>Curate the optional tail explicitly.</strong> Strip from the
+generated encoder any geth optional field <em>newer than XDC's fork
+point</em> that you can't guarantee stays nil (the port stripped
+<code>BlockAccessListHash</code> and <code>SlotNumber</code>). Keep
+<code>BaseFee</code> and the Cancun fields as nil-by-default stubs.</li>
+<li>For <code>StateAccount</code>: disable rlpgen, hand-write
+<code>EncodeRLP</code>/<code>DecodeRLP</code> with the three-way branch
+(BigBalance / nil / uint256), and mirror in
+<code>SlimAccountRLP</code>/<code>FullAccount</code>.</li>
+</ol>
+<p><strong>Fragility: HIGH</strong> — the single most
+consensus-sensitive change. Wrong field order, an accidental
+<code>rlp:"optional"</code> tag, or a stray serialised optional →
+<em>every header hash is wrong from genesis</em>.</p>
+<h3 id="73-consensus-engine--wiring">7.3 Consensus engine &amp;
+wiring</h3>
+<p><strong>What XDC adds</strong> — <code>consensus/XDPoS/</code> is a
+<strong>V1 wrapper engine that delegates to V2</strong>.
+<code>xdpos.go</code> implements <code>consensus.Engine</code>; every
+method dispatches by version via <code>IsV2Block(header)</code> =
+<code>header.Number &gt;= config.V2.SwitchBlock</code>.
+<code>New()</code> <strong>panics if
+<code>SwitchBlock % Epoch != 0</code></strong> (V2 switch must be
+epoch-aligned). <code>engines/engine_v2/</code> is a full HotStuff-style
+BFT engine (QC/TC, rounds, round-based epochs, 3-chain commit finality).
+<code>engine_v2.New()</code> is a <strong>process-global
+singleton</strong> (<code>engineOnce.Do</code>) to avoid OOM at the
+switch block.</p>
+<p>The <strong>reward hook lives outside the engine package</strong> —
+in <code>eth/hooks/engine_v2_hooks.go</code> — because the V2 reward
+path needs <code>*core.BlockChain</code> + <code>core/rawdb</code> to
+walk signing transactions, dependencies the engine deliberately avoids
+to stay import-cycle-free.</p>
+<p><strong>The upstream seam — and the exact wiring sequence (this is
+where V2 silently dies if you get it wrong):</strong></p>
+<ol type="1">
+<li><code>eth/ethconfig/config.go</code>
+<code>CreateConsensusEngine</code> — <strong>first check</strong>,
+before the <code>TerminalTotalDifficulty == nil</code> guard:
+<div class="sourceCode" id="cb11"><pre
+class="sourceCode go"><code class="sourceCode go"><span id="cb11-1"><a href="#cb11-1" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> config<span class="op">.</span>XDPoS <span class="op">!=</span> <span class="ot">nil</span> <span class="op">{</span> <span class="cf">return</span> XDPoS<span class="op">.</span>New<span class="op">(</span>config<span class="op">.</span>XDPoS<span class="op">,</span> db<span class="op">),</span> <span class="ot">nil</span> <span class="op">}</span></span></code></pre></div></li>
+<li><code>eth/backend.go</code> <code>New()</code>,
+<strong>before</strong> <code>CreateConsensusEngine</code>:
+<code>common.CopyXDCConstants(chainID)</code> +
+<code>XDPoS.SetNetworkConstants(chainID)</code>.</li>
+<li><code>eth/backend.go</code> <code>New()</code>,
+<strong>after</strong> the blockchain exists — type-assert
+<code>*XDPoS.XDPoS</code>, then call <strong>in this exact
+order</strong>:
+<div class="sourceCode" id="cb12"><pre
+class="sourceCode go"><code class="sourceCode go"><span id="cb12-1"><a href="#cb12-1" aria-hidden="true" tabindex="-1"></a>hooks<span class="op">.</span>AttachConsensusV1Hooks<span class="op">(</span>xdposEngine<span class="op">,</span> blockchain<span class="op">,</span> chainConfig<span class="op">)</span></span>
+<span id="cb12-2"><a href="#cb12-2" aria-hidden="true" tabindex="-1"></a>hooks<span class="op">.</span>AttachConsensusV2Hooks<span class="op">(</span>xdposEngine<span class="op">,</span> blockchain<span class="op">,</span> chainConfig<span class="op">)</span>   <span class="co">// sets wrapper.HookReward</span></span>
+<span id="cb12-3"><a href="#cb12-3" aria-hidden="true" tabindex="-1"></a>v2 <span class="op">:=</span> engine_v2<span class="op">.</span>New<span class="op">(</span>chainConfig<span class="op">,</span> chainDb<span class="op">,</span> <span class="ot">nil</span><span class="op">,</span> <span class="ot">nil</span><span class="op">)</span>                  <span class="co">// nil chans = verify mode</span></span>
+<span id="cb12-4"><a href="#cb12-4" aria-hidden="true" tabindex="-1"></a>v2<span class="op">.</span>HookCommitBlock <span class="op">=</span> <span class="kw">func</span><span class="op">(</span>h <span class="op">*</span>types<span class="op">.</span>Header<span class="op">)</span> <span class="op">{</span> blockchain<span class="op">.</span>SetFinalized<span class="op">(</span>h<span class="op">)</span> <span class="op">}</span></span>
+<span id="cb12-5"><a href="#cb12-5" aria-hidden="true" tabindex="-1"></a>xdposEngine<span class="op">.</span>SetEngineV2<span class="op">(</span>v2<span class="op">)</span>                                          <span class="co">// ← flips wrapper to V2 dispatch</span></span>
+<span id="cb12-6"><a href="#cb12-6" aria-hidden="true" tabindex="-1"></a>v2<span class="op">.</span>SetHookReward<span class="op">(</span><span class="kw">func</span><span class="op">(...)</span> <span class="op">{</span> <span class="cf">return</span> xdposEngine<span class="op">.</span>HookReward<span class="op">(...)</span> <span class="op">})</span>   <span class="co">// ← the ONLY effective reward wiring</span></span></code></pre></div></li>
+<li><code>core/state_processor.go</code> — after the pre-tx state copy:
+<code>if e, ok := chain.Engine().(interface{ SetParentState(*state.StateDB) }); ok { e.SetParentState(statedb.Copy()) }</code>.
+Rewards read <strong>pre-transaction</strong> balances; omit this and
+every epoch-boundary state root diverges.</li>
+<li><code>eth/backend.go</code> <code>APIs()</code> — re-register the
+engine RPC namespace manually (upstream <strong>removed
+<code>APIs()</code> from <code>consensus.Engine</code></strong>, #814):
+<code>apis = append(apis, xdposEng.APIs(s.blockchain)...)</code>.</li>
+</ol>
+<p><strong>Re-port recipe</strong> — copy
+<code>consensus/XDPoS/**</code> and <code>eth/hooks/**</code> verbatim;
+ensure <code>core.XdcBulkSyncMode</code> (an <code>atomic.Bool</code> in
+<code>core/xdc_sync_opts.go</code>) exists. Then re-cut the five wiring
+points above. The engine's method signatures are pinned to geth's
+<code>consensus.Engine</code> interface — if upstream changes
+<code>Finalize</code>/<code>Seal</code>/<code>FinalizeAndAssemble</code>
+signatures, the wrapper must track them.</p>
+<p><strong>Fragility: HIGH</strong> for the wiring (six ordered calls in
+<code>eth.New</code>, a function upstream refactors constantly); MED for
+the engine source itself.</p>
+<blockquote>
+<p><strong>The single most common reason V2 silently doesn't
+activate:</strong> the reward-hook ordering.
+<code>AttachConsensusV2Hooks</code> runs <em>before</em>
+<code>SetEngineV2</code>, so its internal
+<code>EngineV2.SetHookReward</code> is dead (EngineV2 still nil at that
+moment). The <strong>only</strong> effective wiring of the V2 engine's
+reward callback is the explicit <code>v2.SetHookReward(...)</code> call
+<em>after</em> <code>SetEngineV2</code>. Because
+<code>EngineV2.Finalize</code> checks the <em>V2 engine's</em>
+<code>HookReward</code> field — not the wrapper's — omitting or
+misordering that one line means V2 epoch-switch rewards never fire. Zero
+compile errors, zero verification errors — just a state-root divergence
+at the first V2 epoch boundary.</p>
+</blockquote>
+<h3 id="74-evm-precompiles-gas--state-transition">7.4 EVM, precompiles,
+gas &amp; state transition</h3>
+<p>The organising principle: <strong>XDC activates a non-standard EIP
+bundle at <code>Eip1559Block</code>, not at
+Berlin/London/Shanghai.</strong> Everything here exists to reproduce
+XDPoSChain's <code>newEip1559InstructionSet</code>, which enables
+EIP-2929 + EIP-3529 + EIP-2565 + EIP-3860 <em>all together</em> at
+<code>Eip1559Block</code>.</p>
+<table>
+<thead>
+<tr>
+<th>Change</th>
+<th>What</th>
+<th>Seam</th>
+<th>Fragility</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>EVM rules decoupling</strong></td>
+<td>Four "marker" instruction sets
+(<code>xdcBerlin/London/Merge/Shanghai</code>) gate opcode pricing by
+<code>IsEIP1559</code>, not the upstream fork. The
+<code>isXDC &amp;&amp; IsEIP1559</code> case is inserted
+<strong>above</strong> <code>IsShanghai</code> in <code>NewEVM</code> so
+XDC jumps to the Shanghai table (2929+3529+3860) at
+<code>Eip1559Block</code>.</td>
+<td><code>NewEVM</code> instruction-set switch;
+<code>ChainConfig.Rules()</code></td>
+<td><strong>HIGH</strong> —
+<code>jump_table.go</code>/<code>eips.go</code> reorganised almost every
+upstream release</td>
+</tr>
+<tr>
+<td><strong>MODEXP deferral</strong></td>
+<td><code>PrecompiledContractsXDCBerlin</code> with
+<code>bigModExp{eip2565:false}</code> charges old (expensive) MODEXP gas
+for Berlin..pre-EIP1559.</td>
+<td><code>activePrecompiledContracts</code>,
+<code>case rules.IsBerlin</code></td>
+<td>MED</td>
+</tr>
+<tr>
+<td><strong>EIP-2028 OFF (permanent)</strong></td>
+<td><code>IntrinsicGas</code> always charges <strong>68 gas / non-zero
+data byte</strong>, never 16. XDPoSChain never implemented 2028.</td>
+<td><code>IntrinsicGas</code> call in <code>execute()</code></td>
+<td>HIGH</td>
+</tr>
+<tr>
+<td><strong>EIP-3529 deferral</strong></td>
+<td>Refund cap stays 1/2 (not 1/5) until <code>Eip1559Block</code>
+(<code>calcRefund</code>:
+<code>IsLondon</code>→<code>IsEIP1559</code>).</td>
+<td><code>calcRefund()</code></td>
+<td>HIGH</td>
+</tr>
+<tr>
+<td><strong>Fixed base fee</strong></td>
+<td><code>CalcBaseFee</code> returns constant <code>XDCBaseFee</code>
+(12.5 gwei) for any XDC chain — never market-driven.
+<code>VerifyEIP1559Header</code>: pre-<code>Eip1559Block</code> headers
+must carry no BaseFee.</td>
+<td><code>eip1559.CalcBaseFee</code> /
+<code>VerifyEIP1559Header</code></td>
+<td>MED</td>
+</tr>
+<tr>
+<td><strong>No base-fee burn / TRC21 routing</strong></td>
+<td>Past <code>TIPTRC21Fee</code> with a non-zero owner, the
+<strong>full <code>gasUsed*gasPrice</code></strong> is credited to the
+token owner, not the coinbase, with no base-fee deduction. XDC burns
+nothing.</td>
+<td>fee-credit block at end of <code>execute()</code>;
+<code>owner ...common.Address</code> variadic threaded through
+<code>ApplyMessage</code></td>
+<td>HIGH</td>
+</tr>
+<tr>
+<td><strong>Special transactions</strong></td>
+<td>Txs to BlockSigners <code>0x89</code> →
+<code>ApplySigningTransaction</code> (zero gas, <strong>minimal log
+<code>{Address, BlockNumber}</code></strong>, nonce bump, no EVM). Txs
+to trading <code>0x92</code>/lending <code>0x93</code> →
+<code>ApplyEmptyTransaction</code>. Bypass the
+<code>GasFeeCap &lt; BaseFee</code> check in <code>preCheck</code>.</td>
+<td>tx loop in <code>StateProcessor.Process</code> (before
+<code>TransactionToMessage</code>)</td>
+<td>HIGH</td>
+</tr>
+<tr>
+<td><strong>TIPSigning self-destruct</strong></td>
+<td>At <code>block.Number == TIPSigning</code>:
+<code>IntermediateRoot(false)</code> → <code>SelfDestruct(0x89)</code> →
+<code>Finalise(true)</code> → <code>IntermediateRoot(true)</code>. The
+leading <code>IntermediateRoot(false)</code> is required for pathdb
+correctness.</td>
+<td><code>StateProcessor.Process</code>, after DAO handling</td>
+<td>HIGH</td>
+</tr>
+<tr>
+<td><strong><code>parentState</code> reward seam</strong></td>
+<td><code>statedb.Copy()</code> snapshotted at top of
+<code>Process</code>, pushed to engine via <code>SetParentState</code>
+before <code>Finalize</code>.</td>
+<td><code>StateProcessor.Process</code></td>
+<td>HIGH</td>
+</tr>
+<tr>
+<td><strong>PREVRANDAO</strong></td>
+<td>For XDC chains,
+<code>random = Keccak256Hash(header.Number.Bytes())</code> (XDPoS has no
+difficulty/mixdigest).</td>
+<td><code>NewEVMBlockContext</code></td>
+<td>LOW-MED</td>
+</tr>
+<tr>
+<td><strong>StaticCall touch gating</strong></td>
+<td>The zero-value account touch at the top of <code>StaticCall</code>
+is gated `!IsXDC()</td>
+<td></td>
+<td>IsIstanbul(num)<code>— else a STATICCALL to</code>ecrecover<code>deletes leaf</code>0x01`
+and diverges the root by one leaf.</td>
+</tr>
+</tbody>
+</table>
+<p><strong>System contracts</strong> (<code>contracts/**</code>): the
+engine reads masternode/signer/reward data through <strong>hardcoded
+storage-slot layouts</strong> (<code>core/state/statedb_utils.go</code>
+— <code>slotValidatorMapping</code>,
+<code>slotBlockSignerMapping</code>), <em>not</em> via EVM
+<code>eth_call</code>. The generated Go bindings are mostly for
+RPC/tooling. <strong>The storage-slot constants are the
+consensus-critical data dependency</strong> — a wrong slot silently
+corrupts reward distribution.</p>
+<p><strong>Re-port recipe</strong> — search <code>execute()</code> for
+the <code>IntrinsicGas(</code> call, the coinbase fee-credit
+<code>if/else</code>, <code>calcRefund</code>, and
+<code>preCheck</code>'s fee-cap check; re-cut each. Re-derive the four
+marker tables from whatever the new geth calls
+<code>newIstanbulInstructionSet</code>/<code>enable3198</code>/<code>enable3855</code>/<code>opRandom</code>.
+Port
+<code>ApplySigningTransaction</code>/<code>ApplyEmptyTransaction</code>
+verbatim — <strong>the minimal-log shape is consensus-critical</strong>
+(a "richer" log breaks the bloom and receipts root).</p>
+<h3 id="75-eth-wire-protocol-p2p--sync">7.5 eth wire protocol, P2P &amp;
+sync</h3>
+<p><strong>What XDC adds</strong></p>
+<ul>
+<li><strong>Protocol</strong>: keeps <code>ProtocolName = "eth"</code>,
+adds <strong>version <code>XDPOS2 = 100</code></strong> offered
+<em>first</em> in <code>ProtocolVersions</code> (two XDC nodes negotiate
+<code>eth/100</code>; stock geth falls back to 69/70).
+<code>protocolLengths[XDPOS2] = 227</code>. Re-introduces
+post-merge-removed <code>NewBlockHashesMsg = 0x01</code> /
+<code>NewBlockMsg = 0x07</code>, adds BFT codes
+<code>VoteMsg=0xe0</code>, <code>TimeoutMsg=0xe1</code>,
+<code>SyncInfoMsg=0xe2</code>.</li>
+<li><strong>Handshake</strong>: XDPOS2 uses a pre-merge
+<code>StatusPacket62</code> (ProtocolVersion, NetworkID, TD, Head,
+Genesis) with <strong>NO ForkID</strong>. Validates only NetworkID +
+ProtocolVersion + Genesis. The peer's <code>TD</code> is stashed as a
+<strong>peer-ranking metric only</strong> — <em>it is not a block
+number</em> (≈4 difficulty units/block on Apothem).</li>
+<li><strong>Discovery</strong>: <code>p2p/discover/v4wire</code> —
+<code>UseXDCPing = true</code> → pings go out as <strong>packet type
+5</strong> (XDC mainnet nodes only understand pingXDC). Without this you
+find zero peers.</li>
+<li><strong>Sync driver</strong> (<code>eth/sync_xdc.go</code>, ~1240
+lines, NEW): v1.17.3's <code>BeaconSync</code> is post-merge and idles
+after one batch waiting for a CL message XDC never sends.
+<code>xdcSyncer</code> drives sync continuously — a 500ms ticker, picks
+best peer by the TD-rank, fetches 4096 headers + bodies,
+<code>InsertChain</code>. <strong>Caught-up test is hash equality, not
+TD comparison.</strong> Includes self-healing fork rollback
+(<code>SetHead(head - window)</code> with exponential backoff on
+repeated <code>ErrUnknownAncestor</code>).
+<code>XdcBulkSyncMode atomic.Bool</code>
+(<code>core/xdc_sync_opts.go</code>) gates fast-paths during bulk
+sync.</li>
+<li><strong>BFT dispatch</strong>: for sync nodes, Vote/Timeout/SyncInfo
+packets are <strong>accept-and-ignore</strong>
+(<code>handler_eth.go</code> returns nil — <em>never drop the
+peer</em>). Full BFT (<code>eth/bft/</code>) is only needed for
+masternode block production (M8).</li>
+<li><strong>No-RequestId bridge</strong>: XDPOS2 (eth/63-era) requests
+carry no RequestId, so geth's response dispatcher can't route them.
+Solved with bypass channels
+(<code>XDCHeaderResp</code>/<code>XDCBodyResp</code>) for the xdcSyncer
+plus a FIFO re-anchoring bridge for the downloader.</li>
+</ul>
+<p><strong>Re-port recipe</strong> — re-add the <code>XDPOS2=100</code>
+const (first in <code>ProtocolVersions</code>,
+<code>protocolLengths[100]=227</code>), the <code>StatusPacket62</code>
+handshake path (no ForkID), the <code>xdpos2</code> handler map,
+<code>UseXDCPing</code>, and the xdcSyncer wiring in
+<code>eth/handler.go</code> <code>Start()</code>/<code>Stop()</code>.
+The downloader/skeleton internals churn heavily upstream — re-derive the
+no-RequestId bridge against the new tracker API; keep the
+re-anchor-by-hash logic verbatim (it handles fleet quirks, not geth
+behaviour).</p>
+<p><strong>Fragility: HIGH</strong> for the no-RequestId bridge and the
+two-pivot snap machine (both sit on the most volatile upstream code);
+MED for the xdcSyncer wiring; MED but mechanically simple for v4wire and
+the protocol const additions.</p>
+<h3 id="76-rpc--api-surface">7.6 RPC / API surface</h3>
+<p><strong>What XDC adds</strong></p>
+<ul>
+<li><strong><code>XDPoS</code> namespace</strong> (PascalCase — JSON-RPC
+is case-sensitive; tooling calls
+<code>XDPoS_getMasternodesByNumber</code>), via
+<code>consensus/XDPoS/api.go</code> + <code>api_extended.go</code>:
+<code>getSnapshot</code>, <code>getSigners</code>,
+<code>getMasternodes</code>, <code>getMasternodesByNumber</code>,
+<code>getCandidates</code>, <code>proposals</code>,
+<code>getV2BlockByNumber</code>, <code>getBlockInfoByEpochNum</code>,
+<code>getEpochNumbersBetween</code>, <code>networkInformation</code>,
+<code>getRewardByAccount</code>, …</li>
+<li><strong><code>eth_*</code> extensions</strong>
+(<code>internal/ethapi/api_xdc.go</code>):
+<code>getBlockSignersByNumber</code>,
+<code>getBlockFinalityByNumber</code>, <code>getCandidates</code>,
+<code>getRewardByHash</code>,
+<code>getTransactionAndReceiptProof</code>, <code>getAccountInfo</code>,
+<code>getStakerROI</code>, …</li>
+<li><strong><code>Backend</code> interface</strong>
+(<code>internal/ethapi/backend.go</code>) gains
+<code>GetRewardByHash(...)</code> and
+<code>BlockChain() *core.BlockChain</code>; implemented in
+<code>eth/api_backend.go</code>.</li>
+</ul>
+<p><strong>The upstream seam</strong> — because upstream <strong>removed
+<code>APIs()</code> from the <code>consensus.Engine</code>
+interface</strong> (#814), engine namespaces aren't auto-registered. The
+port re-registers manually in <code>Ethereum.APIs()</code> via a type
+assertion (see <a href="#73-consensus-engine--wiring">§7.3</a> step
+5).</p>
+<p><strong>Re-port recipe</strong> — register the namespace manually in
+<code>Ethereum.APIs()</code>; extend the <code>Backend</code> interface
+and implement in <code>api_backend.go</code> (this forces <em>every</em>
+<code>Backend</code> implementor to add the two methods, or the build
+breaks); regenerate <code>gen_header_json.go</code> so
+<code>eth_getBlockByNumber</code> actually emits the
+<code>validators</code>/<code>validator</code>/<code>penalties</code>
+fields.</p>
+<p><strong>Fragility: HIGH</strong> — the <code>Backend</code> interface
+extension is the most likely re-port build break; the manual
+<code>APIs()</code> registration lives in a frequently-refactored
+function. See <a href="#12-known-gaps-in-the-current-port">§12</a> for
+current RPC defects.</p>
+<hr />
+<h2 id="8-consensus-parity-invariants--what-must-be-bit-exact">8.
+Consensus-parity invariants — what MUST be bit-exact</h2>
+<p>If you change <em>nothing else correctly</em>, these are the things
+that, if wrong, fork the chain. They are ordered by how early/often they
+bite.</p>
+<ol type="1">
+<li><strong>Genesis hash.</strong> Mainnet <code>0x4a9d748b…d6b1</code>,
+Apothem <code>0xbdea512b…0075</code>. Driven by the embedded JSON
+(extraData masternode encoding, alloc, timestamp, gasLimit) + the
+empty-slice init of the three header fields. <em>Assert this
+first.</em></li>
+<li><strong>Header RLP layout.</strong> <code>Validators</code>,
+<code>Validator</code>, <code>Penalties</code> as <code>[]byte</code>,
+always-encoded, at indices 16/17/18, between <code>Nonce</code> and
+<code>BaseFee</code>. No <code>rlp:"optional"</code>. No stray
+serialised upstream optional.</li>
+<li><strong>StateAccount RLP.</strong> Balances ≤ 2^256-1 encode
+byte-identically to upstream; only true &gt;256-bit balances take the
+<code>BigBalance</code> path.</li>
+<li><strong>The EIP bundle at <code>Eip1559Block</code>.</strong>
+EIP-2929, 3529, 2565, 3860 all defer to <code>Eip1559Block</code>;
+EIP-2028 permanently off (68 gas/non-zero byte).
+<code>IsEIP1559 != IsLondon</code>.</li>
+<li><strong>Special-tx handling.</strong>
+<code>0x89</code>/<code>0x92</code>/<code>0x93</code> txs: zero gas,
+minimal <code>{Address, BlockNumber}</code> log, exact bloom.</li>
+<li><strong>TIPSigning self-destruct sequence</strong> of
+<code>0x89</code> (with the pathdb-correct
+<code>IntermediateRoot(false)</code> first).</li>
+<li><strong><code>parentState</code> for rewards.</strong> Reward calc
+reads pre-transaction balances.</li>
+<li><strong>TRC21 fee routing &amp; no base-fee burn.</strong> Full fee
+to the candidate owner past <code>TIPTRC21Fee</code>.</li>
+<li><strong>Fixed base fee = 12500000000.</strong></li>
+<li><strong>TIP fork-block constants &amp; reward percentages</strong>
+(<code>common/types.go</code> / <code>CopyXDCConstants</code>): 90%
+owner / 10% foundation; the TIP block numbers per chain.</li>
+<li><strong>StaticCall zero-value touch gated to
+<code>IsIstanbul</code>.</strong></li>
+<li><strong>PREVRANDAO =
+<code>Keccak256(blockNumber)</code>.</strong></li>
+</ol>
+<p>Treat any mismatch in these as <strong>P0 — stop everything and
+root-cause it before continuing.</strong></p>
+<hr />
+<h2 id="9-the-fork-activation-timeline-the-inertness-window">9. The
+fork-activation timeline (the "inertness window")</h2>
+<p>A subtle but powerful operational insight from
+<code>docs/port/HANDOFF.md</code>: <strong>most of what you port is
+inert until the chain reaches the activation height.</strong> This lets
+you sync a node on an old binary through the early chain, then swap in
+the new binary before the relevant fork.</p>
+<pre><code>Apothem:
+GENESIS ─── 23.78M ──────── 56.83M ──────── 61.29M ──────── 71.55M ─────── HEAD
+              │                │                │                │
+          TIPSigning      V2 Switch      Berlin/late forks   EIP-1559
+          (signer SD)     (BFT engine)   (61,290,000)       XDCBaseFee
+                                                            MODEXP/2929/3529/3860</code></pre>
+<p>Implications for the re-port:</p>
+<ul>
+<li>A bug in the V2 engine wiring <strong>cannot</strong> manifest
+before the V2 switch block — so an early-chain sync that's green tells
+you <em>nothing</em> about V2 correctness.</li>
+<li>Your parity harness <strong>must</strong> cover the fork-boundary
+blocks (the switch block ± a few epochs), not just genesis-onward.</li>
+<li>You can stage deployment: validate the inert early range first, then
+gate the fork ranges behind the parity harness.</li>
+</ul>
+<hr />
+<h2 id="10-validation--the-parity-harness">10. Validation &amp; the
+parity harness</h2>
+<p>Three tiers, escalating in cost and confidence (from
+<code>docs/port/XDC_PORTING_PLAYBOOK.html</code> §8):</p>
+<p><strong>Tier 1 — build + vet + tests</strong> (every change)</p>
+<div class="sourceCode" id="cb14"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb14-1"><a href="#cb14-1" aria-hidden="true" tabindex="-1"></a><span class="ex">go</span> build ./...</span>
+<span id="cb14-2"><a href="#cb14-2" aria-hidden="true" tabindex="-1"></a><span class="ex">go</span> vet ./...</span>
+<span id="cb14-3"><a href="#cb14-3" aria-hidden="true" tabindex="-1"></a><span class="ex">go</span> test <span class="at">-short</span> <span class="at">-count</span><span class="op">=</span>1 ./consensus/XDPoS/... ./core/... ./params/ <span class="dt">\</span></span>
+<span id="cb14-4"><a href="#cb14-4" aria-hidden="true" tabindex="-1"></a>  ./consensus/misc/eip1559/ ./core/vm/ ./core/txpool/... ./internal/web3ext/</span></code></pre></div>
+<p>The engine ships its own parity vectors —
+<code>consensus/XDPoS/cross_client_vectors_test.go</code>,
+<code>state_root_vectors_test.go</code>,
+<code>header_rlp_compat_test.go</code>, and
+<code>testvectors/*.json</code>. <strong>Run these — they catch RLP/hash
+drift directly.</strong></p>
+<p><strong>Tier 2 — local sync-test cluster</strong>
+(<code>scripts/local-sync-test.sh</code>)</p>
+<div class="sourceCode" id="cb15"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb15-1"><a href="#cb15-1" aria-hidden="true" tabindex="-1"></a><span class="ex">scripts/local-sync-test.sh</span> wipe-stateful <span class="kw">&amp;&amp;</span> <span class="ex">scripts/local-sync-test.sh</span> start all</span></code></pre></div>
+<p>A multi-node local cluster that exercises real block import + sync.
+Grep the logs — these must return <strong>zero hits</strong>:
+<code>BAD BLOCK</code>, <code>invalid merkle root</code>,
+<code>state-root bypass</code>, <code>forced trie commit</code>.</p>
+<p><strong>Tier 3 — canonical parity (the real gate)</strong> For block
+N with its pre-state, the ported binary MUST produce an
+<strong>identical post-state root, receipts root, and block
+hash</strong> to canonical XDC. Run it across:</p>
+<ul>
+<li>A genesis-to-head sync against the production fleet, asserting head
+hash == public XDC explorer.</li>
+<li>The fork-boundary ranges specifically (V2 switch, EIP-1559
+activation).</li>
+<li><code>scripts/validate-canonical-parity.sh</code> /
+<code>scripts/xdc-parity-check.sh</code>.</li>
+</ul>
+<p><strong>When parity fails:</strong> isolate the first divergent
+block, dump pre-state + post-state for it on both binaries, diff the
+state roots leaf-by-leaf, and <code>git diff &lt;base&gt;..HEAD</code>
+the file in that code path. The bug is almost always a missing or
+misplaced surgical seam from <a
+href="#7-subsystem-reference-the-six-seams">§7</a>. Use
+<code>GOMAXPROCS=1</code> and <code>-race</code> to rule out a
+concurrency artefact in <code>IntermediateRoot</code>.</p>
+<hr />
+<h2 id="11-gotchas-traps--war-stories">11. Gotchas, traps &amp; war
+stories</h2>
+<p>These are the lessons that cost the team hours — written down so they
+cost you minutes.</p>
+<ul>
+<li><strong><code>IsEIP1559 != IsLondon</code>.</strong> This decoupling
+pervades five files. Any code gating <em>pricing/fee</em> logic on
+<code>IsLondon</code> for XDC is a bug; only marker-opcode availability
+uses <code>IsLondon</code>.</li>
+<li><strong>The reward-hook ordering</strong> (see <a
+href="#73-consensus-engine--wiring">§7.3</a>). The most expensive
+invisible bug in the port: V2 rewards silently never fire, diverging the
+state root at the first V2 epoch boundary, with no compile or
+verification error.</li>
+<li><strong>"TD is not a block number."</strong> The XDPOS2 handshake's
+<code>TD</code> field is ≈4 difficulty-units/block and is used
+<em>only</em> for peer ranking. Any code that subtracts it from local
+head to compute "blocks behind" produces garbage. The caught-up check
+uses <strong>hash equality</strong>.</li>
+<li><strong>The two-pivot / <code>fsMinFullBlocks</code>
+misdiagnosis</strong> (the documented 4-hour debug,
+<code>docs/port/MENTAL_MODEL.md</code>). The downloader's state pivot is
+<em>always</em> <code>head − fsMinFullBlocks (=64)</code> — it is
+<strong>not</strong> a knob for pinning some externally chosen pivot.
+Pass the peer's <strong>true tip</strong> as
+<code>BeaconSync(head, …)</code> and the QC-trusted ancestor
+(<code>peer_tip − 1024</code>) as <code>final</code>. Raising
+<code>fsMinFullBlocks</code> pushes the pivot <em>backward into
+history</em> (toward pruned state), it does not move it toward your
+chosen pivot.</li>
+<li><strong>Minimal logs for special txs.</strong> The natural instinct
+is to emit the "real" Sign event — that breaks the bloom and receipts
+root. Canonical emits only <code>{Address, BlockNumber}</code>.</li>
+<li><strong>Lost-on-reset regressions.</strong> The StaticCall touch
+gating and the EVM marker tables were <em>silently dropped</em> in a
+prior reset and had to be restored. A clean upstream merge re-introduces
+upstream defaults and re-breaks parity — gate these with the parity
+harness, not eyeballing.</li>
+<li><strong><code>xdc</code> address prefix &amp; misspelled JSON
+tag.</strong> <code>foudationWalletAddr</code> is misspelled <em>on
+purpose</em> (match canonical). Addresses in genesis use the
+<code>xdc</code> hex prefix — the <code>common</code> unmarshaler must
+honour it or the JSON won't parse.</li>
+<li><strong><code>engine_v2.New</code> is a singleton.</strong> Calling
+it twice (e.g. in tests or a multi-chain setup) returns the
+<em>first</em> config.</li>
+<li><strong><code>ChainConfig</code> is non-copyable by value</strong>
+(the <code>V2</code> struct embeds a <code>sync.RWMutex</code>).
+<code>cfg := *someConfig</code> trips <code>go vet</code>.</li>
+</ul>
+<hr />
+<h2 id="12-known-gaps-in-the-current-port">12. Known gaps in the current
+port</h2>
+<p>Surfaced by the subsystem analysis (verified against the branch).
+Document these so a re-porter doesn't mistake them for working
+features:</p>
+<ul>
+<li><strong><code>gen_header_json.go</code> is stale.</strong> It was
+regenerated against pristine v1.17.3 (correctly dropping
+<code>BlockAccessListHash</code>/<code>SlotNumber</code>) but
+<strong>not</strong> re-run after the three XDC fields were added to
+<code>headerMarshaling</code>. Because it defines a real
+<code>MarshalJSON</code>, it wins over struct tags — so
+<strong><code>eth_getBlockByNumber</code> does not currently emit
+<code>validators</code>/<code>validator</code>/<code>penalties</code></strong>.
+Fix: re-run <code>go generate ./core/types/</code>. <em>(This is the
+highest-impact RPC parity defect.)</em></li>
+<li><strong>RPC namespace casing collision.</strong>
+<code>XDPoS.APIs()</code> serves <code>XDPoS_*</code> (PascalCase) but
+<code>web3ext.go</code> registers the console module <code>xdpos</code>
+calling <code>xdpos_*</code> (lowercase) — they don't match at
+runtime.</li>
+<li><strong><code>EventAPI</code> defined but never registered.</strong>
+<code>xdpos_subscribe</code> (newQC/newTC/roundChange/newEpoch) is dead
+code — <code>NewEventAPI</code> is never added to any
+<code>rpc.API</code> list.</li>
+<li><strong><code>xdc_*</code> console namespace is dead.</strong>
+<code>XDCJs</code>/<code>XDCxJs</code>/<code>XDCLendingJs</code> are
+defined in <code>web3ext_xdc.go</code> but never added to the
+<code>Modules</code> map, and there's no Go service backing
+<code>xdc_*</code> RPC.</li>
+<li><strong><code>CacheInvalidator.InvalidateCaches</code></strong> —
+interface + call site exist, but no engine implements it yet
+(forward-declared hardening for reorgs).</li>
+<li><strong><code>NetworkInformation</code> hardcodes chainID
+50</strong> (wrong on Apothem); <strong><code>getLatestPoolStatus</code>
+is a stub</strong> returning 0/0.</li>
+<li><strong>Deferred to M8 (masternode block production):</strong> the
+full BFT dispatcher wiring, <code>miner/xdc_agent.go</code>, broadcast
+LRU caches. A pure sync node doesn't need these.</li>
+</ul>
+<hr />
+<h2 id="13-the-re-port-checklist-copy-paste">13. The re-port checklist
+(copy-paste)</h2>
+<pre><code>PHASE 0 — BASELINE &amp; ORACLE
+[ ] Check out target geth tag; tag as v&lt;ver&gt;-pristine; confirm clean build
+[ ] Enumerate XDC overlay vs old base: git diff &lt;old-base&gt;..xdc-HEAD --name-status
+[ ] Stand up a parity oracle (synced canonical XDC node or block/state dumps)
+[ ] Create empty docs/RESET_CONFLICT_LOG.md
+
+PHASE 1 — COPY VERBATIM (category A)
+[ ] consensus/XDPoS/**            [ ] contracts/**            [ ] eth/hooks/**
+[ ] core/xdc_genesis/** + genesis_xdc.go
+[ ] params/xdc_features.go        [ ] common/xdc_contracts.go [ ] core/xdc_sync_opts.go
+[ ] eth/sync_xdc.go, eth/bft/**, eth/handler_xdc.go
+[ ] node/config_xdc.go, node/health.go
+
+PHASE 2 — SURGICAL SEAMS (in this order)
+[ ] params/config.go: structs, 2 chain configs, genesis-hash consts, Is* overrides
+[ ] params/protocol_params.go: XDCBaseFee = 12500000000
+[ ] common/types.go: TIP constants, CopyXDCConstants, xdc-prefix, reward %
+[ ] core/types/block.go: 3 header fields after Nonce; regenerate gen_header_{rlp,json}.go
+[ ] core/types/state_account.go: BigBalance + hand-written RLP; mirror SlimAccount
+[ ] core/genesis.go: patchMissingForkBlocks in SetupGenesis + LoadChainConfig; header field init
+[ ]   &gt;&gt;&gt; ASSERT genesis hashes == 0x4a9d748b… / 0xbdea512b… &lt;&lt;&lt;
+[ ] core/vm/{evm,jump_table,eips,contracts}.go: marker tables, MODEXP defer, opcode gating
+[ ] core/evm.go: PREVRANDAO=Keccak256(num); CanTransfer BigBalance
+[ ] core/state_transition.go: EIP-2028 off, 3529 defer, special-tx fee-cap bypass, TRC21 routing
+[ ] core/state_processor.go: parentState snapshot+SetParentState, TIPSigning SD, Apply{Signing,Empty}Tx
+[ ] consensus/misc/eip1559/eip1559.go: fixed XDCBaseFee, header verify tolerances
+[ ] eth/ethconfig/config.go: CreateConsensusEngine XDPoS branch (first)
+[ ] eth/backend.go: CopyXDCConstants before engine; the 6-call V2 wiring sequence; APIs() registration
+[ ] eth/protocols/eth/{protocol,handshake,handler,handlers,peer}.go: XDPOS2=100, StatusPacket62, xdpos2 map, no-RequestId bridge
+[ ] eth/handler.go + handler_eth.go: xdcSyncer start/stop; BFT accept-and-ignore
+[ ] p2p/discover/v4wire/v4wire.go: UseXDCPing (ping type 5)
+[ ] internal/ethapi/{backend,api_xdc}.go + eth/api_backend.go: Backend iface + eth_* methods
+[ ] internal/web3ext/web3ext.go: console module registration
+[ ] cmd/utils/flags.go + params/bootnodes.go: --apothem/--xdcmainnet + bootnodes
+
+PHASE 3 — BUILD &amp; WIRE
+[ ] go build ./... ; go vet ./...  (resolve each missing seam; log conflicts)
+
+PHASE 4 — VALIDATE
+[ ] go test ./consensus/XDPoS/... (parity vectors)  + touched packages
+[ ] scripts/local-sync-test.sh wipe-stateful &amp;&amp; start all ; grep logs = zero bad hits
+[ ] Canonical parity across genesis→head AND fork boundaries (V2 switch, EIP-1559)
+[ ] Assert head hash == public XDC explorer</code></pre>
+<hr />
+<h2 id="14-for-an-ai-agent-executing-this-port">14. For an AI agent
+executing this port</h2>
+<p>This guide is written so an autonomous agent (Claude or otherwise)
+can execute the port. Specific guidance:</p>
+<ul>
+<li><strong>Decompose by subsystem, fan out, verify.</strong> The six
+subsystems in <a href="#7-subsystem-reference-the-six-seams">§7</a> are
+independent enough to analyse in parallel sub-agents, but <strong>every
+consensus-critical claim must be adversarially verified against the
+actual code</strong> before you act on it. (This guide was itself built
+that way; the agents found real bugs, e.g. the stale
+<code>gen_header_json.go</code>.) Cite <code>file:line</code>.</li>
+<li><strong>The spec is the canonical client, not your priors.</strong>
+When in doubt about a value (a fork block, a reward %, a gas constant),
+read it out of <code>XDPoSChain</code>/<code>XDCIndia/go-ethereum</code>
+— never infer it.</li>
+<li><strong>Consensus parity is sacred.</strong> Do not "improve",
+"optimise", or "clean up" any consensus path. Do not change RLP
+encoding. Do not force upstream defaults onto an XDC-customised path. A
+hash mismatch is P0.</li>
+<li><strong>Escalate irreversible architectural calls.</strong> The
+original team escalated to a planning model for: the catch-up strategy
+(big-bang vs incremental vs freeze), any module rewrite, the first
+consensus mismatch (root cause may be architectural), the bundle
+ordering, and any decision that changes block-hash output. Do the same —
+these are scalpel decisions, not routine fixes.</li>
+<li><strong>Use the markers</strong> (<a
+href="#5-the-four-marker-conventions-find-xdc-code-in-any-tree">§5</a>)
+to locate XDC code, and the <strong>fork-activation timeline</strong>
+(<a href="#9-the-fork-activation-timeline-the-inertness-window">§9</a>)
+to know what a given test range can and can't prove.</li>
+<li><strong>Maintain a running log.</strong> Append every decision and
+every conflict resolution to a port log + conflict log. The next agent
+(or human) needs the trail.</li>
+<li><strong>A reusable skill exists for this.</strong> See
+<code>.claude/skills/port-xdc-onto-geth/SKILL.md</code> in this repo —
+it encodes this methodology as an invokable skill.</li>
+</ul>
+<hr />
+<h2 id="15-references--tooling">15. References &amp; tooling</h2>
+<h3 id="sibling-docs-in-this-repo">Sibling docs (in this repo)</h3>
+<table>
+<thead>
+<tr>
+<th>Doc</th>
+<th>What it gives you</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><a href="./PROPOSAL.md"><code>PROPOSAL.md</code></a></td>
+<td><strong>Status &amp; landing plan</strong> for
+<code>reset/integration-1.17.3</code> — what the branch is, what it
+inherits from geth v1.17.3, bit-exact consensus parity, the phased
+validation, and the asks</td>
+</tr>
+<tr>
+<td><a
+href="./WHY-MODERN-GETH.md"><code>WHY-MODERN-GETH.md</code></a></td>
+<td>The <strong>rationale</strong> companion — what the
+<code>reset/integration-1.17.3</code> branch inherits from the geth
+v1.17.3 base (the 1.8.3 → 1.17.3 capability timeline) and the disk/sync
+economics, verified against upstream</td>
+</tr>
+<tr>
+<td><a href="./EVIDENCE-BASE.md"><code>EVIDENCE-BASE.md</code></a></td>
+<td><strong>Externally-sourced, adversarially-verified
+citations</strong> (geth release blogs, EIPs, devp2p spec) for the
+rationale's claims — 25/25 verified, with the code-ship-vs-feature-ship
+reconciliation (e.g. PBSS shipped v1.13.0)</td>
+</tr>
+<tr>
+<td><code>docs/port/XDC_PORTING_PLAYBOOK.html</code></td>
+<td>The original 14-section playbook (this guide consolidates + verifies
+it)</td>
+</tr>
+<tr>
+<td><code>docs/port/XDC_CONSENSUS_CHANGES.html</code></td>
+<td>Interactive map of XDC changes vs upstream + fork timeline</td>
+</tr>
+<tr>
+<td><code>docs/port/XDC_DEEP_DIFF.html</code></td>
+<td>Deep file-by-file diff explorer</td>
+</tr>
+<tr>
+<td><code>docs/RESET_BUNDLES.md</code></td>
+<td>The bundle catalogue + merge order + conflict policy</td>
+</tr>
+<tr>
+<td><code>docs/port/MENTAL_MODEL.md</code></td>
+<td>The two-pivot snap-sync model (the 4-hour war story)</td>
+</tr>
+<tr>
+<td><code>docs/port/HANDOFF.md</code></td>
+<td>The inertness-window deployment strategy</td>
+</tr>
+<tr>
+<td><code>docs/adr/001-genesis-config-merge.md</code></td>
+<td>The SetupGenesis patch rationale (ADR-001)</td>
+</tr>
+<tr>
+<td><code>docs/XDPoS.md</code></td>
+<td>XDPoS consensus overview (V1/V2, masternodes, rewards,
+penalties)</td>
+</tr>
+</tbody>
+</table>
+<h3 id="scripts">Scripts</h3>
+<table>
+<thead>
+<tr>
+<th>Script</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>scripts/local-sync-test.sh</code></td>
+<td>Multi-node local sync cluster (Tier 2 gate)</td>
+</tr>
+<tr>
+<td><code>scripts/validate-canonical-parity.sh</code>,
+<code>scripts/xdc-parity-check.sh</code></td>
+<td>Canonical parity (Tier 3 gate)</td>
+</tr>
+<tr>
+<td><code>scripts/run-xdc-mainnet.sh</code>,
+<code>scripts/run_xdc_node.sh</code></td>
+<td>Run a node against mainnet/apothem</td>
+</tr>
+</tbody>
+</table>
+<h3 id="canonical-reference-clients-read-only--the-spec">Canonical
+reference clients (read-only — the spec)</h3>
+<ul>
+<li><code>XDPoSChain</code> — the reference XDC consensus
+implementation.</li>
+<li><code>XDCIndia/go-ethereum</code> (this fork's origin) — the
+geth-based canonical client.</li>
+</ul>
+<h3 id="external">External</h3>
+<ul>
+<li>XDC docs: <a
+href="https://docs.xinfin.org">https://docs.xinfin.org</a></li>
+<li>go-ethereum: <a
+href="https://github.com/ethereum/go-ethereum">https://github.com/ethereum/go-ethereum</a></li>
+</ul>
+<hr />
+<p><em>Generated from a verified analysis of the
+<code>117e067f…e9898e81</code> range on
+<code>origin/reset/integration-1.17.3</code>. Every file:line reference
+is on that branch. When upstream geth moves, the seams move with it —
+but the intent, the invariants, and the order in this guide do
+not.</em></p>
+
+  </main>
+</div>
+<a href="#top" class="top-link" id="topLink" title="Back to top">↑</a>
+<script>
+(function(){
+  // active-section highlight
+  var links = Array.prototype.slice.call(document.querySelectorAll('.sidebar a'));
+  var map = {};
+  links.forEach(function(a){ var id=a.getAttribute('href').slice(1); map[id]=a; });
+  var heads = Array.prototype.slice.call(document.querySelectorAll('h2[id],h3[id]'));
+  var obs = new IntersectionObserver(function(entries){
+    entries.forEach(function(e){
+      if(e.isIntersecting){
+        links.forEach(function(l){l.classList.remove('active');});
+        var a = map[e.target.id]; if(a){a.classList.add('active'); a.scrollIntoView({block:'nearest'});}
+      }
+    });
+  },{rootMargin:'0px 0px -78% 0px'});
+  heads.forEach(function(h){obs.observe(h);});
+
+  // fragility badge coloring
+  document.querySelectorAll('strong,td,li,p').forEach(function(el){
+    if(el.children.length===0||el.tagName==='TD'){
+      el.innerHTML = el.innerHTML
+        .replace(/\bFragility:\s*(HIGH)\b/g,'Fragility: <span class="frag frag-high">$1</span>')
+        .replace(/\bFragility:\s*(MED(?:-HIGH|–HIGH|-MED)?|MEDIUM|MED–HIGH|MED-HIGH)\b/g,'Fragility: <span class="frag frag-med">$1</span>')
+        .replace(/\bFragility:\s*(LOW(?:-MED|–MED|-MED)?)\b/g,'Fragility: <span class="frag frag-low">$1</span>');
+    }
+  });
+
+  // back to top
+  var topLink=document.getElementById('topLink');
+  window.addEventListener('scroll',function(){ topLink.classList.toggle('show', window.scrollY>500); });
+
+  // mobile sidebar
+  var sb=document.getElementById('sidebar'), btn=document.getElementById('menuBtn');
+  if(btn){ btn.addEventListener('click',function(){sb.classList.toggle('open');}); }
+  document.querySelectorAll('.sidebar a').forEach(function(a){a.addEventListener('click',function(){sb.classList.remove('open');});});
+})();
+</script>
+</body>
+</html>

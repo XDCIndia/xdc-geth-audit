@@ -102,6 +102,31 @@ func newTxIndexer(limit uint64, chain *BlockChain) *txIndexer {
 	return indexer
 }
 
+// xdcGapSkipTail advances tail past any XDC fast-sync placeholder gap (A.85/A.86).
+// A.85 writes zero canonical hashes for pre-pivot gap blocks; no real transactions
+// exist there so walking them one-by-one generates WARN noise for weeks at tip-rate.
+// Binary search finds the end of the contiguous zero-hash run in O(log N) reads.
+// Returns the original tail if not in a gap (hash != zero or tail == 0).
+func xdcGapSkipTail(db ethdb.Database, tail, ceiling uint64) uint64 {
+	if tail == 0 || tail >= ceiling {
+		return tail
+	}
+	if rawdb.ReadCanonicalHash(db, tail) != (common.Hash{}) {
+		return tail // real block — not in gap
+	}
+	// Binary search: find first block in [tail, ceiling) with a non-zero hash.
+	lo, hi := tail, ceiling
+	for lo < hi {
+		mid := lo + (hi-lo)/2
+		if rawdb.ReadCanonicalHash(db, mid) == (common.Hash{}) {
+			lo = mid + 1
+		} else {
+			hi = mid
+		}
+	}
+	return lo // first non-gap block, or ceiling if entire range is gap
+}
+
 // run executes the scheduled indexing/unindexing task in a separate thread.
 // If the stop channel is closed, the task should terminate as soon as possible.
 // The done channel will be closed once the task is complete.
@@ -128,6 +153,13 @@ func (indexer *txIndexer) run(head uint64, stop chan struct{}, done chan struct{
 			from = head - indexer.limit + 1
 		}
 		from = max(from, indexer.cutoff)
+		// A.86: skip fast-sync placeholder gap at the start of the index range.
+		if gapEnd := xdcGapSkipTail(indexer.db, from, head+1); gapEnd > from {
+			log.Info("xdc: A.86 gap-skip initial tx-index range",
+				"gapStart", from, "gapEnd", gapEnd, "realBlocks", head+1-gapEnd)
+			rawdb.WriteTxIndexTail(indexer.db, gapEnd)
+			from = gapEnd
+		}
 		rawdb.IndexTransactions(indexer.db, from, head+1, stop, true)
 		return
 	}
@@ -148,8 +180,18 @@ func (indexer *txIndexer) run(head uint64, stop chan struct{}, done chan struct{
 		// Reindex a part of missing indices and rewind index tail to HEAD-limit
 		rawdb.IndexTransactions(indexer.db, from, *tail, stop, true)
 	} else {
-		// Unindex a part of stale indices and forward index tail to HEAD-limit
-		rawdb.UnindexTransactions(indexer.db, *tail, from, stop, false)
+		// Unindex a part of stale indices and forward index tail to HEAD-limit.
+		// A.86: skip fast-sync placeholder gap (A.85 zero-hash blocks) in O(log N)
+		// to avoid weeks of WARN log noise at tip-rate (1 warning per live block).
+		if gapEnd := xdcGapSkipTail(indexer.db, *tail, from); gapEnd > *tail {
+			log.Debug("xdc: A.86 gap-skip tx-index unindex", "from", *tail, "to", gapEnd)
+			rawdb.WriteTxIndexTail(indexer.db, gapEnd)
+			newTail := gapEnd
+			tail = &newTail
+		}
+		if *tail < from {
+			rawdb.UnindexTransactions(indexer.db, *tail, from, stop, false)
+		}
 	}
 }
 

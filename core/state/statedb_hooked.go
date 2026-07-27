@@ -47,6 +47,15 @@ func NewHookedState(stateDb *StateDB, hooks *tracing.Hooks) *hookedStateDB {
 	return s
 }
 
+// Underlying returns the wrapped *StateDB. XDC consensus needs this to call
+// UpdateMasternodesFromHeader during Finalize when tracing wraps the StateDB —
+// the type assertion to *state.StateDB silently fails for hookedStateDB and
+// the snapshot write is skipped, producing stale candidate lists at the next
+// V2 gap block (chain-halt root cause #3 on devnet-5151, 2026-06-13).
+func (s *hookedStateDB) Underlying() *StateDB {
+	return s.inner
+}
+
 func (s *hookedStateDB) CreateAccount(addr common.Address) {
 	s.inner.CreateAccount(addr)
 }

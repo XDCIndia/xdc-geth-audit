@@ -1,0 +1,1383 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>XDC Porting Guide — Reconstructing the XDC overlay on a fresh geth release</title>
+<style>
+  :root{
+    --fg:#1a1a1a; --bg:#fafafa; --mut:#666; --acc:#0b69c7; --acc2:#7b2d8e;
+    --code-bg:#f0f0f0; --code-fg:#222; --border:#d0d0d0; --row:#f5f5f5;
+    --warn:#a05500; --good:#1f7a1f;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;padding:0}
+  body{
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    color:var(--fg); background:var(--bg);
+    font-size:15px; line-height:1.55;
+  }
+  /* Layout */
+  .wrap{display:flex; min-height:100vh}
+  nav.toc{
+    position:sticky; top:0; align-self:flex-start;
+    width:280px; max-width:30vw; height:100vh; overflow-y:auto;
+    padding:24px 18px; background:#f0f0f0; border-right:1px solid var(--border);
+    font-size:13px;
+  }
+  nav.toc h2{margin-top:0; font-size:14px; text-transform:uppercase; letter-spacing:.05em; color:var(--mut)}
+  nav.toc ol{margin:0; padding-left:18px}
+  nav.toc ol ol{padding-left:14px; margin-top:4px}
+  nav.toc li{margin:3px 0}
+  nav.toc a{color:var(--fg); text-decoration:none}
+  nav.toc a:hover{color:var(--acc); text-decoration:underline}
+  main{flex:1; padding:32px 48px; max-width:1100px; min-width:0}
+  /* Typography */
+  h1{font-size:28px; margin:0 0 8px 0; line-height:1.25}
+  h2{font-size:22px; margin:38px 0 10px 0; padding-bottom:6px; border-bottom:1px solid var(--border); line-height:1.3}
+  h3{font-size:18px; margin:28px 0 8px 0; color:var(--acc2)}
+  h4{font-size:16px; margin:22px 0 6px 0; color:#444}
+  p{margin:10px 0}
+  a{color:var(--acc)}
+  code{
+    font-family: "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+    background:var(--code-bg); color:var(--code-fg);
+    padding:1px 5px; border-radius:3px;
+    font-size:13px;
+  }
+  pre{
+    background:var(--code-bg); color:var(--code-fg);
+    border:1px solid var(--border); border-radius:5px;
+    padding:14px 16px; overflow-x:auto;
+    font-family: "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+    font-size:13px; line-height:1.45;
+    margin:14px 0;
+  }
+  pre code{background:transparent; padding:0; font-size:inherit}
+  blockquote{
+    border-left:3px solid var(--acc); padding:6px 14px;
+    margin:12px 0; background:#f5f5f5; color:#333;
+  }
+  /* Tables */
+  table{
+    border-collapse:collapse; width:100%;
+    margin:14px 0; font-size:13.5px;
+  }
+  th,td{
+    padding:6px 10px; border:1px solid var(--border);
+    text-align:left; vertical-align:top;
+  }
+  th{background:#e8e8e8; font-weight:600}
+  tbody tr:nth-child(odd){background:var(--row)}
+  tbody tr:hover{background:#ffefcd}
+  /* Headers with anchor */
+  h2, h3 { scroll-margin-top: 16px }
+  h2 a.anchor, h3 a.anchor{
+    visibility:hidden; margin-left:8px; color:var(--mut); font-size:.7em; text-decoration:none;
+  }
+  h2:hover a.anchor, h3:hover a.anchor{visibility:visible}
+  /* Misc */
+  .meta{color:var(--mut); font-size:13px; margin-bottom:18px}
+  hr{border:0; border-top:1px solid var(--border); margin:30px 0}
+  ul,ol{padding-left:24px}
+  ul li, ol li{margin:3px 0}
+  .warn{color:var(--warn); font-weight:600}
+  .good{color:var(--good); font-weight:600}
+  /* Print */
+  @media print{
+    nav.toc{display:none}
+    main{padding:0; max-width:100%}
+    body{font-size:11pt}
+    pre{font-size:9pt; page-break-inside:avoid}
+    table{page-break-inside:avoid}
+    h2,h3{page-break-after:avoid}
+  }
+  /* Small screens */
+  @media (max-width:900px){
+    .wrap{flex-direction:column}
+    nav.toc{position:static; width:100%; max-width:100%; height:auto; border-right:0; border-bottom:1px solid var(--border)}
+    main{padding:20px}
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+<nav class="toc" id="toc">
+  <h2>Contents</h2>
+  <ol>
+    <li><a href="#exec">Executive summary</a></li>
+    <li><a href="#prereq">Prerequisites &amp; skills</a></li>
+    <li><a href="#arch">Architecture diagram</a></li>
+    <li><a href="#archaeology">Repository archaeology</a></li>
+    <li><a href="#subsystems">Subsystem-by-subsystem changes</a>
+      <ol>
+        <li><a href="#sub-params">5.a Chain configuration &amp; params</a></li>
+        <li><a href="#sub-genesis">5.b Genesis</a></li>
+        <li><a href="#sub-engine">5.c Consensus engine</a></li>
+        <li><a href="#sub-types">5.d Block validation &amp; types</a></li>
+        <li><a href="#sub-evm">5.e State, precompiles, EVM</a></li>
+        <li><a href="#sub-sync">5.f Sync layer</a></li>
+        <li><a href="#sub-rpc">5.g RPC / API</a></li>
+        <li><a href="#sub-contracts">5.h Contracts</a></li>
+        <li><a href="#sub-cli">5.i CLI &amp; node config</a></li>
+        <li><a href="#sub-fleet">5.j P2P fleet integration</a></li>
+        <li><a href="#sub-docs">5.k Docs in tree</a></li>
+      </ol>
+    </li>
+    <li><a href="#fork-timeline">Hard fork timeline</a></li>
+    <li><a href="#bypass">Bypass log family</a></li>
+    <li><a href="#recreation">Recreation procedure</a></li>
+    <li><a href="#pitfalls">Pitfalls</a></li>
+    <li><a href="#appendix">Reference appendix</a>
+      <ol>
+        <li><a href="#app-files">File path index</a></li>
+        <li><a href="#app-network">Network IDs / chain IDs</a></li>
+        <li><a href="#app-contracts">System contracts</a></li>
+        <li><a href="#app-bootnodes">Bootnodes</a></li>
+        <li><a href="#app-prs">External references</a></li>
+      </ol>
+    </li>
+  </ol>
+</nav>
+<main>
+
+<h1>XDC Porting Guide</h1>
+<p class="meta">Reconstructing the XDC overlay on a fresh geth release —
+generated from branch <code>reset/integration-1.17.3</code> at commit
+<code>8337f48ec</code>, fork base <code>117e067f0</code> (geth v1.17.3).
+Scope: 262 files, +69,413 / -412 lines, 243 commits.</p>
+
+<p>This document records every XDC-specific change applied on top of pristine
+go-ethereum <strong>v1.17.3</strong> (commit
+<code>117e067f0f0bae1a17082321f224dedb6765b10f</code>) to produce the head of
+branch <code>reset/integration-1.17.3</code>. The intended audience is an
+engineer (human or AI) tasked with applying the same overlay to a future
+upstream tag — e.g. v1.18.x, v2.0. Every claim below is grounded in the
+actual files present in the tree; line numbers and quoted snippets were
+re-read at the time of writing.</p>
+
+<h2 id="exec">1. Executive summary <a class="anchor" href="#exec">#</a></h2>
+
+<p>XDC Network is a delegated-PoS chain forked from Ethereum. It uses two
+consensus generations:</p>
+<ul>
+  <li><strong>XDPoS V1</strong> — Clique-style round-robin leader rotation over
+  a 108-node masternode set. Epoch length 900 blocks. Used from genesis to a
+  per-network <code>V2.SwitchBlock</code>.</li>
+  <li><strong>XDPoS V2</strong> — HotStuff-derived BFT with QuorumCerts,
+  votes, timeouts. Switches in mid-chain (mainnet block <code>80,370,000</code>,
+  Apothem block <code>56,828,700</code>). Reward distribution, masternode
+  rotation, and finality flow change at the switch.</li>
+</ul>
+
+<p>This port adds:</p>
+<ol>
+  <li>The XDPoS engine (V1 + V2) under <code>consensus/XDPoS/...</code>.</li>
+  <li>XDC-specific chain configs and 80+ trusted-sync checkpoints in <code>params/config.go</code>.</li>
+  <li>Embedded genesis JSON with pre-deployed validator/blocksigner/randomize smart contracts.</li>
+  <li>A custom XDPOS/100 wire protocol that coexists with upstream ETH/69 + ETH/70 on the same <code>eth</code> capability.</li>
+  <li>A pre-merge sync loop (<code>eth/sync_xdc.go</code>, ~1240 lines).</li>
+  <li>An RPC namespace <code>XDPoS_*</code> plus <code>eth_*</code> extensions.</li>
+  <li>~30 <code>XDC:</code> bypass log call-sites in <code>core/*</code> and <code>eth/*</code>.</li>
+  <li>Solidity-derived Go bindings for XDPoS system contracts.</li>
+</ol>
+
+<p>The branch HEAD <code>8337f48ec</code> is <strong>not</strong> at full
+consensus parity with canonical XDPoSChain v2.6.8. See
+<code>docs/port/CONSENSUS_PARITY.md</code> and <code>docs/port/STATUS.md</code>.
+The port is M3-blocked on peer-fleet snapshot indexing; consensus-rule
+mismatches are tracked inline as <code>XDC:</code> comments and as ADRs under
+<code>docs/adr/</code>.</p>
+
+<h2 id="prereq">2. Prerequisites &amp; skills required <a class="anchor" href="#prereq">#</a></h2>
+
+<ul>
+  <li><strong>Go</strong>, including modern generics (geth v1.17.x uses
+    <code>lru.Cache[K,V]</code>, <code>rlp.RawList[T]</code>).</li>
+  <li><strong>go-ethereum internals</strong>: <code>core.BlockChain</code>,
+    <code>core/state.StateDB</code>, <code>eth/downloader</code>,
+    <code>eth/protocols/eth</code>, <code>eth/protocols/snap</code>, the
+    <code>consensus.Engine</code> interface (now also <code>consensus.CacheInvalidator</code>).</li>
+  <li><strong>Ethereum consensus model</strong>: header layout, RLP encoding,
+    trie / pathdb, receipt-root / state-root semantics, EIP-2929/3529/3860 gas
+    rules, EIP-1559 base-fee semantics, EIP-2565 MODEXP pricing.</li>
+  <li><strong>XDPoS BFT specification</strong>: rounds, QuorumCerts, TimeoutCerts,
+    epoch-switch headers, the "M1 (signers)" and "M2 (validators)"
+    double-signing scheme used in V1, masternode set computation via the
+    Validator (0x88), BlockSigner (0x89), and Randomize (0x90) contracts.</li>
+  <li><strong>Cryptography</strong>: secp256k1 ECDSA <code>crypto.Sign</code> /
+    <code>crypto.Ecrecover</code>. BLS is <strong>not</strong> used — XDPoS V2
+    uses k-of-N ECDSA signatures over the QC payload, not aggregate signatures.</li>
+  <li><strong>Solidity</strong> for reading/regenerating XDPoS system-contract
+    bindings under <code>contracts/</code>.</li>
+  <li><strong>Git rebase + merge workflows</strong>: the original port used a
+    bundle-merge mechanic (B0..B11) preserving 677 SHAs while presenting
+    ~12 reviewable units. See <code>docs/PORT_LOG.md</code>.</li>
+</ul>
+
+<h2 id="arch">3. High-level architecture diagram <a class="anchor" href="#arch">#</a></h2>
+
+<pre><code>                       node startup (cmd/geth)
+                              │
+                              ▼
+   ┌──────────────────────────────────────────────────────────┐
+   │ cmd/utils/flags.go::SetXDCNetworkConfig                  │
+   │   --xdcmainnet  / --apothem flag                         │
+   │     → cfg.NetworkId = 50 / 51                            │
+   │     → cfg.Genesis = core.DefaultXDC{Mainnet,Apothem}     │
+   │                                                          │
+   │ params.XDC{Mainnet,Apothem}ChainConfig (params/config.go)│
+   │   ChainID 50 / 51                                        │
+   │   XDPoS = { Period: 2, Epoch: 900, Gap: 450, Reward:5000}│
+   │   XDPoS.V2 = { SwitchBlock, AllConfigs, CurrentConfig }  │
+   │   TrustedSyncCheckpoints = [...]                         │
+   └──────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+   ┌──────────────────────────────────────────────────────────┐
+   │ core/genesis.go::SetupGenesisBlock / LoadChainConfig     │
+   │   • patchMissingForkBlocks (mainnet/apothem)             │
+   │   • patch missing V2 / TrustedSyncCheckpoints            │
+   │   • write genesis state from xdc_genesis/{mainnet,       │
+   │     apothem}.json — pre-deploys 0x88/0x89/0x90 bytecode  │
+   └──────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+   ┌──────────────────────────────────────────────────────────┐
+   │ eth/backend.go::New                                      │
+   │   engine := XDPoS.New(chainConfig.XDPoS, chainDb)        │
+   │   hooks.AttachConsensusV1Hooks(engine, blockchain, cfg)  │
+   │   hooks.AttachConsensusV2Hooks(engine, blockchain, cfg)  │
+   │   v2 := engine_v2.New(chainConfig, db, nil, nil)         │
+   │   engine.SetEngineV2(v2)                                 │
+   │   v2.SetHookReward(engine.HookReward)                    │
+   │   common.CopyXDCConstants(chainConfig.ChainID.Uint64())  │
+   └──────────────────────────────────────────────────────────┘
+                              │
+            block import path  │  RPC path     P2P path
+              ┌────────────────┼────────────────┐
+              ▼                ▼                ▼
+   ┌─────────────────┐ ┌─────────────────┐ ┌───────────────────┐
+   │ core/           │ │ internal/ethapi/│ │ eth/protocols/eth/│
+   │  block_         │ │  api_xdc.go     │ │  protocol.go      │
+   │  validator.go   │ │  (xdc_* RPCs,   │ │  XDPOS2 = 100     │
+   │  • checkpoint   │ │   RPCMarshal-   │ │  VoteMsg 0xe0     │
+   │    sync bypass  │ │   HeaderXDC)    │ │  TimeoutMsg 0xe1  │
+   │                 │ │                 │ │  SyncInfoMsg 0xe2 │
+   │ core/           │ │ consensus/      │ │  StatusPacket62   │
+   │  state_         │ │  XDPoS/         │ │                   │
+   │  processor.go   │ │  api*.go        │ │ eth/handler_xdc.go│
+   │  • TIPSigning   │ │  (XDPoS_* RPCs) │ │  Broadcast{Vote,  │
+   │    dispatch     │ │                 │ │   Timeout,        │
+   │  • ApplyEmpty   │ │                 │ │   SyncInfo}       │
+   │    Transaction  │ │                 │ │                   │
+   │  • TRC21 owner  │ │                 │ │ eth/sync_xdc.go   │
+   │    routing      │ │                 │ │  • xdcSyncer loop │
+   │  • parentState  │ │                 │ │  • snap phase FSM │
+   │    snapshot     │ │                 │ │  • fork-tainted   │
+   │                 │ │                 │ │    peer pool      │
+   │ consensus/XDPoS │ │                 │ │  • rollback on    │
+   │  /xdpos.go      │ │                 │ │    UnknownAncestor│
+   │  Author/Verify/ │ │                 │ │                   │
+   │  Prepare/       │ │                 │ │ eth/bft/handler.go│
+   │  Finalize/Seal  │ │                 │ │  V2 BFT message   │
+   │  → routes V1/V2 │ │                 │ │  dispatcher       │
+   │  by IsV2Block   │ │                 │ │                   │
+   └─────────────────┘ └─────────────────┘ └───────────────────┘
+</code></pre>
+
+<h2 id="archaeology">4. Repository archaeology <a class="anchor" href="#archaeology">#</a></h2>
+
+<h3>4.1 Fork base</h3>
+<ul>
+  <li>Upstream geth tag: <strong>v1.17.3</strong></li>
+  <li>Commit SHA: <code>117e067f0f0bae1a17082321f224dedb6765b10f</code></li>
+  <li>Branch HEAD at time of writing: <code>8337f48ec</code> on <code>reset/integration-1.17.3</code></li>
+  <li>Commits in overlay: 243</li>
+  <li>Lines added/deleted: +69,413 / -412</li>
+</ul>
+
+<p>The overlay was produced by an explicit baseline reset: the original
+xdc-network branch carried ~677 commits on top of geth pre-1.17.0
+(commit <code>54a91b3a</code>). Issue #740 reset that overlay onto v1.17.3 in
+bundles B0..B11; see <code>docs/PORT_LOG.md</code> for the bundle merge
+ordering decision recorded as <code>[PLANNER-ADVICE 2026-05-23]</code>.</p>
+
+<h3>4.2 Major themes by date (selected)</h3>
+<table>
+<thead><tr><th>Commit</th><th>Theme</th></tr></thead>
+<tbody>
+<tr><td><code>4aeb4ab7e</code></td><td>feat(engine): Register XDPoS engine and add XDC genesis handling</td></tr>
+<tr><td><code>def2a50dd</code></td><td>feat(params): Add XDC mainnet and Apothem chain configurations</td></tr>
+<tr><td><code>a2adfac0e</code></td><td>feat: Add XDPoS consensus engine for XDC Network</td></tr>
+<tr><td><code>c25528c75</code></td><td>merge: B0 — foundation (XDPoS engine + chain config + contracts + genesis)</td></tr>
+<tr><td><code>b787b7099</code></td><td>B10: partial port of eth/</td></tr>
+<tr><td><code>c40a66f70</code></td><td>B5: bulk XDC overlay onto v1.17.3 (deferred F-bucket)</td></tr>
+<tr><td><code>74f7f44f9</code></td><td>B3: add XDPOS2/100 wire protocol per Opus advice</td></tr>
+<tr><td><code>7daa274b8</code></td><td>xdc: wire XDPoS V2 engine + accept V2 BFT messages at handler</td></tr>
+<tr><td><code>880456794</code></td><td>core/vm: XDC EVM instruction set markers for Berlin..Shanghai</td></tr>
+<tr><td><code>b0644ebd9</code></td><td>eth/sync_xdc: panic recover so node survives reward overflow</td></tr>
+<tr><td><code>e8ddde738</code></td><td>consensus/XDPoS, eth/backend: expose XDPoS_* RPC namespace (#814)</td></tr>
+<tr><td><code>08d651913</code></td><td>core/vm: gate StaticCall zero-value touch on Istanbul for XDC (#812)</td></tr>
+<tr><td><code>1506e0a67</code></td><td>core/vm: opBlobBaseFee — handle nil BlobBaseFee (XDC mainnet stall fix)</td></tr>
+<tr><td><code>b9c9ab4c7..111967600</code></td><td>#807 Phase 3..14: snap-sync state machine + stall fallback</td></tr>
+</tbody></table>
+
+<h3>4.3 How to reproduce the baseline reset against a future tag</h3>
+<pre><code># starting state: branch reset/integration-1.17.3 head = 8337f48ec
+# new upstream tag: vX.Y.Z
+
+git remote add upstream https://github.com/ethereum/go-ethereum.git
+git fetch upstream --tags
+git checkout -b reset/integration-vX.Y.Z vX.Y.Z
+
+# replay the 243 XDC-overlay commits onto the new base:
+git rebase --onto reset/integration-vX.Y.Z 117e067f0 reset/integration-1.17.3
+</code></pre>
+
+<p>In practice you will not get a clean rebase. The conflict surface is
+concentrated in:</p>
+<ul>
+  <li><code>consensus/consensus.go</code> — engine interface; XDC adds <code>CacheInvalidator</code>.</li>
+  <li><code>core/blockchain.go</code> — many <code>XDC:</code> markers around <code>SetHead</code>, <code>checkpointSyncNoState</code>, V2-switch trie commit.</li>
+  <li><code>core/state_processor.go</code> — <code>Process()</code> parentState capture, TIPSigning dispatch, TIPXDCXReceiver dispatch, <code>coinbaseOwner</code> resolution.</li>
+  <li><code>core/state_transition.go</code> — TRC21 owner routing, special-tx fee bypass, XDC blacklist enforcement, EIP-3529 deferral, EIP-2028 disable.</li>
+  <li><code>core/types/block.go</code> — three new always-encoded header fields (<code>Validators</code>, <code>Validator</code>, <code>Penalties</code>) and <code>HashNoValidator</code>.</li>
+  <li><code>core/types/state_account.go</code> — <code>BigBalance</code> overflow path.</li>
+  <li><code>eth/protocols/eth/protocol.go</code> — <code>XDPOS2 = 100</code>, <code>VoteMsg</code>/<code>TimeoutMsg</code>/<code>SyncInfoMsg</code>, <code>StatusPacket62</code> (no ForkID).</li>
+  <li><code>eth/handler.go</code>, <code>eth/handler_eth.go</code> — XDPOS2 dispatch + xdcSyncer trigger.</li>
+  <li><code>params/config.go</code> — entire XDC mainnet/Apothem chain configs + <code>Rules{IsXDC, IsEIP1559, IsEIP3860}</code> extensions.</li>
+</ul>
+
+<p>Bundle order used in the original port (per Opus planner advice in
+<code>docs/PORT_LOG.md</code>):</p>
+<pre><code>B0 (engine + config + contracts + genesis) →
+B1 (Phase A continuation, drop cmd/XDC) →
+B3 (XDPOS2/100 wire protocol) →
+B4 (P2P discovery v4 + XDPOS2 RLP) →
+B5 (bulk XDC overlay) →
+B7 (core/blockchain*) →
+B2 (V2 engine wiring) →
+B6 (snap-sync hooks) →
+B8 (state_processor + transition + evm) →
+B9 (downloader) →
+B10 (eth/handlers) →
+B11 (RPC + final polish)
+</code></pre>
+
+<h2 id="subsystems">5. Subsystem-by-subsystem changes <a class="anchor" href="#subsystems">#</a></h2>
+
+<h3 id="sub-params">5.a Chain configuration &amp; params</h3>
+<h4>Why</h4>
+<p>XDC mainnet and Apothem each have their own chain ID, fork schedule,
+masternode bootstrap list, and XDPoS-specific V2 round configuration.
+Several "EIPs" that upstream couples to a single fork block are split
+across two on XDC (e.g. EIP-2929/3529/3860 land at <code>Eip1559Block</code>,
+not Berlin/London/Shanghai).</p>
+
+<h4>What was added/modified</h4>
+<table>
+<thead><tr><th>File</th><th>Δ lines</th><th>Purpose</th></tr></thead>
+<tbody>
+<tr><td><code>params/config.go</code></td><td>+2022</td><td><code>XDCMainnetChainConfig</code>, <code>XDCApothemChainConfig</code>, <code>XDPoSConfig</code>, <code>V2</code>, <code>V2Config</code>, <code>MainnetV2Configs</code>, <code>ApothemV2Configs</code>, <code>TrustedSyncCheckpoint</code>, <code>Rules{IsXDC,IsEIP1559,IsEIP3860}</code>, <code>IsXDC()</code>, <code>XDCBlocksPerYear()</code>, <code>patchMissingForkBlocks()</code>, ~17 <code>IsTIP*</code> predicates</td></tr>
+<tr><td><code>params/bootnodes.go</code></td><td>+85</td><td><code>XDCMainnetBootnodes</code> (28 entries), <code>XDCApothemBootnodes</code></td></tr>
+<tr><td><code>params/protocol_params.go</code></td><td>+8</td><td><code>XDCBaseFee = 12_500_000_000</code> (constant 12.5 gwei post-EIP1559)</td></tr>
+<tr><td><code>params/xdc_features.go</code></td><td>+55 (new)</td><td><code>XDCFeatures{V2SwitchBlock, V2FirstEpochPenaltySkip}</code></td></tr>
+<tr><td><code>common/types.go</code></td><td>+many</td><td>TIP fork-block globals, <code>blacklist[Address]</code>, <code>CopyXDCConstants(chainID)</code></td></tr>
+<tr><td><code>common/constants.go</code></td><td>+24 (new)</td><td><code>MaxMasternodes=18</code>, <code>BlocksPerYear=15_768_000</code>, <code>RangeReturnSigner=150</code></td></tr>
+<tr><td><code>common/xdc_contracts.go</code></td><td>+60 (new)</td><td>System-contract addresses</td></tr>
+</tbody></table>
+
+<h4>How the patterns work</h4>
+<p><code>XDCMainnetChainConfig</code> in <code>params/config.go:200</code> sets
+<code>ChainID=50</code>, fork blocks aligned with XDPoSChain v2.6.8 mainnet
+constants, and an <code>XDPoSConfig{Period:2, Epoch:900, Reward:5000,
+RewardCheckpoint:900, Gap:450, FoudationWalletAddr:0x92a289...}</code>. The
+V2 block is <code>80,370,000</code> on mainnet, <code>56,828,700</code> on
+Apothem.</p>
+
+<p><code>TrustedSyncCheckpoints</code> is a per-network array of pre-verified
+<code>{Number, Hash, Root, Masternodes, Penalties}</code> quadruples. V2-era
+anchors (post-V2-switch) carry the embedded masternode list as well, because
+V2 headers do not carry it in <code>header.Validators</code>.</p>
+
+<p><code>Rules{IsXDC, IsEIP1559, IsEIP3860}</code> carry XDC-aware EVM rule
+flags. EIP-2929/3529/3860 are deferred to <code>Eip1559Block</code> on XDC,
+not Berlin/London/Shanghai:</p>
+
+<pre><code>isEIP2929 := c.IsBerlin(num) &amp;&amp; !isVerkle
+if c.IsXDC() {
+    isEIP2929 = c.IsEIP1559(num) &amp;&amp; !isVerkle
+}
+...
+if c.IsXDC() {
+    isMergeRule = c.IsLondon(num)
+    isShanghai  = c.IsLondon(num)
+    isCancun    = c.IsCancunBlock(num)
+    isEIP3860   = c.IsEIP1559(num)
+}
+</code></pre>
+
+<p><code>IsXDC()</code> at <code>params/config.go:2665</code> is the single
+discriminator: true iff <code>c.XDPoS != nil</code>. This replaces ~11
+historical hard-coded <code>chainID == 50 || chainID == 51</code> sites.</p>
+
+<p>The TIP fork-block globals in <code>common/types.go:97-122</code> are
+package-level <code>*big.Int</code> defaults set to mainnet values;
+<code>common.CopyXDCConstants(chainID)</code> mutates them at engine wiring
+time. <strong class="warn">This is a load-bearing global-mutation pattern</strong>:
+any test that touches these constants must call <code>CopyXDCConstants</code>
+with the right chain ID first.</p>
+
+<h4>When applying to a future geth</h4>
+<ul>
+  <li><code>Rules</code> struct: upstream may add new flags (Verkle, Amsterdam, Pectra). Re-thread <code>IsXDC</code> / <code>IsEIP1559</code> / <code>IsEIP3860</code>.</li>
+  <li><code>ChainConfig.CheckConfigForkOrder</code>: XDC config sets <code>Constantinople == Petersburg == Istanbul == Berlin == London</code> on mainnet (<code>76_321_000</code>). Keep these tied.</li>
+  <li><code>Eip1559Block</code> is XDC-specific (not standard geth); preserve it.</li>
+  <li><code>XDPoS.V2.BuildConfigIndex()</code> is called from the engine <code>New()</code> after AllConfigs is populated.</li>
+</ul>
+
+<h3 id="sub-genesis">5.b Genesis</h3>
+<h4>Why</h4>
+<p>XDC chains require three system contracts pre-deployed at addresses 0x88
+(Validator/MasternodeVoting), 0x89 (BlockSigners), 0x90 (Randomize). The
+mainnet genesis state contains the initial 108 masternode set encoded into
+validator-contract storage. The genesis header's <code>extraData</code>
+carries an <code>extraVanity (32 bytes) || signers || extraSeal (65 bytes)</code>
+block, the V1 signer encoding.</p>
+
+<h4>What was added/modified</h4>
+<table>
+<thead><tr><th>File</th><th>Δ lines</th><th>Purpose</th></tr></thead>
+<tbody>
+<tr><td><code>core/genesis_xdc.go</code></td><td>+106 (new)</td><td>Embed mainnet.json + apothem.json; <code>DefaultXDCMainnetGenesisBlock()</code>, <code>DefaultXDCApothemGenesisBlock()</code></td></tr>
+<tr><td><code>core/xdc_genesis/mainnet.json</code></td><td>+112</td><td>Full mainnet genesis</td></tr>
+<tr><td><code>core/xdc_genesis/apothem.json</code></td><td>+142</td><td>Apothem genesis</td></tr>
+<tr><td><code>core/genesis.go</code></td><td>many</td><td>SetupGenesisBlock / LoadChainConfig patch missing V2 config, TrustedSyncCheckpoints, fork blocks for chain IDs 50 / 51</td></tr>
+<tr><td><code>genesis/genesis.go</code></td><td>+14 (new)</td><td>Alternate genesis package</td></tr>
+</tbody></table>
+
+<h4>How the patterns work</h4>
+<pre><code>//go:embed xdc_genesis/mainnet.json
+var xdcMainnetGenesisJSON []byte
+
+//go:embed xdc_genesis/apothem.json
+var xdcApothemGenesisJSON []byte
+</code></pre>
+
+<p>Verified hashes:</p>
+<ul>
+  <li>Mainnet: <code>0x4a9d748bd78a8d0385b67788c2435dcdb914f98a96250b68863a1f8b7642d6b1</code></li>
+  <li>Apothem: <code>0xbdea512b4f12ff1135ec92c00dc047ffb93890c2ea1aa0eefe9b013d80640075</code></li>
+</ul>
+
+<p><strong class="warn">Critical</strong>: <code>core/genesis.go</code> was
+modified to patch missing fields the JSON does not carry. The JSON omits later
+fork blocks and the V2 config, so <code>LoadChainConfig</code> and
+<code>SetupGenesisBlock</code> re-inject them from
+<code>params.XDC{Mainnet,Apothem}ChainConfig</code>. Each patch emits an
+<code>XDC:</code> info log. Without these patches the runtime forkID hash would
+differ from canonical XDC and wire handshake against production peers
+would fail.</p>
+
+<h3 id="sub-engine">5.c Consensus engine</h3>
+<h4>Why</h4>
+<p>XDC has two consensus generations: V1 (Clique-derived) up to V2.SwitchBlock,
+V2 (HotStuff BFT) afterwards. Reward distribution, masternode rotation, and
+finality semantics change at the switch.</p>
+
+<h4>What was added/modified</h4>
+<table>
+<thead><tr><th>File</th><th>Lines</th><th>Purpose</th></tr></thead>
+<tbody>
+<tr><td><code>consensus/XDPoS/xdpos.go</code></td><td>2049</td><td>Engine wrapper. Routes V1/V2 by <code>IsV2Block</code>. Implements <code>consensus.Engine</code>.</td></tr>
+<tr><td><code>consensus/XDPoS/engines/engine_v2/engine.go</code></td><td>2361</td><td>Full V2: New, Prepare, Finalize, Seal, verifyHeader, calcMasternodes, IsEpochSwitch, InvalidateCaches, SelectSnapPivot.</td></tr>
+<tr><td><code>consensus/XDPoS/engines/engine_v2/verifyHeader.go</code></td><td>313</td><td>V2 header validation.</td></tr>
+<tr><td><code>consensus/XDPoS/engines/engine_v2/vote.go</code></td><td>373</td><td>Vote handling.</td></tr>
+<tr><td><code>consensus/XDPoS/engines/engine_v2/timeout.go</code></td><td>440</td><td>Timeout handling.</td></tr>
+<tr><td><code>consensus/XDPoS/engines/engine_v2/forensics.go</code></td><td>568</td><td>Equivocation detection.</td></tr>
+<tr><td><code>consensus/XDPoS/engines/engine_v2/epochSwitch.go</code></td><td>89</td><td>Epoch-switch identification.</td></tr>
+<tr><td><code>consensus/XDPoS/engines/engine_v2/snapshot.go</code></td><td>156</td><td>V2 snapshot store.</td></tr>
+<tr><td><code>consensus/XDPoS/engines/engine_v2/snap_pivot.go</code></td><td>213</td><td>ADR-807 Phase 1 pivot selection.</td></tr>
+<tr><td><code>consensus/XDPoS/engines/engine_v1/engine.go</code></td><td>981</td><td>V1 (Clique-style).</td></tr>
+<tr><td><code>consensus/XDPoS/reward.go</code></td><td>500</td><td>Reward calculation.</td></tr>
+<tr><td><code>consensus/XDPoS/snapshot.go</code></td><td>272</td><td>V1 snapshot type.</td></tr>
+<tr><td><code>consensus/XDPoS/api*.go</code></td><td>~16k</td><td>RPC namespace methods.</td></tr>
+<tr><td><code>consensus/consensus.go</code></td><td>+24</td><td>Adds <code>CacheInvalidator</code> optional interface.</td></tr>
+</tbody></table>
+
+<h4>How the patterns work</h4>
+<p>Block routing via <code>IsV2Block</code> (xdpos.go:460):</p>
+<pre><code>func (c *XDPoS) IsV2Block(header *types.Header) bool {
+    if c.config == nil || c.config.V2 == nil || c.config.V2.SwitchBlock == nil {
+        return false
+    }
+    return header.Number.Cmp(c.config.V2.SwitchBlock) &gt;= 0
+}
+</code></pre>
+
+<p>The V2 engine's <code>verifyHeader</code>
+(<code>engine_v2/verifyHeader.go:23</code>):</p>
+<ol>
+  <li><code>len(header.Validator) == 65</code> — single ECDSA signature.</li>
+  <li><code>header.Time &lt;= now</code> (when fullVerify).</li>
+  <li>Parent number/hash check, gas-limit 1/1024 bound.</li>
+  <li><code>getExtraFields</code> to decode round, QC, signers.</li>
+  <li>QC validation (signature count ≥ certThreshold).</li>
+  <li>Signer-membership check.</li>
+</ol>
+
+<p>The reward path
+(<code>consensus/XDPoS/reward.go:66 GetRewardForCheckpoint</code>) walks
+backwards from <code>header.Number</code> by parent hash for
+<code>(rCheckpoint * 2) - 1</code> blocks, using <strong>DB-read not cache</strong>
+to guarantee deterministic counts.</p>
+
+<p>The wrapper-level <code>parentState</code> capture
+(<code>core/state_processor.go:82</code>):</p>
+<pre><code>parentState := statedb.Copy()
+...
+if xdposEngine, ok := p.chain.Engine().(interface{ SetParentState(*state.StateDB) }); ok {
+    xdposEngine.SetParentState(parentState)
+}
+p.chain.Engine().Finalize(p.chain, header, tracingStateDB, block.Body())
+</code></pre>
+
+<p><strong class="warn">Load-bearing for consensus parity</strong>: reward
+calculation must read balances from pre-tx state, not post-tx.</p>
+
+<h4>When applying to a future geth</h4>
+<ul>
+  <li><code>consensus.Engine</code> interface: upstream v1.17.x removed <code>APIs() []rpc.API</code> from the interface; the XDC port re-adds it via explicit registration in <code>eth/backend.go:475-477</code>.</li>
+  <li>The engine V2 holds singleton caches keyed by hash. If <code>BlockChain.SetHead</code> is invoked, the cache must be invalidated via <code>consensus.CacheInvalidator</code>.</li>
+  <li><code>types.Body</code>: v1.17.3 introduced <code>Finalize(chain, header, statedb, body)</code>. The wrapper bridges to the older multi-arg V1 signature.</li>
+  <li><code>state.StateDB</code>: <code>AddBalance(addr, *uint256.Int, tracing.BalanceChangeReason)</code> is current.</li>
+</ul>
+
+<h3 id="sub-types">5.d Block validation &amp; types</h3>
+<h4>Why</h4>
+<p>XDC headers carry three additional always-encoded fields:
+<code>Validators</code> (M2 signers at epoch-switch blocks),
+<code>Validator</code> (M1 signer per block, 65-byte ECDSA), and
+<code>Penalties</code> (penalty list). Geth's upstream header RLP must be
+extended; this changes the genesis hash and every block hash.</p>
+
+<h4>What was added/modified</h4>
+<table>
+<thead><tr><th>File</th><th>Δ</th><th>Purpose</th></tr></thead>
+<tbody>
+<tr><td><code>core/types/block.go</code></td><td>+60~</td><td><code>Header.{Validators,Validator,Penalties}</code>, <code>headerMarshaling</code>, <code>HashNoNonce</code>, <code>HashNoValidator</code></td></tr>
+<tr><td><code>core/types/gen_header_rlp.go</code></td><td>regen</td><td>RLP for new header</td></tr>
+<tr><td><code>core/types/gen_account_rlp.go</code></td><td>hand-written</td><td>BigBalance-aware StateAccount RLP</td></tr>
+<tr><td><code>core/types/state_account.go</code></td><td>rewritten</td><td><code>BigBalance *big.Int</code> overflow field</td></tr>
+<tr><td><code>core/types/transaction.go</code></td><td>+13</td><td><code>IsSpecialTx(to)</code> predicate</td></tr>
+<tr><td><code>core/types/consensus_v2.go</code></td><td>+282 (new)</td><td>V2 BFT message types</td></tr>
+<tr><td><code>core/block_validator.go</code></td><td>+60~</td><td>Checkpoint-sync bypass, genesis-sync bypass</td></tr>
+<tr><td><code>core/blockchain.go</code></td><td>many</td><td>checkpointSyncNoState, V2-switch trie commit, SetHead cache invalidation</td></tr>
+<tr><td><code>core/blockchain_xdc.go</code></td><td>+84 (new)</td><td>HookReward, HookPenalty stubs</td></tr>
+</tbody></table>
+
+<h4>How the patterns work</h4>
+<p><code>Header</code> in <code>core/types/block.go:81</code>:</p>
+<pre><code>type Header struct {
+    ParentHash  common.Hash    `json:"parentHash"`
+    UncleHash   common.Hash    `json:"sha3Uncles"`
+    ...
+    MixDigest   common.Hash    `json:"mixHash"`
+    Nonce       BlockNonce     `json:"nonce"`
+
+    // XDPoS fields for validator consensus (always encoded, not optional)
+    Validators []byte `json:"validators"`
+    Validator  []byte `json:"validator"`
+    Penalties  []byte `json:"penalties"`
+
+    BaseFee *big.Int `json:"baseFeePerGas" rlp:"optional"`
+    ...
+}
+</code></pre>
+
+<p>The three XDC fields are placed <strong>before</strong> the EIP-1559+
+optional fields, so they participate in every block's RLP encoding and hash.
+This is what makes the genesis hash XDC-specific.</p>
+
+<p><code>StateAccount.BigBalance</code> in
+<code>core/types/state_account.go:46</code>:</p>
+<pre><code>type StateAccount struct {
+    Nonce    uint64
+    Balance  *uint256.Int
+    Root     common.Hash
+    CodeHash []byte
+    BigBalance *big.Int `rlp:"-"`
+}
+</code></pre>
+
+<p><code>BigBalance</code> is not RLP-encoded directly; instead
+<code>SlimAccountRLP</code> checks <code>account.BigBalance != nil</code> and
+serializes via <code>slimAccountBigBal</code> struct using <code>big.Int</code>
+instead of <code>uint256.Int</code>. This exists because XDC genesis accounts
+hold <code>2^256-1</code> balance and rewards can push real balance past that.</p>
+
+<p>Checkpoint-sync bypass in <code>core/block_validator.go:130</code>:</p>
+<pre><code>if !parentIsTrustedCheckpoint &amp;&amp; !v.bc.HasBlockAndState(parentHash, parentNum) {
+    checkpointNoState := v.bc.checkpointSyncNoState.Load()
+    if checkpointNoState {
+        log.Debug("ValidateBody: checkpointSyncNoState=true, skipping state check", ...)
+    } else if !v.bc.HasBlock(parentHash, parentNum) {
+        return consensus.ErrUnknownAncestor
+    } else {
+        if v.config.XDPoS != nil &amp;&amp; parentNum &lt; 10000 {
+            // genesis sync early block, allow
+        } else {
+            return consensus.ErrPrunedAncestor
+        }
+    }
+}
+</code></pre>
+
+<h3 id="sub-evm">5.e State, precompiles, and the EVM jump table</h3>
+<h4>Why</h4>
+<p>XDC defers several EIPs from the upstream blocks geth ties them to:</p>
+<ul>
+  <li><strong>EIP-2929</strong> (cold/warm access lists): geth at Berlin → XDC at <code>Eip1559Block</code>.</li>
+  <li><strong>EIP-3529</strong> (refund cap reduction): geth at London → XDC at <code>Eip1559Block</code>.</li>
+  <li><strong>EIP-3860</strong> (initcode word cost): geth at Shanghai → XDC at <code>Eip1559Block</code>.</li>
+  <li><strong>EIP-2565</strong> (cheaper MODEXP): geth at Berlin → XDC at <code>Eip1559Block</code>.</li>
+  <li><strong>EIP-2028</strong> (calldata gas reduction): unconditionally disabled on XDC.</li>
+</ul>
+
+<h4>How the patterns work</h4>
+<p>XDC instruction-set markers in <code>core/vm/jump_table.go</code>:</p>
+<pre><code>func newXDCBerlinInstructionSet() JumpTable {
+    return validate(newIstanbulInstructionSet())
+}
+func newXDCLondonInstructionSet() JumpTable {
+    instructionSet := newXDCBerlinInstructionSet()
+    enable3198(&amp;instructionSet) // BASEFEE
+    return validate(instructionSet)
+}
+func newXDCMergeInstructionSet() JumpTable {
+    instructionSet := newXDCLondonInstructionSet()
+    instructionSet[PREVRANDAO] = &amp;operation{ execute: opRandom, ... }
+    return validate(instructionSet)
+}
+func newXDCShanghaiInstructionSet() JumpTable {
+    instructionSet := newXDCMergeInstructionSet()
+    enable3855(&amp;instructionSet) // PUSH0
+    return validate(instructionSet)
+}
+</code></pre>
+
+<p><code>core/vm/contracts.go:108</code> defines
+<code>PrecompiledContractsXDCBerlin</code> which is identical to
+<code>PrecompiledContractsBerlin</code> except <code>bigModExp{eip2565: false}</code>.
+Selected at <code>activePrecompiledContracts</code> (contracts.go:246):</p>
+<pre><code>case rules.IsBerlin:
+    if rules.IsXDC &amp;&amp; !rules.IsEIP1559 {
+        return PrecompiledContractsXDCBerlin
+    }
+    return PrecompiledContractsBerlin
+</code></pre>
+
+<p>The TIPSigning self-destruct of 0x89
+(<code>core/state_processor.go:118</code>):</p>
+<pre><code>if common.TIPSigning.Cmp(block.Number()) == 0 {
+    _ = statedb.IntermediateRoot(false)
+    statedb.SelfDestruct(common.BlockSignersBinary)
+    statedb.Finalise(true)
+    _ = statedb.IntermediateRoot(true)
+}
+</code></pre>
+
+<p>The <code>IntermediateRoot(false)</code> before SelfDestruct is required
+for pathdb correctness.</p>
+
+<h3 id="sub-sync">5.f Sync layer</h3>
+<h4>Why</h4>
+<p>Upstream v1.17.3 dropped the pre-merge <code>chainSyncer</code>. Its sync
+model is now <code>BeaconSync(head, final)</code> driven by a consensus-layer
+<code>forkchoiceUpdated</code>. XDC has no consensus layer; the BFT consensus
+is self-contained inside the masternode set. After the first BeaconSync round
+the downloader idles.</p>
+
+<p>The fix is a dedicated pre-merge sync loop (<code>xdcSyncer</code>) plus a
+state machine that gates <code>--syncmode snap</code> engagement against the
+XDC peer fleet's snap readiness.</p>
+
+<h4>What was added/modified</h4>
+<table>
+<thead><tr><th>File</th><th>Lines</th><th>Purpose</th></tr></thead>
+<tbody>
+<tr><td><code>eth/sync_xdc.go</code></td><td>1241</td><td>xdcSyncer — pre-merge sync loop, multi-peer retry, fork-tainted peer pool, self-healing rollback, snap-sync phase FSM, panic recovery, stall detection.</td></tr>
+<tr><td><code>eth/handler_xdc.go</code></td><td>100</td><td>BroadcastVote/Timeout/SyncInfo helpers.</td></tr>
+<tr><td><code>eth/protocols/eth/protocol.go</code></td><td>+84</td><td><code>XDPOS2=100</code>, VoteMsg/TimeoutMsg/SyncInfoMsg, StatusPacket62.</td></tr>
+<tr><td><code>eth/protocols/eth/peer.go</code></td><td>+175</td><td>XDPOS2 legacy-response dispatch; lastXDCHeader/BodyReqID accessors; FIFO queue.</td></tr>
+<tr><td><code>eth/protocols/eth/handlers.go</code></td><td>many</td><td>XDPOS2 legacy-shape decode; truncate batch to requested count.</td></tr>
+<tr><td><code>eth/handler.go</code>, <code>eth/handler_eth.go</code></td><td>many</td><td>XDPOS2 dispatch + xdcSyncer trigger.</td></tr>
+<tr><td><code>eth/downloader/beaconsync.go</code></td><td>mod</td><td>TrustedSyncCheckpoint cutoff handling.</td></tr>
+</tbody></table>
+
+<h4>How the patterns work</h4>
+<p>XDPOS2 wire protocol (<code>eth/protocols/eth/protocol.go:35</code>):</p>
+<pre><code>const (
+    ETH69  = 69
+    ETH70  = 70
+    XDPOS2 = 100 // XDC consensus protocol (refs #740)
+)
+var ProtocolVersions = []uint{XDPOS2, ETH70, ETH69}
+var protocolLengths = map[uint]uint64{ETH69: 18, ETH70: 18, XDPOS2: 227}
+</code></pre>
+
+<p>Status handshake uses two distinct shapes:</p>
+<ul>
+  <li><strong>ETH/69, ETH/70</strong>: <code>StatusPacket{ProtocolVersion, NetworkID, Genesis, ForkID, EarliestBlock, LatestBlock, LatestBlockHash}</code>.</li>
+  <li><strong>XDPOS2</strong>: <code>StatusPacket62{ProtocolVersion, NetworkID, TD, Head, Genesis}</code>. No ForkID. TD is a placeholder (block number).</li>
+</ul>
+
+<p>The xdcSyncer FSM (<code>eth/sync_xdc.go:109</code>):</p>
+<pre><code>const (
+    phaseFullSync xdcSnapPhase = iota
+    phaseSnapSelecting
+    phaseSnapRunning
+    phaseTipCatch
+    phaseAtTip
+)
+</code></pre>
+
+<p>Transitions gated behind double opt-in: <code>--syncmode snap</code> AND
+<code>XDC_EXPERIMENTAL_SNAPSYNC=1</code>. Without the env var, SNAP_RUNNING
+logs a warning and the syncer falls back to FULL_SYNC.</p>
+
+<p>Key constants in <code>eth/sync_xdc.go:61</code>:</p>
+<pre><code>xdcForceSyncCycle      = 500 * time.Millisecond
+xdcBatchSize           = 4096
+xdcReqTimeout          = 8 * time.Second
+xdcMaxPeerTriesPerSync = 4
+xdcUnknownAncestorThreshold = 8
+xdcRollbackWindowInit       = 128
+xdcRollbackWindowMax        = 8192
+xdcForkTaintTTL = 60 * time.Second
+</code></pre>
+
+<h3 id="sub-rpc">5.g RPC / API</h3>
+<h4>Why</h4>
+<p>XDC tooling (block explorers, masternode dashboards, validator monitors)
+depends on a <code>XDPoS_*</code> JSON-RPC namespace plus XDC-specific fields
+in <code>eth_*</code> responses.</p>
+
+<h4>What was added/modified</h4>
+<table>
+<thead><tr><th>File</th><th>Lines</th><th>Purpose</th></tr></thead>
+<tbody>
+<tr><td><code>consensus/XDPoS/api.go</code></td><td>~5700</td><td>Clique-style API: GetSnapshot, GetSigners, GetMasternodes, Propose, GetCandidates.</td></tr>
+<tr><td><code>consensus/XDPoS/api_extended.go</code></td><td>~10k</td><td>V2 / extension API: GetV2BlockByNumber, GetMasternodesByNumber, GetBlockInfoByEpochNum, NetworkInformation, GetRewardByAccount.</td></tr>
+<tr><td><code>internal/ethapi/api_xdc.go</code></td><td>582 (new)</td><td>XDC extensions to BlockChainAPI: GetBlockSignersByHash, GetBlockFinalityByHash, RPCMarshalHeaderXDC, GetRewardByHash, GetStakerROI.</td></tr>
+<tr><td><code>internal/web3ext/web3ext_xdc.go</code></td><td>385 (new)</td><td>web3.xdpos.* JS method bindings.</td></tr>
+<tr><td><code>internal/web3ext/web3ext.go</code></td><td>+1</td><td>Register <code>"xdpos": XDPoSJs</code>.</td></tr>
+<tr><td><code>eth/backend.go (APIs())</code></td><td>+9</td><td>Explicit XDPoS_* registration (PR #814).</td></tr>
+</tbody></table>
+
+<h4>How the patterns work</h4>
+<p><code>eth/backend.go:469-477</code> is the load-bearing wiring:</p>
+<pre><code>// XDC #814: upstream geth removed APIs() from the consensus.Engine interface,
+// so engine-specific namespaces are no longer auto-registered. XDPoS exposes
+// the XDPoS_* family (getMasternodesByNumber, networkInformation,
+// getEpochNumbersBetween, …) that block explorers, masternode dashboards,
+// and validator monitors depend on for v2.6.8 / v2.7.0 compatibility.
+// Wire it explicitly here.
+if xdposEng, ok := s.engine.(*XDPoS.XDPoS); ok {
+    apis = append(apis, xdposEng.APIs(s.blockchain)...)
+}
+</code></pre>
+
+<h3 id="sub-contracts">5.h Contracts</h3>
+<h4>Why</h4>
+<p>XDC has on-chain governance, voting, reward-tracking contracts.
+The Solidity source lives in <code>../XDPoSChain/contracts/</code>; the
+go-ethereum-overlay carries only the generated Go bindings + Go-side
+wrappers.</p>
+
+<table>
+<thead><tr><th>Path</th><th>Purpose</th></tr></thead>
+<tbody>
+<tr><td><code>contracts/blocksigner/contract/blocksigner.go</code></td><td>abigen-generated bindings for BlockSigner.sol</td></tr>
+<tr><td><code>contracts/blocksigner/block_signer.go</code></td><td>Higher-level wrapper</td></tr>
+<tr><td><code>contracts/validator/contract/validator.go</code></td><td>bindings for Validator.sol</td></tr>
+<tr><td><code>contracts/validator/xdc_validator.go</code></td><td>Live-call helpers for masternode lookup</td></tr>
+<tr><td><code>contracts/randomize/contract/randomize.go</code></td><td>bindings</td></tr>
+<tr><td><code>contracts/multisigwallet/contract/multisigwallet.go</code></td><td>bindings</td></tr>
+<tr><td><code>contracts/trc21issuer/contract/TRC21.go</code></td><td>TRC21 fee-token bindings</td></tr>
+<tr><td><code>contracts/XDCx/contract/*.go</code></td><td>XDCx trading + lending bindings</td></tr>
+<tr><td><code>contracts/utils.go</code></td><td>Shared ABI / msg encoding helpers</td></tr>
+</tbody></table>
+
+<p><strong class="warn">Important</strong>: the contract bytecode pre-deployed
+at genesis is <strong>not</strong> regenerated from source — it is verbatim
+from canonical XDPoSChain mainnet. Recompiling Solidity at a newer compiler
+version produces different bytecode and breaks the genesis hash.</p>
+
+<h3 id="sub-cli">5.i CLI &amp; node configuration</h3>
+<p><code>cmd/utils/flags.go:168-175</code>:</p>
+<pre><code>XDCMainnetFlag = &amp;cli.BoolFlag{
+    Name:     "xdcmainnet",
+    Usage:    "XDC mainnet (network ID 50): XDPoS BFT consensus network",
+}
+XDCApothemFlag = &amp;cli.BoolFlag{
+    Name:     "apothem",
+    Usage:    "XDC Apothem testnet (network ID 51): XDPoS BFT consensus test network",
+}
+</code></pre>
+
+<p><code>cmd/utils/flags.go:1972-1981</code> is where the flags load the
+embedded genesis:</p>
+<pre><code>case ctx.Bool(XDCMainnetFlag.Name):
+    cfg.NetworkId = 50
+    cfg.Genesis = core.DefaultXDCMainnetGenesisBlock()
+case ctx.Bool(XDCApothemFlag.Name):
+    cfg.NetworkId = 51
+    cfg.Genesis = core.DefaultXDCApothemGenesisBlock()
+</code></pre>
+
+<p>XDC ping wire-shape (<code>p2p/discover/v4wire/v4wire.go</code>):</p>
+<pre><code>const (
+    PingPacket = iota + 1
+    PongPacket
+    FindnodePacket
+    NeighborsPacket
+    ENRRequestPacket  // = 5, XDC uses this slot for PingXDC
+    ENRResponsePacket // = 6
+)
+
+// XDC uses packet type 5 for ping instead of type 1.
+var UseXDCPing = true
+
+func (req *Ping) Kind() byte {
+    if UseXDCPing { return ENRRequestPacket }
+    return PingPacket
+}
+</code></pre>
+
+<p>ENRRequest is shadowed; nodes wanting to ask for ENR records over
+discovery v4 will not be able to on XDC. ENR over discovery v5
+(<code>discv5</code>) is unaffected.</p>
+
+<h3 id="sub-fleet">5.j P2P fleet integration</h3>
+<p>Deployment tools (brief). Listed for completeness; a future port-engineer
+can ignore them initially and focus on consensus correctness.</p>
+<ul>
+  <li><code>scripts/local-sync-test.sh</code> — 1234-line multi-node sync test harness with snapshot restore, FLEET_ENODES pinning.</li>
+  <li><code>scripts/run-xdc-mainnet.sh</code>, <code>run_xdc_node.sh</code></li>
+  <li><code>scripts/snap-pivot-validate.sh</code> — ADR-807 Phase 2 validation script.</li>
+  <li><code>scripts/snapshot-daily.sh</code>, <code>sync-bench.sh</code>, <code>archive-integrity-probe.sh</code></li>
+  <li><code>scripts/validate-canonical-parity.sh</code> — state-root parity validator.</li>
+  <li><code>scripts/xdc-parity-check.sh</code></li>
+  <li><code>prometheus.yml</code> — fleet metrics.</li>
+</ul>
+
+<h3 id="sub-docs">5.k Documentation present in tree</h3>
+<p><code>docs/port/</code>: STATUS.md, HANDOFF.md, MENTAL_MODEL.md
+(two-pivot snap-sync model), ADOPTION_STATUS_FINAL.md,
+DOWNLOADER_XDC_PORT_ATTEMPT.md, MISSING_FROM_XDC_NETWORK.md,
+PENDING_PORTS_FROM_XDC_NETWORK.md, REMAINING_WORK.md,
+SYNC_RUNNING_STATUS.md, V117_FILE_AUDIT.md,
+V117_UPGRADE_LOOPHOLES.md, XDC_SYNC_BREAKTHROUGH.md,
+XDPOS2_DATAPLANE_PORT.md, XDC_*.html dashboards.</p>
+
+<p><code>docs/adr/</code>: 001-genesis-config-merge.md (PR #757),
+002-syncmode-aliasing.md (PR #757).</p>
+
+<p><code>docs/03-architecture-decisions/</code>:
+801-v2-bft-finalization-fix.md, 807-snap-sync-phase-1-pivot-selection.md,
+807-snap-sync-phase-3-gating-design.md.</p>
+
+<p><code>docs/PORT_LOG.md</code> — running diary including
+<code>[PLANNER-ADVICE 2026-05-23]</code> Opus planner output that defined the
+bundle order.</p>
+
+<h2 id="fork-timeline">6. Hard fork timeline <a class="anchor" href="#fork-timeline">#</a></h2>
+
+<h3>6.1 XDC Mainnet (chainId 50)</h3>
+<table>
+<thead><tr><th>Fork</th><th style="text-align:right">Block</th><th>What activates</th></tr></thead>
+<tbody>
+<tr><td>Homestead</td><td style="text-align:right">1</td><td>EIP-2/3/7</td></tr>
+<tr><td>EIP-150</td><td style="text-align:right">2</td><td>Gas cost increases for IO-heavy ops</td></tr>
+<tr><td>EIP-155</td><td style="text-align:right">3</td><td>Replay protection (chain ID in signature)</td></tr>
+<tr><td>EIP-158</td><td style="text-align:right">3</td><td>State clearing (empty-account rule)</td></tr>
+<tr><td>Byzantium</td><td style="text-align:right">4</td><td>RETURNDATA*, STATICCALL, REVERT</td></tr>
+<tr><td>TIPSigning</td><td style="text-align:right">3,000,000</td><td>BlockSigner contract @ 0x89 self-destructed; signing txs → <code>ApplySigningTransaction</code></td></tr>
+<tr><td>TIPRandomize</td><td style="text-align:right">3,464,000</td><td>Randomize contract activation</td></tr>
+<tr><td>TIPIncreaseMasternodes</td><td style="text-align:right">5,000,000</td><td>Masternode count limit increase</td></tr>
+<tr><td>TIPXDCX / TIPNoHalvingMNReward / TIPTRC21Fee</td><td style="text-align:right">38,383,838</td><td>XDCx trading + lending activate; reward halving disabled; TRC21 fees route to coinbase owner; effective Istanbul activation</td></tr>
+<tr><td>Berlin / Constantinople / Petersburg / Istanbul / London / TIPMerge / TIPShanghai</td><td style="text-align:right">76,321,000</td><td>All bundled. XDC instruction sets drive opcode availability.</td></tr>
+<tr><td>BlockNumberGas50x / TIPV2SwitchBlock / TIPXDCXMinerDisable</td><td style="text-align:right">80,370,000</td><td><strong class="warn">V2 BFT switch.</strong></td></tr>
+<tr><td>TIPXDCXReceiverDisable</td><td style="text-align:right">80,370,900</td><td>XDCx receiver-side dispatch disabled</td></tr>
+<tr><td>Eip1559Block</td><td style="text-align:right">98,800,200</td><td>EIP-2929 / 3529 / 3860 / 2565 activate. EIP-1559 tx-type accepted. Base fee constant 12.5 gwei.</td></tr>
+<tr><td>CancunBlock</td><td style="text-align:right">98,802,000</td><td>Cancun opcodes (BLOBHASH, MCOPY, TLOAD/TSTORE)</td></tr>
+</tbody></table>
+
+<h3>6.2 Apothem testnet (chainId 51)</h3>
+<table>
+<thead><tr><th>Fork</th><th style="text-align:right">Block</th></tr></thead>
+<tbody>
+<tr><td>Homestead..Byzantium</td><td style="text-align:right">1..4</td></tr>
+<tr><td>TIPSigning</td><td style="text-align:right">3,000,000</td></tr>
+<tr><td>TIPRandomize</td><td style="text-align:right">3,464,000</td></tr>
+<tr><td>TIPXDCX / ... / TIPTRC21Fee</td><td style="text-align:right">23,779,191</td></tr>
+<tr><td>BlockNumberGas50x</td><td style="text-align:right">56,828,700</td></tr>
+<tr><td>TIPV2SwitchBlock</td><td style="text-align:right">56,828,700 (V2 BFT switch)</td></tr>
+<tr><td>Berlin..London / TIPMerge / TIPShanghai</td><td style="text-align:right">61,290,000</td></tr>
+<tr><td>TIPXDCXMinerDisable</td><td style="text-align:right">61,290,000</td></tr>
+<tr><td>TIPXDCXReceiverDisable</td><td style="text-align:right">66,825,000</td></tr>
+<tr><td>Eip1559Block</td><td style="text-align:right">71,550,000</td></tr>
+<tr><td>CancunBlock</td><td style="text-align:right">71,551,800</td></tr>
+</tbody></table>
+
+<p>Source: <code>common/types.go:194 CopyXDCConstants</code> and
+<code>params/config.go</code> chain configs.</p>
+
+<h2 id="bypass">7. Bypass log family ("XDC:" prefix) <a class="anchor" href="#bypass">#</a></h2>
+
+<p>Approximately 30 inline <code>XDC:</code> log call-sites mark places where
+XDC's state model legitimately diverges from upstream Ethereum validation.</p>
+
+<h3>7.1 <code>core/genesis.go</code></h3>
+<ul>
+  <li>Lines 395, 503: patch missing <code>TrustedSyncCheckpoints</code>.</li>
+  <li>Lines 409, 518: patch missing V2 config.</li>
+  <li>Line 432: patch missing fork blocks (<code>patchMissingForkBlocks</code>).</li>
+  <li>Lines 600/604/608/612/616/620/624: log when each fork block is patched.</li>
+</ul>
+
+<h3>7.2 <code>core/blockchain.go</code></h3>
+<ul>
+  <li>Line 778: notify consensus engine to purge in-memory caches via <code>CacheInvalidator</code>.</li>
+  <li>Lines 1788-1796: V2-switch force-commit (critical consensus boundary).</li>
+</ul>
+
+<h3>7.3 <code>core/block_validator.go</code></h3>
+<ul>
+  <li>Line 131: checkpoint-sync state-check bypass.</li>
+  <li>Line 141: genesis-sync early-block bypass.</li>
+  <li>Line 174: checkpoint-sync gas mismatch tolerance.</li>
+</ul>
+
+<h3>7.4 <code>core/state_processor.go</code></h3>
+<ul>
+  <li>Line 78: <code>parentState := statedb.Copy()</code> capture.</li>
+  <li>Line 102: TIPSigning self-destruct of 0x89.</li>
+  <li>Line 142: TRC21 fee recipient resolution.</li>
+  <li>Line 155: TIPSigning dispatch to ApplySigningTransaction.</li>
+  <li>Line 172: TIPXDCXReceiver dispatch to ApplyEmptyTransaction.</li>
+  <li>Line 215: SetParentState on engine.</li>
+</ul>
+
+<h3>7.5 <code>core/state_transition.go</code></h3>
+<ul>
+  <li>Line 428: BigBalance overflow sender path.</li>
+  <li>Line 500: maxFeePerGas-vs-baseFee skip for special txs.</li>
+  <li>Line 591: EIP-2028 disable.</li>
+  <li>Line 715: pre-EIP1559 IsLondon=true with BaseFee==nil.</li>
+  <li>Line 827: EIP-3529 deferred from London to Eip1559Block.</li>
+</ul>
+
+<h3>7.6 State + trie + pathdb</h3>
+<ul>
+  <li><code>core/evm.go:147</code> — BigBalance overflow sender.</li>
+  <li><code>core/state/reader.go:112,358</code> — preserve overflow + panic recover.</li>
+  <li><code>core/state/snapshot/disklayer.go:94</code>, <code>difflayer.go:226</code> — DecodeSlimAccount.</li>
+  <li><code>trie/secure_trie.go:118</code> — GetAccount panic recover.</li>
+  <li><code>triedb/pathdb/reader.go:136,287</code> — pathdb DecodeSlimAccount.</li>
+</ul>
+
+<h3>7.7 txpool</h3>
+<ul>
+  <li><code>core/txpool/validation.go:129</code> — EIP-2028 disable.</li>
+  <li><code>core/txpool/legacypool/legacypool.go:578</code> — blacklist enforcement.</li>
+</ul>
+
+<h3>7.8 <code>eth/*</code></h3>
+<ul>
+  <li><code>eth/backend.go:185</code> — CopyXDCConstants init.</li>
+  <li><code>eth/backend.go:300</code> — Attach V1 + V2 hooks.</li>
+  <li><code>eth/handler.go:142,383,444,449</code> — auto-sync trigger.</li>
+  <li><code>eth/sync_xdc.go:189,823</code> — bulk-sync, TD-as-block-number.</li>
+  <li><code>eth/downloader/beaconsync.go:289</code> — TrustedSyncCheckpoint cutoff.</li>
+  <li><code>eth/protocols/eth/peer.go:82,102</code> — XDPOS2 legacy-response queueing.</li>
+</ul>
+
+<blockquote class="warn">Every <code>XDC:</code> log line is
+<strong>load-bearing for consensus parity</strong>. Removing or "improving"
+any will produce a state-root divergence at the first block where the
+condition fires. Every one has historical justification — usually traceable
+to a specific PR # in the commit log.</blockquote>
+
+<h2 id="recreation">8. Step-by-step recreation procedure <a class="anchor" href="#recreation">#</a></h2>
+
+<h3>8.1 Prerequisites</h3>
+<ul>
+  <li>Go 1.23+ (geth v1.17.3 minimum)</li>
+  <li>git, gh (GitHub CLI)</li>
+  <li>~20 GB free disk</li>
+  <li>Local clones of XDPoSChain and XinFin-Node (read-only references)</li>
+</ul>
+
+<h3>8.2 Setting up the repo</h3>
+<pre><code>cd /workspace
+git clone https://github.com/ethereum/go-ethereum.git go-ethereum
+cd go-ethereum
+git checkout vX.Y.Z   # the new target upstream tag
+git remote add xdc-overlay &lt;path-or-url-to-this-repo&gt;
+git fetch xdc-overlay
+</code></pre>
+
+<h3>8.3 Bundle 0 — engine + config + contracts + genesis</h3>
+<pre><code>git checkout -b reset/integration-vX.Y.Z
+
+git checkout xdc-overlay/reset/integration-1.17.3 -- \
+    consensus/XDPoS/ \
+    contracts/blocksigner/ contracts/validator/ contracts/randomize/ \
+    contracts/multisigwallet/ contracts/trc21issuer/ contracts/XDCx/ \
+    contracts/utils.go contracts/utils_test.go \
+    core/xdc_genesis/ \
+    core/genesis_xdc.go core/blockchain_xdc.go core/events_xdc.go \
+    core/state_processor_xdc.go core/state_processor_xdc_test.go \
+    core/xdc_sync_opts.go core/rawdb/accessors_xdc.go core/rawdb/accessors_sync.go \
+    common/xdc_contracts.go common/constants.go common/countdown/ \
+    common/sort/ common/bytes.go \
+    params/bootnodes.go params/xdc_features.go \
+    accounts/abi/bind/xdc_bind.go \
+    eth/hooks/ eth/util/ \
+    eth/sync_xdc.go eth/sync_xdc_phase_test.go eth/handler_xdc.go \
+    eth/bft/ \
+    eth/protocols/snap/xdc_snap_verify.go eth/protocols/snap/xdc_snap_verify_test.go \
+    internal/ethapi/api_xdc.go internal/ethapi/api_xdc_test.go \
+    internal/web3ext/web3ext_xdc.go \
+    les/api_backend_xdc.go \
+    node/config_xdc.go node/health.go \
+    genesis/ apothem-genesis.json genesis-apothem.json \
+    mainnet-genesis.json mainnet-genesis-fixed.json \
+    XDCx/ XDCxlending/ \
+    cmd/clearxdpos/ cmd/extract-checkpoint-state/ cmd/xdc-replay/ \
+    scripts/ \
+    docs/port/ docs/adr/ docs/03-architecture-decisions/ docs/PORT_LOG.md \
+    docs/runbooks/ docs/RESET_BUNDLES.md docs/RESET_CONFLICT_LOG.md \
+    docs/SYNC.md docs/TESTING.md docs/XDCx.md docs/XDCxLending.md docs/XDPoS.md \
+    docs/GENESIS_COMPATIBILITY_FIX.md docs/RESET_B5_DEFERRED.md \
+    Dockerfile* docker/ docker-compose.yml prometheus.yml \
+    test-xdc-mainnet.sh TESTING.md \
+    .github/workflows/xdc-build.yml .github/workflows/xdc-test.yml \
+    build/ci_xdc.go
+
+git commit -m "B0: import XDC overlay files"
+</code></pre>
+
+<h3>8.4 Bundle 1 — params/config.go merge</h3>
+<p>3-way merge by hand. Re-apply XDC additions on top of the new upstream
+config.go. Look for: XDCMainnetChainConfig, XDCApothemChainConfig, XDPoSConfig,
+V2, V2Config, MainnetV2Configs, ApothemV2Configs, TrustedSyncCheckpoint,
+Rules{IsXDC, IsEIP1559, IsEIP3860}, IsXDC(), XDCBlocksPerYear(), IsTIP*
+predicates. Then common/types.go (TIP fork blocks + blacklist).</p>
+
+<h3>8.5 Bundle 2 — header struct + RLP</h3>
+<pre><code>git checkout xdc-overlay/reset/integration-1.17.3 -- \
+    core/types/block.go core/types/gen_header_rlp.go core/types/gen_header_json.go \
+    core/types/header_rlp_compat_test.go \
+    core/types/gen_account_rlp.go core/types/state_account.go \
+    core/types/transaction.go core/types/consensus_v2.go \
+    core/types/vote_pool.go core/types/order_transaction.go
+git commit -m "B2: header + state account BigBalance + V2 BFT types"
+go build ./core/types/... &amp;&amp; go test ./core/types/...
+</code></pre>
+
+<h3>8.6 Bundle 3 — XDPOS2 wire protocol</h3>
+<pre><code>git checkout xdc-overlay/reset/integration-1.17.3 -- \
+    eth/protocols/eth/protocol.go eth/protocols/eth/handler.go \
+    eth/protocols/eth/handlers.go eth/protocols/eth/handshake.go \
+    eth/protocols/eth/peer.go
+git commit -m "B3: XDPOS2/100 wire protocol"
+</code></pre>
+
+<h3>8.7 Bundle 4 — P2P discovery, Bundle 5 — state + EVM, Bundle 6 — txpool</h3>
+<p>(See markdown guide for full file lists.)</p>
+
+<h3>8.8 Bundle 7 — core/blockchain* + state_processor</h3>
+<p>Highest-conflict step. Strategy: upstream skeleton + re-apply XDC additions
+marked with <code>XDC:</code> comments. Pay extra attention to:</p>
+<ul>
+  <li><code>core/blockchain.go:778</code> — CacheInvalidator on SetHead</li>
+  <li><code>core/blockchain.go:1788-1796</code> — V2-switch trie force-commit</li>
+  <li><code>core/state_processor.go:78</code> — parentState snapshot</li>
+  <li><code>core/state_processor.go:102</code> — TIPSigning self-destruct of 0x89</li>
+  <li><code>core/state_processor.go:162</code> — TIPSigning dispatch</li>
+  <li><code>core/state_processor.go:180</code> — TIPXDCXReceiver dispatch</li>
+  <li><code>core/state_processor.go:215</code> — SetParentState on engine</li>
+  <li><code>core/state_processor.go:499</code> — ApplySigningTransaction</li>
+  <li><code>core/state_processor.go:555</code> — ApplyEmptyTransaction</li>
+  <li><code>core/genesis.go:395+</code> — patchMissing* family</li>
+  <li><code>core/block_validator.go:130+</code> — checkpoint-sync bypass</li>
+</ul>
+
+<h3>8.13 Build + initial validation</h3>
+<pre><code>make all
+./build/bin/geth --apothem init genesis/xdc_apothem.json
+./build/bin/geth --apothem --datadir /tmp/apothem-test \
+                 --syncmode full --http --port 30303
+# Watch logs for "XDC: patched missing V2 config in genesis spec for apothem"
+# and for the apothem genesis hash
+# 0xbdea512b4f12ff1135ec92c00dc047ffb93890c2ea1aa0eefe9b013d80640075.
+</code></pre>
+
+<h3>8.14 Consensus parity validation</h3>
+<p>The parity harness lives at... <strong>not</strong> in
+<code>tools/parity-harness/</code> (this directory does not exist in this tree
+— that path is aspirational per the CLAUDE.md operating manual). What does
+exist:</p>
+<ul>
+  <li><code>scripts/validate-canonical-parity.sh</code> — 497-line script that compares state root / receipts root / block hash against a canonical RPC.</li>
+  <li><code>scripts/xdc-parity-check.sh</code> — wrapper to verify against XDC v2.6.8.</li>
+  <li><code>consensus/XDPoS/state_root_vectors_test.go</code> — embedded test vectors.</li>
+  <li><code>consensus/XDPoS/cross_client_vectors_test.go</code> — cross-client RLP test vectors.</li>
+</ul>
+
+<pre><code>go test ./consensus/XDPoS/...
+./scripts/validate-canonical-parity.sh --network=apothem --from=23779000 --to=23780000
+</code></pre>
+
+<h2 id="pitfalls">9. Pitfalls &amp; "don't do this" <a class="anchor" href="#pitfalls">#</a></h2>
+
+<h3>9.1 Consensus correctness is sacred</h3>
+<p>Never "improve" XDPoS rules during port work. Specifically:</p>
+<ul>
+  <li>Do not modify reward calculation, masternode selection, or epoch boundaries.</li>
+  <li>Do not change RLP encoding of any block / header / receipt field.</li>
+  <li>Do not force upstream defaults onto XDC-customised paths.</li>
+  <li>Treat hash mismatch as P0 — stop everything until root-caused.</li>
+</ul>
+
+<h3>9.2 The "XDC:" markers are load-bearing</h3>
+<p>Removing or "cleaning up" any <code>XDC:</code> log line will likely
+produce a state-root divergence at a future block. The markers identify
+exactly where canonical XDPoSChain v2.6.8 behaviour differs from upstream
+Ethereum validation.</p>
+
+<h3>9.3 V1 → V2 hardfork boundary is high-risk</h3>
+<p>At mainnet block <code>80,370,000</code>:</p>
+<ul>
+  <li>The trie must be force-committed (<code>core/blockchain.go:1788</code>).</li>
+  <li>V1 snapshot logic stops applying; V2 snapshot store activates.</li>
+  <li><code>header.Validators</code> (V1 M2 signers) becomes empty.</li>
+  <li>Reward distribution moves from <code>Number % 900 == 0</code> to epoch-switch-keyed.</li>
+  <li>The first V2 block (V2.SwitchBlock + 1) <strong>skips</strong> reward distribution entirely.</li>
+</ul>
+
+<p>The TrustedSyncCheckpoint at <code>80,370,000</code> mainnet is "Path B":
+its <code>Masternodes</code> field is populated so
+<code>InsertHeadersBeforeCutoff</code> can pre-seed the V2 snapshot store
+without needing contract state. Without that pre-seed, the engine fails
+verification of the very next block.</p>
+
+<h3>9.4 BigBalance is a 4-file invariant</h3>
+<p>The <code>BigBalance</code> overflow path lives in:</p>
+<ul>
+  <li><code>core/types/state_account.go</code></li>
+  <li><code>core/state/state_object.go</code></li>
+  <li><code>core/state/snapshot/{disklayer,difflayer}.go</code></li>
+  <li><code>core/state/reader.go</code></li>
+  <li><code>trie/secure_trie.go</code></li>
+  <li><code>triedb/pathdb/reader.go</code></li>
+</ul>
+<p>If you touch any one, audit the others. The historical divergence cases
+(#793/#794/#795/#796) all traced to one half of the pair being updated
+without the other.</p>
+
+<h3>9.5 Snap-sync semantics are subtle</h3>
+<p>Read <code>docs/port/MENTAL_MODEL.md</code> before touching
+<code>eth/sync_xdc.go</code>. The two-pivot model (xdcSyncer pivot vs
+downloader pivot) is the most common source of incorrect bug-fixes.</p>
+
+<blockquote><code>fsMinFullBlocks</code> controls the <strong>downloader's</strong>
+pivot offset from head. It is <strong>not</strong> a knob for pinning any
+other pivot. The downloader pivot is <strong>always</strong>
+<code>head − fsMinFullBlocks</code> — the only way to relocate it is to
+relocate <code>head</code>.</blockquote>
+
+<h3>9.6 XDC peer fleet does not currently serve snap</h3>
+<p>As of STATUS.md, the XDC peer fleet has not generated a snap-protocol
+snapshot index. The <code>--syncmode snap</code> path will engage but
+ultimately fall back to FULL_SYNC via Phase 14.4 stall detection. This is
+expected behaviour until task #96 is done.</p>
+
+<h3>9.7 The blacklist is hardcoded and chain-specific</h3>
+<p><code>common/types.go:126</code> holds a 57-address blacklist used at
+all blocks ≥ <code>BlackListHFNumber</code> (mainnet: 38,383,838; Apothem:
+23,779,191). Both sender and recipient are checked. Do not remove entries.</p>
+
+<h3>9.8 The <code>common.TIP*</code> globals are mutated at runtime</h3>
+<p><code>common.CopyXDCConstants(chainID)</code> mutates package-level
+<code>*big.Int</code> globals. Called once during engine construction.
+<strong class="warn">Never call it twice with different chain IDs in the same
+process</strong> — tests exercising both mainnet and Apothem in one binary
+will alias the latter on top of the former.</p>
+
+<h3>9.9 The <code>Foudation</code> typo</h3>
+<p><code>common/xdc_contracts.go:32</code>: <code>FoudationAddrBinary</code>
+(missing 'n') is intentional. The historical misspelling propagated through
+canonical XDPoSChain, exported APIs depend on it, and a fix would touch
+~20 sites.</p>
+
+<h2 id="appendix">10. Reference appendix <a class="anchor" href="#appendix">#</a></h2>
+
+<h3 id="app-files">10.1 Key file paths</h3>
+<table>
+<thead><tr><th>Path</th><th>Description</th></tr></thead>
+<tbody>
+<tr><td><code>consensus/XDPoS/xdpos.go</code></td><td>XDPoS engine wrapper (2049 lines)</td></tr>
+<tr><td><code>consensus/XDPoS/engines/engine_v2/engine.go</code></td><td>V2 BFT engine (2361 lines)</td></tr>
+<tr><td><code>consensus/XDPoS/engines/engine_v2/verifyHeader.go</code></td><td>V2 header verification</td></tr>
+<tr><td><code>consensus/XDPoS/engines/engine_v2/vote.go</code></td><td>V2 vote handling</td></tr>
+<tr><td><code>consensus/XDPoS/engines/engine_v2/timeout.go</code></td><td>V2 timeout handling</td></tr>
+<tr><td><code>consensus/XDPoS/engines/engine_v2/forensics.go</code></td><td>V2 equivocation detection</td></tr>
+<tr><td><code>consensus/XDPoS/engines/engine_v2/snap_pivot.go</code></td><td>ADR-807 snap-sync pivot selection</td></tr>
+<tr><td><code>consensus/XDPoS/engines/engine_v1/engine.go</code></td><td>V1 (Clique-style) engine (981 lines)</td></tr>
+<tr><td><code>consensus/XDPoS/reward.go</code></td><td>Reward calculation per-checkpoint</td></tr>
+<tr><td><code>consensus/XDPoS/snapshot.go</code></td><td>V1 snapshot type</td></tr>
+<tr><td><code>consensus/XDPoS/api.go</code></td><td>XDPoS_* RPC namespace (clique-style)</td></tr>
+<tr><td><code>consensus/XDPoS/api_extended.go</code></td><td>XDPoS_* extended RPC</td></tr>
+<tr><td><code>consensus/XDPoS/network_constants.go</code></td><td>Per-network constants map</td></tr>
+<tr><td><code>consensus/consensus.go</code></td><td><code>consensus.Engine</code> + <code>CacheInvalidator</code></td></tr>
+<tr><td><code>params/config.go</code></td><td>Chain configs, V2 configs, Rules, IsXDC</td></tr>
+<tr><td><code>params/bootnodes.go</code></td><td>XDCMainnetBootnodes, XDCApothemBootnodes</td></tr>
+<tr><td><code>params/protocol_params.go</code></td><td>XDCBaseFee constant (12.5 gwei)</td></tr>
+<tr><td><code>params/xdc_features.go</code></td><td>XDCFeatures struct</td></tr>
+<tr><td><code>common/types.go</code></td><td>TIP fork-block globals, blacklist, CopyXDCConstants</td></tr>
+<tr><td><code>common/constants.go</code></td><td>MaxMasternodes, BlocksPerYear</td></tr>
+<tr><td><code>common/xdc_contracts.go</code></td><td>System contract address constants</td></tr>
+<tr><td><code>core/genesis.go</code></td><td>SetupGenesisBlock with XDC patching</td></tr>
+<tr><td><code>core/genesis_xdc.go</code></td><td>Embed mainnet.json + apothem.json</td></tr>
+<tr><td><code>core/xdc_genesis/mainnet.json</code></td><td>Embedded mainnet genesis JSON</td></tr>
+<tr><td><code>core/xdc_genesis/apothem.json</code></td><td>Embedded Apothem genesis JSON</td></tr>
+<tr><td><code>core/blockchain.go</code></td><td>checkpointSyncNoState + V2 force-commit</td></tr>
+<tr><td><code>core/blockchain_xdc.go</code></td><td>XDC blockchain hooks</td></tr>
+<tr><td><code>core/block_validator.go</code></td><td>Checkpoint-sync bypasses</td></tr>
+<tr><td><code>core/state_processor.go</code></td><td>parentState snapshot, TIPSigning, TIPXDCXReceiver dispatch</td></tr>
+<tr><td><code>core/state_transition.go</code></td><td>TRC21 owner fee routing, EIP-2028 disable, EIP-3529 deferral</td></tr>
+<tr><td><code>core/types/block.go</code></td><td>Header fields + HashNoValidator</td></tr>
+<tr><td><code>core/types/state_account.go</code></td><td>StateAccount + BigBalance</td></tr>
+<tr><td><code>core/types/consensus_v2.go</code></td><td>V2 BFT message types</td></tr>
+<tr><td><code>core/types/transaction.go</code></td><td>IsSpecialTx predicate</td></tr>
+<tr><td><code>core/vm/jump_table.go</code></td><td>newXDC{Berlin,London,Merge,Shanghai}InstructionSet</td></tr>
+<tr><td><code>core/vm/contracts.go</code></td><td>PrecompiledContractsXDCBerlin</td></tr>
+<tr><td><code>core/xdc_sync_opts.go</code></td><td>XdcBulkSyncMode atomic + constants</td></tr>
+<tr><td><code>core/rawdb/accessors_xdc.go</code></td><td>XDC key-prefix accessors</td></tr>
+<tr><td><code>core/state/reader.go</code></td><td>BigBalance preserve + panic recover</td></tr>
+<tr><td><code>core/state/snapshot/disklayer.go</code></td><td>DecodeSlimAccount for BigBalance</td></tr>
+<tr><td><code>core/state/snapshot/difflayer.go</code></td><td>DecodeSlimAccount mirror</td></tr>
+<tr><td><code>trie/secure_trie.go</code></td><td>GetAccount panic recover</td></tr>
+<tr><td><code>triedb/pathdb/reader.go</code></td><td>pathdb DecodeSlimAccount</td></tr>
+<tr><td><code>eth/backend.go</code></td><td>Engine + hooks + XDPoS_* API registration</td></tr>
+<tr><td><code>eth/handler.go</code></td><td>xdcSyncer trigger; SNAP_RUNNING peer-disconnect skip</td></tr>
+<tr><td><code>eth/handler_xdc.go</code></td><td>BroadcastVote/Timeout/SyncInfo</td></tr>
+<tr><td><code>eth/sync_xdc.go</code></td><td>xdcSyncer pre-merge sync loop</td></tr>
+<tr><td><code>eth/bft/handler.go</code></td><td>V2 BFT message channel</td></tr>
+<tr><td><code>eth/protocols/eth/protocol.go</code></td><td>XDPOS2 = 100, VoteMsg, TimeoutMsg, SyncInfoMsg, StatusPacket62</td></tr>
+<tr><td><code>eth/protocols/eth/peer.go</code></td><td>XDPOS2 legacy-response dispatch + FIFO</td></tr>
+<tr><td><code>eth/protocols/eth/handlers.go</code></td><td>XDPOS2 GetBlockHeaders/Bodies legacy decode</td></tr>
+<tr><td><code>eth/protocols/snap/xdc_snap_verify.go</code></td><td>XDC-specific snap proof verification</td></tr>
+<tr><td><code>eth/downloader/beaconsync.go</code></td><td>TrustedSyncCheckpoint cutoff handling</td></tr>
+<tr><td><code>eth/hooks/hooks.go</code></td><td>AttachConsensusV1Hooks</td></tr>
+<tr><td><code>eth/hooks/engine_v2_hooks.go</code></td><td>AttachConsensusV2Hooks</td></tr>
+<tr><td><code>eth/util/util.go</code></td><td>RewardInflation halving-bypass</td></tr>
+<tr><td><code>internal/ethapi/api_xdc.go</code></td><td>XDC extensions to BlockChainAPI</td></tr>
+<tr><td><code>internal/web3ext/web3ext_xdc.go</code></td><td>web3.xdpos.* JS bindings</td></tr>
+<tr><td><code>p2p/discover/v4wire/v4wire.go</code></td><td>XDC ping = packet type 5</td></tr>
+<tr><td><code>cmd/utils/flags.go</code></td><td>--xdcmainnet / --apothem flags</td></tr>
+<tr><td><code>node/config_xdc.go</code></td><td>XDC node defaults</td></tr>
+<tr><td><code>contracts/blocksigner/contract/blocksigner.go</code></td><td>BlockSigner.sol bindings</td></tr>
+<tr><td><code>contracts/validator/contract/validator.go</code></td><td>Validator.sol bindings</td></tr>
+<tr><td><code>contracts/randomize/contract/randomize.go</code></td><td>Randomize.sol bindings</td></tr>
+<tr><td><code>contracts/validator/xdc_validator.go</code></td><td>Validator live-call helpers</td></tr>
+<tr><td><code>scripts/local-sync-test.sh</code></td><td>Multi-node fleet sync harness</td></tr>
+<tr><td><code>scripts/validate-canonical-parity.sh</code></td><td>State-root parity validator</td></tr>
+<tr><td><code>docs/port/STATUS.md</code></td><td>Live status</td></tr>
+<tr><td><code>docs/port/MENTAL_MODEL.md</code></td><td>Two-pivot snap-sync mental model</td></tr>
+<tr><td><code>docs/PORT_LOG.md</code></td><td>Running diary + PLANNER-ADVICE entries</td></tr>
+<tr><td><code>docs/adr/001-genesis-config-merge.md</code></td><td>ADR for genesis config patching</td></tr>
+<tr><td><code>docs/adr/002-syncmode-aliasing.md</code></td><td>ADR for syncmode aliasing</td></tr>
+</tbody></table>
+
+<p>All paths above are relative to
+<code>/Users/anilchinchawale/github/XDCNetwork/deVTest/go-ethereum/</code>.</p>
+
+<h3 id="app-network">10.2 Network IDs, chain IDs, ports</h3>
+<table>
+<thead><tr><th>Network</th><th>NetworkID</th><th>ChainID</th><th>Genesis hash</th></tr></thead>
+<tbody>
+<tr><td>Mainnet</td><td>50</td><td>50</td><td><code>0x4a9d748bd78a8d0385b67788c2435dcdb914f98a96250b68863a1f8b7642d6b1</code></td></tr>
+<tr><td>Apothem</td><td>51</td><td>51</td><td><code>0xbdea512b4f12ff1135ec92c00dc047ffb93890c2ea1aa0eefe9b013d80640075</code></td></tr>
+<tr><td>Devnet (XDPoSChain main)</td><td>551</td><td>551</td><td>(devnet variable)</td></tr>
+<tr><td>Legacy devnet</td><td>5551</td><td>5551</td><td>(V2 switch at block 2700)</td></tr>
+<tr><td>Private dev chain</td><td>99999</td><td>99999</td><td>(cmd/puppeth generated)</td></tr>
+</tbody></table>
+
+<p>Default ports: P2P 30303, HTTP 8545, WS 8546.</p>
+
+<h3 id="app-contracts">10.3 System contract addresses</h3>
+<table>
+<thead><tr><th>Address</th><th>Contract</th></tr></thead>
+<tbody>
+<tr><td><code>0x...0088</code></td><td>MasternodeVotingSMCBinary (Validator contract — naming overloaded)</td></tr>
+<tr><td><code>0x...0089</code></td><td>BlockSignersBinary (self-destructed at TIPSigning)</td></tr>
+<tr><td><code>0x...0090</code></td><td>RandomizeSMCBinary</td></tr>
+<tr><td><code>0x...0068</code></td><td>FoudationAddrBinary [sic — typo preserved]</td></tr>
+<tr><td><code>0x...0099</code></td><td>TeamAddrBinary</td></tr>
+<tr><td><code>0x...0091</code></td><td>XDCXAddrBinary</td></tr>
+<tr><td><code>0x...0092</code></td><td>TradingStateAddrBinary</td></tr>
+<tr><td><code>0x...0093</code></td><td>XDCXLendingAddressBinary</td></tr>
+<tr><td><code>0x...0094</code></td><td>XDCXLendingFinalizedTradeAddressBinary</td></tr>
+<tr><td><code>0x...0011</code></td><td>LendingLockAddressBinary</td></tr>
+<tr><td><code>0x...009a</code></td><td>MintedRecordAddressBinary</td></tr>
+<tr><td><code>0x...0001</code></td><td>XDCNativeAddressBinary</td></tr>
+</tbody></table>
+
+<h3 id="app-bootnodes">10.4 Bootnode list location</h3>
+<ul>
+  <li><code>params/bootnodes.go:85</code> — <code>XDCMainnetBootnodes</code> (28 entries, canonical XinFinOrg fleet).</li>
+  <li><code>params/bootnodes.go:126</code> — <code>XDCApothemBootnodes</code> (small fleet).</li>
+  <li><code>scripts/local-sync-test.sh:FLEET_ENODES=...</code> — operational fleet enodes (xdc01..xdc05, refreshed <code>8337f48ec</code>).</li>
+</ul>
+
+<h3 id="app-prs">10.5 External references — PR / issue numbers</h3>
+<ul>
+  <li><strong>#740</strong> — Reset onto v1.17.3 (master tracker)</li>
+  <li><strong>#742</strong> — B5-B10 cumulative XDC overlay PR</li>
+  <li><strong>#651, #682</strong> — bypass-log family origins</li>
+  <li><strong>#694</strong> — system-contract-address split</li>
+  <li><strong>#710, #716</strong> — <code>Rules.IsXDC</code> / <code>IsEIP1559</code> derivation</li>
+  <li><strong>#724</strong> — StaticCall Istanbul gate (re-applied in #812)</li>
+  <li><strong>#757</strong> — Genesis merge fork-blocks + V2 patching (ADR-001)</li>
+  <li><strong>#763..#776</strong> — XDPOS2 wire-shape ports</li>
+  <li><strong>#788..#792</strong> — sync_xdc continuous loop + panic recovery</li>
+  <li><strong>#793, #794, #795, #796</strong> — BigBalance overflow path quartet</li>
+  <li><strong>#797</strong> — pathdb RLP import follow-up</li>
+  <li><strong>#798, #799</strong> — issue #798 bug-hunt orchestrator</li>
+  <li><strong>#801, #802</strong> — self-healing rollback + fork-tainted peer pool</li>
+  <li><strong>#807 Phase 1..14</strong> — snap-sync state machine</li>
+  <li><strong>#812</strong> — StaticCall Istanbul gate restore</li>
+  <li><strong>#814</strong> — XDPoS_* RPC namespace explicit registration</li>
+  <li><strong>#822, #824, #825, #826</strong> — bootnode + fleet pinning fixes</li>
+</ul>
+
+<p>XDPoS V2 specification reference: <code>../XDPoSChain</code> (canonical Go
+implementation) and <code>../XinFin-Node</code> (operator deployment
+patterns) in the working tree. The XDPoS BFT whitepaper is referenced in
+<code>docs/XDPoS.md</code> and the original XDPoSChain README.</p>
+
+<hr>
+<p class="meta">End of guide. Generated from branch
+<code>reset/integration-1.17.3</code> at commit <code>8337f48ec</code>,
+against fork base <code>117e067f0</code> (geth v1.17.3).</p>
+
+</main>
+</div>
+</body>
+</html>

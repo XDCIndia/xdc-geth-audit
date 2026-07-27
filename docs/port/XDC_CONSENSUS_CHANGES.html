@@ -1,0 +1,852 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>XDC Consensus Changes vs geth 1.17.3 — Interactive Reference</title>
+<style>
+  :root {
+    --xdc-primary: #1a8cff;
+    --xdc-accent: #00d9a3;
+    --upstream: #6b7280;
+    --bg: #0f1218;
+    --bg-elevated: #1a1f2b;
+    --bg-card: #232938;
+    --text: #e5e7eb;
+    --text-muted: #9ca3af;
+    --border: #2d3548;
+    --critical: #ef4444;
+    --warn: #f59e0b;
+    --ok: #22c55e;
+    --info: #3b82f6;
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.5;
+    padding-bottom: 4rem;
+  }
+
+  header {
+    background: linear-gradient(135deg, #0a1929 0%, #1a3050 100%);
+    padding: 3rem 2rem 2rem;
+    text-align: center;
+    border-bottom: 1px solid var(--border);
+  }
+
+  header h1 {
+    font-size: 2rem;
+    margin-bottom: 0.5rem;
+    background: linear-gradient(90deg, var(--xdc-primary), var(--xdc-accent));
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+  }
+
+  header p {
+    color: var(--text-muted);
+    font-size: 1rem;
+    max-width: 720px;
+    margin: 0 auto;
+  }
+
+  .stats {
+    display: flex;
+    justify-content: center;
+    gap: 2rem;
+    margin-top: 1.5rem;
+    flex-wrap: wrap;
+  }
+
+  .stat {
+    background: rgba(255,255,255,0.05);
+    padding: 0.75rem 1.5rem;
+    border-radius: 8px;
+    border: 1px solid var(--border);
+  }
+
+  .stat .num {
+    font-size: 1.5rem;
+    font-weight: 700;
+    color: var(--xdc-accent);
+  }
+
+  .stat .lbl {
+    font-size: 0.75rem;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+  }
+
+  main {
+    max-width: 1200px;
+    margin: 2rem auto;
+    padding: 0 2rem;
+  }
+
+  .controls {
+    display: flex;
+    gap: 0.5rem;
+    margin-bottom: 1.5rem;
+    flex-wrap: wrap;
+    align-items: center;
+  }
+
+  .search {
+    flex: 1;
+    min-width: 200px;
+    background: var(--bg-elevated);
+    border: 1px solid var(--border);
+    color: var(--text);
+    padding: 0.6rem 1rem;
+    border-radius: 8px;
+    font-size: 0.9rem;
+  }
+  .search:focus { outline: none; border-color: var(--xdc-primary); }
+
+  .filter-btn {
+    background: var(--bg-elevated);
+    border: 1px solid var(--border);
+    color: var(--text);
+    padding: 0.6rem 1rem;
+    border-radius: 8px;
+    cursor: pointer;
+    font-size: 0.85rem;
+    transition: all 0.15s;
+  }
+  .filter-btn:hover { background: var(--bg-card); }
+  .filter-btn.active {
+    background: var(--xdc-primary);
+    border-color: var(--xdc-primary);
+  }
+
+  .timeline {
+    background: var(--bg-elevated);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 1.5rem;
+    margin-bottom: 2rem;
+    overflow-x: auto;
+  }
+
+  .timeline h2 {
+    font-size: 1.1rem;
+    margin-bottom: 1rem;
+    color: var(--text-muted);
+  }
+
+  .timeline-bar {
+    position: relative;
+    height: 80px;
+    background: linear-gradient(90deg, #1a3050 0%, #2d3548 100%);
+    border-radius: 6px;
+    min-width: 800px;
+  }
+
+  .fork-marker {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    width: 2px;
+    background: var(--xdc-accent);
+  }
+  .fork-marker .label {
+    position: absolute;
+    top: -22px;
+    left: 50%;
+    transform: translateX(-50%);
+    background: var(--xdc-accent);
+    color: var(--bg);
+    padding: 2px 8px;
+    border-radius: 4px;
+    font-size: 0.7rem;
+    font-weight: 600;
+    white-space: nowrap;
+  }
+  .fork-marker .num {
+    position: absolute;
+    bottom: -22px;
+    left: 50%;
+    transform: translateX(-50%);
+    font-size: 0.7rem;
+    color: var(--text-muted);
+    white-space: nowrap;
+  }
+  .fork-marker.v2 { background: var(--xdc-primary); }
+  .fork-marker.v2 .label { background: var(--xdc-primary); color: white; }
+
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(380px, 1fr));
+    gap: 1rem;
+  }
+
+  .card {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 1.25rem;
+    cursor: pointer;
+    transition: all 0.2s;
+    position: relative;
+    overflow: hidden;
+  }
+  .card:hover {
+    transform: translateY(-2px);
+    border-color: var(--xdc-primary);
+    box-shadow: 0 10px 30px rgba(26, 140, 255, 0.15);
+  }
+
+  .card-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    gap: 0.5rem;
+    margin-bottom: 0.5rem;
+  }
+
+  .card h3 {
+    font-size: 1.05rem;
+    color: var(--text);
+    margin: 0;
+  }
+
+  .badge {
+    font-size: 0.65rem;
+    padding: 2px 8px;
+    border-radius: 12px;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    font-weight: 600;
+    white-space: nowrap;
+  }
+  .badge-consensus { background: #7c3aed20; color: #a78bfa; border: 1px solid #7c3aed40; }
+  .badge-evm { background: #f59e0b20; color: #fbbf24; border: 1px solid #f59e0b40; }
+  .badge-state { background: #06b6d420; color: #22d3ee; border: 1px solid #06b6d440; }
+  .badge-sync { background: #22c55e20; color: #4ade80; border: 1px solid #22c55e40; }
+  .badge-wire { background: #ef444420; color: #f87171; border: 1px solid #ef444440; }
+  .badge-rpc { background: #3b82f620; color: #60a5fa; border: 1px solid #3b82f640; }
+  .badge-fork { background: #ec489920; color: #f472b6; border: 1px solid #ec489940; }
+
+  .impact {
+    display: inline-block;
+    font-size: 0.7rem;
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-weight: 600;
+    margin-left: 0.5rem;
+  }
+  .impact-high { background: var(--critical); color: white; }
+  .impact-med { background: var(--warn); color: var(--bg); }
+  .impact-low { background: var(--upstream); color: white; }
+
+  .card-summary {
+    color: var(--text-muted);
+    font-size: 0.875rem;
+    margin: 0.5rem 0;
+  }
+
+  .card-details {
+    max-height: 0;
+    overflow: hidden;
+    transition: max-height 0.3s;
+    color: var(--text-muted);
+    font-size: 0.85rem;
+  }
+  .card.open .card-details {
+    max-height: 1000px;
+    margin-top: 0.75rem;
+    padding-top: 0.75rem;
+    border-top: 1px solid var(--border);
+  }
+  .card.open { background: var(--bg-elevated); }
+
+  .compare {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 0.75rem;
+    margin: 0.75rem 0;
+  }
+  .compare-col {
+    background: var(--bg);
+    padding: 0.75rem;
+    border-radius: 6px;
+    border: 1px solid var(--border);
+  }
+  .compare-col h4 {
+    font-size: 0.7rem;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    margin-bottom: 0.5rem;
+    color: var(--text-muted);
+  }
+  .compare-col.upstream h4 { color: var(--upstream); }
+  .compare-col.xdc h4 { color: var(--xdc-accent); }
+  .compare-col code {
+    display: block;
+    font-family: "SF Mono", Monaco, Consolas, monospace;
+    font-size: 0.75rem;
+    color: var(--text);
+    word-break: break-word;
+  }
+
+  .files {
+    font-family: "SF Mono", Monaco, Consolas, monospace;
+    font-size: 0.7rem;
+    color: var(--xdc-accent);
+    margin-top: 0.5rem;
+  }
+  .files .file {
+    display: inline-block;
+    background: var(--bg);
+    padding: 2px 6px;
+    border-radius: 4px;
+    margin: 2px 4px 2px 0;
+    border: 1px solid var(--border);
+  }
+
+  .reason {
+    margin-top: 0.5rem;
+    padding: 0.5rem 0.75rem;
+    background: rgba(26, 140, 255, 0.08);
+    border-left: 3px solid var(--xdc-primary);
+    border-radius: 4px;
+    font-size: 0.8rem;
+    color: var(--text);
+  }
+  .reason strong { color: var(--xdc-accent); }
+
+  .arch-diagram {
+    background: var(--bg-elevated);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 1.5rem;
+    margin-bottom: 2rem;
+  }
+
+  .arch-diagram h2 {
+    font-size: 1.1rem;
+    margin-bottom: 1rem;
+    color: var(--text-muted);
+  }
+
+  .arch-layers {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+  }
+  .arch-layer {
+    display: grid;
+    grid-template-columns: 140px 1fr 1fr;
+    gap: 0.5rem;
+    align-items: stretch;
+  }
+  .arch-label {
+    background: var(--bg);
+    padding: 0.75rem;
+    border-radius: 6px;
+    border: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    font-weight: 600;
+    color: var(--text-muted);
+    font-size: 0.85rem;
+  }
+  .arch-cell {
+    padding: 0.75rem;
+    border-radius: 6px;
+    font-size: 0.85rem;
+  }
+  .arch-cell.upstream { background: rgba(107, 114, 128, 0.1); border: 1px solid rgba(107, 114, 128, 0.3); }
+  .arch-cell.xdc { background: rgba(26, 140, 255, 0.1); border: 1px solid var(--xdc-primary); }
+  .arch-cell.xdc .changed { color: var(--xdc-accent); font-weight: 600; }
+  .arch-headers { display: grid; grid-template-columns: 140px 1fr 1fr; gap: 0.5rem; margin-bottom: 0.5rem; }
+  .arch-headers div { text-align: center; font-size: 0.75rem; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.05em; }
+
+  .legend {
+    display: flex;
+    gap: 1.5rem;
+    flex-wrap: wrap;
+    justify-content: center;
+    margin-top: 1.5rem;
+    font-size: 0.75rem;
+    color: var(--text-muted);
+  }
+  .legend-item { display: flex; align-items: center; gap: 0.4rem; }
+  .legend-dot { width: 12px; height: 12px; border-radius: 50%; }
+
+  footer {
+    text-align: center;
+    padding: 2rem;
+    color: var(--text-muted);
+    font-size: 0.8rem;
+  }
+  footer code { background: var(--bg-elevated); padding: 1px 6px; border-radius: 4px; }
+
+  .hidden { display: none !important; }
+
+  @media (max-width: 720px) {
+    .arch-layer, .arch-headers { grid-template-columns: 100px 1fr 1fr; }
+    .compare { grid-template-columns: 1fr; }
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>XDC Consensus Changes — on top of geth v1.17.3</h1>
+  <p>An interactive map of every XDC-Network-specific behavior layered onto the upstream Ethereum client. Click any card to see what changed, why, and where in the codebase.</p>
+  <div class="stats">
+    <div class="stat"><div class="num">23</div><div class="lbl">Tracked changes</div></div>
+    <div class="stat"><div class="num">6</div><div class="lbl">Subsystems touched</div></div>
+    <div class="stat"><div class="num">v1.17.3</div><div class="lbl">Upstream base</div></div>
+    <div class="stat"><div class="num" id="visible-count">23</div><div class="lbl">Showing</div></div>
+  </div>
+</header>
+
+<main>
+
+  <!-- Apothem block timeline -->
+  <section class="timeline">
+    <h2>Apothem chain forks &mdash; where each change activates</h2>
+    <div class="timeline-bar" id="timeline">
+      <!-- markers populated by JS -->
+    </div>
+    <div class="legend">
+      <div class="legend-item"><div class="legend-dot" style="background:var(--xdc-accent)"></div>XDC-specific fork (TIPSigning, V2 switch)</div>
+      <div class="legend-item"><div class="legend-dot" style="background:var(--xdc-primary)"></div>Ethereum-compatible fork (Berlin, EIP-1559)</div>
+    </div>
+  </section>
+
+  <!-- Architecture diff diagram -->
+  <section class="arch-diagram">
+    <h2>Architecture &mdash; what's the same, what's different</h2>
+    <div class="arch-headers">
+      <div></div>
+      <div>Upstream geth v1.17.3</div>
+      <div>XDC fork</div>
+    </div>
+    <div class="arch-layers">
+      <div class="arch-layer">
+        <div class="arch-label">Consensus</div>
+        <div class="arch-cell upstream">Ethash (PoW) &rarr; Beacon (PoS)<br><small>Post-merge only</small></div>
+        <div class="arch-cell xdc">
+          <span class="changed">XDPoS V1 + V2</span><br>
+          <small>V1 round-robin masternodes; V2 BFT with QC, 3-chain finality</small>
+        </div>
+      </div>
+      <div class="arch-layer">
+        <div class="arch-label">Sync engine</div>
+        <div class="arch-cell upstream">BeaconSync via Engine API<br><small>Driven by consensus layer</small></div>
+        <div class="arch-cell xdc">
+          <span class="changed">Continuous import loop</span><br>
+          <small>xdcSyncer fetches batches direct from peers, calls InsertChain</small>
+        </div>
+      </div>
+      <div class="arch-layer">
+        <div class="arch-label">Base fee</div>
+        <div class="arch-cell upstream">Dynamic EIP-1559<br><small>Adjusts per parent gas usage</small></div>
+        <div class="arch-cell xdc">
+          <span class="changed">Fixed 12.5 gwei</span><br>
+          <small>XDCBaseFee constant, ignores parent</small>
+        </div>
+      </div>
+      <div class="arch-layer">
+        <div class="arch-label">State scheme</div>
+        <div class="arch-cell upstream">Hash or Path (PBSS)<br><small>v1.17.3 added PBSS</small></div>
+        <div class="arch-cell xdc">
+          PBSS preserved + <span class="changed">BigBalance decode</span><br>
+          <small>Accounts with balance &gt; 2^256-1 decode without panic</small>
+        </div>
+      </div>
+      <div class="arch-layer">
+        <div class="arch-label">Wire protocol</div>
+        <div class="arch-cell upstream">eth/68 only<br><small>Post-merge — no NewBlock/Hashes</small></div>
+        <div class="arch-cell xdc">
+          <span class="changed">eth/63-shaped XDPOS2</span><br>
+          <small>Bare GetBlockHeaders/Bodies, plus Vote/Timeout/SyncInfo</small>
+        </div>
+      </div>
+      <div class="arch-layer">
+        <div class="arch-label">RPC</div>
+        <div class="arch-cell upstream">eth, net, debug, admin, ...</div>
+        <div class="arch-cell xdc">
+          All upstream + <span class="changed">xdpos.* + xdc address format</span>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Filters -->
+  <div class="controls">
+    <input type="search" class="search" id="search" placeholder="Search changes... (try: V2, baseFee, MODEXP, sync)">
+    <button class="filter-btn active" data-filter="all">All</button>
+    <button class="filter-btn" data-filter="consensus">Consensus</button>
+    <button class="filter-btn" data-filter="evm">EVM</button>
+    <button class="filter-btn" data-filter="state">State</button>
+    <button class="filter-btn" data-filter="sync">Sync</button>
+    <button class="filter-btn" data-filter="wire">Wire</button>
+    <button class="filter-btn" data-filter="rpc">RPC</button>
+    <button class="filter-btn" data-filter="fork">Forks</button>
+  </div>
+
+  <div class="grid" id="cards"></div>
+</main>
+
+<footer>
+  Audited from XDC <code>xdc-network</code> branch (676 commits ahead of pre-1.17.0 base) rebased onto upstream <code>v1.17.3</code>.<br>
+  Reset branch: <code>fix/pathdb-rlp-import</code> at XDCIndia/go-ethereum.
+</footer>
+
+<script>
+// ============= CHANGE DATA =============
+const CHANGES = [
+  // CONSENSUS
+  {
+    cat: "consensus", impact: "high",
+    title: "XDPoS V1 engine",
+    summary: "Delegated Proof-of-Stake replaces Ethash entirely. Masternodes selected each epoch (900 blocks), sign in round-robin order.",
+    upstream: "Ethash PoW (legacy) → BeaconSync (post-merge). Sealed by chosen validator each slot.",
+    xdc: "XDPoS V1: epoch-elected masternode set signs blocks in deterministic order. Reward distribution at epoch boundary via HookReward.",
+    why: "XDC Network is a permissioned-leaning DPoS chain — no PoW, no random selection. Masternode rotation provides finality without a beacon chain.",
+    files: ["consensus/XDPoS/engines/engine_v1/", "consensus/XDPoS/xdpos.go"],
+    activates: "Genesis"
+  },
+  {
+    cat: "consensus", impact: "high",
+    title: "XDPoS V2 BFT engine",
+    summary: "V2 introduces BFT consensus with Quorum Certificates (QC) and 3-chain finality, similar to HotStuff.",
+    upstream: "No direct equivalent. Closest analogues are upstream's Aura (Gnosis) or Parlia (BSC).",
+    xdc: "Vote / Timeout / SyncInfo messages drive rounds. QC over 2f+1 votes finalizes a block. 3-chain commit rule for BFT safety.",
+    why: "Hardens XDC's finality guarantees. Without V2 a malicious masternode could indefinitely fork the chain at low cost.",
+    files: ["consensus/XDPoS/engines/engine_v2/engine.go", "consensus/XDPoS/engines/engine_v2/vote.go", "consensus/XDPoS/engines/engine_v2/timeout.go"],
+    activates: "Apothem block 56,828,700 (V2 switch)"
+  },
+  {
+    cat: "consensus", impact: "high",
+    title: "V2 engine wiring in backend",
+    summary: "Wires engine_v2.New() into the XDPoS wrapper, attaches HookReward / HookCommitBlock / HookPenalty callbacks.",
+    upstream: "Backend constructs the configured engine (Ethash/Clique/Beacon) directly.",
+    xdc: "After NewBlockChain, cast engine to *XDPoS.XDPoS, call AttachConsensusV1/V2Hooks, construct engine_v2.New, SetEngineV2, then forward HookReward to V2.",
+    why: "Without this, XDPoS.EngineV2 stays nil and V2 blocks pass through the V1 light-verify fast path — no QC checks, no rewards, no finality.",
+    files: ["eth/backend.go (line ~290)"],
+    activates: "Always (XDPoS chains)"
+  },
+  {
+    cat: "consensus", impact: "med",
+    title: "Reward distribution hook",
+    summary: "At each epoch-switch block, distribute newly-minted XDC to active masternodes proportional to signing count.",
+    upstream: "Consensus layer issues rewards via beacon chain.",
+    xdc: "engine.Finalize calls HookReward at epoch boundaries; reads BlockSigners contract, applies foundation cut, splits remainder among masternodes.",
+    why: "Self-contained reward economics — no separate consensus layer, no MEV-Boost. All issuance happens in Finalize.",
+    files: ["eth/hooks/hooks.go", "eth/hooks/engine_v2_hooks.go", "consensus/XDPoS/engines/engine_v2/engine.go:631"],
+    activates: "Every epoch boundary (Apothem: 900 blocks)"
+  },
+  {
+    cat: "consensus", impact: "med",
+    title: "Masternode penalty calculation",
+    summary: "Masternodes that fail to sign enough blocks in their slot get penalized — removed from the next epoch's signer set.",
+    upstream: "No analog — slashing is handled out-of-band.",
+    xdc: "HookPenalty walks the prior epoch's signing log; nodes below threshold land in penalty list, rotated back after LimitPenaltyEpochV2 epochs.",
+    why: "Liveness incentive — keeps offline masternodes from blocking finality, but allows comeback after temporary downtime.",
+    files: ["consensus/XDPoS/engines/engine_v2/engine.go (HookPenalty field)", "eth/hooks/engine_v2_hooks.go"],
+    activates: "Every V2 epoch boundary"
+  },
+  // EVM
+  {
+    cat: "evm", impact: "high",
+    title: "Fixed base fee (XDCBaseFee = 12.5 gwei)",
+    summary: "XDC implements EIP-1559 header format with a constant base fee — ignores parent gas usage.",
+    upstream: "Dynamic base fee that responds to parent gas usage with 12.5% per-block adjustment.",
+    xdc: "CalcBaseFee returns params.XDCBaseFee = 12,500,000,000 wei for every post-fork block. Parent inputs ignored.",
+    why: "Predictable transaction cost for XDC users. Removes the dynamic fee market — gas pricing is set protocol-side, not market-driven.",
+    files: ["consensus/misc/eip1559/eip1559.go", "params/protocol_params.go (XDCBaseFee constant)"],
+    activates: "Apothem Eip1559Block (~61.29M)"
+  },
+  {
+    cat: "evm", impact: "high",
+    title: "MODEXP without EIP-2565 (Berlin..pre-EIP1559)",
+    summary: "XDC keeps the expensive pre-Berlin MODEXP gas formula until the EIP-1559 fork, not at Berlin like upstream.",
+    upstream: "EIP-2565 (cheaper MODEXP) activates at Berlin.",
+    xdc: "PrecompiledContractsXDCBerlin uses bigModExp{eip2565: false} until rules.IsEIP1559. After EIP-1559 fork, standard Berlin precompile takes over.",
+    why: "Canonical XDPoSChain v2.6.8 deferred EIP-2565 to align with their fork schedule. Without this, MODEXP gas-used diverges every block with MODEXP in the Berlin..EIP-1559 stretch.",
+    files: ["core/vm/contracts.go (PrecompiledContractsXDCBerlin)"],
+    activates: "Apothem Berlin (~61.29M) until Eip1559Block"
+  },
+  {
+    cat: "evm", impact: "high",
+    title: "EIP-2028 disabled (calldata gas)",
+    summary: "XDC always charges 68 gas per non-zero calldata byte. Upstream drops to 16 gas at Istanbul.",
+    upstream: "EIP-2028 reduces non-zero-byte calldata gas from 68 → 16 at Istanbul.",
+    xdc: "core/txpool/validation.go forces isEIP2028=false when chain config IsXDC(). IntrinsicGas computes with 68 gas/byte regardless of Istanbul status.",
+    why: "Canonical XDPoSChain never adopted EIP-2028. Mismatching intrinsic gas calculation would cause every tx with calldata to be rejected as underpriced.",
+    files: ["core/txpool/validation.go"],
+    activates: "Always (XDPoS chains)"
+  },
+  {
+    cat: "evm", impact: "med",
+    title: "XDC EVM instruction set variants",
+    summary: "XDC selects custom instruction sets per fork: no EIP-2929 at Berlin, +EIP-3198 at London, +PREVRANDAO at Merge, +PUSH0 at Shanghai.",
+    upstream: "Standard Berlin/London/Merge/Shanghai instruction sets with all canonical EIPs.",
+    xdc: "newXDCBerlinInstructionSet (= Istanbul, no EIP-2929) → newXDCLondonInstructionSet (+ BASEFEE) → newXDCMergeInstructionSet (+ PREVRANDAO) → newXDCShanghaiInstructionSet (+ PUSH0).",
+    why: "Cherry-picks the EIPs XDC governance approved per fork — same as canonical XDPoSChain. EIP-2929 (cold/warm storage gas) was never enabled on XDC.",
+    files: ["core/vm/jump_table.go", "core/vm/evm.go"],
+    activates: "Each XDC fork (~61.29M onward)"
+  },
+  // STATE
+  {
+    cat: "state", impact: "high",
+    title: "BigBalance overflow decode",
+    summary: "XDC accounts can hold balance &gt; 2^256-1. Custom RLP encoder/decoder preserves the extra precision.",
+    upstream: "StateAccount.Balance is uint256.Int. RLP decode panics on values exceeding 2^256-1.",
+    xdc: "types.DecodeSlimAccount detects oversize balance, stores it in SlimAccount.BigBalance (*big.Int). All read paths (statedb, snapshot, PBSS, trie) use this decoder.",
+    why: "Genesis-allocated foundation wallets and historic reward accumulations exceed uint256 range. Without BigBalance these accounts panic on read — sync halts at block 2,700.",
+    files: ["core/types/state_account.go", "core/state/snapshot/{disklayer,difflayer}.go", "triedb/pathdb/reader.go", "trie/secure_trie.go"],
+    activates: "Always (XDPoS chains)"
+  },
+  {
+    cat: "state", impact: "med",
+    title: "PBSS reader BigBalance support",
+    summary: "Path-Based State Scheme reader uses DecodeSlimAccount instead of raw rlp.DecodeBytes.",
+    upstream: "PBSS reader calls rlp.DecodeBytes(blob, &SlimAccount{}) — panics on BigBalance.",
+    xdc: "triedb/pathdb/reader.go uses types.DecodeSlimAccount at both diffLayer and diskLayer read sites. Returned struct may carry BigBalance.",
+    why: "PBSS is a v1.17.3 addition that xdc-network didn't have. The reader was the root cause of the block 2,700 panic (PR #796).",
+    files: ["triedb/pathdb/reader.go"],
+    activates: "Always with PBSS enabled"
+  },
+  {
+    cat: "state", impact: "med",
+    title: "Checkpoint trie commit (P1)",
+    summary: "Force a state trie commit every Epoch blocks, plus an extra commit at the V2 switch block.",
+    upstream: "TrieDB Cap-based flushing — commits when dirty cache exceeds threshold.",
+    xdc: "BlockChain.writeBlockWithState explicitly calls Commit on epoch boundaries (every 900 blocks on Apothem) and at V2 SwitchBlock.",
+    why: "Bounds recovery time after crash and creates known-good checkpoints for V2 anchor relaxation. Also keeps PBSS journal sizes manageable.",
+    files: ["core/blockchain.go (writeBlockWithState)"],
+    activates: "Every epoch + V2 switch"
+  },
+  // SYNC
+  {
+    cat: "sync", impact: "high",
+    title: "Continuous block-import sync loop",
+    summary: "Replaces v1.17.3's post-merge BeaconSync with a continuous loop that fetches block batches direct from peers.",
+    upstream: "Sync driven by consensus layer via Engine API forkchoiceUpdated calls.",
+    xdc: "xdcSyncer loop: every cycle picks best peer, fetches xdcBatchSize (4096) headers + bodies, combines into types.Block, calls blockchain.InsertChain.",
+    why: "XDC is pre-merge — no consensus layer to drive sync. Without this loop, the binary has no sync engine at all and head stays at 0.",
+    files: ["eth/sync_xdc.go", "eth/handler.go (h.xdcSync field)"],
+    activates: "Always (XDPoS chains, sync mode)"
+  },
+  {
+    cat: "sync", impact: "med",
+    title: "Bypass dispatcher for XDPOS2 wire",
+    summary: "XDPOS2 messages don't carry a RequestID — the upstream dispatcher's pending-map can't track them. Bypass by reading direct from per-peer channels.",
+    upstream: "All eth/68 requests carry a 64-bit RequestId; responses match via dispatcher's pending-map.",
+    xdc: "Peer.XDCHeaderResp / XDCBodyResp buffered channels. handleBlockHeaders pushes XDPOS2 responses direct to channel, skipping the dispatcher.",
+    why: "Without this, every header/body response on XDPOS2 gets dropped as 'no matching request' and sync stalls after 512 blocks.",
+    files: ["eth/protocols/eth/peer.go", "eth/protocols/eth/handlers.go", "eth/sync_xdc.go"],
+    activates: "Always with XDPOS2 peers"
+  },
+  {
+    cat: "sync", impact: "med",
+    title: "XdcBulkSyncMode atomic flag",
+    summary: "Global atomic.Bool that flips on during sync, off during steady-state. Lets sync-time-only optimizations gate themselves.",
+    upstream: "No equivalent. Sync mode is implicit in the downloader state.",
+    xdc: "core.XdcBulkSyncMode.Store(true) when xdcSyncer starts. Read by VerifyHeaders (skip seal verification in bulk), state writes (skip preimage cache), block validator (relax checks).",
+    why: "Trades correctness checks for speed during initial sync. With current binary at 3000 bps, this flag is what enables fast catchup.",
+    files: ["core/blockchain.go (XdcBulkSyncMode global)", "eth/sync_xdc.go"],
+    activates: "During sync loop"
+  },
+  {
+    cat: "sync", impact: "low",
+    title: "4096 batch size for header/body fetch",
+    summary: "xdcSyncer requests 4096 headers per batch (peer-side cap is 1024).",
+    upstream: "Skeleton/header sync uses adaptive batch sizing.",
+    xdc: "xdcBatchSize const = 4096; peer caps at 1024 so effective batch is 1024 with header chain assembled across batches.",
+    why: "Larger batches amortize round-trip cost on the synchronous fetch loop. 1024 is the max peer respects.",
+    files: ["eth/sync_xdc.go (xdcBatchSize)"],
+    activates: "Always during sync"
+  },
+  // WIRE
+  {
+    cat: "wire", impact: "high",
+    title: "XDPOS2 wire protocol (eth/63-shaped)",
+    summary: "Custom protocol-version negotiation: production XDC peers speak XDPOS2/100, which uses bare eth/63 message shapes.",
+    upstream: "eth/68 with wrapped RequestId envelopes on every request/response.",
+    xdc: "Status62 handshake (5-field, no Genesis or ForkID), bare GetBlockHeaders without RequestId envelope, bare BlockBodies, NewBlock + NewBlockHashes (codes 0x07, 0x01) preserved.",
+    why: "XDC mainnet runs XDPoSChain v2.6.8 / v2.7.0 which never adopted upstream's RequestId envelope. Sync requires speaking their dialect.",
+    files: ["eth/protocols/eth/handshake.go (StatusPacket62)", "eth/protocols/eth/peer.go (RequestHeaders branching)", "eth/protocols/eth/handlers.go"],
+    activates: "Any peer with XDPOS2 advertised"
+  },
+  {
+    cat: "wire", impact: "med",
+    title: "V2 BFT message codes (0xe0/0xe1/0xe2)",
+    summary: "VoteMsg, TimeoutMsg, SyncInfoMsg added to the eth/63 protocol surface.",
+    upstream: "No equivalent — V2 BFT doesn't exist in upstream.",
+    xdc: "VotePacket / TimeoutPacket / SyncInfoPacket types with [vote_rlp_bytes] payload. Routed through ethHandler.Handle.",
+    why: "BFT requires inter-masternode voting. Without these codes the V2 engine can't reach consensus across the network.",
+    files: ["eth/protocols/eth/protocol.go (VoteMsg=0xe0, etc.)", "eth/handler_eth.go"],
+    activates: "Always with V2 chain config"
+  },
+  // FORKS
+  {
+    cat: "fork", impact: "high",
+    title: "TIPSigning fork &mdash; BlockSigners wipe",
+    summary: "At Apothem block 23,779,191 the BlockSigners contract at address 0x89 is SelfDestructed.",
+    upstream: "No equivalent — selfdestruct of a system contract is unprecedented in upstream.",
+    xdc: "core/state_processor.go: when block.Number == common.TIPSigning, statedb.SelfDestruct(common.BlockSigners) before tx execution.",
+    why: "Original BlockSigners contract stored full signing history. By TIPSigning the storage trie was prohibitively large — wiping it shrunk Apothem state by gigabytes.",
+    files: ["core/state_processor.go", "common/types.go (TIPSigning constant)"],
+    activates: "Apothem block 23,779,191"
+  },
+  {
+    cat: "fork", impact: "high",
+    title: "V2 switch block",
+    summary: "At Apothem block 56,828,700 consensus transitions from V1 (round-robin) to V2 (BFT). Block 56,828,700 itself uses V1 format.",
+    upstream: "No equivalent — Merge is the only consensus transition upstream knows about.",
+    xdc: "chainConfig.XDPoS.V2.SwitchBlock = 56,828,700. core.NewBlockChain forces a state trie commit at this block.",
+    why: "Hard fork moving the entire network to BFT finality. After this, every block is verified by the V2 engine (when wired).",
+    files: ["core/blockchain.go (writeBlockWithState V2 commit)", "params/config.go", "consensus/XDPoS/xdpos.go"],
+    activates: "Apothem block 56,828,700"
+  },
+  {
+    cat: "fork", impact: "med",
+    title: "TrustedSyncCheckpoints anchors",
+    summary: "15 hardcoded checkpoint blocks that masternodes pre-sign so light clients can sync from mid-chain.",
+    upstream: "No equivalent — upstream uses CHTs and weak subjectivity checkpoints instead.",
+    xdc: "params/config.go XDPoS.TrustedSyncCheckpoints[] holds (number, hash) tuples for both Apothem and mainnet. Genesis patcher inserts them if missing.",
+    why: "Reduces sync time for resource-constrained clients. V2 engine relaxes round-based QC checks within 1 epoch of an anchor.",
+    files: ["params/config.go", "core/genesis.go (patchMissingForkBlocks)"],
+    activates: "On checkpoint sync mode"
+  },
+  // RPC
+  {
+    cat: "rpc", impact: "med",
+    title: "xdc address format (xdc-prefix)",
+    summary: "FromHex accepts both 0x... and xdc... address prefixes.",
+    upstream: "FromHex strips 0x/0X prefix only. Other prefixes produce silent zero-byte decoding.",
+    xdc: "common.FromHex strips 0x or xdc (case-insensitive). hasXdcPrefix helper enables the branch.",
+    why: "XDC display format uses xdc prefix everywhere — wallets, explorers, RPC clients. Without this, JSON-RPC calls passing xdc... silently get zero address.",
+    files: ["common/bytes.go (FromHex + hasXdcPrefix)"],
+    activates: "Every JSON-RPC address parameter"
+  },
+  {
+    cat: "rpc", impact: "med",
+    title: "xdpos JS module registration",
+    summary: "web3.xdpos.* RPC methods (getEpochSwitchInfo, getMasternodes, getCurrentRound, etc.) registered with the JS console.",
+    upstream: "Standard modules: eth, net, debug, admin, miner, txpool.",
+    xdc: "internal/web3ext/web3ext.go adds 'xdpos': XDPoSJs to the Modules map. XDPoSJs constant defines the full method surface in web3ext_xdc.go.",
+    why: "XDPoS-specific RPCs need to be reachable from the console and from web3.js clients. Without registration they exist server-side but no client can call them.",
+    files: ["internal/web3ext/web3ext.go", "internal/web3ext/web3ext_xdc.go"],
+    activates: "Every JSON-RPC client"
+  },
+  {
+    cat: "rpc", impact: "low",
+    title: "Mempool blacklist enforcement",
+    summary: "Past BlackListHFNumber, mempool rejects txs whose sender or recipient is on the on-chain blacklist.",
+    upstream: "Mempool only checks fees, nonce, and signer validity.",
+    xdc: "core/txpool/legacypool/legacypool.go validateTx prologue: from := types.Sender(...); if common.IsInBlacklist(&from) → ErrBlacklisted. Same for tx.To().",
+    why: "Canonical XDPoSChain has a governance-managed blacklist for compromised accounts. Without enforcement we'd propagate txs the network drops on import.",
+    files: ["core/txpool/legacypool/legacypool.go", "common/types.go (IsInBlacklist, BlackListHFNumber)"],
+    activates: "Apothem block 23,779,191 (BlackListHFNumber)"
+  }
+];
+
+// ============= TIMELINE =============
+const FORKS = [
+  { name: "TIPSigning",   block: 23779191,  type: "v2", pos: 0.20 },
+  { name: "V2 Switch",    block: 56828700,  type: "v2", pos: 0.55 },
+  { name: "Berlin",       block: 61290000,  type: "v1", pos: 0.65 },
+  { name: "London",       block: 61290000,  type: "v1", pos: 0.66 },
+  { name: "EIP-1559",     block: 61290000,  type: "v2", pos: 0.68 },
+  { name: "Cancun",       block: 71551800,  type: "v1", pos: 0.85 }
+];
+const tl = document.getElementById('timeline');
+FORKS.forEach(f => {
+  const m = document.createElement('div');
+  m.className = 'fork-marker ' + (f.type === 'v2' ? 'v2' : '');
+  m.style.left = (f.pos * 100) + '%';
+  m.innerHTML = `<span class="label">${f.name}</span><span class="num">${(f.block/1e6).toFixed(2)}M</span>`;
+  tl.appendChild(m);
+});
+
+// ============= CARDS =============
+const grid = document.getElementById('cards');
+function badgeFor(cat) {
+  const map = {
+    consensus: ['badge-consensus', 'Consensus'],
+    evm:       ['badge-evm', 'EVM'],
+    state:     ['badge-state', 'State'],
+    sync:      ['badge-sync', 'Sync'],
+    wire:      ['badge-wire', 'Wire'],
+    rpc:       ['badge-rpc', 'RPC'],
+    fork:      ['badge-fork', 'Fork']
+  };
+  return map[cat] || ['badge-consensus', cat];
+}
+function impactLabel(i) {
+  return { high: 'CRITICAL', med: 'IMPORTANT', low: 'MINOR' }[i] || i;
+}
+function render(filter='all', search='') {
+  grid.innerHTML = '';
+  let visible = 0;
+  CHANGES.forEach((c, idx) => {
+    if (filter !== 'all' && c.cat !== filter) return;
+    const q = search.toLowerCase();
+    if (q && !(c.title + c.summary + c.upstream + c.xdc + c.why + c.files.join(' ')).toLowerCase().includes(q)) return;
+    visible++;
+
+    const [badgeCls, badgeText] = badgeFor(c.cat);
+    const card = document.createElement('div');
+    card.className = 'card';
+    card.innerHTML = `
+      <div class="card-header">
+        <h3>${c.title}</h3>
+        <div>
+          <span class="badge ${badgeCls}">${badgeText}</span>
+          <span class="impact impact-${c.impact === 'high' ? 'high' : (c.impact === 'med' ? 'med' : 'low')}">${impactLabel(c.impact)}</span>
+        </div>
+      </div>
+      <p class="card-summary">${c.summary}</p>
+      <div class="card-details">
+        <div class="compare">
+          <div class="compare-col upstream">
+            <h4>Upstream geth v1.17.3</h4>
+            <code>${c.upstream}</code>
+          </div>
+          <div class="compare-col xdc">
+            <h4>XDC behavior</h4>
+            <code>${c.xdc}</code>
+          </div>
+        </div>
+        <div class="reason"><strong>Why:</strong> ${c.why}</div>
+        <div class="reason" style="background:rgba(0,217,163,0.08);border-left-color:var(--xdc-accent)"><strong>Activates:</strong> ${c.activates}</div>
+        <div class="files">${c.files.map(f => `<span class="file">${f}</span>`).join('')}</div>
+      </div>
+    `;
+    card.addEventListener('click', () => card.classList.toggle('open'));
+    grid.appendChild(card);
+  });
+  document.getElementById('visible-count').textContent = visible;
+}
+render();
+
+// ============= FILTERS =============
+let currentFilter = 'all';
+document.querySelectorAll('.filter-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('.filter-btn').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    currentFilter = btn.dataset.filter;
+    render(currentFilter, document.getElementById('search').value);
+  });
+});
+document.getElementById('search').addEventListener('input', e => {
+  render(currentFilter, e.target.value);
+});
+</script>
+
+</body>
+</html>

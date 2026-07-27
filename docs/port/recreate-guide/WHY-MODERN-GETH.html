@@ -1,0 +1,1041 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The geth v1.17.3 Base — What reset/integration-1.17.3 Inherits</title>
+<style>
+:root{
+  --accent:#2b50d6; --accent2:#0fb5a6; --ink:#1b2230; --muted:#5b6678;
+  --bg:#ffffff; --bg2:#f6f8fc; --line:#e3e8f0;
+  --sidebar:#0f1729; --sidebar-ink:#aeb8cc; --sidebar-active:#8fd6ff;
+  --code-bg:#0d1320; --code-ink:#e6edf7;
+  --hi:#fff6d6; --hi-line:#f1c40f;
+}
+*{box-sizing:border-box}
+html{scroll-behavior:smooth}
+body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  color:var(--ink);background:var(--bg);line-height:1.62;font-size:16px;-webkit-font-smoothing:antialiased}
+a{color:var(--accent);text-decoration:none}
+a:hover{text-decoration:underline}
+
+/* layout */
+.wrap{display:flex;min-height:100vh}
+.sidebar{width:300px;flex:0 0 300px;background:var(--sidebar);color:var(--sidebar-ink);
+  position:sticky;top:0;height:100vh;overflow-y:auto;padding:22px 16px 40px}
+.sidebar .brand{font-weight:700;color:#fff;font-size:15px;letter-spacing:.2px;margin:4px 8px 4px}
+.sidebar .brand small{display:block;font-weight:400;color:#7f8aa3;font-size:12px;margin-top:3px;letter-spacing:0}
+.sidebar nav{margin-top:14px;display:flex;flex-direction:column}
+.sidebar a{display:block;color:var(--sidebar-ink);font-size:13px;padding:4px 8px;border-radius:6px;
+  border-left:2px solid transparent;line-height:1.35}
+.sidebar a:hover{background:#16213a;color:#fff;text-decoration:none}
+.sidebar a.toc-h3{padding-left:20px;font-size:12px;color:#8893aa}
+.sidebar a.active{color:var(--sidebar-active);border-left-color:var(--accent2);background:#16213a}
+
+.content{flex:1 1 auto;max-width:920px;margin:0 auto;padding:42px 46px 120px;min-width:0}
+
+/* hero */
+.hero{border-bottom:1px solid var(--line);margin-bottom:8px;padding-bottom:8px}
+.pill{display:inline-block;background:linear-gradient(90deg,var(--accent),var(--accent2));color:#fff;
+  font-size:12px;font-weight:600;padding:3px 11px;border-radius:999px;letter-spacing:.3px}
+
+/* headings */
+h1{font-size:31px;line-height:1.2;margin:.5em 0 .3em;letter-spacing:-.4px}
+h2{font-size:23px;margin:2.1em 0 .5em;padding-top:.5em;border-top:1px solid var(--line);letter-spacing:-.2px}
+h2:first-of-type{border-top:none}
+h3{font-size:17.5px;margin:1.6em 0 .4em;color:#26324a}
+h4{font-size:15px;margin:1.3em 0 .3em;color:var(--muted);text-transform:uppercase;letter-spacing:.04em}
+h1 .header-section-number,h2 .header-section-number,h3 .header-section-number{color:var(--accent);font-weight:700}
+
+/* code */
+code{font-family:"SF Mono", "JetBrains Mono",Menlo,Consolas,monospace;font-size:.88em;
+  background:#eef1f7;color:#1c2742;padding:.12em .38em;border-radius:5px}
+pre{background:var(--code-bg);color:var(--code-ink);padding:16px 18px;border-radius:10px;overflow-x:auto;
+  font-size:13px;line-height:1.5;border:1px solid #1b2740}
+pre code{background:none;color:inherit;padding:0;font-size:13px}
+
+/* tables */
+table{border-collapse:collapse;width:100%;margin:1.1em 0;font-size:14px;display:block;overflow-x:auto}
+th,td{border:1px solid var(--line);padding:8px 11px;text-align:left;vertical-align:top}
+th{background:var(--bg2);font-weight:600}
+tr:nth-child(even) td{background:#fafbfe}
+
+/* blockquote */
+blockquote{margin:1.1em 0;padding:.6em 1.1em;background:var(--hi);border-left:4px solid var(--hi-line);
+  border-radius:0 8px 8px 0;color:#5b4a06}
+blockquote p{margin:.4em 0}
+blockquote code{background:#fbeeb8}
+
+/* lists */
+ul,ol{padding-left:1.4em}
+li{margin:.22em 0}
+li::marker{color:var(--accent)}
+
+hr{border:none;border-top:1px solid var(--line);margin:2.4em 0}
+
+/* fragility badge auto-styling done via JS below */
+.frag{font-weight:700;padding:0 6px;border-radius:5px;font-size:.92em}
+.frag-high{background:#fde2e1;color:#b3261e}
+.frag-med{background:#fdeccb;color:#9a6700}
+.frag-low{background:#d8f3e3;color:#1a7f4b}
+
+.top-link{position:fixed;right:18px;bottom:18px;background:var(--accent);color:#fff;border-radius:50%;
+  width:42px;height:42px;display:flex;align-items:center;justify-content:center;font-size:20px;
+  box-shadow:0 4px 14px rgba(43,80,214,.4);opacity:.0;transition:opacity .2s;z-index:50}
+.top-link.show{opacity:.92}
+
+.mobile-bar{display:none}
+@media(max-width:1000px){
+  .sidebar{position:fixed;left:0;top:0;transform:translateX(-100%);transition:transform .25s;z-index:100;box-shadow:2px 0 18px rgba(0,0,0,.3)}
+  .sidebar.open{transform:translateX(0)}
+  .content{padding:64px 20px 100px}
+  .mobile-bar{display:flex;align-items:center;gap:10px;position:fixed;top:0;left:0;right:0;height:50px;
+    background:var(--sidebar);color:#fff;z-index:90;padding:0 14px;font-weight:600;font-size:14px}
+  .mobile-bar button{background:#16213a;color:#fff;border:none;border-radius:7px;padding:7px 11px;font-size:16px}
+}
+</style>
+</head>
+<body>
+<div class="mobile-bar"><button id="menuBtn">☰</button><span>XDC → geth Port Guide</span></div>
+<div class="wrap">
+  <aside class="sidebar" id="sidebar">
+    <div class="brand">XDC × go-ethereum<small>What the branch inherits</small></div>
+    <nav>
+<a class="toc-h2" href="#1-tldr--what-the-branch-inherits">1. TL;DR — what the branch
+inherits</a>
+<a class="toc-h2" href="#2-what-each-one-actually-is">2. What each one actually is</a>
+<a class="toc-h2" href="#3-side-by-side-xdc-270-vs-geth-1173">3. Side-by-side: XDC 2.7.0
+vs geth 1.17.3</a>
+<a class="toc-h3" href="#identity--lineage">Identity &amp; lineage</a>
+<a class="toc-h3" href="#consensus--block-production">Consensus &amp; block
+production</a>
+<a class="toc-h3" href="#evm--execution-semantics">EVM &amp; execution semantics</a>
+<a class="toc-h3" href="#state-storage--database">State storage &amp; database</a>
+<a class="toc-h3" href="#sync--networking">Sync &amp; networking</a>
+<a class="toc-h3" href="#rpc--tooling">RPC &amp; tooling</a>
+<a class="toc-h2" href="#4-the-7-year-improvement-timeline-183--1173">4. The 7-year
+improvement timeline (1.8.3 → 1.17.3)</a>
+<a class="toc-h2" href="#5-area-by-area-deep-dive">5. Area-by-area deep dive</a>
+<a class="toc-h3" href="#52-chain-data-layout--freezer-v190--era-files-v11312">5.2
+Chain-data layout — freezer (v1.9.0) &amp; era files
+(v1.13.12)</a>
+<a class="toc-h3" href="#55-wire-protocol--eth63--eth70">5.5 Wire protocol — eth/63 →
+eth/70</a>
+<a class="toc-h3" href="#56-transaction-pool--evm-subpool--blobpool-v1121">5.6
+Transaction pool &amp; EVM (subpool + blobpool
+v1.12.1)</a>
+<a class="toc-h3" href="#57-execution-internals">5.7 Execution internals</a>
+<a class="toc-h3" href="#58-consensus-integration--the-one-xdc-keeps-deliberately">5.8
+Consensus integration — the one XDC keeps deliberately</a>
+<a class="toc-h2" href="#6-the-disk-economics-25-tb-archive--800-gb-full">6. The disk
+economics (2.5 TB archive / 800 GB full)</a>
+<a class="toc-h2" href="#7-what-this-means-for-the-xdc-port">7. What this means for the
+XDC port</a>
+<a class="toc-h2" href="#8-references">8. References</a>
+    </nav>
+  </aside>
+  <main class="content"><span id="top"></span>
+<h1 id="the-geth-v1173-base--what-resetintegration-1173-inherits">The
+geth v1.17.3 Base — What <code>reset/integration-1.17.3</code>
+Inherits</h1>
+<p><strong>Seven years of upstream go-ethereum engineering (1.8.3 →
+1.17.3), and what the <code>reset/integration-1.17.3</code> branch
+inherits by building on the pristine v1.17.3 base.</strong></p>
+<blockquote>
+<p>Companion to <a href="./README.md"><code>README.md</code></a> (the
+reproduction guide). This doc is the <em>why</em>; the README is the
+<em>how</em>.</p>
+<p><strong>Scope:</strong> this catalogs the modern-geth capabilities
+the <code>reset/integration-1.17.3</code> branch inherits by building on
+pristine geth v1.17.3. Where the legacy geth-1.8-era
+<strong>XDPoSChain</strong> client appears in comparison tables, it is
+the older canonical client shown <em>for contrast</em> — not a
+characterization of XDC's current multi-client fleet (GP5, Erigon,
+Nethermind, Reth — see the <a
+href="https://xdc.network/network-architecture.html">Architecture</a>
+overview).</p>
+<p>Verified against local checkouts: <strong>XDPoSChain</strong> working
+tree (<code>params/version.go</code> = <code>2.7.0-beta</code>) and
+<strong>pristine geth v1.17.3</strong>
+(<code>117e067f0f0bae1a17082321f224dedb6765b10f</code>). <strong>Every
+feature→release attribution in §4 is verified against upstream
+go-ethereum git history</strong> — each version is the first stable
+<code>v1.x.y</code> tag whose history contains the feature's introducing
+commit (commit SHAs cited inline).</p>
+</blockquote>
+<hr />
+
+<hr />
+<h2 id="1-tldr--what-the-branch-inherits">1. TL;DR — what the branch
+inherits</h2>
+<p>By building on pristine geth v1.17.3, the
+<code>reset/integration-1.17.3</code> branch inherits seven years of
+upstream engineering that the older XDC overlay — and the legacy
+geth-1.8-era XDPoSChain client — never had: modern state storage, sync,
+database, and wire protocol. This doc catalogs exactly what the v1.17.3
+base provides, verified against upstream git history. (For reference,
+the legacy XDPoSChain is a hard fork of ~2018 geth <code>eth/63</code>,
+selectively modernized — Go toolchain, <code>core/txpool</code>,
+<code>trie/triedb/hashdb</code>, forks through Cancun — but still on
+2018-era state/sync/networking.)</p>
+<p>The payoff of hosting XDPoS on a 1.17.3-class base, ranked by
+operator impact:</p>
+<ol type="1">
+<li><strong>Path-based state storage (PBSS)</strong> → full nodes stop
+growing and need no periodic resync. <em>(Biggest win — directly
+addresses the 800 GB-and-rising full node.)</em></li>
+<li><strong>Flat snapshot + snap sync</strong> → from-scratch sync drops
+from days to hours.</li>
+<li><strong>Pebble DB</strong> → smoother I/O and compaction at TB
+scale.</li>
+<li><strong><code>eth/66+</code> request IDs + ForkID</strong> → robust
+peering, and it removes the custom "no-RequestId" bridging the port
+currently needs.</li>
+<li><strong>Era files / EIP-4444</strong> → future history offloading to
+shrink both archive and full nodes.</li>
+</ol>
+<p>The one place "newer" is <em>not</em> the goal: <strong>block
+production</strong>. Upstream geth removed internal mining at the Merge
+and now only <em>executes</em> what a consensus layer feeds it. XDPoS
+<em>is</em> XDC's consensus and produces blocks internally — so the port
+keeps XDC's model and merely re-hosts it on modern
+execution/storage.</p>
+<hr />
+<h2 id="2-what-each-one-actually-is">2. What each one actually is</h2>
+<p>These aren't two versions of one thing — they're two different
+animals:</p>
+<ul>
+<li><p><strong>XDC 2.7.0 (XDPoSChain v2.7.0-beta)</strong> — the
+<strong>canonical XDC mainnet client</strong>. A hard fork of
+go-ethereum ~1.8.x, <strong>pre-Merge</strong>, <strong>hash-trie
+only</strong>, <strong>fast/full-sync only</strong>,
+<strong>LevelDB-era</strong>, carrying the <strong>full XDPoS consensus
+engine + internal masternode block production</strong>. Selectively
+modernized: Go 1.25, <code>core/txpool</code> package, the
+<code>trie/triedb/hashdb</code> package layout, EVM forks defined
+through Cancun (block-gated). <em>(Live working tree audited: branch
+<code>fixfastsync-new</code>, <code>git describe</code> =
+<code>v2.4.6-beta1-2384</code>; latest release tag is
+v2.7.0.)</em></p></li>
+<li><p><strong>Geth 1.17.3</strong> — <strong>current upstream
+Ethereum</strong>. <strong>Post-Merge PoS</strong> (block production is
+external, via a consensus layer over the Engine API), <strong>PBSS
+path-based state</strong>, <strong>snap sync</strong>, <strong>Pebble
+DB</strong>, <strong>EIP-4844 blobs</strong>, timestamp-gated forks.
+Contains <strong>zero</strong> XDC-specific code.</p></li>
+</ul>
+<p>So "XDC 2.7.0 vs geth 1.17.3" is really <em>"XDC's production node"
+vs "where upstream Ethereum infrastructure is today."</em> The gap
+between the two is exactly the chasm the <a
+href="./README.md#3-the-methodology-that-worked-reset-and-replay-in-bundles"><code>reset/integration-1.17.3</code></a>
+port crosses.</p>
+<hr />
+<h2 id="3-side-by-side-xdc-270-vs-geth-1173">3. Side-by-side: XDC 2.7.0
+vs geth 1.17.3</h2>
+<h3 id="identity--lineage">Identity &amp; lineage</h3>
+<table>
+<thead>
+<tr>
+<th>Dimension</th>
+<th>XDC 2.7.0 (XDPoSChain)</th>
+<th>Geth 1.17.3</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Module</td>
+<td><code>github.com/XinFinOrg/XDPoSChain</code></td>
+<td><code>github.com/ethereum/go-ethereum</code></td>
+</tr>
+<tr>
+<td>Version string</td>
+<td><code>2.7.0-beta</code></td>
+<td><code>1.17.3-stable</code></td>
+</tr>
+<tr>
+<td>Nature</td>
+<td>Hard fork of go-ethereum (~1.8 era)</td>
+<td>Upstream original</td>
+</tr>
+<tr>
+<td>Networking lineage</td>
+<td>~2018 geth (<code>eth/62</code>, <code>eth/63</code>)</td>
+<td>2025 geth (<code>eth/69</code>, <code>eth/70</code>)</td>
+</tr>
+<tr>
+<td>Go toolchain</td>
+<td><code>go 1.25</code></td>
+<td><code>go 1.24.0</code></td>
+</tr>
+<tr>
+<td>Target network</td>
+<td>XDC Mainnet (50) / Apothem (51)</td>
+<td>Ethereum mainnet + testnets</td>
+</tr>
+</tbody>
+</table>
+<h3 id="consensus--block-production">Consensus &amp; block
+production</h3>
+<table>
+<thead>
+<tr>
+<th>Dimension</th>
+<th>XDC 2.7.0</th>
+<th>Geth 1.17.3</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Consensus</td>
+<td><strong>XDPoS</strong> (v1 round-robin → v2 HotStuff-style BFT)</td>
+<td><strong>PoS / The Merge</strong> (validated, not produced, by the
+EL)</td>
+</tr>
+<tr>
+<td>Block production</td>
+<td><strong>Internal</strong> — <code>miner/</code> + masternodes seal
+blocks</td>
+<td><strong>External</strong> — CL builds/finalizes via Engine API</td>
+</tr>
+<tr>
+<td>Finality</td>
+<td>BFT QC/TC, 3-chain commit (v2)</td>
+<td>Casper-FFG via the beacon chain</td>
+</tr>
+<tr>
+<td>Validator set</td>
+<td><strong>108 masternodes</strong>, on-chain via system contracts;
+epoch = 900 blocks</td>
+<td>Beacon-chain validators (off the EL)</td>
+</tr>
+<tr>
+<td>Block time</td>
+<td><strong>~2 s</strong></td>
+<td>~12 s (CL slot)</td>
+</tr>
+<tr>
+<td>Merge machinery (TTD)</td>
+<td><strong>Absent</strong> (pre-Merge by design)</td>
+<td>Present (TTD, <code>mergeNetsplitBlock</code>)</td>
+</tr>
+</tbody>
+</table>
+<h3 id="evm--execution-semantics">EVM &amp; execution semantics</h3>
+<table>
+<thead>
+<tr>
+<th>Dimension</th>
+<th>XDC 2.7.0</th>
+<th>Geth 1.17.3</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Header fields</td>
+<td><strong>+ <code>Validators</code>, <code>Validator</code>,
+<code>Penalties</code></strong> (<code>gencodec:"required"</code>)</td>
+<td>Standard (no XDPoS fields)</td>
+</tr>
+<tr>
+<td>Fork coverage</td>
+<td>Constantinople → … → <strong>Shanghai, Cancun</strong>, all
+<strong>block-gated</strong></td>
+<td>Through Cancun/Prague, <strong>timestamp-gated</strong>
+post-Merge</td>
+</tr>
+<tr>
+<td>Fork activation</td>
+<td>XDC bundles EIP-2929/3529/2565/3860 at
+<strong><code>Eip1559Block</code></strong>; <strong>EIP-2028
+off</strong></td>
+<td>Standard Ethereum schedule</td>
+</tr>
+<tr>
+<td>EIP-1559 base fee</td>
+<td><strong>Fixed</strong> (<code>12.5 gwei</code>, non-market)</td>
+<td><strong>Dynamic</strong> (market formula)</td>
+</tr>
+<tr>
+<td>EIP-4844 blobs</td>
+<td><strong>No</strong></td>
+<td><strong>Yes</strong> (blob txs, blob pool, KZG)</td>
+</tr>
+<tr>
+<td>Special transactions</td>
+<td><code>0x89</code>/<code>0x92</code>/<code>0x93</code> zero-gas,
+minimal-log path</td>
+<td>none</td>
+</tr>
+<tr>
+<td>Big balances</td>
+<td><code>BigBalance</code> (&gt;2²⁵⁶) overflow path</td>
+<td><code>uint256</code> only</td>
+</tr>
+</tbody>
+</table>
+<h3 id="state-storage--database">State storage &amp; database</h3>
+<table>
+<thead>
+<tr>
+<th>Dimension</th>
+<th>XDC 2.7.0</th>
+<th>Geth 1.17.3</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>State scheme</td>
+<td><strong>Hash-based MPT</strong> (<code>trie/triedb/hashdb</code>, no
+<code>pathdb</code>)</td>
+<td><strong>PBSS path-based</strong> (default) + hash scheme</td>
+</tr>
+<tr>
+<td>Flat state snapshot</td>
+<td><strong>None</strong> (<code>core/state/snapshot</code> absent)</td>
+<td>Present (snapshot/flat layer)</td>
+</tr>
+<tr>
+<td>Ancients / freezer</td>
+<td><strong>None</strong> ❌ — runs <code>nofreezedb</code> (no cold/hot
+split)</td>
+<td>Present + <strong>era1 files</strong></td>
+</tr>
+<tr>
+<td>DB backend</td>
+<td><strong>LevelDB-era</strong> (no <code>ethdb/pebble</code>)</td>
+<td><strong>Pebble</strong> (default) + LevelDB</td>
+</tr>
+<tr>
+<td>State pruning</td>
+<td>Limited (no online prune; resync to reclaim)</td>
+<td>Path-scheme history window (~90k blocks), online pruning</td>
+</tr>
+</tbody>
+</table>
+<h3 id="sync--networking">Sync &amp; networking</h3>
+<table>
+<thead>
+<tr>
+<th>Dimension</th>
+<th>XDC 2.7.0</th>
+<th>Geth 1.17.3</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Sync modes</td>
+<td><strong>Fast + Full</strong> (no snap)</td>
+<td><strong>Snap</strong> (default) + Full + <strong>beacon
+sync</strong></td>
+</tr>
+<tr>
+<td>eth wire versions</td>
+<td><code>eth/62</code>, <code>eth/63</code>,
+<strong><code>xdpos2</code>(100)</strong></td>
+<td><code>eth/69</code>, <code>eth/70</code></td>
+</tr>
+<tr>
+<td>ForkID (EIP-2124)</td>
+<td><strong>No</strong></td>
+<td>Yes (handshake fork filtering)</td>
+</tr>
+<tr>
+<td>Request IDs (<code>eth/66</code>)</td>
+<td><strong>No</strong> (responses unmatched to requests)</td>
+<td>Yes (multiplexed req/resp)</td>
+</tr>
+<tr>
+<td>Discovery</td>
+<td>XDC ping (packet <strong>type 5</strong>)</td>
+<td>standard discv4 / discv5</td>
+</tr>
+<tr>
+<td>BFT gossip</td>
+<td>Vote/Timeout/SyncInfo (<code>0xe0/e1/e2</code>) over wire</td>
+<td>none</td>
+</tr>
+<tr>
+<td>txpool</td>
+<td><code>core/txpool</code> package (no blob pool)</td>
+<td><code>core/txpool</code> <strong>+ blobpool</strong></td>
+</tr>
+</tbody>
+</table>
+<h3 id="rpc--tooling">RPC &amp; tooling</h3>
+<table>
+<thead>
+<tr>
+<th>Dimension</th>
+<th>XDC 2.7.0</th>
+<th>Geth 1.17.3</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Custom RPC</td>
+<td><strong><code>XDPoS_*</code></strong> namespace +
+<code>XDC</code>/<code>XDCx</code> modules</td>
+<td>none</td>
+</tr>
+<tr>
+<td><code>eth_getBlock*</code></td>
+<td>includes
+<code>validators</code>/<code>validator</code>/<code>penalties</code></td>
+<td>standard fields only</td>
+</tr>
+<tr>
+<td>Engine API</td>
+<td>not used (no CL)</td>
+<td>core to operation (CL ↔︎ EL)</td>
+</tr>
+<tr>
+<td>Addressing</td>
+<td>accepts <strong><code>xdc…</code></strong> address prefix</td>
+<td><code>0x…</code> only</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="4-the-7-year-improvement-timeline-183--1173">4. The 7-year
+improvement timeline (1.8.3 → 1.17.3)</h2>
+<p>Every version below is the <strong>first stable go-ethereum release
+tag that shipped the feature</strong>, verified against upstream git
+history: introducing commit → earliest <code>v1.x.y</code> tag
+containing it. (Dates ≤ v1.13 are real-world release dates; v1.16/v1.17
+reflect this repo's history.)</p>
+<table>
+<thead>
+<tr>
+<th>First release</th>
+<th>Date</th>
+<th>Landmark improvement (introducing commit)</th>
+<th>In XDC 2.7.0?</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>v1.8.x</code></td>
+<td>2018</td>
+<td>The base: <code>eth/62</code>–<code>63</code>, fast-sync, LevelDB,
+hash-trie state</td>
+<td>— (this <em>is</em> the base)</td>
+</tr>
+<tr>
+<td><strong><code>v1.9.0</code></strong></td>
+<td>2019-07</td>
+<td><strong>Freezer / ancients</strong> (immutable data out of the KV
+store); <strong>ForkID</strong> EIP-2124 / <code>eth/64</code>
+(<code>983f923</code>)</td>
+<td>freezer ❌ · ForkID ❌</td>
+</tr>
+<tr>
+<td><strong><code>v1.9.13</code></strong></td>
+<td>2020-02</td>
+<td><strong>State snapshot</strong> — the flat read-acceleration layer
+(<code>542df88</code>)</td>
+<td>❌</td>
+</tr>
+<tr>
+<td><strong><code>v1.10.0</code></strong></td>
+<td>2021-03</td>
+<td><strong>Snap sync</strong> + <code>snap/1</code>
+(<code>017831d</code>); <strong>offline state pruning</strong>
+(<code>f566dd3</code>); <strong><code>eth/66</code> request IDs</strong>
+(<code>6ec1561</code>)</td>
+<td>❌</td>
+</tr>
+<tr>
+<td><strong><code>v1.10.3</code></strong></td>
+<td>2021-04</td>
+<td><strong>Engine API</strong> (catalyst) — the Merge groundwork
+(<code>f79cce5</code>)</td>
+<td>❌</td>
+</tr>
+<tr>
+<td><strong><code>v1.10.4</code></strong></td>
+<td>2021-05</td>
+<td><strong>EIP-1559</strong> implementation (<code>94451c2</code>);
+London mainnet activation Aug 2021 (<code>v1.10.8</code>)</td>
+<td>✅ but <strong>fixed</strong> base fee</td>
+</tr>
+<tr>
+<td><strong><code>v1.10.19</code></strong></td>
+<td>2022</td>
+<td><strong><code>eth/67</code></strong> — drops
+<code>GetNodeData</code> (snap replaces it)</td>
+<td>❌</td>
+</tr>
+<tr>
+<td><strong><code>v1.10.22</code></strong></td>
+<td>2022-09</td>
+<td><strong>The Merge</strong> — mainnet TTD, PoS; internal PoW mining
+retired</td>
+<td>❌ (XDPoS instead)</td>
+</tr>
+<tr>
+<td><strong><code>v1.11.0</code></strong></td>
+<td>2023-02</td>
+<td><strong>Pebble</strong> DB backend (<code>ed51b8c</code>);
+<strong><code>eth/68</code></strong> (<code>b0d4433</code>)</td>
+<td>❌</td>
+</tr>
+<tr>
+<td><strong><code>v1.12.1</code></strong></td>
+<td>2023-08</td>
+<td><strong>txpool subpool</strong> refactor (<code>d40a255</code>);
+<strong>blobpool</strong> / EIP-4844 code (<code>1662228</code>); PBSS
+code merged &amp; present in this tag (<code>7de748d</code>)</td>
+<td>❌</td>
+</tr>
+<tr>
+<td><strong><code>v1.13.0</code></strong></td>
+<td>2023-09</td>
+<td><strong>Path-based state storage (PBSS) officially shipped</strong>
+— online pruning; default for new full nodes in
+<strong><code>v1.14.0</code></strong></td>
+<td>❌</td>
+</tr>
+<tr>
+<td><strong><code>v1.13.12</code></strong></td>
+<td>2024-02</td>
+<td><strong>Era files</strong> — history export, EIP-4444 path
+(<code>1f50aa7</code>)</td>
+<td>❌</td>
+</tr>
+<tr>
+<td><strong><code>v1.16.0</code></strong></td>
+<td>2025</td>
+<td><strong><code>eth/69</code></strong> (<code>7e79254</code>)</td>
+<td>❌</td>
+</tr>
+<tr>
+<td><strong><code>v1.17.3</code></strong></td>
+<td>2026 (base)</td>
+<td><strong><code>eth/70</code></strong> (<code>965bd6b</code>);
+Verkle/UBT + block-access-list (EIP-7928) groundwork</td>
+<td>❌</td>
+</tr>
+</tbody>
+</table>
+<blockquote>
+<p><strong>Code-ship vs feature-ship (corrected against EF release blogs
+— see <a
+href="./EVIDENCE-BASE.md"><code>EVIDENCE-BASE.md</code></a>):</strong>
+the path-based state-scheme PR (#25963) merged Aug 2023 and is
+<em>present in the <code>v1.12.1</code> tag</em>, but geth
+<strong>officially shipped PBSS in <code>v1.13.0</code></strong>
+(2023-09) and made it the <strong>default for new full nodes in
+<code>v1.14.0</code></strong>. Likewise the <strong>blobpool</strong>
+code landed in <code>v1.12.1</code> while EIP-4844 blobs
+<em>activated</em> on mainnet later (Dencun, 2024). The lesson: "code
+present in tag X" ≠ "feature shipped in X" ≠ "activated on mainnet in X"
+— cite <strong>v1.13.0 / v1.14.0</strong> for PBSS.</p>
+</blockquote>
+<p><strong>The honest ledger:</strong> XDC 2.7.0 modernized the
+<em>toolchain and EVM rules</em> (Go 1.25, forks→Cancun,
+<code>core/txpool</code> package, <code>trie/triedb/hashdb</code>
+layout) but kept <strong>2018-era networking</strong>
+(<code>eth/63</code>, no ForkID, no request IDs) and <strong>2018-era
+state/sync</strong> (hash-trie, no snapshot, no snap-sync, no PBSS,
+<strong>no functional freezer</strong> — <code>nofreezedb</code>,
+LevelDB) — and is currently <em>patching fast-sync</em> (the
+<code>fixfastsync-new</code> branch) rather than adopting snap.</p>
+<hr />
+<h2 id="5-area-by-area-deep-dive">5. Area-by-area deep dive</h2>
+<h3
+id="51-state-storage--the-headline-snapshot-v1913--pbss-shipped-v1130-default-v1140">5.1
+State storage — the headline (snapshot <code>v1.9.13</code> → PBSS
+shipped <code>v1.13.0</code>, default <code>v1.14.0</code>)</h3>
+<p>This single area explains most of the 2.5 TB / 800 GB numbers.</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>XDC 2.7.0 (geth ~1.8)</th>
+<th>Geth 1.17.3</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Trie node keying</td>
+<td><strong>Hash-based</strong> (node keyed by its hash)</td>
+<td><strong>Path-based (PBSS)</strong> default; hash still
+available</td>
+</tr>
+<tr>
+<td>Read path</td>
+<td>Walk the MPT every access</td>
+<td><strong>Flat snapshot</strong> → O(1) account/storage reads</td>
+</tr>
+<tr>
+<td>Dead-node handling</td>
+<td>Accumulates; needs GC / offline prune</td>
+<td><strong>Online pruning</strong>, bounded state-history window (~90k
+blocks)</td>
+</tr>
+<tr>
+<td>Full-node growth</td>
+<td><strong>Unbounded</strong> — state portion drifts up forever</td>
+<td><strong>Bounded</strong> — live state ≈ current state, stays
+~flat</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Why hash-scheme grows and PBSS doesn't:</strong> every state
+write creates new trie nodes and orphans old ones. In the hash scheme
+those orphans pile up in the KV store unless you run offline pruning —
+which itself <em>requires the snapshot layer XDC doesn't have</em>. So
+XDC full nodes bloat over time and operators must periodically
+<strong>resync</strong>. PBSS keys nodes by path (one live node per path
++ a bounded history segment) and prunes history <strong>online</strong>,
+so the state portion stops growing. <strong>This is the #1 reason to
+move XDC onto a 1.17.3 base.</strong></p>
+<h3 id="52-chain-data-layout--freezer-v190--era-files-v11312">5.2
+Chain-data layout — freezer (<code>v1.9.0</code>) &amp; era files
+(<code>v1.13.12</code>)</h3>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>XDC 2.7.0</th>
+<th>Geth 1.17.3</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Hot KV vs cold data</td>
+<td><strong>No freezer</strong> ❌ — <code>nofreezedb</code>;
+blocks/receipts stay in LevelDB</td>
+<td>Freezer + <strong>era1 files</strong> (exportable, compressible
+history; EIP-4444 path)</td>
+</tr>
+<tr>
+<td>History expiry</td>
+<td>No</td>
+<td>Era files let nodes <strong>offload / drop ancient history</strong>
+entirely</td>
+</tr>
+</tbody>
+</table>
+<p>Correcting an earlier assumption (verified against the live
+codebase): XDPoSChain has <strong>no functional freezer</strong> — it
+runs geth's <code>nofreezedb</code> path (ancient reads return
+<code>errNotSupported</code>; <code>core/rawdb/freezer_table.go</code>
+is a 34-line stub; no freezer is ever opened). So <strong>all blocks and
+receipts sit in LevelDB alongside state</strong> — there is no cold/hot
+split at all, and no <strong>era / EIP-4444</strong> offload. Both the
+freezer (geth v1.9.0) and era files are modern-geth wins XDC still
+lacks.</p>
+<h3
+id="53-database-engine--leveldb--pebble-added-v1110-default-v1120">5.3
+Database engine — LevelDB → Pebble (added <code>v1.11.0</code>, default
+<code>v1.12.0</code>)</h3>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>XDC 2.7.0</th>
+<th>Geth 1.17.3</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Engine</td>
+<td><strong>LevelDB</strong> (Go port, single-threaded compaction)</td>
+<td><strong>Pebble</strong> (default; concurrent compaction, better
+write-amp at TB scale)</td>
+</tr>
+</tbody>
+</table>
+<p>At multi-hundred-GB sizes LevelDB compaction stalls hurt write
+throughput during sync and under load; Pebble (built by CockroachDB) was
+designed for exactly this regime.</p>
+<h3
+id="54-sync--fast--snap--healing-snap1-v1100-default-v1104-fast-sync-removed-v11014">5.4
+Sync — fast → snap + healing (<code>snap/1</code> <code>v1.10.0</code>,
+default <code>v1.10.4</code>, fast-sync removed
+<code>v1.10.14</code>)</h3>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>XDC 2.7.0</th>
+<th>Geth 1.17.3</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Initial sync</td>
+<td><strong>Fast sync</strong> — fetch every state trie node by hash
+(<code>GetNodeData</code>), millions of tiny round-trips</td>
+<td><strong>Snap sync</strong> — fetch contiguous account/storage
+<strong>ranges</strong> from the snapshot, then <strong>heal</strong>
+the trie</td>
+</tr>
+<tr>
+<td>Speed</td>
+<td>Days; bottlenecked on latency &amp; node-by-node retrieval</td>
+<td>Hours; bandwidth-bound, far fewer round-trips</td>
+</tr>
+<tr>
+<td>Pre-req</td>
+<td>—</td>
+<td>Needs the snapshot layer (which is why XDC can't do it today)</td>
+</tr>
+</tbody>
+</table>
+<p>This is exactly the friction the port hit: the XDC fleet serves no
+snapshot index, so <code>reset/integration-1.17.3</code> falls back to a
+custom continuous full-sync driver. A modern base + a snapshot-serving
+fleet would unlock snap sync.</p>
+<h3 id="55-wire-protocol--eth63--eth70">5.5 Wire protocol — eth/63 →
+eth/70</h3>
+<table>
+<thead>
+<tr>
+<th>Capability</th>
+<th>XDC 2.7.0 (<code>eth/62/63</code> + <code>xdpos2</code>)</th>
+<th>Geth 1.17.3 — first shipped</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>ForkID</strong> (EIP-2124)</td>
+<td>❌ — can't pre-filter wrong-fork peers</td>
+<td>✅ <code>eth/64</code>, <strong><code>v1.9.0</code></strong></td>
+</tr>
+<tr>
+<td>Tx hash announcement</td>
+<td>full-tx flooding</td>
+<td><code>eth/65</code>, <strong><code>v1.9.x</code></strong></td>
+</tr>
+<tr>
+<td><strong>Request IDs</strong></td>
+<td>❌ — responses can't be matched to requests</td>
+<td>✅ <code>eth/66</code>, <strong><code>v1.10.0</code></strong></td>
+</tr>
+<tr>
+<td>GetNodeData</td>
+<td>present (fast-sync)</td>
+<td>removed in <code>eth/67</code>,
+<strong><code>v1.10.19</code></strong> (snap replaces it)</td>
+</tr>
+<tr>
+<td>Tx type+size announce</td>
+<td>—</td>
+<td><code>eth/68</code>, <strong><code>v1.11.0</code></strong> →
+<code>eth/69</code> <code>v1.16.0</code> → <code>eth/70</code>
+<code>v1.17.3</code></td>
+</tr>
+</tbody>
+</table>
+<p>The <strong>missing request IDs</strong> is the root of the gnarliest
+part of the port (the "no-RequestId bridge" + FIFO re-anchoring) —
+modern geth peers assume <code>eth/66+</code> semantics. And there is a
+<strong>load-bearing link to storage</strong>: <code>eth/67</code>
+<em>dropping</em> <code>GetNodeData</code> (EIP-4938) was the
+<strong>prerequisite for PBSS</strong> — a node that still serves raw
+trie nodes by hash cannot move to path-based keys. XDC 2.7.0 still
+serves <code>GetNodeData</code>, so the wire protocol must evolve
+<em>before</em> the storage scheme can. (Verified — see <a
+href="./EVIDENCE-BASE.md"><code>EVIDENCE-BASE.md</code></a> §8.)</p>
+<h3 id="56-transaction-pool--evm-subpool--blobpool-v1121">5.6
+Transaction pool &amp; EVM (subpool + blobpool
+<code>v1.12.1</code>)</h3>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>XDC 2.7.0</th>
+<th>Geth 1.17.3</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Txpool</td>
+<td><code>core/txpool</code> package ✅ (backported), legacy subpool
+only</td>
+<td><strong>Subpool arch</strong> + <strong>blobpool</strong>
+(EIP-4844)</td>
+</tr>
+<tr>
+<td>Tx types</td>
+<td>legacy + (some) typed</td>
+<td>EIP-2718 typed: access-list, dynamic-fee, <strong>blob
+(4844)</strong>, <strong>set-code (7702)</strong></td>
+</tr>
+<tr>
+<td>Fee market</td>
+<td>EIP-1559 header with <strong>fixed 12.5 gwei</strong> base fee</td>
+<td>dynamic base fee + blob fee market</td>
+</tr>
+<tr>
+<td>Precompiles/EIPs</td>
+<td>XDC bundles 2929/3529/2565/3860 at <code>Eip1559Block</code>; 2028
+off</td>
+<td>standard schedule, KZG point-eval, BLS (Prague)</td>
+</tr>
+</tbody>
+</table>
+<h3 id="57-execution-internals">5.7 Execution internals</h3>
+<p>Since 1.8, upstream added a <strong>trie prefetcher</strong> (warm
+the trie concurrently with EVM execution), <strong>parallel state
+hashing</strong> in <code>IntermediateRoot</code>, <strong>code/state
+separation</strong> (code dedup by hash), <strong>stacktrie</strong> for
+fast root computation during sync, structured
+<strong>slog/log-v3</strong>, richer metrics, and the
+<strong>stateless/Verkle (UBT) + block-access-list (EIP-7928)</strong>
+groundwork. XDC 2.7.0 runs the 2018 single-threaded paths.</p>
+<h3 id="58-consensus-integration--the-one-xdc-keeps-deliberately">5.8
+Consensus integration — the one XDC keeps deliberately</h3>
+<p>Geth removed internal PoW mining at the Merge (<code>v1.10.22</code>)
+and now <em>executes</em> blocks an external consensus layer produces
+(Engine API, <code>v1.10.3</code>). <strong>XDC must NOT adopt
+this</strong> — XDPoS <em>is</em> XDC's consensus and produces blocks
+internally via <code>miner/</code> + masternodes. This is the single
+area where "newer" isn't the target; the port keeps XDC's
+block-production model and just hosts it on modern
+execution/storage.</p>
+<hr />
+<h2 id="6-the-disk-economics-25-tb-archive--800-gb-full">6. The disk
+economics (2.5 TB archive / 800 GB full)</h2>
+<p>Where the bytes actually live, and how each improvement moves
+them:</p>
+<pre><code>                          XDPoSChain full node (~800 GB)          Geth-1.17.3-class full node
+  ┌─ Blocks + receipts ─ in LevelDB (NO freezer · nofreezedb) ──  Ancients freezer (flat files; era offload)
+  ├─ Live state (hash) ─ GROWS unbounded (no online prune)    ──  BOUNDED by PBSS (~current state)
+  └─ DB engine         ─ LevelDB only                         ──  Pebble (better at TB scale)</code></pre>
+<ul>
+<li><strong>Full node (~800 GB, rising):</strong> most of the
+<em>growth</em> is dead trie nodes in the hash-scheme state that can't
+be pruned online (no snapshot → no <code>prune-state</code>). Operators
+resync periodically to reclaim it. <strong>On PBSS the state portion
+stabilizes</strong> — the node stops bloating and the ancients dominate
+(large but immutable). Net: a 1.17.3-class XDC full node would be
+<strong>smaller and, more importantly, stop growing</strong>, with no
+resync ritual.</li>
+<li><strong>Archive (~2.5 TB):</strong> hash-scheme archive keeps
+<em>every</em> trie node ever written — inherently huge, and access is
+slow (trie walks). A <strong>PBSS path-scheme archive + era
+files</strong> stores history more compactly and reads it flat; archive
+stays large but grows slower and queries faster.</li>
+<li><strong>Sync time:</strong> fast-sync (XDC today) is latency-bound
+and slow at these state sizes; <strong>snap sync</strong> would cut a
+from-scratch sync from days to hours — <em>if</em> the fleet serves
+snapshots.</li>
+</ul>
+<p><strong>Measured (field reference).</strong> On
+<strong>xdc01</strong> — this branch (<code>02ebae0d</code>) running XDC
+<strong>mainnet</strong>, geth 1.17.3-stable, PBSS full node, synced to
+head (~103.3M, 24 peers, <code>syncing=false</code>): <strong>303 GB
+total = 281 GB freezer (immutable) + ~22 GB live PBSS state</strong>.
+That **~22 GB live state is the PBSS thesis confirmed in production** —
+bounded by online pruning, while the freezer holds the compressible
+immutable bulk.</p>
+<p><strong>Measured side-by-side</strong> (both over IPC, same chain
+head ~103.31M): the canonical legacy <strong>XDPoSChain v2.6.8</strong>
+node holds <strong>919 GB in one LevelDB</strong> (no freezer, no online
+pruning) and serves warm RPC reads **~2–6× slower**
+(<code>getStorageAt</code> 1.87 ms vs 0.30 ms; <code>getCode</code> 4.83
+ms vs 1.60 ms; <code>getBalance</code> 1.63 ms vs 0.53 ms). Same
+consensus, same head — the 1.17.3 base is <strong>~3× smaller (303 GB vs
+919 GB)</strong> with bounded hot state. <em>(An earlier "~100× faster
+RPC" estimate was not supported once the legacy node was measured
+directly; the real, measured figure is ~2–6× for warm reads.)</em></p>
+<hr />
+<h2 id="7-what-this-means-for-the-xdc-port">7. What this means for the
+XDC port</h2>
+<p>The <code>reset/integration-1.17.3</code> branch puts XDC's consensus
+and economic rules onto modern storage/sync — the pristine geth v1.17.3
+base catalogued above — <strong>without changing the rules
+themselves</strong>.</p>
+<p>That reframing explains why the <em>hard</em> parts of the port are
+exactly the modernized layers:</p>
+<ul>
+<li><strong>State storage</strong> — hash→PBSS, the
+<code>BigBalance</code> RLP overflow path, byte-exact account
+leaves.</li>
+<li><strong>Sync</strong> — fast→snap/beacon, the two-pivot model,
+bridging <code>xdpos2</code> requests onto <code>eth/70</code> peers
+that expect request IDs.</li>
+<li><strong>Pre-Merge → post-Merge networking</strong> impedance
+mismatch (no ForkID, no request IDs, a continuous syncer instead of
+beacon idle).</li>
+</ul>
+<p>…and why the <strong>consensus engine itself copies over fairly
+cleanly</strong> — it's self-contained and version-agnostic. The full
+step-by-step is in <a href="./README.md"><code>README.md</code></a>; the
+consensus-parity invariants that must survive the move are in <a
+href="./README.md#8-consensus-parity-invariants--what-must-be-bit-exact">README
+§8</a>.</p>
+<hr />
+<h2 id="8-references">8. References</h2>
+<ul>
+<li><a href="./README.md"><code>README.md</code></a> — the reproduction
+guide (the <em>how</em>).</li>
+<li><a href="./EVIDENCE-BASE.md"><code>EVIDENCE-BASE.md</code></a> —
+externally-sourced, adversarially-verified citations for every claim in
+this doc (the version numbers in §4 are cross-checked there).</li>
+<li><code>docs/port/XDC_PORTING_PLAYBOOK.html</code> — the original
+14-section playbook.</li>
+<li><code>docs/RESET_BUNDLES.md</code>,
+<code>docs/port/MENTAL_MODEL.md</code> — methodology + the sync war
+story.</li>
+<li>Canonical clients (read-only, the spec): <code>XDPoSChain</code>
+(v2.7.0-beta), <code>XDCIndia/go-ethereum</code>.</li>
+<li>Upstream: <a
+href="https://github.com/ethereum/go-ethereum">https://github.com/ethereum/go-ethereum</a>
+— feature→release attributions in §4 were derived from this repo's tag
+history (<code>git tag --contains &lt;introducing-commit&gt;</code>,
+earliest stable <code>v1.x.y</code>).</li>
+</ul>
+<hr />
+<p><em>Verified against local checkouts of XDPoSChain (v2.7.0-beta) and
+pristine geth v1.17.3 (<code>117e067f</code>). Feature→release
+attributions in §4 verified against upstream go-ethereum git history
+(introducing commit → earliest containing stable tag). Mainnet
+<em>activation</em> milestones (London, the Merge, Dencun) are network
+events distinct from the code-shipping release noted here.</em></p>
+
+  </main>
+</div>
+<a href="#top" class="top-link" id="topLink" title="Back to top">↑</a>
+<script>
+(function(){
+  // active-section highlight
+  var links = Array.prototype.slice.call(document.querySelectorAll('.sidebar a'));
+  var map = {};
+  links.forEach(function(a){ var id=a.getAttribute('href').slice(1); map[id]=a; });
+  var heads = Array.prototype.slice.call(document.querySelectorAll('h2[id],h3[id]'));
+  var obs = new IntersectionObserver(function(entries){
+    entries.forEach(function(e){
+      if(e.isIntersecting){
+        links.forEach(function(l){l.classList.remove('active');});
+        var a = map[e.target.id]; if(a){a.classList.add('active'); a.scrollIntoView({block:'nearest'});}
+      }
+    });
+  },{rootMargin:'0px 0px -78% 0px'});
+  heads.forEach(function(h){obs.observe(h);});
+
+  // fragility badge coloring
+  document.querySelectorAll('strong,td,li,p').forEach(function(el){
+    if(el.children.length===0||el.tagName==='TD'){
+      el.innerHTML = el.innerHTML
+        .replace(/\bFragility:\s*(HIGH)\b/g,'Fragility: <span class="frag frag-high">$1</span>')
+        .replace(/\bFragility:\s*(MED(?:-HIGH|–HIGH|-MED)?|MEDIUM|MED–HIGH|MED-HIGH)\b/g,'Fragility: <span class="frag frag-med">$1</span>')
+        .replace(/\bFragility:\s*(LOW(?:-MED|–MED|-MED)?)\b/g,'Fragility: <span class="frag frag-low">$1</span>');
+    }
+  });
+
+  // back to top
+  var topLink=document.getElementById('topLink');
+  window.addEventListener('scroll',function(){ topLink.classList.toggle('show', window.scrollY>500); });
+
+  // mobile sidebar
+  var sb=document.getElementById('sidebar'), btn=document.getElementById('menuBtn');
+  if(btn){ btn.addEventListener('click',function(){sb.classList.toggle('open');}); }
+  document.querySelectorAll('.sidebar a').forEach(function(a){a.addEventListener('click',function(){sb.classList.remove('open');});});
+})();
+</script>
+</body>
+</html>

@@ -23,6 +23,7 @@ import (
 	"github.com/ethereum/go-ethereum/consensus"
 	"github.com/ethereum/go-ethereum/consensus/misc/eip4844"
 	"github.com/ethereum/go-ethereum/core/tracing"
+	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/core/vm"
 	"github.com/ethereum/go-ethereum/params"
@@ -60,7 +61,15 @@ func NewEVMBlockContext(header *types.Header, chain ChainContext, author *common
 	if header.ExcessBlobGas != nil {
 		blobBaseFee = eip4844.CalcBlobFee(chain.Config(), header)
 	}
-	if header.Difficulty.Sign() == 0 {
+	// XDC Network: Use Keccak256(blockNumber) as PREVRANDAO
+	// XDC doesn't use difficulty/mixdigest for randomness.
+	// Reference: XDPoSChain/core/evm.go — "since xdpos chain do not use difficulty
+	// and mixdigest, we use hash of the block number as random"
+	// Fixes: https://github.com/AnilChinchawale/go-ethereum/issues/40
+	if chain != nil && chain.Config().IsXDC() {
+		xdcRandom := crypto.Keccak256Hash(header.Number.Bytes())
+		random = &xdcRandom
+	} else if header.Difficulty.Sign() == 0 {
 		random = &header.MixDigest
 	}
 	if header.SlotNumber != nil {
@@ -135,7 +144,20 @@ func GetHashFn(ref *types.Header, chain ChainContext) func(n uint64) common.Hash
 
 // CanTransfer checks whether there are enough funds in the address' account to make a transfer.
 // This does not take the necessary gas in to account to make the transfer valid.
+//
+// XDC: when the sender holds a BigBalance overflow (real balance > uint256max),
+// db.GetBalance returns only the wrapped uint256 value, which can be far less
+// than the requested transfer amount. The wrapped check would incorrectly fail.
+// If the concrete state DB reports a non-nil BigBalance, the sender has at
+// least uint256max — more than any uint256 amount — so allow the transfer.
 func CanTransfer(db vm.StateDB, addr common.Address, amount *uint256.Int) bool {
+	if bigBalProvider, ok := db.(interface {
+		GetBigBalance(common.Address) *big.Int
+	}); ok {
+		if big := bigBalProvider.GetBigBalance(addr); big != nil {
+			return true
+		}
+	}
 	return db.GetBalance(addr).Cmp(amount) >= 0
 }
 

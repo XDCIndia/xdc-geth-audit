@@ -65,7 +65,58 @@ var (
 	pragueInstructionSet           = newPragueInstructionSet()
 	osakaInstructionSet            = newOsakaInstructionSet()
 	amsterdamInstructionSet        = newAmsterdamInstructionSet()
+
+	// XDC: instruction-set markers for Berlin..Shanghai (refs #740).
+	// Canonical XDPoSChain defers EIP-2929/3529/3860 from Berlin/London/
+	// Shanghai to the EIP-1559 block. So on XDC chains, Berlin..Shanghai
+	// before EIP-1559 use these marker-only tables (no EIP-2929 = no
+	// access lists, no cold/warm gas costs); at IsEIP1559 the upstream
+	// shanghaiInstructionSet takes over. Without this, every post-Berlin
+	// transaction executes with different gas costs vs canonical and
+	// the state root diverges at every block.
+	xdcBerlinInstructionSet   = newXDCBerlinInstructionSet()
+	xdcLondonInstructionSet   = newXDCLondonInstructionSet()
+	xdcMergeInstructionSet    = newXDCMergeInstructionSet()
+	xdcShanghaiInstructionSet = newXDCShanghaiInstructionSet()
 )
+
+// newXDCBerlinInstructionSet returns the XDC Berlin marker — equivalent to
+// Istanbul (no EIP-2929). XDC defers access-list semantics to EIP-1559.
+func newXDCBerlinInstructionSet() JumpTable {
+	return validate(newIstanbulInstructionSet())
+}
+
+// newXDCLondonInstructionSet returns the XDC London marker — Berlin marker
+// + EIP-3198 (BASEFEE opcode). EIP-3529 stays off; it activates at Cancun.
+func newXDCLondonInstructionSet() JumpTable {
+	instructionSet := newXDCBerlinInstructionSet()
+	enable3198(&instructionSet) // EIP-3198 BASEFEE opcode
+	return validate(instructionSet)
+}
+
+// newXDCMergeInstructionSet returns the XDC Merge marker — London marker
+// + PREVRANDAO (replacing DIFFICULTY).
+func newXDCMergeInstructionSet() JumpTable {
+	instructionSet := newXDCLondonInstructionSet()
+	instructionSet[PREVRANDAO] = &operation{
+		execute:     opRandom,
+		constantGas: GasQuickStep,
+		minStack:    minStack(0, 1),
+		maxStack:    maxStack(0, 1),
+	}
+	return validate(instructionSet)
+}
+
+// newXDCShanghaiInstructionSet returns the XDC Shanghai marker — Merge
+// marker + PUSH0 (EIP-3855). EIP-3860 (initcode word cost) is intentionally
+// NOT enabled here; canonical XDPoSChain defers it to Cancun. The matching
+// intrinsic-gas surcharge path in core/state_transition.go is gated on
+// Rules.IsEIP3860 which for XDC chains evaluates to IsCancunBlock.
+func newXDCShanghaiInstructionSet() JumpTable {
+	instructionSet := newXDCMergeInstructionSet()
+	enable3855(&instructionSet) // EIP-3855 PUSH0 instruction
+	return validate(instructionSet)
+}
 
 // JumpTable contains the EVM opcodes supported at a given fork.
 type JumpTable [256]*operation

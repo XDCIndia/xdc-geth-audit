@@ -1,0 +1,674 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>reset/integration-1.17.3 — Landing XDPoS on geth v1.17.3</title>
+<style>
+:root{
+  --accent:#2b50d6; --accent2:#0fb5a6; --ink:#1b2230; --muted:#5b6678;
+  --bg:#ffffff; --bg2:#f6f8fc; --line:#e3e8f0;
+  --sidebar:#0f1729; --sidebar-ink:#aeb8cc; --sidebar-active:#8fd6ff;
+  --code-bg:#0d1320; --code-ink:#e6edf7;
+  --hi:#fff6d6; --hi-line:#f1c40f;
+}
+*{box-sizing:border-box}
+html{scroll-behavior:smooth}
+body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  color:var(--ink);background:var(--bg);line-height:1.62;font-size:16px;-webkit-font-smoothing:antialiased}
+a{color:var(--accent);text-decoration:none}
+a:hover{text-decoration:underline}
+
+/* layout */
+.wrap{display:flex;min-height:100vh}
+.sidebar{width:300px;flex:0 0 300px;background:var(--sidebar);color:var(--sidebar-ink);
+  position:sticky;top:0;height:100vh;overflow-y:auto;padding:22px 16px 40px}
+.sidebar .brand{font-weight:700;color:#fff;font-size:15px;letter-spacing:.2px;margin:4px 8px 4px}
+.sidebar .brand small{display:block;font-weight:400;color:#7f8aa3;font-size:12px;margin-top:3px;letter-spacing:0}
+.sidebar nav{margin-top:14px;display:flex;flex-direction:column}
+.sidebar a{display:block;color:var(--sidebar-ink);font-size:13px;padding:4px 8px;border-radius:6px;
+  border-left:2px solid transparent;line-height:1.35}
+.sidebar a:hover{background:#16213a;color:#fff;text-decoration:none}
+.sidebar a.toc-h3{padding-left:20px;font-size:12px;color:#8893aa}
+.sidebar a.active{color:var(--sidebar-active);border-left-color:var(--accent2);background:#16213a}
+
+.content{flex:1 1 auto;max-width:920px;margin:0 auto;padding:42px 46px 120px;min-width:0}
+
+/* hero */
+.hero{border-bottom:1px solid var(--line);margin-bottom:8px;padding-bottom:8px}
+.pill{display:inline-block;background:linear-gradient(90deg,var(--accent),var(--accent2));color:#fff;
+  font-size:12px;font-weight:600;padding:3px 11px;border-radius:999px;letter-spacing:.3px}
+
+/* headings */
+h1{font-size:31px;line-height:1.2;margin:.5em 0 .3em;letter-spacing:-.4px}
+h2{font-size:23px;margin:2.1em 0 .5em;padding-top:.5em;border-top:1px solid var(--line);letter-spacing:-.2px}
+h2:first-of-type{border-top:none}
+h3{font-size:17.5px;margin:1.6em 0 .4em;color:#26324a}
+h4{font-size:15px;margin:1.3em 0 .3em;color:var(--muted);text-transform:uppercase;letter-spacing:.04em}
+h1 .header-section-number,h2 .header-section-number,h3 .header-section-number{color:var(--accent);font-weight:700}
+
+/* code */
+code{font-family:"SF Mono", "JetBrains Mono",Menlo,Consolas,monospace;font-size:.88em;
+  background:#eef1f7;color:#1c2742;padding:.12em .38em;border-radius:5px}
+pre{background:var(--code-bg);color:var(--code-ink);padding:16px 18px;border-radius:10px;overflow-x:auto;
+  font-size:13px;line-height:1.5;border:1px solid #1b2740}
+pre code{background:none;color:inherit;padding:0;font-size:13px}
+
+/* tables */
+table{border-collapse:collapse;width:100%;margin:1.1em 0;font-size:14px;display:block;overflow-x:auto}
+th,td{border:1px solid var(--line);padding:8px 11px;text-align:left;vertical-align:top}
+th{background:var(--bg2);font-weight:600}
+tr:nth-child(even) td{background:#fafbfe}
+
+/* blockquote */
+blockquote{margin:1.1em 0;padding:.6em 1.1em;background:var(--hi);border-left:4px solid var(--hi-line);
+  border-radius:0 8px 8px 0;color:#5b4a06}
+blockquote p{margin:.4em 0}
+blockquote code{background:#fbeeb8}
+
+/* lists */
+ul,ol{padding-left:1.4em}
+li{margin:.22em 0}
+li::marker{color:var(--accent)}
+
+hr{border:none;border-top:1px solid var(--line);margin:2.4em 0}
+
+/* fragility badge auto-styling done via JS below */
+.frag{font-weight:700;padding:0 6px;border-radius:5px;font-size:.92em}
+.frag-high{background:#fde2e1;color:#b3261e}
+.frag-med{background:#fdeccb;color:#9a6700}
+.frag-low{background:#d8f3e3;color:#1a7f4b}
+
+.top-link{position:fixed;right:18px;bottom:18px;background:var(--accent);color:#fff;border-radius:50%;
+  width:42px;height:42px;display:flex;align-items:center;justify-content:center;font-size:20px;
+  box-shadow:0 4px 14px rgba(43,80,214,.4);opacity:.0;transition:opacity .2s;z-index:50}
+.top-link.show{opacity:.92}
+
+.mobile-bar{display:none}
+@media(max-width:1000px){
+  .sidebar{position:fixed;left:0;top:0;transform:translateX(-100%);transition:transform .25s;z-index:100;box-shadow:2px 0 18px rgba(0,0,0,.3)}
+  .sidebar.open{transform:translateX(0)}
+  .content{padding:64px 20px 100px}
+  .mobile-bar{display:flex;align-items:center;gap:10px;position:fixed;top:0;left:0;right:0;height:50px;
+    background:var(--sidebar);color:#fff;z-index:90;padding:0 14px;font-weight:600;font-size:14px}
+  .mobile-bar button{background:#16213a;color:#fff;border:none;border-radius:7px;padding:7px 11px;font-size:16px}
+}
+</style>
+</head>
+<body>
+<div class="mobile-bar"><button id="menuBtn">☰</button><span>XDC → geth Port Guide</span></div>
+<div class="wrap">
+  <aside class="sidebar" id="sidebar">
+    <div class="brand">XDC × go-ethereum<small>Status & plan to land the baseline</small></div>
+    <nav>
+<a class="toc-h2" href="#1-executive-summary">1. Executive summary</a>
+<a class="toc-h2" href="#2-what-the-v1173-base-resolves">2. What the v1.17.3 base
+resolves</a>
+<a class="toc-h2" href="#3-root-cause">3. Root cause</a>
+<a class="toc-h2" href="#4-proposed-solution">4. Proposed solution</a>
+<a class="toc-h2" href="#5-pain--remedy-mapping">5. Pain → remedy mapping</a>
+<a class="toc-h2" href="#6-what-does-not-change">6. What does NOT change</a>
+<a class="toc-h2" href="#7-why-this-is-low-risk-proof-points">7. Why this is low-risk:
+proof points</a>
+<a class="toc-h2" href="#8-approach--methodology">8. Approach &amp; methodology</a>
+<a class="toc-h2" href="#9-phased-plan--milestones">9. Phased plan &amp; milestones</a>
+<a class="toc-h2" href="#10-risks--mitigations">10. Risks &amp; mitigations</a>
+<a class="toc-h2" href="#11-success-criteria">11. Success criteria</a>
+<a class="toc-h2" href="#12-effort--timeline">12. Effort &amp; timeline</a>
+<a class="toc-h2" href="#13-recommendation--decision-requested">13. Recommendation &amp;
+decision requested</a>
+<a class="toc-h2" href="#14-appendix">14. Appendix</a>
+<a class="toc-h3" href="#verified-feature--first-upstream-release-map">Verified feature →
+first-upstream-release map</a>
+<a class="toc-h3" href="#companion-documents">Companion documents</a>
+<a class="toc-h3" href="#glossary">Glossary</a>
+    </nav>
+  </aside>
+  <main class="content"><span id="top"></span>
+<h1
+id="resetintegration-1173--landing-xdpos-on-go-ethereum-v1173"><code>reset/integration-1.17.3</code>
+— Landing XDPoS on go-ethereum v1.17.3</h1>
+<p><strong>A clean re-baseline of XDC's XDPoS consensus onto pristine
+geth v1.17.3 — what the branch is, what it inherits, and what's left to
+land it. Bit-exact consensus throughout.</strong></p>
+<blockquote>
+<p><strong>Status:</strong> DRAFT for review · <strong>Date:</strong>
+2026-06-01 · <strong>Prepared for:</strong> XDC Core / XinFin
+engineering &amp; leadership <strong>Related:</strong> <a
+href="https://github.com/XDCIndia/go-ethereum/pull/827">PR #827</a> · <a
+href="./README.md"><code>README.md</code></a> (reproduction guide) · <a
+href="./WHY-MODERN-GETH.md"><code>WHY-MODERN-GETH.md</code></a>
+(engineering rationale) <strong>Asks:</strong> keep the consensus-parity
+harness as the mandatory release gate; resource the remaining validation
+(mainnet + RPC parity) to land the <code>reset/integration-1.17.3</code>
+baseline.</p>
+</blockquote>
+<hr />
+
+<hr />
+<h2 id="1-executive-summary">1. Executive summary</h2>
+<p><strong>Context.</strong> <code>reset/integration-1.17.3</code> is a
+clean re-baseline of XDC's XDPoS consensus onto <strong>pristine
+upstream geth v1.17.3</strong> (commit <code>117e067f</code>). It was
+created (issue #740) to replace a long-lived pre-1.17 overlay that had
+accumulated state-divergence drift — replaying the XDPoS overlay onto a
+known-good upstream release rather than continuing to patch the old
+base.</p>
+<p><strong>Why it matters.</strong> Building on pristine v1.17.3 means
+the branch inherits modern geth <strong>wholesale</strong> —
+<strong>PBSS</strong> (bounded, self-pruning state), the
+<strong>freezer</strong>, <strong>Pebble</strong>, <strong>snap
+sync</strong>, and the <strong>modern wire protocol</strong> — instead
+of back-porting each feature. The diff is fresh and auditable against a
+known release, and the branch stays <strong>within one minor of
+upstream</strong>.</p>
+<p><strong>Status.</strong> A live node (<strong>xdc01</strong>, commit
+<code>02ebae0d</code>) runs the branch on <strong>XDC mainnet, synced to
+head</strong> — block ~103.3M, <code>syncing=false</code>, 24 peers,
+<strong>zero consensus divergence</strong> — on PBSS + Pebble + an
+active freezer. On disk: <strong>303 GB total = 281 GB freezer + ~22 GB
+live PBSS state</strong> (bounded). XDPoS consensus, block production,
+economics, and block hashes remain <strong>bit-for-bit
+identical</strong> to canonical XDC (harness-gated); the methodology and
+parity invariants are fully documented (PR #827). <strong>Remaining work
+is validation — formal fork-boundary parity via the harness and RPC
+parity — then landing the baseline.</strong></p>
+<hr />
+<h2 id="2-what-the-v1173-base-resolves">2. What the v1.17.3 base
+resolves</h2>
+<p><em>These are the costs of the long-lived pre-1.17 overlay (and of
+the legacy geth-1.8-era XDPoSChain client) that building on a modern
+base eliminates — included for contrast, not as a description of XDC's
+current multi-client fleet.</em></p>
+<table>
+<thead>
+<tr>
+<th>#</th>
+<th>Pain point</th>
+<th>Evidence</th>
+<th>Who it hurts</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>P1</strong></td>
+<td><strong>Full nodes grow unbounded; periodic resync
+required</strong></td>
+<td>~800 GB and rising. Hash-scheme trie accumulates dead nodes;
+<strong>no online pruning</strong> (XDC has no snapshot layer → no
+<code>prune-state</code>).</td>
+<td>Every node operator, masternodes, RPC providers — rising disk cost +
+recurring downtime</td>
+</tr>
+<tr>
+<td><strong>P2</strong></td>
+<td><strong>Initial sync takes days</strong></td>
+<td>Fast-sync only (no snap). State is fetched <strong>node-by-node by
+hash</strong> — millions of latency-bound round-trips.</td>
+<td>New masternode / RPC bring-up; disaster recovery; onboarding</td>
+</tr>
+<tr>
+<td><strong>P3</strong></td>
+<td><strong>Archive nodes ~2.5 TB and slow to query</strong></td>
+<td>Hash-scheme archive keeps <strong>every trie node ever
+written</strong>; reads walk the trie.</td>
+<td>Explorers, indexers, analytics, RPC providers — cost + latency</td>
+</tr>
+<tr>
+<td><strong>P4</strong></td>
+<td><strong>Fragile peering / aging networking</strong></td>
+<td><code>eth/62</code>–<code>63</code>, <strong>no ForkID</strong>,
+<strong>no request IDs</strong>; custom bridging is needed to talk to
+modern peers.</td>
+<td>Reliability; engineering maintenance burden; interop</td>
+</tr>
+<tr>
+<td><strong>P5</strong></td>
+<td><strong>Maintenance drift — ~7 years behind upstream</strong></td>
+<td>Base ≈ geth <strong>1.8 (2018)</strong>. The prior overlay
+accumulated state-divergence bugs, which is what <strong>forced the #740
+baseline reset</strong>.</td>
+<td>Security backports hard; can't adopt new EIPs; low developer
+mindshare; risk compounds over time</td>
+</tr>
+<tr>
+<td><strong>P6</strong></td>
+<td><strong>No modern data/history features</strong></td>
+<td>No EIP-4844 blobs; no <strong>era files / EIP-4444</strong> history
+expiry.</td>
+<td>Future scalability optionality; archive footprint</td>
+</tr>
+<tr>
+<td><strong>P7</strong></td>
+<td><strong>Slower execution internals</strong></td>
+<td>Single-threaded 2018 code paths (no trie prefetch, no parallel state
+hashing, no Pebble).</td>
+<td>Throughput headroom under load</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Net effect:</strong> higher infrastructure cost, slower and
+more fragile node operations, a shrinking pool of operators willing to
+run nodes, and an accelerating maintenance/security risk as the gap to
+upstream widens.</p>
+<hr />
+<h2 id="3-root-cause">3. Root cause</h2>
+<blockquote>
+<p>The XDC client is a <strong>hard fork of go-ethereum ~1.8.x</strong>.
+The entire modernization arc — state storage (snapshot → PBSS), sync
+(fast → snap), networking (<code>eth/64</code>–<code>70</code>), and
+database (LevelDB → Pebble) — happened <strong>upstream</strong> and was
+never adopted. XDC selectively backported the <em>toolchain and EVM
+rules</em> (Go 1.25, forks through Cancun, the <code>core/txpool</code>
+package, the <code>trie/triedb/hashdb</code> layout) but kept
+<strong>2018-era state, sync, and networking</strong> — including
+<strong>no functional freezer</strong> (<code>nofreezedb</code>) and an
+actively-patched <strong>fast-sync</strong> (no snap).</p>
+</blockquote>
+<p>The fix is therefore not a feature project — it is a
+<strong>re-platforming</strong>: move XDPoS onto a base where these
+capabilities already exist, battle-tested, on Ethereum mainnet.</p>
+<hr />
+<h2 id="4-proposed-solution">4. Proposed solution</h2>
+<p>Complete the migration of <strong>XDPoS consensus onto upstream
+go-ethereum v1.17.3</strong> (the <code>reset/integration-1.17.3</code>
+line), preserving <strong>bit-exact consensus parity</strong> with
+canonical XDC, and ship it as a tagged production release with an
+operator migration path.</p>
+<p>This is <strong>the engine-room swap, not a constitutional
+change</strong>: XDC keeps its consensus, block production, rewards, and
+block hashes; it gains modern execution, storage, sync, and networking
+underneath.</p>
+<hr />
+<h2 id="5-pain--remedy-mapping">5. Pain → remedy mapping</h2>
+<table>
+<thead>
+<tr>
+<th>Pain</th>
+<th>Remedy (upstream capability)</th>
+<th>First shipped</th>
+<th>Expected outcome</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>P1</strong> unbounded full node, resync ritual</td>
+<td><strong>PBSS</strong> path-based state + <strong>online
+pruning</strong></td>
+<td>geth <code>v1.13.0</code> (default <code>v1.14.0</code>)</td>
+<td>Full node <strong>stops growing</strong>; bounded steady-state;
+<strong>no more resyncs</strong></td>
+</tr>
+<tr>
+<td><strong>P2</strong> days-long sync</td>
+<td><strong>Flat snapshot</strong> + <strong>snap sync</strong></td>
+<td><code>v1.9.13</code> / <code>v1.10.0</code></td>
+<td>Fresh node to head in <strong>hours</strong> (fleet snapshot-serving
+permitting)</td>
+</tr>
+<tr>
+<td><strong>P3</strong> huge, slow archive</td>
+<td><strong>PBSS path-scheme archive</strong> + <strong>era
+files</strong></td>
+<td><code>v1.13.0</code> / <code>v1.13.12</code></td>
+<td>Smaller, <strong>flat (O(1)) reads</strong>; slower growth</td>
+</tr>
+<tr>
+<td><strong>P4</strong> fragile peering</td>
+<td><strong><code>eth/66+</code> request IDs</strong> +
+<strong>ForkID</strong> (+ <code>eth/70</code>)</td>
+<td><code>v1.9.0</code> / <code>v1.10.0</code></td>
+<td>Robust peering; <strong>removes the custom no-RequestId
+bridge</strong></td>
+</tr>
+<tr>
+<td><strong>P5</strong> maintenance drift</td>
+<td><strong>Within one minor of upstream</strong></td>
+<td>ongoing</td>
+<td>Security fixes &amp; new EIPs land cleanly; developer mindshare; rot
+escaped</td>
+</tr>
+<tr>
+<td><strong>P6</strong> no modern data features</td>
+<td><strong>blobpool / EIP-4844</strong>, <strong>era /
+EIP-4444</strong></td>
+<td><code>v1.12.1</code> / <code>v1.13.12</code></td>
+<td>Optionality for blobs + history offloading when XDC wants them</td>
+</tr>
+<tr>
+<td><strong>P7</strong> slow internals</td>
+<td><strong>trie prefetch, parallel hashing, Pebble</strong></td>
+<td><code>v1.10</code>–<code>v1.11</code></td>
+<td>Throughput headroom</td>
+</tr>
+</tbody>
+</table>
+<p><em>(Version attributions verified against upstream git history — see
+<a
+href="./WHY-MODERN-GETH.md#4-the-7-year-improvement-timeline-183--1173"><code>WHY-MODERN-GETH.md</code>
+§4</a>.)</em></p>
+<hr />
+<h2 id="6-what-does-not-change">6. What does NOT change</h2>
+<p>This is the most important section for risk assessment. The migration
+is <strong>consensus-neutral by construction</strong>:</p>
+<ul>
+<li>✅ <strong>XDPoS consensus</strong> — v1 (round-robin) and v2
+(HotStuff-style BFT), QC/TC, epochs, masternode selection —
+<strong>unchanged</strong>.</li>
+<li>✅ <strong>Internal block production</strong> — masternodes seal
+blocks via XDC's <code>miner</code>/engine path. We <strong>do
+not</strong> adopt geth's external-CL/Engine-API model.</li>
+<li>✅ <strong>Block &amp; header RLP and hashes</strong> —
+<code>Validators</code>/<code>Validator</code>/<code>Penalties</code>
+header fields, byte-exact encoding, genesis hashes —
+<strong>unchanged</strong>.</li>
+<li>✅ <strong>Economics</strong> — fixed 12.5 gwei base fee (no burn),
+TRC21 fee routing, rewards (90/10), penalties —
+<strong>unchanged</strong>.</li>
+<li>✅ <strong>Chain identity</strong> — chain IDs (50/51), genesis,
+fork schedule, system contracts
+(<code>0x88</code>/<code>0x89</code>/<code>0x90</code>) —
+<strong>unchanged</strong>.</li>
+</ul>
+<p>For any block, the migrated node must produce an <strong>identical
+post-state root, receipts root, and block hash</strong> to canonical
+XDC. This is a hard, enforced constraint (§10, §11), not an
+aspiration.</p>
+<hr />
+<h2 id="7-why-this-is-low-risk-proof-points">7. Why this is low-risk:
+proof points</h2>
+<p>This is <strong>not a greenfield bet</strong> — the approach is
+already validated:</p>
+<ul>
+<li><strong>The branch exists and builds.</strong>
+<code>reset/integration-1.17.3</code> carries the full XDC overlay (243
+commits) on pristine geth v1.17.3.</li>
+<li><strong>Live mainnet sync verified.</strong> The branch runs on
+<strong>XDC mainnet on xdc01, synced to head</strong> (block ~103.3M,
+<code>syncing=false</code>, 24 peers) with <strong>zero
+<code>BAD BLOCK</code> / merkle-root mismatches</strong> — measured
+directly on the node, not just Apothem.</li>
+<li><strong>Measured head-to-head</strong> (both IPC, same chain head,
+vs the canonical legacy <strong>XDPoSChain v2.6.8</strong> node): 1.17.3
+is <strong>~3× smaller on disk</strong> (303 GB vs 919 GB), keeps
+<strong>~22 GB hot state</strong> vs one growing 919 GB LevelDB, and
+serves warm RPC reads <strong>~2–6× faster</strong> — same XDPoS
+consensus. (See <code>EVIDENCE-BASE.md</code> for the full table.)</li>
+<li><strong>The hard parts are mapped.</strong> The 58 surgical
+integration points, the consensus-parity invariants, and the
+version-agnostic re-port methodology are <strong>fully
+documented</strong> (<a
+href="./README.md"><code>README.md</code></a>).</li>
+<li><strong>The methodology is proven.</strong> Reset-and-replay in
+logical bundles + a consensus-parity harness is already in use and
+produced the clean branch.</li>
+</ul>
+<p>The remaining work is <strong>completion and
+productionization</strong>, not discovery.</p>
+<hr />
+<h2 id="8-approach--methodology">8. Approach &amp; methodology</h2>
+<ol type="1">
+<li><strong>Pinned base.</strong> Build on a frozen upstream tag
+(v1.17.3); catch up to newer upstream only after parity holds.</li>
+<li><strong>Reset-and-replay in bundles.</strong> The XDC overlay is
+replayed as logical bundles (config/genesis → V1 engine → header
+plumbing → bulk-sync → V2 engine → …), each built, tested, and merged
+independently, foundation-first.</li>
+<li><strong>Consensus-parity harness as the gate.</strong> Every
+consensus-touching change is validated to produce bit-exact state roots
+/ receipts roots / block hashes vs canonical XDC, across normal blocks
+<strong>and fork-boundary blocks</strong> (V2 switch, EIP-1559
+activation).</li>
+<li><strong>Staged rollout behind the "inertness window."</strong> Most
+ported changes activate only at specific fork heights, so a node can
+sync the early chain on the current binary and switch to the new binary
+before the relevant fork — enabling low-risk, incremental production
+validation.</li>
+</ol>
+<hr />
+<h2 id="9-phased-plan--milestones">9. Phased plan &amp; milestones</h2>
+<table>
+<thead>
+<tr>
+<th>Phase</th>
+<th>Milestones</th>
+<th>Status</th>
+<th>Exit criteria</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>1 — Foundation &amp; sync</strong></td>
+<td>Chain recognition, engine, <strong>block &amp; state
+parity</strong>, mainnet sync (M1–M6)</td>
+<td><strong>Done</strong> — xdc01 on <strong>mainnet, synced to
+head</strong> (~103.3M, zero divergence)</td>
+<td>genesis→head, zero BAD BLOCK</td>
+</tr>
+<tr>
+<td><strong>2 — Mainnet &amp; RPC parity</strong></td>
+<td>XDC <strong>mainnet sync</strong> (M6), <strong>RPC parity</strong>
+(M7)</td>
+<td>In progress / next</td>
+<td>Mainnet genesis→head parity; 100% RPC parity vs geth-XDC</td>
+</tr>
+<tr>
+<td><strong>3 — Productionize &amp; release</strong></td>
+<td>Operator docs, <strong>migration guide from geth-XDC</strong>,
+staged rollout (canary → fresh-wipe validation → soak → mainnet),
+<strong>tagged release</strong></td>
+<td>Planned</td>
+<td>External operator runs a node from docs; production soak clean</td>
+</tr>
+<tr>
+<td><strong>4 — Ecosystem (optional)</strong></td>
+<td>Masternode block production on new client (M8);
+<strong>snapshot-serving fleet</strong> to unlock snap sync
+network-wide</td>
+<td>Optional / future</td>
+<td>Mixed-client masternode network produces accepted blocks; snap sync
+available</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="10-risks--mitigations">10. Risks &amp; mitigations</h2>
+<table>
+<thead>
+<tr>
+<th>Risk</th>
+<th>Severity</th>
+<th>Mitigation</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Consensus parity divergence</strong></td>
+<td><strong>P0</strong></td>
+<td>Parity harness on every consensus-touching change; bit-exact gates
+on fork boundaries; staged rollout behind the inertness window; treat
+any mismatch as stop-the-line</td>
+</tr>
+<tr>
+<td>Snap sync needs the fleet to <strong>serve snapshots</strong></td>
+<td>Medium</td>
+<td>Interim continuous full-sync driver already works; enable snap
+incrementally as the fleet upgrades (Phase 4)</td>
+</tr>
+<tr>
+<td><strong>Operator migration friction</strong></td>
+<td>Medium</td>
+<td>Migration guide; parallel-run period; preserve data compatibility
+where feasible; clear rollback runbook</td>
+</tr>
+<tr>
+<td><strong>Scope creep</strong> into consensus "improvements"</td>
+<td>Medium</td>
+<td>Hard rule: <strong>re-platform only, no consensus changes</strong>;
+ADRs for any deviation; parity harness blocks accidental drift</td>
+</tr>
+<tr>
+<td>Upstream <strong>churn</strong> during the effort</td>
+<td>Low</td>
+<td>Freeze on the pinned v1.17.3 base; catch up to newer upstream only
+after parity is green</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="11-success-criteria">11. Success criteria</h2>
+<p>The migration is <strong>done</strong> when:</p>
+<ol type="1">
+<li><strong>Bit-exact consensus parity</strong> — Apothem
+<strong>and</strong> mainnet sync genesis→head with post-state root +
+receipts root + block hash matching canonical XDC; <strong>zero
+<code>BAD BLOCK</code></strong> records across the full range, including
+fork boundaries.</li>
+<li><strong>Bounded full node</strong> — with PBSS, the state portion
+stops growing; steady-state disk is bounded; <strong>no resync
+required</strong>.</li>
+<li><strong>Fast sync</strong> — a fresh node reaches head materially
+faster than today (target: hours via snap/continuous sync).</li>
+<li><strong>100% RPC parity</strong> — every documented XDC RPC method
+matches geth-XDC in shape and value (<code>XDPoS_*</code>, XDC
+<code>eth_*</code> extensions, block fields).</li>
+<li><strong>Upstream proximity</strong> — within one minor version of
+upstream geth, with parity still passing.</li>
+<li><strong>Operability</strong> — an external operator can follow the
+docs and run a syncing node; a clean migration path exists from the
+current client.</li>
+</ol>
+<hr />
+<h2 id="12-effort--timeline">12. Effort &amp; timeline</h2>
+<p><em>Order-of-magnitude estimate, to be validated against
+parity-harness results and fleet readiness — not a commitment.</em></p>
+<ul>
+<li><strong>Phase 2 (mainnet + RPC parity):</strong> weeks — dominated
+by mainnet parity validation across fork boundaries and closing the
+documented RPC gaps (stale <code>gen_header_json.go</code>, namespace
+casing, <code>EventAPI</code>).</li>
+<li><strong>Phase 3 (productionize + release):</strong> weeks — operator
+docs, migration guide, staged rollout + soak, tagged release.</li>
+<li><strong>To production v1.0:</strong> on the order of <strong>a
+quarter</strong>, contingent on parity results and fleet upgrade
+cadence.</li>
+<li><strong>Phase 4 (optional):</strong> separate workstream; masternode
+block production requires its own design review before
+implementation.</li>
+</ul>
+<p>The dominant cost is <strong>validation rigor</strong> (parity), not
+net-new feature development — most of the build is complete.</p>
+<hr />
+<h2 id="13-recommendation--decision-requested">13. Recommendation &amp;
+decision requested</h2>
+<p><strong>Recommendation: land it.</strong> The branch is built and
+de-risked — <strong>xdc01 runs it on XDC mainnet, synced to
+head</strong> (~103.3M, <code>syncing=false</code>, 24 peers, zero
+divergence) — and it changes nothing at the consensus layer. What
+remains is validation, not discovery.</p>
+<p><strong>Asks:</strong></p>
+<ol type="1">
+<li><strong>Approve</strong> taking
+<code>reset/integration-1.17.3</code> to a tagged production
+release.</li>
+<li><strong>Adopt the consensus-parity harness as the mandatory release
+gate.</strong></li>
+<li><strong>Resource Phases 2–3</strong> (mainnet + RPC parity, then
+productionization &amp; rollout).</li>
+<li><strong>Defer Phase 4</strong> (masternode production,
+snapshot-serving fleet) to a follow-on decision after Phase 3 soak.</li>
+</ol>
+<hr />
+<h2 id="14-appendix">14. Appendix</h2>
+<h3 id="verified-feature--first-upstream-release-map">Verified feature →
+first-upstream-release map</h3>
+<p>freezer + ForkID <code>v1.9.0</code> · snapshot <code>v1.9.13</code>
+· snap sync + offline pruner + <code>eth/66</code> <code>v1.10.0</code>
+(snap default <code>v1.10.4</code>) · Engine API <code>v1.10.3</code> ·
+EIP-1559 <code>v1.10.4</code> · <code>eth/67</code>
+<code>v1.10.19</code> · Merge TTD <code>v1.10.22</code> · Pebble
+<code>v1.11.0</code> (default <code>v1.12.0</code>) +
+<code>eth/68</code> · subpool + blobpool code <code>v1.12.1</code> ·
+<strong>PBSS shipped <code>v1.13.0</code> (default
+<code>v1.14.0</code>)</strong> · era files <code>v1.13.12</code> ·
+<code>eth/69</code> <code>v1.16.0</code> · <code>eth/70</code>
+<code>v1.17.3</code>. <em>(Code-ship vs feature-ship reconciled against
+EF release blogs — see <a
+href="./EVIDENCE-BASE.md"><code>EVIDENCE-BASE.md</code></a>.)</em></p>
+<h3 id="companion-documents">Companion documents</h3>
+<ul>
+<li><a href="./README.md"><code>README.md</code></a> — the
+version-agnostic reproduction guide (the <em>how</em>).</li>
+<li><a href="./WHY-MODERN-GETH.md"><code>WHY-MODERN-GETH.md</code></a> —
+the engineering rationale &amp; disk economics (the <em>why</em>).</li>
+<li><a href="./EVIDENCE-BASE.md"><code>EVIDENCE-BASE.md</code></a> —
+externally-sourced, adversarially-verified citations (geth release
+blogs, EIPs, devp2p spec) for the technical claims in this
+proposal.</li>
+<li><a href="https://github.com/XDCIndia/go-ethereum/pull/827">PR
+#827</a> — the documentation set this proposal accompanies.</li>
+</ul>
+<h3 id="glossary">Glossary</h3>
+<ul>
+<li><strong>PBSS</strong> — path-based state storage; trie nodes keyed
+by path with a bounded, self-pruning state-history window.</li>
+<li><strong>Snapshot</strong> — flat account/storage acceleration layer
+enabling O(1) reads and snap sync.</li>
+<li><strong>Snap sync</strong> — range-based state download + trie
+healing (vs. node-by-node fast sync).</li>
+<li><strong>Parity</strong> — bit-exact post-state root / receipts root
+/ block hash equality vs canonical XDC.</li>
+<li><strong>Inertness window</strong> — the span before a fork's
+activation height during which ported changes are dormant, enabling
+staged rollout.</li>
+</ul>
+<hr />
+<p><em>DRAFT prepared 2026-06-01 for XDC Core review. Pain points and
+remedies are grounded in verified analysis of the local
+<code>XDPoSChain</code> (v2.7.0-beta) and
+<code>XDCIndia/go-ethereum</code> <code>reset/integration-1.17.3</code>
+checkouts. Can be reframed as an XDCIP or condensed into a one-page
+leadership memo on request.</em></p>
+
+  </main>
+</div>
+<a href="#top" class="top-link" id="topLink" title="Back to top">↑</a>
+<script>
+(function(){
+  // active-section highlight
+  var links = Array.prototype.slice.call(document.querySelectorAll('.sidebar a'));
+  var map = {};
+  links.forEach(function(a){ var id=a.getAttribute('href').slice(1); map[id]=a; });
+  var heads = Array.prototype.slice.call(document.querySelectorAll('h2[id],h3[id]'));
+  var obs = new IntersectionObserver(function(entries){
+    entries.forEach(function(e){
+      if(e.isIntersecting){
+        links.forEach(function(l){l.classList.remove('active');});
+        var a = map[e.target.id]; if(a){a.classList.add('active'); a.scrollIntoView({block:'nearest'});}
+      }
+    });
+  },{rootMargin:'0px 0px -78% 0px'});
+  heads.forEach(function(h){obs.observe(h);});
+
+  // fragility badge coloring
+  document.querySelectorAll('strong,td,li,p').forEach(function(el){
+    if(el.children.length===0||el.tagName==='TD'){
+      el.innerHTML = el.innerHTML
+        .replace(/\bFragility:\s*(HIGH)\b/g,'Fragility: <span class="frag frag-high">$1</span>')
+        .replace(/\bFragility:\s*(MED(?:-HIGH|–HIGH|-MED)?|MEDIUM|MED–HIGH|MED-HIGH)\b/g,'Fragility: <span class="frag frag-med">$1</span>')
+        .replace(/\bFragility:\s*(LOW(?:-MED|–MED|-MED)?)\b/g,'Fragility: <span class="frag frag-low">$1</span>');
+    }
+  });
+
+  // back to top
+  var topLink=document.getElementById('topLink');
+  window.addEventListener('scroll',function(){ topLink.classList.toggle('show', window.scrollY>500); });
+
+  // mobile sidebar
+  var sb=document.getElementById('sidebar'), btn=document.getElementById('menuBtn');
+  if(btn){ btn.addEventListener('click',function(){sb.classList.toggle('open');}); }
+  document.querySelectorAll('.sidebar a').forEach(function(a){a.addEventListener('click',function(){sb.classList.remove('open');});});
+})();
+</script>
+</body>
+</html>

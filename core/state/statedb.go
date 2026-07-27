@@ -22,6 +22,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"math/big"
 	"slices"
 	"sort"
 	"sync"
@@ -339,6 +340,17 @@ func (s *StateDB) GetBalance(addr common.Address) *uint256.Int {
 	return common.U2560
 }
 
+// GetBigBalance returns the BigBalance overflow value if set, else nil. XDC chains
+// can hold balances greater than uint256max; this exposes the true big.Int value to
+// callers (e.g. CanTransfer) that need overflow-aware semantics.
+func (s *StateDB) GetBigBalance(addr common.Address) *big.Int {
+	stateObject := s.getStateObject(addr)
+	if stateObject != nil && stateObject.data.BigBalance != nil {
+		return new(big.Int).Set(stateObject.data.BigBalance)
+	}
+	return nil
+}
+
 // GetNonce retrieves the nonce from the given address or 0 if object not found
 func (s *StateDB) GetNonce(addr common.Address) uint64 {
 	stateObject := s.getStateObject(addr)
@@ -465,6 +477,24 @@ func (s *StateDB) SubBalance(addr common.Address, amount *uint256.Int, reason tr
 	}
 	if amount.IsZero() {
 		return *(stateObject.Balance())
+	}
+	// If the account has BigBalance (overflow), use big.Int arithmetic
+	if stateObject.data.BigBalance != nil {
+		bigAmount := amount.ToBig()
+		newBigBal := new(big.Int).Sub(stateObject.data.BigBalance, bigAmount)
+		prev := *stateObject.data.Balance
+		stateObject.db.journal.balanceChange(stateObject.address, stateObject.data.Balance, stateObject.data.BigBalance)
+		result, overflow := uint256.FromBig(newBigBal)
+		if overflow {
+			// Still > uint256 after subtraction
+			stateObject.data.Balance = result
+			stateObject.data.BigBalance = newBigBal
+		} else {
+			// Now fits in uint256
+			stateObject.data.Balance = result
+			stateObject.data.BigBalance = nil
+		}
+		return prev
 	}
 	return stateObject.SetBalance(new(uint256.Int).Sub(stateObject.Balance(), amount))
 }

@@ -1,0 +1,814 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>XDC Port Status — xdc-network vs reset/1.17.3</title>
+<style>
+  :root {
+    --xdc-primary: #1a8cff;
+    --xdc-accent: #00d9a3;
+    --bg: #0f1218;
+    --bg-elevated: #1a1f2b;
+    --bg-card: #232938;
+    --text: #e5e7eb;
+    --text-muted: #9ca3af;
+    --border: #2d3548;
+    --done: #22c55e;
+    --critical: #ef4444;
+    --pending: #f59e0b;
+    --deferred: #6b7280;
+    --not-needed: #475569;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.5;
+    padding-bottom: 4rem;
+  }
+  header {
+    background: linear-gradient(135deg, #0a1929 0%, #1a3050 100%);
+    padding: 3rem 2rem 1.5rem;
+    text-align: center;
+    border-bottom: 1px solid var(--border);
+  }
+  header h1 {
+    font-size: 1.9rem;
+    background: linear-gradient(90deg, var(--xdc-primary), var(--xdc-accent));
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+  }
+  header p {
+    color: var(--text-muted);
+    max-width: 720px;
+    margin: 0.5rem auto 0;
+  }
+  main { max-width: 1400px; margin: 2rem auto; padding: 0 2rem; }
+
+  /* Progress dashboard */
+  .dashboard {
+    display: grid;
+    grid-template-columns: 1.2fr 1fr;
+    gap: 1.5rem;
+    margin-bottom: 2rem;
+  }
+  .progress-card, .stats-card {
+    background: var(--bg-elevated);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 1.5rem;
+  }
+  .progress-card h2, .stats-card h2 {
+    font-size: 0.85rem;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    margin-bottom: 1rem;
+  }
+  .progress-bar {
+    height: 28px;
+    background: var(--bg);
+    border-radius: 14px;
+    overflow: hidden;
+    border: 1px solid var(--border);
+    display: flex;
+    margin-bottom: 0.75rem;
+  }
+  .progress-seg {
+    height: 100%;
+    transition: width 0.4s;
+    position: relative;
+  }
+  .progress-seg.done { background: linear-gradient(90deg, var(--done), #16a34a); }
+  .progress-seg.pending { background: linear-gradient(90deg, var(--pending), #d97706); }
+  .progress-seg.deferred { background: linear-gradient(90deg, var(--deferred), #475569); }
+  .progress-seg.not-needed { background: linear-gradient(90deg, var(--not-needed), #334155); }
+
+  .progress-legend {
+    display: flex;
+    gap: 1.5rem;
+    flex-wrap: wrap;
+    font-size: 0.8rem;
+  }
+  .progress-legend .item {
+    display: flex; align-items: center; gap: 0.4rem;
+  }
+  .progress-legend .swatch { width: 14px; height: 14px; border-radius: 4px; }
+  .progress-legend .pct { color: var(--text-muted); margin-left: 0.25rem; }
+
+  .stats-grid {
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 0.75rem;
+  }
+  .stat-tile {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 0.9rem;
+    text-align: center;
+  }
+  .stat-tile .num {
+    font-size: 1.8rem;
+    font-weight: 700;
+  }
+  .stat-tile.done .num { color: var(--done); }
+  .stat-tile.pending .num { color: var(--pending); }
+  .stat-tile.deferred .num { color: var(--deferred); }
+  .stat-tile.not-needed .num { color: var(--not-needed); }
+  .stat-tile .lbl {
+    font-size: 0.7rem;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    margin-top: 4px;
+  }
+
+  /* Critical issues banner */
+  .critical-banner {
+    background: linear-gradient(135deg, rgba(239,68,68,0.1), rgba(245,158,11,0.05));
+    border: 1px solid rgba(239,68,68,0.3);
+    border-radius: 12px;
+    padding: 1rem 1.25rem;
+    margin-bottom: 2rem;
+    display: flex;
+    gap: 1rem;
+    align-items: center;
+  }
+  .critical-banner .icon {
+    font-size: 1.5rem;
+  }
+  .critical-banner .body {
+    flex: 1;
+  }
+  .critical-banner strong { color: #fbbf24; }
+  .critical-banner .body p { color: var(--text-muted); font-size: 0.85rem; margin-top: 0.25rem; }
+
+  /* Batch summary */
+  .batches {
+    background: var(--bg-elevated);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 1.5rem;
+    margin-bottom: 2rem;
+  }
+  .batches h2 {
+    font-size: 0.85rem;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    margin-bottom: 1rem;
+  }
+  .batch-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    gap: 0.75rem;
+  }
+  .batch {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-left: 4px solid var(--done);
+    padding: 1rem;
+    border-radius: 8px;
+  }
+  .batch.deferred { border-left-color: var(--deferred); }
+  .batch-name {
+    font-size: 0.7rem;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+  }
+  .batch-title {
+    font-size: 0.95rem;
+    margin: 0.25rem 0 0.5rem;
+    font-weight: 600;
+  }
+  .batch-files {
+    font-size: 0.75rem;
+    color: var(--text-muted);
+  }
+  .batch-status {
+    display: inline-block;
+    font-size: 0.65rem;
+    padding: 2px 8px;
+    border-radius: 12px;
+    background: var(--done);
+    color: var(--bg);
+    margin-top: 0.5rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+  }
+  .batch.deferred .batch-status {
+    background: var(--deferred);
+    color: white;
+  }
+
+  /* Filters */
+  .controls {
+    display: flex;
+    gap: 0.5rem;
+    margin-bottom: 1rem;
+    flex-wrap: wrap;
+    align-items: center;
+  }
+  .search {
+    flex: 1;
+    min-width: 200px;
+    background: var(--bg-elevated);
+    border: 1px solid var(--border);
+    color: var(--text);
+    padding: 0.6rem 1rem;
+    border-radius: 8px;
+    font-size: 0.9rem;
+  }
+  .search:focus { outline: none; border-color: var(--xdc-primary); }
+  .filter-btn {
+    background: var(--bg-elevated);
+    border: 1px solid var(--border);
+    color: var(--text);
+    padding: 0.55rem 0.95rem;
+    border-radius: 8px;
+    cursor: pointer;
+    font-size: 0.8rem;
+    transition: all 0.15s;
+  }
+  .filter-btn:hover { background: var(--bg-card); }
+  .filter-btn.active {
+    background: var(--xdc-primary);
+    border-color: var(--xdc-primary);
+  }
+  .filter-btn.active.done { background: var(--done); border-color: var(--done); color: white; }
+  .filter-btn.active.pending { background: var(--pending); border-color: var(--pending); color: var(--bg); }
+  .filter-btn.active.deferred { background: var(--deferred); border-color: var(--deferred); color: white; }
+  .filter-btn.active.not-needed { background: var(--not-needed); border-color: var(--not-needed); color: white; }
+
+  /* File table */
+  .file-table {
+    background: var(--bg-elevated);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    overflow: hidden;
+  }
+  .file-row {
+    display: grid;
+    grid-template-columns: 110px 2.5fr 1fr 90px;
+    gap: 0.75rem;
+    padding: 0.9rem 1.25rem;
+    border-bottom: 1px solid var(--border);
+    align-items: center;
+    cursor: pointer;
+    transition: background 0.15s;
+  }
+  .file-row:hover { background: var(--bg-card); }
+  .file-row:last-child { border-bottom: none; }
+  .file-row.header {
+    background: var(--bg-card);
+    cursor: default;
+    font-size: 0.7rem;
+    text-transform: uppercase;
+    color: var(--text-muted);
+    letter-spacing: 0.05em;
+    font-weight: 600;
+  }
+  .file-row.header:hover { background: var(--bg-card); }
+
+  .file-path {
+    font-family: "SF Mono", Monaco, Consolas, monospace;
+    font-size: 0.78rem;
+    color: var(--text);
+    word-break: break-all;
+  }
+  .file-note {
+    color: var(--text-muted);
+    font-size: 0.78rem;
+  }
+  .file-category {
+    font-size: 0.7rem;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+  }
+  .status-pill {
+    font-size: 0.65rem;
+    padding: 3px 10px;
+    border-radius: 10px;
+    text-align: center;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    white-space: nowrap;
+  }
+  .status-pill.done { background: rgba(34,197,94,0.15); color: #4ade80; border: 1px solid rgba(34,197,94,0.3); }
+  .status-pill.pending { background: rgba(245,158,11,0.15); color: #fbbf24; border: 1px solid rgba(245,158,11,0.3); }
+  .status-pill.deferred { background: rgba(107,114,128,0.15); color: #9ca3af; border: 1px solid rgba(107,114,128,0.3); }
+  .status-pill.not-needed { background: rgba(71,85,105,0.15); color: #64748b; border: 1px solid rgba(71,85,105,0.3); }
+
+  .file-details {
+    grid-column: 1 / -1;
+    max-height: 0;
+    overflow: hidden;
+    transition: max-height 0.3s;
+    color: var(--text-muted);
+    font-size: 0.85rem;
+  }
+  .file-row.open { background: var(--bg-card); }
+  .file-row.open .file-details {
+    max-height: 600px;
+    margin-top: 0.75rem;
+    padding-top: 0.75rem;
+    border-top: 1px solid var(--border);
+  }
+  .file-details .what-done {
+    background: rgba(34,197,94,0.06);
+    border-left: 3px solid var(--done);
+    padding: 0.6rem 0.9rem;
+    border-radius: 4px;
+    margin-bottom: 0.5rem;
+  }
+  .file-details .what-remains {
+    background: rgba(245,158,11,0.06);
+    border-left: 3px solid var(--pending);
+    padding: 0.6rem 0.9rem;
+    border-radius: 4px;
+    margin-bottom: 0.5rem;
+  }
+  .file-details .why-defer {
+    background: rgba(107,114,128,0.06);
+    border-left: 3px solid var(--deferred);
+    padding: 0.6rem 0.9rem;
+    border-radius: 4px;
+    margin-bottom: 0.5rem;
+  }
+  .file-details strong { color: var(--text); }
+
+  footer {
+    text-align: center;
+    padding: 2rem;
+    color: var(--text-muted);
+    font-size: 0.8rem;
+  }
+  footer code { background: var(--bg-elevated); padding: 1px 6px; border-radius: 4px; }
+
+  .hidden { display: none !important; }
+
+  @media (max-width: 900px) {
+    .dashboard { grid-template-columns: 1fr; }
+    .file-row { grid-template-columns: 1fr; gap: 0.5rem; }
+    .file-row.header { display: none; }
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>XDC Port Status — xdc-network → reset/1.17.3</h1>
+  <p>Deep comparison of the canonical XDC <code style="background:rgba(255,255,255,0.1);padding:1px 6px;border-radius:4px">xdc-network</code> branch against the current 1.17.3 reset branch. Tracks every Go file XDC modified, what's been ported, and what remains.</p>
+</header>
+
+<main>
+
+  <!-- Critical issue banner -->
+  <div class="critical-banner">
+    <div class="icon">✦</div>
+    <div class="body">
+      <strong>Latest session: 11 critical files ported in 3 commits</strong>
+      <p>Batch A (EVM consensus parity) + Batch B (V2 engine activation) + Batch C1 (V2 message accept) + Batch D (RPC + tx-pool) all merged into <code>fix/pathdb-rlp-import</code>. Build + vet clean. Most changes are inert until ~56.8M (V2 switch) or ~61.29M (Berlin/EIP-1559) — current sync at ~7M unaffected.</p>
+    </div>
+  </div>
+
+  <!-- Dashboard -->
+  <section class="dashboard">
+    <div class="progress-card">
+      <h2>Overall porting progress</h2>
+      <div class="progress-bar" id="progressBar"></div>
+      <div class="progress-legend">
+        <div class="item"><div class="swatch" style="background:var(--done)"></div>Ported <span class="pct" id="pct-done">--</span></div>
+        <div class="item"><div class="swatch" style="background:var(--pending)"></div>Pending <span class="pct" id="pct-pending">--</span></div>
+        <div class="item"><div class="swatch" style="background:var(--deferred)"></div>Deferred <span class="pct" id="pct-deferred">--</span></div>
+        <div class="item"><div class="swatch" style="background:var(--not-needed)"></div>Not needed <span class="pct" id="pct-not-needed">--</span></div>
+      </div>
+    </div>
+
+    <div class="stats-card">
+      <h2>Status counts</h2>
+      <div class="stats-grid">
+        <div class="stat-tile done"><div class="num" id="count-done">0</div><div class="lbl">Done</div></div>
+        <div class="stat-tile pending"><div class="num" id="count-pending">0</div><div class="lbl">Pending</div></div>
+        <div class="stat-tile deferred"><div class="num" id="count-deferred">0</div><div class="lbl">Deferred</div></div>
+        <div class="stat-tile not-needed"><div class="num" id="count-not-needed">0</div><div class="lbl">Not needed</div></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Batch summary -->
+  <section class="batches">
+    <h2>Port batches — this session</h2>
+    <div class="batch-grid">
+      <div class="batch">
+        <div class="batch-name">Batch A</div>
+        <div class="batch-title">EVM consensus parity</div>
+        <div class="batch-files">4 files: XDCBaseFee, EIP-1559, XDCBerlin precompile, EIP-2028 disable</div>
+        <div class="batch-status">Done</div>
+      </div>
+      <div class="batch">
+        <div class="batch-name">Batch B</div>
+        <div class="batch-title">V2 engine wiring</div>
+        <div class="batch-files">2 files: backend.go + blockchain_reader.go (GetTrustedCheckpointAnchor)</div>
+        <div class="batch-status">Done</div>
+      </div>
+      <div class="batch">
+        <div class="batch-name">Batch C1</div>
+        <div class="batch-title">V2 BFT message accept</div>
+        <div class="batch-files">1 file: handler_eth.go (Vote/Timeout/SyncInfo no-op stubs)</div>
+        <div class="batch-status">Done</div>
+      </div>
+      <div class="batch">
+        <div class="batch-name">Batch D</div>
+        <div class="batch-title">RPC + tx-pool parity</div>
+        <div class="batch-files">3 files: xdc-prefix, xdpos JS module, blacklist guard</div>
+        <div class="batch-status">Done</div>
+      </div>
+      <div class="batch deferred">
+        <div class="batch-name">Batch C2</div>
+        <div class="batch-title">Broadcast LRU caches</div>
+        <div class="batch-files">2 files: peer.go + peerset.go. Deferred — only matters for masternode mode (M8)</div>
+        <div class="batch-status">Deferred</div>
+      </div>
+      <div class="batch deferred">
+        <div class="batch-name">Robustness</div>
+        <div class="batch-title">#638 sync stability fixes</div>
+        <div class="batch-files">4 files: fetchers_concurrent, queue, dial, util. Deferred — XDC timing overrides 1.17.3 defaults</div>
+        <div class="batch-status">Deferred</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Filter controls -->
+  <div class="controls">
+    <input type="search" class="search" id="search" placeholder="Search files... (try: backend, eip1559, txpool)">
+    <button class="filter-btn active" data-filter="all">All</button>
+    <button class="filter-btn done" data-filter="done">Done</button>
+    <button class="filter-btn pending" data-filter="pending">Pending</button>
+    <button class="filter-btn deferred" data-filter="deferred">Deferred</button>
+    <button class="filter-btn not-needed" data-filter="not-needed">Not needed</button>
+  </div>
+
+  <!-- File table -->
+  <section class="file-table" id="fileTable">
+    <div class="file-row header">
+      <div>Status</div>
+      <div>File</div>
+      <div>Category</div>
+      <div>Impact</div>
+    </div>
+    <!-- rows populated by JS -->
+  </section>
+
+</main>
+
+<footer>
+  Source audit: <code>docs/port/PENDING_PORTS_FROM_XDC_NETWORK.md</code> &middot;
+  Branch: <code>fix/pathdb-rlp-import</code> @ XDCIndia/go-ethereum &middot;
+  49 Go files audited (excluding tests, docs, .github artifacts)
+</footer>
+
+<script>
+const FILES = [
+  // ============= DONE THIS SESSION =============
+  { p: "params/protocol_params.go", cat: "EVM Params", status: "done", impact: "critical",
+    done: "Added XDCBaseFee = 12,500,000,000 wei (12.5 gwei) constant. Trivial 8-line addition.",
+    note: "Dependency for eip1559.go XDC base-fee returns." },
+
+  { p: "consensus/misc/eip1559/eip1559.go", cat: "EVM Consensus", status: "done", impact: "critical",
+    done: "Replaced IsLondon→IsEIP1559 throughout. CalcBaseFee returns XDCBaseFee for XDC chains. Skip elasticity-multiplier at fork. Added checkpoint-sync relaxations for parent BaseFee=nil and parent GasUsed=0 carry-forward.",
+    note: "Without this, every post-EIP-1559 block fails base-fee verification." },
+
+  { p: "core/vm/contracts.go", cat: "EVM Precompiles", status: "done", impact: "critical",
+    done: "Added PrecompiledContractsXDCBerlin (MODEXP with eip2565: false). Selected when rules.IsXDC && !rules.IsEIP1559.",
+    note: "Without this, MODEXP gas-used diverges on every block containing MODEXP in the Berlin..pre-EIP1559 stretch." },
+
+  { p: "core/txpool/validation.go", cat: "TxPool", status: "done", impact: "critical",
+    done: "Branch on opts.Config.IsXDC() to disable EIP-2028 (calldata gas reduction). XDC always uses 68 gas per non-zero byte.",
+    note: "Without this, intrinsic-gas calculation diverges on every tx with calldata." },
+
+  { p: "common/bytes.go", cat: "Common", status: "done", impact: "critical",
+    done: "FromHex now accepts xdc/XDC prefix (in addition to 0x/0X). Added hasXdcPrefix helper.",
+    note: "XDC display format uses xdc prefix. Without this, JSON-RPC calls with xdc... silently produce zero address." },
+
+  { p: "internal/web3ext/web3ext.go", cat: "RPC", status: "done", impact: "critical",
+    done: "Registered xdpos JS module (XDPoSJs constant) so web3.xdpos.* methods work from console.",
+    note: "XDPoSJs definition was already in web3ext_xdc.go but not wired into the Modules map." },
+
+  { p: "core/txpool/legacypool/legacypool.go", cat: "TxPool", status: "done", impact: "critical",
+    done: "Added XDC blacklist enforcement at validateTx prologue. Past BlackListHFNumber, rejects txs where sender or recipient is on common.IsInBlacklist. Added ErrBlacklisted error.",
+    note: "Canonical XDPoSChain enforces this at mempool layer." },
+
+  { p: "eth/backend.go", cat: "Backend Wiring", status: "done", impact: "critical",
+    done: "After LoadChainConfig: CopyXDCConstants + SetNetworkConstants. After NewBlockChain: cast to *XDPoS.XDPoS, call AttachConsensusV1/V2Hooks, construct engine_v2.New, wire HookCommitBlock (SetFinalized), SetEngineV2, forward HookReward via SetHookReward.",
+    note: "THE highest-leverage gap. Without this, XDPoS.EngineV2 stays nil and V2 blocks pass through V1 light-verify fast path — no QC checks, no rewards, no finality." },
+
+  { p: "core/blockchain_reader.go", cat: "Chain Reader", status: "done", impact: "critical",
+    done: "Added GetTrustedCheckpointAnchor() (uint64, common.Hash, bool) backed by historyPrunePoint. Returns active=false until full checkpoint-sync support lands.",
+    note: "V2 engine asserts this interface on the chain to relax round-based QC checks within ~1 epoch of anchor." },
+
+  { p: "eth/handler_eth.go", cat: "Wire Handler", status: "done", impact: "critical",
+    done: "Added accept-and-ignore cases for VotePacket (0xe0), TimeoutPacket (0xe1), SyncInfoPacket (0xe2). Previously fell through to 'unexpected eth packet type' and dropped peer.",
+    note: "Full BFT dispatch deferred to M8 (requires bft.Bfter plumbing + peer.SetHead). Sync-only nodes don't need dispatch." },
+
+  // ============= DONE PREVIOUSLY =============
+  { p: "triedb/pathdb/reader.go", cat: "State Reader", status: "done", impact: "critical",
+    done: "PR #796 — uses types.DecodeSlimAccount at both diffLayer and diskLayer read sites for BigBalance support.",
+    note: "Root cause of block 2700 panic. Unblocked sync past block 2700 → 7M+." },
+
+  { p: "core/types/state_account.go", cat: "State Types", status: "done", impact: "critical",
+    done: "SlimAccount.BigBalance (*big.Int) field + custom RLP encoder/decoder (DecodeSlimAccount) that handles balance > 2^256-1.",
+    note: "Foundation accounts can hold balances exceeding uint256." },
+
+  { p: "core/state/snapshot/disklayer.go", cat: "Snapshot", status: "done", impact: "critical",
+    done: "Uses types.DecodeSlimAccount for BigBalance support. Same for difflayer.go.",
+    note: "" },
+
+  { p: "core/state/reader.go", cat: "State Reader", status: "done", impact: "critical",
+    done: "multiStateReader.Account wraps reader calls in defer/recover for decode panic safety.",
+    note: "" },
+
+  { p: "trie/secure_trie.go", cat: "State Trie", status: "done", impact: "critical",
+    done: "StateTrie.GetAccount wrapped in defer/recover for decode panic safety.",
+    note: "" },
+
+  { p: "core/state_processor.go", cat: "State Processor", status: "done", impact: "critical",
+    done: "TIPSigning fork wipe (SelfDestruct 0x89 at common.TIPSigning). Process() dispatches BlockSignersBinary → ApplySigningTransaction. parentState := statedb.Copy() at entry, then SetParentState before Finalize.",
+    note: "" },
+
+  { p: "core/blockchain.go", cat: "BlockChain", status: "done", impact: "critical",
+    done: "writeBlockWithState: P1 checkpoint trie commit (every epoch) + V2 switch block trie commit.",
+    note: "" },
+
+  { p: "core/block_validator.go", cat: "Validator", status: "done", impact: "critical",
+    done: "TrustedSyncCheckpoint parent allowance, checkpointSyncNoState skip path, genesis-sync early-block allowance, CacheSigningTxsFromBlock hook, gas-mismatch tolerance during checkpoint sync.",
+    note: "" },
+
+  { p: "core/vm/jump_table.go", cat: "EVM Tables", status: "done", impact: "critical",
+    done: "Added newXDCBerlinInstructionSet (= Istanbul, no EIP-2929), newXDCLondonInstructionSet (+EIP-3198), newXDCMergeInstructionSet (+PREVRANDAO), newXDCShanghaiInstructionSet (+PUSH0).",
+    note: "" },
+
+  { p: "core/vm/evm.go", cat: "EVM", status: "done", impact: "critical",
+    done: "Dispatch: isXDC && IsEIP1559(blockNum) → shanghaiInstructionSet, else XDC marker variants.",
+    note: "" },
+
+  { p: "core/genesis.go", cat: "Genesis", status: "done", impact: "critical",
+    done: "patchMissingForkBlocks helper + 3 patch points (SetupGenesisBlock + LoadChainConfig) for V2/TrustedSyncCheckpoints/fork blocks.",
+    note: "" },
+
+  { p: "eth/sync_xdc.go", cat: "Sync", status: "done", impact: "critical",
+    done: "Continuous sync loop replacing BeaconSync. xdcBatchSize=4096, XdcBulkSyncMode flag, peer.XDCHeaderResp/XDCBodyResp bypass dispatcher.",
+    note: "" },
+
+  { p: "eth/protocols/eth/peer.go", cat: "Wire Protocol", status: "done", impact: "critical",
+    done: "XDCHeaderResp/XDCBodyResp channels. RequestHeadersBy*/RequestBodies branch on XDPOS2 → bare wire shape.",
+    note: "" },
+
+  { p: "eth/protocols/eth/handlers.go", cat: "Wire Protocol", status: "done", impact: "critical",
+    done: "handleBlockHeaders/Bodies XDPOS2 branch: bare decode + push to peer.XDC*Resp channel. handleGetBlockHeaders/Bodies XDPOS2 branch: decode bare + ReplyBlockHeadersRLPLegacy.",
+    note: "" },
+
+  { p: "eth/protocols/eth/handler.go", cat: "Wire Protocol", status: "done", impact: "critical",
+    done: "xdpos2 handler map includes NewBlockHashesMsg → handleNewBlockhashesXDC, NewBlockMsg → handleNewBlockXDC stubs.",
+    note: "" },
+
+  { p: "eth/protocols/eth/handshake.go", cat: "Wire Protocol", status: "done", impact: "critical",
+    done: "StatusPacket62 for XDPOS2 (5-field eth/63 wire shape). handshake62 populates lastRange from Head/TD.",
+    note: "" },
+
+  { p: "eth/handler_xdc.go", cat: "Wire Protocol", status: "done", impact: "critical",
+    done: "BroadcastVote/BroadcastTimeout/BroadcastSyncInfo for V2 BFT propagation. Encodes types and sends to all peers via per-peer Send wrapper.",
+    note: "" },
+
+  { p: "eth/downloader/downloader.go", cat: "Downloader", status: "done", impact: "high",
+    done: "Added Synchronising() public accessor for xdcSyncer to coordinate with downloader.",
+    note: "" },
+
+  { p: "eth/downloader/beaconsync.go", cat: "Downloader", status: "done", impact: "high",
+    done: "Zero-cutoff-hash guard: skip beacon sync until non-zero cutoff is set.",
+    note: "" },
+
+  // ============= DEFERRED =============
+  { p: "eth/peer.go", cat: "Peer Tracking", status: "deferred", impact: "medium",
+    why: "Adds knownVotes/knownTimeouts/knownSyncInfos LRU caches. Only matters for masternode mode (M8) — sync nodes never broadcast V2 messages so broadcast storms can't occur. Pair with peerset.go." },
+
+  { p: "eth/peerset.go", cat: "Peer Tracking", status: "deferred", impact: "medium",
+    why: "PeersWithoutVote/Timeout/SyncInfo helpers for targeted broadcast. Same M8 deferral as peer.go." },
+
+  { p: "eth/downloader/fetchers_concurrent.go", cat: "Downloader", status: "deferred", impact: "low",
+    why: "XDC reduces timeoutGracePeriod 2min→30s + custom stall detection. Per 'leverage 1.17.3 advantages' directive, keep upstream timing defaults until real instability observed." },
+
+  { p: "eth/downloader/queue.go", cat: "Downloader", status: "deferred", impact: "low",
+    why: "XDC enlarges block cache (8k→16k) + reworks errStaleDelivery. Cache tunings are perf-only. errStaleDelivery rework is good but couples to other downloader changes." },
+
+  { p: "p2p/dial.go", cat: "P2P", status: "deferred", impact: "low",
+    why: "staticDialFailBackoff (500ms) + lastErr on dialTask. Stability fix for static-peer setups. Not blocking sync." },
+
+  { p: "p2p/util.go", cat: "P2P", status: "deferred", impact: "low",
+    why: "expHeap.remove(item) helper used by p2p/dial.go. Pair-port if dial.go is ported." },
+
+  { p: "p2p/server.go", cat: "P2P", status: "deferred", impact: "low",
+    why: "firstPeerlessTime + staticDialedConn bypasses MaxPeers cap. Static-peer escape valve." },
+
+  { p: "p2p/discover/v4_udp.go", cat: "P2P", status: "deferred", impact: "low",
+    why: "One Debug log line for diagnostic. Pure logging." },
+
+  { p: "p2p/rlpx/rlpx.go", cat: "P2P", status: "deferred", impact: "low",
+    why: "Restores pre-EIP-8 RLPx auth decode. Only needed for peers running old XDPoSChain v2.6.x." },
+
+  { p: "eth/protocols/eth/discovery.go", cat: "Wire", status: "deferred", impact: "low",
+    why: "IsXDC() check to accept peers without ENR ForkID. Only matters for old XDPoSChain peers." },
+
+  { p: "eth/protocols/eth/broadcast.go", cat: "Wire", status: "deferred", impact: "low",
+    why: "Nil-guard on p.txpool. 4-line safety net." },
+
+  { p: "eth/protocols/snap/sync.go", cat: "Snap Sync", status: "deferred", impact: "low",
+    why: "maxMissingNodeAttempts (8). Only matters in snap-sync mode." },
+
+  { p: "miner/miner.go", cat: "Miner (M8)", status: "deferred", impact: "low",
+    why: "Agent interface scaffolding for XdcAgent. Defer to M8 — masternode work requires Opus planner escalation." },
+
+  { p: "miner/xdc_agent.go", cat: "Miner (M8)", status: "deferred", impact: "low",
+    why: "353-line XDC sealing agent (V1+V2 seal flow, masternode rotation). Pure M8." },
+
+  { p: "eth/downloader/downloader_xdc.go", cat: "Downloader", status: "deferred", impact: "low",
+    why: "Legacy 1330-line XDPOS2 downloader. Functionally replaced by eth/sync_xdc.go (272 lines)." },
+
+  { p: "eth/downloader/downloader_checkpoint.go", cat: "Downloader", status: "deferred", impact: "low",
+    why: "XDC checkpoint-discovery RPC mode. Not blocking sync; current xdcSyncer uses different path." },
+
+  { p: "eth/downloader/peer.go", cat: "Downloader", status: "deferred", impact: "low",
+    why: "Legacy method signatures (RequestHeadersByHashLegacy etc.) on Peer interface. No consumer at HEAD." },
+
+  // Checkpoint sync polish (5 files — skip unless --syncfromblock)
+  { p: "core/headerchain.go", cat: "Checkpoint Sync", status: "deferred", impact: "low",
+    why: "Checkpoint-anchor break in Reorg's parent walk. Only matters when reorging across an anchor." },
+
+  { p: "core/rawdb/chain_freezer.go", cat: "Checkpoint Sync", status: "deferred", impact: "low",
+    why: "Skip freezer loop for checkpoint-synced nodes. Only matters with --syncfromblock." },
+
+  { p: "core/rawdb/chain_iterator.go", cat: "Checkpoint Sync", status: "deferred", impact: "low",
+    why: "Log-level downgrade Warn→Debug for missing pre-anchor bodies. Cosmetic." },
+
+  { p: "core/rawdb/database.go", cat: "Checkpoint Sync", status: "deferred", impact: "low",
+    why: "Allow ancient DB to open without block 1 when checkpoint metadata present." },
+
+  { p: "core/txindexer.go", cat: "Checkpoint Sync", status: "deferred", impact: "low",
+    why: "syncFromBlock field + skip indexing pre-anchor. Only matters with --syncfromblock." },
+
+  // Perf tuning (3 files — trivial)
+  { p: "ethdb/batch.go", cat: "Perf", status: "deferred", impact: "low",
+    why: "IdealBatchSize 100KB → 2MB. Trivial perf tune. Could reduce Pebble flush count 20× during sync." },
+
+  { p: "ethdb/pebble/pebble.go", cat: "Perf", status: "deferred", impact: "low",
+    why: "Pebble L0CompactionThreshold 2→4, L0CompactionConcurrency 1→2. Pure perf tune. Optional." },
+
+  // Cosmetic/log (skip)
+  { p: "core/txpool/txpool.go", cat: "Cosmetic", status: "deferred", impact: "low",
+    why: "Log-level downgrade on state-reset error. Cosmetic." },
+
+  { p: "core/txpool/blobpool/blobpool.go", cat: "Cosmetic", status: "deferred", impact: "low",
+    why: "Log-level downgrade on Reset state error. XDC doesn't use blob txs anyway." },
+
+  { p: "ethstats/ethstats.go", cat: "Cosmetic", status: "deferred", impact: "low",
+    why: "Adds Consensus field to nodeInfo. Cosmetic for dashboard." },
+
+  // Operator UX (4 files)
+  { p: "cmd/geth/main.go", cat: "CLI", status: "deferred", impact: "low",
+    why: "clientIdentifier() function + SyncFromBlockFlag + dumpCheckpointCommand. Operator UX nicety." },
+
+  { p: "cmd/geth/config.go", cat: "CLI", status: "deferred", impact: "low",
+    why: "clientIdentifier() + /health endpoint registration. Operator nicety." },
+
+  { p: "cmd/geth/chaincmd.go", cat: "CLI", status: "deferred", impact: "low",
+    why: "Adds dump-checkpoint CLI subcommand. Operator UX." },
+
+  { p: "cmd/geth/misccmd.go", cat: "CLI", status: "deferred", impact: "low",
+    why: "One-line clientIdentifier() call site. Pair with main.go." },
+
+  { p: "node/config.go", cat: "Node", status: "deferred", impact: "low",
+    why: "Cross-client chaindata dir compat (geth ↔ XDC binary). For drop-in migrators." },
+
+  { p: "build/ci.go", cat: "Build", status: "deferred", impact: "low",
+    why: "Adds -buildvcs=false build flag. Docker convenience." },
+
+  // Recovery utilities (3 files)
+  { p: "triedb/database.go", cat: "Recovery", status: "deferred", impact: "low",
+    why: "DiskLayerRoot() for unclean-shutdown recovery. Add only if crash-recovery needed." },
+
+  { p: "triedb/pathdb/database.go", cat: "Recovery", status: "deferred", impact: "low",
+    why: "Backing implementation of DiskLayerRoot(). Pair with triedb/database.go." },
+
+  // NOT-XDC — FastSync dropped per ADR #58
+  { p: "eth/catalyst/api.go", cat: "Not needed", status: "not-needed", impact: "low",
+    why: "FastSync mode check — XDC dropped fast/fastpath sync modes per ADR #58." },
+
+  { p: "eth/downloader/syncmode.go", cat: "Not needed", status: "not-needed", impact: "low",
+    why: "FastSync constant — dropped per ADR #58." },
+
+  { p: "eth/ethconfig/syncmode.go", cat: "Not needed", status: "not-needed", impact: "low",
+    why: "FastSync constant — dropped per ADR #58." },
+
+  { p: "crypto/ecies/ecies.go", cat: "Not needed", status: "not-needed", impact: "low",
+    why: "Upstream cleanup (params.BlockSize → 1). No XDC content." },
+];
+
+// ============= RENDER =============
+function counts() {
+  const r = { done: 0, pending: 0, deferred: 0, "not-needed": 0 };
+  FILES.forEach(f => r[f.status]++);
+  return r;
+}
+function renderDashboard() {
+  const c = counts();
+  const total = FILES.length;
+  document.getElementById('count-done').textContent = c.done;
+  document.getElementById('count-pending').textContent = c.pending;
+  document.getElementById('count-deferred').textContent = c.deferred;
+  document.getElementById('count-not-needed').textContent = c["not-needed"];
+
+  const pct = k => (c[k] / total * 100).toFixed(1) + '%';
+  document.getElementById('pct-done').textContent = pct('done');
+  document.getElementById('pct-pending').textContent = pct('pending');
+  document.getElementById('pct-deferred').textContent = pct('deferred');
+  document.getElementById('pct-not-needed').textContent = pct('not-needed');
+
+  const bar = document.getElementById('progressBar');
+  bar.innerHTML = '';
+  ['done', 'pending', 'deferred', 'not-needed'].forEach(k => {
+    const seg = document.createElement('div');
+    seg.className = 'progress-seg ' + k;
+    seg.style.width = (c[k] / total * 100) + '%';
+    seg.title = k + ': ' + c[k];
+    bar.appendChild(seg);
+  });
+}
+
+function renderTable(filter = 'all', search = '') {
+  const tbl = document.getElementById('fileTable');
+  // remove old rows except header
+  Array.from(tbl.querySelectorAll('.file-row:not(.header)')).forEach(r => r.remove());
+
+  const q = search.toLowerCase();
+  // Sort: done > pending > deferred > not-needed, then by critical impact within each
+  const order = { done: 0, pending: 1, deferred: 2, "not-needed": 3 };
+  const impactOrder = { critical: 0, high: 1, medium: 2, low: 3 };
+  const sorted = [...FILES].sort((a, b) => {
+    if (order[a.status] !== order[b.status]) return order[a.status] - order[b.status];
+    return impactOrder[a.impact] - impactOrder[b.impact];
+  });
+
+  sorted.forEach(f => {
+    if (filter !== 'all' && f.status !== filter) return;
+    if (q && !(f.p + f.cat + (f.done||'') + (f.why||'') + (f.note||'')).toLowerCase().includes(q)) return;
+
+    const row = document.createElement('div');
+    row.className = 'file-row';
+    const statusLabel = { done: 'Done', pending: 'Pending', deferred: 'Deferred', "not-needed": 'Not needed' }[f.status];
+    const impactLabel = { critical: 'CRITICAL', high: 'High', medium: 'Med', low: 'Low' }[f.impact];
+
+    row.innerHTML = `
+      <div><span class="status-pill ${f.status}">${statusLabel}</span></div>
+      <div class="file-path">${f.p}</div>
+      <div class="file-category">${f.cat}</div>
+      <div class="file-note">${impactLabel}</div>
+      <div class="file-details">
+        ${f.done ? `<div class="what-done"><strong>What was ported:</strong> ${f.done}</div>` : ''}
+        ${f.note ? `<div class="what-remains"><strong>Note:</strong> ${f.note}</div>` : ''}
+        ${f.why ? `<div class="why-defer"><strong>Reason deferred / not needed:</strong> ${f.why}</div>` : ''}
+      </div>
+    `;
+    row.addEventListener('click', e => {
+      if (e.target.tagName === 'A') return;
+      row.classList.toggle('open');
+    });
+    tbl.appendChild(row);
+  });
+}
+
+renderDashboard();
+renderTable();
+
+document.querySelectorAll('.filter-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('.filter-btn').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    renderTable(btn.dataset.filter, document.getElementById('search').value);
+  });
+});
+document.getElementById('search').addEventListener('input', e => {
+  const active = document.querySelector('.filter-btn.active');
+  renderTable(active ? active.dataset.filter : 'all', e.target.value);
+});
+</script>
+
+</body>
+</html>
