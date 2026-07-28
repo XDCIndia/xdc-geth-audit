@@ -73,6 +73,40 @@ func newHandshakeMeters(base string) *hsMeters {
 	}
 }
 
+// A.37 XDC capability meters: tally peers by advertised state scheme +
+// commit-stamp populated-ness so the operator can see at a glance whether
+// the gate is working (e.g. expect mostly HBSS counts on Apothem, a small
+// "legacy" tail for pre-A.37 fleet members). Wired in readStatus62 once
+// per successful handshake. Refs #844 (A.37).
+var (
+	handshakeXDCCapsHBSS    = metrics.NewRegisteredMeter("eth/protocols/eth/handshake/xdccaps/hbss", nil)
+	handshakeXDCCapsPBSS    = metrics.NewRegisteredMeter("eth/protocols/eth/handshake/xdccaps/pbss", nil)
+	handshakeXDCCapsLegacy  = metrics.NewRegisteredMeter("eth/protocols/eth/handshake/xdccaps/legacy", nil)
+	handshakeXDCCapsUnknown = metrics.NewRegisteredMeter("eth/protocols/eth/handshake/xdccaps/unknown", nil)
+)
+
+// markXDCCaps increments the appropriate XDC-caps meter once per handshake.
+// A peer is "legacy" if it advertised a scheme but with an all-zero commit
+// prefix (older build with caps support but pre-commit-stamp); "unknown" if
+// it omitted the trailer entirely (pre-A.37 binary). Refs #844 (A.37).
+func markXDCCaps(c XDCCaps) {
+	if !metrics.Enabled() {
+		return
+	}
+	switch c.Scheme {
+	case XDCStateSchemeHBSS:
+		handshakeXDCCapsHBSS.Mark(1)
+	case XDCStateSchemePBSS:
+		handshakeXDCCapsPBSS.Mark(1)
+	default:
+		if c.CommitPrefix == ([8]byte{}) {
+			handshakeXDCCapsUnknown.Mark(1)
+		} else {
+			handshakeXDCCapsLegacy.Mark(1)
+		}
+	}
+}
+
 func init() {
 	meters = bidirectionalMeters{
 		ingress: newHandshakeMeters("eth/protocols/eth/ingress/handshake/"),

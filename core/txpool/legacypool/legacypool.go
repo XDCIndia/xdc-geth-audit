@@ -19,6 +19,7 @@ package legacypool
 
 import (
 	"errors"
+	"fmt"
 	"maps"
 	"math"
 	"math/big"
@@ -61,6 +62,10 @@ var (
 	// another remote transaction.
 	ErrTxPoolOverflow = errors.New("txpool is full")
 
+	// ErrBlacklisted is returned if the tx sender or recipient is on the XDC
+	// transaction blacklist (active from BlackListHFNumber onward).
+	ErrBlacklisted = errors.New("transaction sender or recipient is blacklisted")
+
 	// ErrOutOfOrderTxFromDelegated is returned when the transaction with gapped
 	// nonce received from the accounts with delegation or pending delegation.
 	ErrOutOfOrderTxFromDelegated = errors.New("gapped-nonce tx from delegated accounts")
@@ -73,6 +78,11 @@ var (
 	// ErrFutureReplacePending is returned if a future transaction replaces a pending
 	// one. Future transactions should only be able to replace other future transactions.
 	ErrFutureReplacePending = errors.New("future transaction tries to replace pending")
+
+	// ErrDuplicateSpecialTransaction is returned when a second special XDC
+	// signing tx arrives for a nonce that already has a special tx pending.
+	// Mirrors XDPoSChain/core/txpool/txpool.go:96.
+	ErrDuplicateSpecialTransaction = errors.New("duplicate a special transaction")
 )
 
 var (
@@ -238,6 +248,14 @@ type LegacyPool struct {
 	signer      types.Signer
 	mu          sync.RWMutex
 
+	// IsSigner is an optional callback set by the XDPoS consensus engine to
+	// check whether an address is a currently-registered masternode signer.
+	// When set, gasPrice=0 special-txs (to BlockSigners/RandomizeSMC) from
+	// registered signers are fast-pathed to pending via promoteSpecialTx,
+	// bypassing pool-full eviction and underpriced checks.
+	// Mirrors XDPoSChain/core/txpool/txpool.go:294 IsSigner field.
+	IsSigner func(address common.Address) bool
+
 	currentHead   atomic.Pointer[types.Header] // Current head of the blockchain
 	currentState  *state.StateDB               // Current state in the blockchain head
 	pendingNonces *noncer                      // Pending state tracking virtual nonces
@@ -289,6 +307,14 @@ func New(config Config, chain BlockChain) *LegacyPool {
 	pool.priced = newPricedList(pool.all)
 
 	return pool
+}
+
+// SetIsSigner wires the consensus engine's signer-check callback into the pool.
+// Once set, gasPrice=0 special-txs (BlockSigners/RandomizeSMC) whose sender
+// is a registered masternode are fast-pathed into pending without price checks.
+// Call from the XDPoS engine after pool creation.
+func (pool *LegacyPool) SetIsSigner(fn func(address common.Address) bool) {
+	pool.IsSigner = fn
 }
 
 // Filter returns whether the given transaction can be consumed by the legacy
@@ -511,11 +537,16 @@ func (pool *LegacyPool) Pending(filter txpool.PendingFilter) (map[common.Address
 	for addr, list := range pool.pending {
 		txs := list.Flatten()
 
-		// If the miner requests tip enforcement, cap the lists now
+		// If the miner requests tip enforcement, cap the lists now.
+		// XDC: special-txs (BlockSigners/RandomizeSMC) are created with
+		// gasPrice=0 and must NOT be filtered by tip enforcement — the miner
+		// must include them regardless of their effective tip.
+		// Mirrors XDPoSChain/core/txpool/txpool.go:572-574:
+		//   if !tx.IsSpecialTransaction() && tx.GasPrice().Cmp(baseFee) < 0
 		if filter.MinTip != nil || filter.GasLimitCap != 0 {
 			for i, tx := range txs {
 				if filter.MinTip != nil {
-					if tx.EffectiveGasTipIntCmp(filter.MinTip, filter.BaseFee) < 0 {
+					if !tx.IsSpecialTransaction() && tx.EffectiveGasTipIntCmp(filter.MinTip, filter.BaseFee) < 0 {
 						txs = txs[:i]
 						break
 					}
@@ -554,6 +585,15 @@ func (pool *LegacyPool) Pending(filter txpool.PendingFilter) (map[common.Address
 // This check is meant as an early check which only needs to be performed once,
 // and does not require the pool mutex to be held.
 func (pool *LegacyPool) ValidateTxBasics(tx *types.Transaction) error {
+	// XDC: special-txs (BlockSigners/RandomizeSMC) are created with gasPrice=0
+	// by design — use MinTip=0 for them so ValidateTransaction's tip-cap check
+	// passes. Mirrors XDPoSChain/core/txpool/txpool.go:710-730 where the entire
+	// ErrZeroGasPrice / ErrUnderMinGasPrice block is guarded by
+	// !tx.IsSpecialTransaction().
+	minTip := pool.gasTip.Load().ToBig()
+	if tx.IsSpecialTransaction() {
+		minTip = new(big.Int) // zero — price-exempt
+	}
 	opts := &txpool.ValidationOptions{
 		Config: pool.chainconfig,
 		Accept: 0 |
@@ -562,7 +602,7 @@ func (pool *LegacyPool) ValidateTxBasics(tx *types.Transaction) error {
 			1<<types.DynamicFeeTxType |
 			1<<types.SetCodeTxType,
 		MaxSize: txMaxSize,
-		MinTip:  pool.gasTip.Load().ToBig(),
+		MinTip:  minTip,
 	}
 	return txpool.ValidateTransaction(tx, pool.currentHead.Load(), pool.signer, opts)
 }
@@ -570,6 +610,22 @@ func (pool *LegacyPool) ValidateTxBasics(tx *types.Transaction) error {
 // validateTx checks whether a transaction is valid according to the consensus
 // rules and adheres to some heuristic limits of the local node (price and size).
 func (pool *LegacyPool) validateTx(tx *types.Transaction) error {
+	// XDC: reject txs whose sender or recipient is on the XDC blacklist, once
+	// the chain has passed BlackListHFNumber. Canonical XDPoSChain enforces this
+	// at the mempool layer — without it we'd accept and propagate txs that the
+	// network will then drop on import.
+	if head := pool.currentHead.Load(); head != nil && head.Number.Uint64() >= common.BlackListHFNumber {
+		from, err := types.Sender(pool.signer, tx)
+		if err != nil {
+			return err
+		}
+		if common.IsInBlacklist(&from) {
+			return fmt.Errorf("%w: sender %v", ErrBlacklisted, from.Hex())
+		}
+		if common.IsInBlacklist(tx.To()) {
+			return fmt.Errorf("%w: recipient %v", ErrBlacklisted, tx.To().Hex())
+		}
+	}
 	opts := &txpool.ValidationOptionsWithState{
 		State: pool.currentState,
 
@@ -604,7 +660,22 @@ func (pool *LegacyPool) checkDelegationLimit(tx *types.Transaction) error {
 	from, _ := types.Sender(pool.signer, tx) // validated
 
 	// Short circuit if the sender has neither delegation nor pending delegation.
-	if pool.currentState.GetCodeHash(from) == types.EmptyCodeHash && !pool.all.hasAuth(from) {
+	//
+	// An account with no state object has no code hash at all: StateDB.GetCodeHash
+	// returns the zero hash (core/state/statedb.go GetCodeHash), not EmptyCodeHash.
+	// Treating the zero hash as "has code" misclassifies every never-touched
+	// account as EIP-7702 delegated. Reachable on XDC because gasless special
+	// txs (gasPrice=0, value=0) pass the balance check from a zero-balance,
+	// non-existent account, so validateAuth is reached where upstream it is not
+	// (upstream, such a tx is rejected with ErrInsufficientFunds first).
+	//
+	// This is safe: an EIP-7702 delegation indicator is the 23-byte sequence
+	// 0xef0100 || address, and keccak256 of that can be neither the zero hash
+	// nor keccak256(nil). So the zero hash provably means "no delegation", and
+	// the added disjunct removes only false positives — a genuinely delegated
+	// account still hits the one-in-flight cap below.
+	codeHash := pool.currentState.GetCodeHash(from)
+	if (codeHash == types.EmptyCodeHash || codeHash == (common.Hash{})) && !pool.all.hasAuth(from) {
 		return nil
 	}
 	pending := pool.pending[from]
@@ -660,6 +731,127 @@ func (pool *LegacyPool) validateAuth(tx *types.Transaction) error {
 	return nil
 }
 
+// promoteSpecialTx directly inserts a special XDC tx (BlockSigners/RandomizeSMC)
+// into the pending pool at its current nonce, bypassing pool-full eviction and
+// underpriced checks. It prevents duplicate special-txs at the same nonce.
+//
+// Called only when IsSigner confirms the sender is a registered masternode;
+// for remote special-txs without IsSigner confirmation the normal add() path
+// is used (price checks are still skipped via ValidateTxBasics/validateTx).
+//
+// Mirrors XDPoSChain/core/txpool/txpool.go:952-988 promoteSpecialTx.
+//
+// DEVIATION from canonical (fixes #932): canonical always returns
+// ErrDuplicateSpecialTransaction when an existing special-tx is at the nonce.
+// This port additionally allows replacement when the incumbent special-tx
+// targets a BlockSigners signing slot whose window has expired
+// (head > targetBlock + epoch*2, matching BlockSigner.sol:21 invariant).
+// Without this escape hatch, a stale signing tx submitted during a catch-up
+// burst would permanently jam the nonce sequence: the reverted tx blocks all
+// later txs, and ErrDuplicateSpecialTransaction blocks the replacement.
+func (pool *LegacyPool) promoteSpecialTx(from common.Address, tx *types.Transaction) (bool, error) {
+	if pool.pending[from] == nil {
+		pool.pending[from] = newList(true)
+	}
+	list := pool.pending[from]
+
+	// Reject if an existing special-tx is already at this nonce, UNLESS the
+	// existing tx is an expired BlockSigners signing tx.
+	// Mirrors XDPoSChain/core/txpool/txpool.go:960:
+	//   if old.IsSpecialTransaction() { return false, ErrDuplicateSpecialTransaction }
+	// Deviation: allow replacement when the old tx's signing window is expired.
+	if old := list.txs.Get(tx.Nonce()); old != nil {
+		if old.IsSpecialTransaction() && !pool.isSigningTxExpired(old) {
+			// Incumbent is a still-valid special tx — reject replacement.
+			// Mirrors XDPoSChain/core/txpool/txpool.go:960.
+			return false, ErrDuplicateSpecialTransaction
+		}
+		// Either the incumbent is a normal tx, or it is an expired signing tx.
+		// In both cases evict it from global index; Put() below overwrites list.txs.
+		if old.IsSpecialTransaction() {
+			log.Debug("XDC: replacing expired BlockSigners signing tx",
+				"nonce", tx.Nonce(), "from", from, "oldHash", old.Hash(), "newHash", tx.Hash())
+		}
+		pool.all.Remove(old.Hash())
+		pool.priced.Removed(1)
+		pendingReplaceMeter.Mark(1)
+	}
+
+	list.txs.Put(tx)
+	if cost, overflow := uint256.FromBig(tx.Cost()); !overflow {
+		if list.costcap.Cmp(cost) < 0 {
+			list.costcap = cost
+		}
+	}
+	if gas := tx.Gas(); list.gascap < gas {
+		list.gascap = gas
+	}
+	if pool.all.Get(tx.Hash()) == nil {
+		pool.all.Add(tx)
+		pool.priced.Put(tx)
+	}
+	pool.pendingNonces.set(from, tx.Nonce()+1)
+	pool.queueTxEvent(tx)
+	log.Trace("XDC: fast-pathed special signing tx to pending", "hash", tx.Hash(), "from", from, "to", tx.To(), "nonce", tx.Nonce())
+	return true, nil
+}
+
+// isSigningTxExpired reports whether tx is a BlockSigners signing tx whose
+// signing window has closed at the current chain head.
+//
+// BlockSigner.sol line 21:
+//
+//	require(block.number <= _blockNumber.add(epochNumber * 2));
+//
+// So the tx is expired when: currentHead > targetBlock + epoch*2.
+//
+// The tx data layout (from contracts.CreateTxSign / common.HexSignMethod):
+//
+//	bytes[0:4]   selector (0xe341eaa4)
+//	bytes[4:36]  uint256 blockNumber (big-endian)
+//	bytes[36:68] bytes32 blockHash
+//
+// Returns false (not expired) if:
+//   - tx is not a BlockSigners tx (no risk of expiry deadlock)
+//   - data is malformed (can't decode → play it safe, treat as fresh)
+//   - XDPoS config not available
+//   - current head is not yet past the expiry point
+func (pool *LegacyPool) isSigningTxExpired(tx *types.Transaction) bool {
+	if tx.To() == nil || *tx.To() != common.BlockSignersBinary {
+		return false // not a signing tx
+	}
+	cfg := pool.chainconfig
+	if cfg.XDPoS == nil {
+		return false
+	}
+	data := tx.Data()
+	if len(data) < 68 {
+		return false // malformed — can't decode, keep as-is
+	}
+	// data[4:36] is the uint256 blockNumber (big-endian, 32 bytes)
+	targetBlock := new(big.Int).SetBytes(data[4:36]).Uint64()
+	epoch := cfg.XDPoS.Epoch
+
+	currentHead := pool.currentHead.Load()
+	if currentHead == nil {
+		return false
+	}
+	headNum := currentHead.Number.Uint64()
+
+	// Expired when head > targetBlock + epoch*2.
+	// Use overflow-safe comparison: epoch*2 can exceed uint64 on a misconfigured
+	// chain (epoch=0 is the only risky case, and epoch=0 means the contract has
+	// no window, so nothing is ever expired → return false).
+	if epoch == 0 {
+		return false
+	}
+	expiry := targetBlock + epoch*2
+	if expiry < targetBlock {
+		return false // overflow guard
+	}
+	return headNum > expiry
+}
+
 // add validates a transaction and inserts it into the non-executable queue for later
 // pending promotion and execution. If the transaction is a replacement for an already
 // pending or queued one, it overwrites the previous transaction if its price is higher.
@@ -680,6 +872,34 @@ func (pool *LegacyPool) add(tx *types.Transaction) (replaced bool, err error) {
 	}
 	// already validated by this point
 	from, _ := types.Sender(pool.signer, tx)
+
+	// XDC: fast-path for special-txs from registered masternode signers.
+	// When IsSigner is wired and the sender is a known signer, special-txs
+	// (BlockSigners/RandomizeSMC) go directly to pending at the expected nonce,
+	// bypassing pool-full eviction and underpriced checks entirely.
+	// Mirrors XDPoSChain/core/txpool/txpool.go:779-780:
+	//   if tx.IsSpecialTransaction() && pool.IsSigner != nil && pool.IsSigner(from)
+	//      && pool.pendingNonces.get(from) == tx.Nonce()
+	//
+	// Extension (#932): also route through promoteSpecialTx when the tx nonce
+	// is BELOW pendingNonces and there is an expired special tx at that nonce.
+	// This handles the "jammed nonce" recovery case: a stale signing tx is stuck
+	// in pending (pendingNonces advanced past it), and a fresh replacement tx
+	// cannot pass the price-bump check in list.Add (gasPrice=0 on both).
+	if tx.IsSpecialTransaction() && pool.IsSigner != nil && pool.IsSigner(from) {
+		pendingN := pool.pendingNonces.get(from)
+		if pendingN == tx.Nonce() {
+			// Normal case: tx nonce matches the expected next pending nonce.
+			return pool.promoteSpecialTx(from, tx)
+		}
+		if pendingN > tx.Nonce() && pool.pending[from] != nil {
+			if old := pool.pending[from].txs.Get(tx.Nonce()); old != nil && pool.isSigningTxExpired(old) {
+				// Expired special tx at a lower nonce — allow replacement via
+				// promoteSpecialTx which will evict the old tx and insert the new one.
+				return pool.promoteSpecialTx(from, tx)
+			}
+		}
+	}
 
 	// If the address is not yet known, request exclusivity to track the account
 	// only by this subpool until all transactions are evicted
@@ -703,8 +923,12 @@ func (pool *LegacyPool) add(tx *types.Transaction) (replaced bool, err error) {
 			}
 		}()
 	}
-	// If the transaction pool is full, discard underpriced transactions
-	if uint64(pool.all.Slots()+numSlots(tx)) > pool.config.GlobalSlots+pool.config.GlobalQueue {
+	// If the transaction pool is full, discard underpriced transactions.
+	// XDC: special-txs are never price-evicted — they bypass pool-full discard
+	// entirely. Mirrors XDPoSChain/core/txpool/txpool.go:779 fast-path which
+	// returns before the pool-full check.
+	if uint64(pool.all.Slots()+numSlots(tx)) > pool.config.GlobalSlots+pool.config.GlobalQueue &&
+		!tx.IsSpecialTransaction() {
 		// If the new transaction is underpriced, don't accept it
 		if pool.priced.Underpriced(tx) {
 			log.Trace("Discarding underpriced transaction", "hash", hash, "gasTipCap", tx.GasTipCap(), "gasFeeCap", tx.GasFeeCap())
@@ -1386,6 +1610,14 @@ func (pool *LegacyPool) reset(oldHead, newHead *types.Header) {
 	}
 	statedb, err := pool.chain.StateAt(newHead)
 	if err != nil {
+		// XDC A.99.6: fast-sync checkpointSyncNoState — real head state root not yet
+		// in trie DB. Keep old state and skip reset rather than flooding ERROR log.
+		// Refs: #1037.
+		if core.CheckpointSyncNoStateActive.Load() {
+			log.Debug("legacypool: head state not yet available (snap-heal pending), skipping reset",
+				"block", newHead.Number, "root", newHead.Root)
+			return
+		}
 		log.Error("Failed to reset txpool state", "err", err)
 		return
 	}

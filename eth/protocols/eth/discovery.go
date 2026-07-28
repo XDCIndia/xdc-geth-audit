@@ -68,12 +68,17 @@ func currentENREntry(chain *core.BlockChain) *enrEntry {
 
 // NewNodeFilter returns a filtering function that returns whether the provided
 // enode advertises a forkid compatible with the current chain.
+//
+// XDC: legacy XDPoSChain peers speak xdpos2/100 and publish no `eth` ENR entry.
+// On XDC chains, accept ENR-less peers and let the wire handshake decide
+// compatibility instead of dropping them at the discovery filter.
 func NewNodeFilter(chain *core.BlockChain) func(*enode.Node) bool {
 	filter := forkid.NewFilter(chain)
+	xdcChain := chain.Config().XDPoS != nil
 	return func(n *enode.Node) bool {
 		var entry enrEntry
 		if err := n.Load(&entry); err != nil {
-			return false
+			return xdcChain
 		}
 		err := filter(entry.ForkID)
 		return err == nil

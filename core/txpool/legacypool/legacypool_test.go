@@ -2718,3 +2718,128 @@ func BenchmarkMultiAccountBatchInsert(b *testing.B) {
 		pool.addRemotesSync([]*types.Transaction{tx})
 	}
 }
+
+// signTransaction builds an XDC masternode block-signing transaction: gasPrice 0,
+// value 0, gas 200000, to the BlockSigners contract (0x…0089). Same shape as
+// contracts.CreateTxSign, which is the only tx an XDPoS masternode coinbase ever
+// sends. gasPrice 0 is deliberate — special-txs are price-exempt in the pool.
+func signTransaction(nonce uint64, key *ecdsa.PrivateKey) *types.Transaction {
+	tx := types.NewTransaction(nonce, common.BlockSignersBinary, big.NewInt(0), 200000, big.NewInt(0), nil)
+	signed, _ := types.SignTx(tx, types.HomesteadSigner{}, key)
+	return signed
+}
+
+// TestGaslessSpecialTxFromNonExistentAccountNotRateLimited pins the reported
+// netv12 failure: an XDPoS masternode coinbase that has no state object at all
+// was classified as EIP-7702 delegated and capped at one in-flight transaction,
+// so every signing tx after the first was rejected with ErrInflightTxLimitReached
+// forever.
+//
+// The misclassification is a code-hash comparison bug: StateDB.GetCodeHash
+// returns the ZERO hash for an account with no state object, not EmptyCodeHash
+// (= keccak256(nil)), so `GetCodeHash(from) == types.EmptyCodeHash` is false for
+// a never-touched account and the delegation cap engages.
+//
+// This is unreachable in upstream geth because ValidateTransactionWithState runs
+// before validateAuth and a non-existent account cannot pay for gas. XDC sign
+// txs are gasPrice=0 / value=0, so cost is 0, the balance check passes at zero
+// balance, and execution reaches the misfiring guard.
+func TestGaslessSpecialTxFromNonExistentAccountNotRateLimited(t *testing.T) {
+	t.Parallel()
+
+	statedb, _ := state.New(types.EmptyRootHash, state.NewDatabaseForTesting())
+	blockchain := newTestBlockChain(params.MergedTestChainConfig, 1000000, statedb, new(event.Feed))
+
+	pool := New(testTxPoolConfig, blockchain)
+	pool.Init(testTxPoolConfig.PriceLimit, blockchain.CurrentBlock(), newReserver())
+	defer pool.Close()
+
+	// The masternode coinbase. Deliberately NOT funded and NOT touched: no
+	// SetBalance, no SetNonce, no SetCode. Every other test in this file
+	// pre-creates its accounts, which is exactly why none of them caught this.
+	key, _ := crypto.GenerateKey()
+	addr := crypto.PubkeyToAddress(key.PublicKey)
+
+	// Pin the statedb semantics the fix depends on.
+	if got := pool.currentState.GetCodeHash(addr); got != (common.Hash{}) {
+		t.Fatalf("expected zero code hash for account with no state object, got %v", got)
+	}
+	if got := pool.currentState.GetCodeHash(addr); got == types.EmptyCodeHash {
+		t.Fatalf("zero hash must differ from types.EmptyCodeHash (%v); the whole defect "+
+			"is that these two are not the same value", types.EmptyCodeHash)
+	}
+	// And confirm the account really is absent / unfunded, i.e. this reproduces the
+	// measured netv12 state (balance 0, nonce 0, no code).
+	if bal := pool.currentState.GetBalance(addr); !bal.IsZero() {
+		t.Fatalf("expected zero balance, got %v", bal)
+	}
+	if n := pool.currentState.GetNonce(addr); n != 0 {
+		t.Fatalf("expected zero nonce, got %d", n)
+	}
+
+	// Three consecutive signing txs must all be accepted. Before the fix, nonce 0
+	// is admitted via the `pending == nil` branch and nonce 1 returns
+	// ErrInflightTxLimitReached — the exact error observed on netv12.
+	for nonce := uint64(0); nonce < 3; nonce++ {
+		if err := pool.addRemoteSync(signTransaction(nonce, key)); err != nil {
+			t.Fatalf("signing tx at nonce %d rejected: %v (want nil)", nonce, err)
+		}
+	}
+	pending, queued := pool.Stats()
+	if pending != 3 || queued != 0 {
+		t.Fatalf("pool stats mismatch: have pending=%d queued=%d, want pending=3 queued=0", pending, queued)
+	}
+	if err := validatePoolInternals(pool); err != nil {
+		t.Fatalf("pool internal state corrupted: %v", err)
+	}
+}
+
+// TestDelegatedAccountStillCappedAtOneInflight is the regression guard in the
+// other direction: the EIP-7702 one-in-flight cap is mempool DoS protection and
+// must survive the zero-hash fix. An account with a REAL delegation
+// (code = 0xef0100 || address, so its code hash is neither the zero hash nor
+// keccak256(nil)) is still capped, even on the gasless XDC special-tx path that
+// FIX 1 opened up.
+func TestDelegatedAccountStillCappedAtOneInflight(t *testing.T) {
+	t.Parallel()
+
+	statedb, _ := state.New(types.EmptyRootHash, state.NewDatabaseForTesting())
+	blockchain := newTestBlockChain(params.MergedTestChainConfig, 1000000, statedb, new(event.Feed))
+
+	pool := New(testTxPoolConfig, blockchain)
+	pool.Init(testTxPoolConfig.PriceLimit, blockchain.CurrentBlock(), newReserver())
+	defer pool.Close()
+
+	key, _ := crypto.GenerateKey()
+	addr := crypto.PubkeyToAddress(key.PublicKey)
+	target := common.Address{0xaa}
+
+	// Give the account a genuine EIP-7702 delegation indicator.
+	statedb.SetCode(addr, types.AddressToDelegation(target), tracing.CodeChangeUnspecified)
+	testAddBalance(pool, addr, big.NewInt(params.Ether))
+
+	// Sanity: the delegation code hash is distinguishable from both sentinel values,
+	// which is why the fix cannot let a delegated account slip past the cap.
+	codeHash := pool.currentState.GetCodeHash(addr)
+	if codeHash == (common.Hash{}) || codeHash == types.EmptyCodeHash {
+		t.Fatalf("delegation code hash collided with a sentinel: %v", codeHash)
+	}
+
+	// First in-flight tx is allowed.
+	if err := pool.addRemoteSync(signTransaction(0, key)); err != nil {
+		t.Fatalf("first tx from delegated account rejected: %v", err)
+	}
+	// Second must still be capped.
+	if err := pool.addRemoteSync(signTransaction(1, key)); !errors.Is(err, txpool.ErrInflightTxLimitReached) {
+		t.Fatalf("error mismatch: want %v, have %v", txpool.ErrInflightTxLimitReached, err)
+	}
+	// And a gapped nonce from a delegated account with nothing pending is still
+	// rejected as out-of-order (checked on a second, freshly delegated account).
+	key2, _ := crypto.GenerateKey()
+	addr2 := crypto.PubkeyToAddress(key2.PublicKey)
+	statedb.SetCode(addr2, types.AddressToDelegation(target), tracing.CodeChangeUnspecified)
+	testAddBalance(pool, addr2, big.NewInt(params.Ether))
+	if err := pool.addRemoteSync(signTransaction(5, key2)); !errors.Is(err, ErrOutOfOrderTxFromDelegated) {
+		t.Fatalf("error mismatch: want %v, have %v", ErrOutOfOrderTxFromDelegated, err)
+	}
+}

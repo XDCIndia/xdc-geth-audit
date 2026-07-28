@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"fmt"
 	"maps"
+	"math/big"
 	"slices"
 	"time"
 
@@ -492,28 +493,69 @@ func (s *stateObject) AddBalance(amount *uint256.Int) uint256.Int {
 		}
 		return *(s.Balance())
 	}
-	return s.SetBalance(new(uint256.Int).Add(s.Balance(), amount))
+
+	// Use big.Int arithmetic to detect overflow beyond uint256.
+	// This is needed for XDC chains where genesis accounts have 2^256-1 balance
+	// and reward additions push the balance beyond uint256 range.
+	// v2.6.8 uses big.Int natively and stores the full value.
+	var bigBal *big.Int
+	if s.data.BigBalance != nil {
+		bigBal = new(big.Int).Set(s.data.BigBalance)
+	} else {
+		bigBal = s.Balance().ToBig()
+	}
+	bigAmount := amount.ToBig()
+	newBigBal := new(big.Int).Add(bigBal, bigAmount)
+
+	// Check if result fits in uint256
+	result, overflow := uint256.FromBig(newBigBal)
+	if overflow {
+		// Balance exceeds uint256 — record in journal and store BigBalance
+		prev := *s.data.Balance
+		s.db.journal.balanceChange(s.address, s.data.Balance, s.data.BigBalance)
+		s.data.Balance = result // modular (wrapped) value
+		s.data.BigBalance = newBigBal
+		return prev
+	}
+	// Normal case: fits in uint256
+	return s.SetBalance(result)
 }
 
 // SetBalance sets the balance for the object, and returns the previous balance.
 func (s *stateObject) SetBalance(amount *uint256.Int) uint256.Int {
 	prev := *s.data.Balance
-	s.db.journal.balanceChange(s.address, s.data.Balance)
+	s.db.journal.balanceChange(s.address, s.data.Balance, s.data.BigBalance)
 	s.setBalance(amount)
 	return prev
 }
 
 func (s *stateObject) setBalance(amount *uint256.Int) {
 	s.data.Balance = amount
+	s.data.BigBalance = nil // Clear BigBalance when setting a uint256 value
+}
+
+// setBigBalance restores both Balance and BigBalance (used by journal revert).
+func (s *stateObject) setBigBalance(amount *uint256.Int, bigAmount *big.Int) {
+	s.data.Balance = amount
+	s.data.BigBalance = bigAmount
 }
 
 func (s *stateObject) deepCopy(db *StateDB) *stateObject {
+	// Deep copy the data (including BigBalance)
+	dataCopy := s.data
+	if s.data.BigBalance != nil {
+		dataCopy.BigBalance = new(big.Int).Set(s.data.BigBalance)
+	}
+	if s.data.Balance != nil {
+		dataCopy.Balance = new(uint256.Int).Set(s.data.Balance)
+	}
+
 	obj := &stateObject{
 		db:                 db,
 		address:            s.address,
 		addressHash:        nil,
 		origin:             s.origin,
-		data:               s.data,
+		data:               dataCopy,
 		code:               s.code,
 		originStorage:      s.originStorage.Copy(),
 		pendingStorage:     s.pendingStorage.Copy(),

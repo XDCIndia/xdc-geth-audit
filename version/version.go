@@ -20,5 +20,5 @@ const (
 	Major = 1        // Major version component of the current release
 	Minor = 17       // Minor version component of the current release
 	Patch = 4        // Patch version component of the current release
-	Meta  = "stable" // Version metadata to append to the version string
+	Meta  = "xdc.7" // Version metadata to append to the version string
 )

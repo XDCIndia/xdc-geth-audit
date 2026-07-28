@@ -18,7 +18,10 @@ package ethstats
 
 import (
 	"strconv"
+	"strings"
 	"testing"
+
+	"github.com/ethereum/go-ethereum/common"
 )
 
 func TestParseEthstatsURL(t *testing.T) {
@@ -77,6 +80,35 @@ func TestParseEthstatsURL(t *testing.T) {
 		}
 		if host != c.host {
 			t.Errorf("case=%d mismatch host value, got: %v ,want: %v", i, host, c.host)
+		}
+	}
+}
+
+type fakeSigner struct {
+	addr   common.Address
+	active bool
+}
+
+func (f fakeSigner) Signer() (common.Address, bool) { return f.addr, f.active }
+
+func TestCoinbaseAndRole(t *testing.T) {
+	realAddr := common.HexToAddress("0xAbCdEf1234567890aBcDeF1234567890ABcdEf12")
+	zeroAddr := strings.ToLower((common.Address{}).Hex())
+	cases := []struct {
+		name         string
+		engine       any
+		wantCoinbase string
+		wantRole     string
+	}{
+		{"no-provider", struct{}{}, zeroAddr, "follower"},
+		{"not-active", fakeSigner{addr: realAddr, active: false}, zeroAddr, "follower"},
+		{"active-zero-address", fakeSigner{addr: common.Address{}, active: true}, zeroAddr, "follower"},
+		{"active-real-address", fakeSigner{addr: realAddr, active: true}, strings.ToLower(realAddr.Hex()), "validator"},
+	}
+	for _, c := range cases {
+		gotCoinbase, gotRole := coinbaseAndRole(c.engine)
+		if gotCoinbase != c.wantCoinbase || gotRole != c.wantRole {
+			t.Errorf("%s: got (%q, %q), want (%q, %q)", c.name, gotCoinbase, gotRole, c.wantCoinbase, c.wantRole)
 		}
 	}
 }

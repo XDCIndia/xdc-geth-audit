@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/big"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/forkid"
@@ -30,9 +31,11 @@ import (
 
 // Constants to match up protocol versions and messages
 const (
-	ETH69 = 69
-	ETH70 = 70
-	ETH71 = 71
+	ETH63  = 63  // legacy eth/63 — required for XDC mainnet mesh acceptance (refs #857 A.59)
+	ETH69  = 69
+	ETH70  = 70
+	ETH71  = 71  // upstream eth/71 (additively included)
+	XDPOS2 = 100 // XDC consensus protocol (refs #740)
 )
 
 // ProtocolName is the official short name of the `eth` protocol used during
@@ -40,12 +43,27 @@ const (
 const ProtocolName = "eth"
 
 // ProtocolVersions are the supported versions of the `eth` protocol (first
-// is primary).
-var ProtocolVersions = []uint{ETH71, ETH70, ETH69}
+// is primary). XDPOS2 is offered first so XDC peers prefer it over the
+// upstream ETH/* family; stock-geth peers fall back to ETH/70 or ETH/69.
+//
+// A.59 (refs #857): ETH63 is appended to the advertised capability list so
+// XDC public mesh peers — which expect `eth/63` in the cap list before
+// accepting an inbound connection — see a compatible legacy version. devp2p
+// version negotiation still picks the highest common version, which is
+// XDPOS2/100 for every XDC peer (they all carry it), so the runtime wire
+// protocol remains XDPOS2/100 and no eth/63 message handling is exercised.
+// Side-by-side experiment 2026-06-06 showed fresh XDPoSChain v2.7.0 with
+// `caps=[xdpos2,eth/63]` attracted 2 peers in 7 min while fresh modern
+// without ETH63 sat at 0 peers for 50+ min on the same bootnodes.
+var ProtocolVersions = []uint{XDPOS2, ETH70, ETH69, ETH63}
 
 // protocolLengths are the number of implemented message corresponding to
-// different protocol versions.
-var protocolLengths = map[uint]uint64{ETH71: 20, ETH69: 18, ETH70: 18}
+// different protocol versions. ETH63 uses 17 messages (msg codes 0x00..0x10)
+// per the legacy go-ethereum eth/63 protocol definition; this is advertised
+// for cap negotiation only and never runs at runtime on XDC peers because
+// XDPOS2/100 always wins highest-common-version selection.
+// ETH71 included additively for upstream compat.
+var protocolLengths = map[uint]uint64{ETH63: 17, ETH69: 18, ETH70: 18, ETH71: 20, XDPOS2: 229}
 
 // maxMessageSize is the maximum cap on the size of a protocol message.
 const maxMessageSize = 10 * 1024 * 1024
@@ -65,11 +83,23 @@ const (
 	NewPooledTransactionHashesMsg = 0x08
 	GetPooledTransactionsMsg      = 0x09
 	PooledTransactionsMsg         = 0x0a
+	// XDC-specific NodeData messages on XDPOS2 (refs #844, #845).
+	// Restored from upstream Geth v1.10.13 to enable classical Fast Sync.
+	// HBSS-only on the server side — PBSS state scheme cannot serve these.
+	GetNodeDataMsg = 0x0d
+	NodeDataMsg    = 0x0e
+
 	GetReceiptsMsg                = 0x0f
 	ReceiptsMsg                   = 0x10
 	BlockRangeUpdateMsg           = 0x11
 	GetBlockAccessListsMsg        = 0x12
 	BlockAccessListsMsg           = 0x13
+
+	// XDPOS2 consensus messages (refs #740). Numeric codes preserved from XDC
+	// fork to keep wire compatibility with existing XDC fleet nodes.
+	VoteMsg     = 0xe0
+	TimeoutMsg  = 0xe1
+	SyncInfoMsg = 0xe2
 )
 
 var (
@@ -90,7 +120,7 @@ type Packet interface {
 	Kind() byte   // Kind returns the message type.
 }
 
-// StatusPacket is the network packet for the status message.
+// StatusPacket is the network packet for the status message (ETH/69, ETH/70 — upstream shape).
 type StatusPacket struct {
 	ProtocolVersion uint32
 	NetworkID       uint64
@@ -100,6 +130,66 @@ type StatusPacket struct {
 	EarliestBlock   uint64
 	LatestBlock     uint64
 	LatestBlockHash common.Hash
+}
+
+// XDC state-scheme constants advertised in the A.37 handshake trailer. Wire
+// values are intentionally small to keep the optional RLP tail compact.
+// Refs #844 (A.37) — proactive sibling to A.40's reactive PBSS blacklist.
+const (
+	XDCStateSchemeUnknown byte = 0 // peer did not advertise (pre-A.37 or non-XDC build)
+	XDCStateSchemeHBSS    byte = 1 // legacy hash-based scheme, can serve NodeData
+	XDCStateSchemePBSS    byte = 2 // path-based scheme, cannot serve classical NodeData
+)
+
+// XDCCaps is the XDC capabilities trailer attached to StatusPacket62. It
+// announces the peer's state scheme and a short build identifier so a
+// fast-sync requester can avoid NodeData against incompatible-binary peers.
+// Encoded as the trailing optional field of StatusPacket62 — legacy peers
+// (pre-A.37) silently omit the trailer and the decoder produces a zero-value
+// XDCCaps. Refs #844 (A.37 ADR).
+type XDCCaps struct {
+	Scheme       byte    // one of XDCStateScheme{Unknown,HBSS,PBSS}
+	CommitPrefix [8]byte // first 8 bytes of the peer's git commit (build identity)
+}
+
+// StatusPacket62 is the network packet for the status message on the XDC
+// XDPOS2 protocol (refs #740). XDC is pre-merge and uses this format
+// without ForkID. TD is a placeholder (block number on XDC); peers must
+// not rely on it for sync decisions. Matches the production geth-XDC
+// fleet's on-wire shape so reset binaries can complete the handshake.
+//
+// A.37 fix (#844): the wire shape MUST remain exactly 5 fields. The
+// previous A.37 attempt appended an `rlp:"optional"` Caps trailer, which
+// is decode-tolerant on OUR side but legacy peers (pre-A.37 geth-XDC,
+// e.g. the canonical a119e0b archive fleet) use a strict 5-field decoder
+// that rejects extra trailing list elements with "input list has too many
+// elements" and drops the connection. The Caps gate is now derived
+// entirely from REACTIVE signals (A.40 PBSS blacklist + empty-response
+// counters). XDCCaps remains as a typed handle so the downloader's
+// dormant gating flags continue to compile, but it is never read from or
+// written to the wire.
+type StatusPacket62 struct {
+	ProtocolVersion uint32
+	NetworkID       uint64
+	TD              *big.Int // placeholder: block number on XDC (pre-merge)
+	Head            common.Hash
+	Genesis         common.Hash
+}
+
+// NewBlockHashesPacket is the legacy eth/63/XDPOS2 block-announcement packet
+// (msg id 0x01). XDC peers gossip newly-produced tip blocks via this; without
+// processing it the node stalls at tip even when bulk-sync caught up. Upstream
+// v1.17.3 dropped this (post-merge geth has no NewBlock); XDC overlay restores it.
+type NewBlockHashesPacket []struct {
+	Hash   common.Hash
+	Number uint64
+}
+
+// NewBlockPacket is the legacy eth/63/XDPOS2 NewBlock packet (msg id 0x07).
+// Carries a fully-mined tip block plus the announcing peer's cumulative TD.
+type NewBlockPacket struct {
+	Block *types.Block
+	TD    *big.Int
 }
 
 // TransactionsPacket is the network packet for broadcasting new transactions.
@@ -313,6 +403,9 @@ type BlockAccessListPacket struct {
 func (*StatusPacket) Name() string { return "Status" }
 func (*StatusPacket) Kind() byte   { return StatusMsg }
 
+func (*StatusPacket62) Name() string { return "Status" }
+func (*StatusPacket62) Kind() byte   { return StatusMsg }
+
 func (*TransactionsPacket) Name() string { return "Transactions" }
 func (*TransactionsPacket) Kind() byte   { return TransactionsMsg }
 
@@ -327,6 +420,12 @@ func (*GetBlockBodiesRequest) Kind() byte   { return GetBlockBodiesMsg }
 
 func (*BlockBodiesResponse) Name() string { return "BlockBodies" }
 func (*BlockBodiesResponse) Kind() byte   { return BlockBodiesMsg }
+
+func (*NewBlockHashesPacket) Name() string { return "NewBlockHashes" }
+func (*NewBlockHashesPacket) Kind() byte   { return NewBlockHashesMsg }
+
+func (*NewBlockPacket) Name() string { return "NewBlock" }
+func (*NewBlockPacket) Kind() byte   { return NewBlockMsg }
 
 func (*NewPooledTransactionHashesPacket) Name() string { return "NewPooledTransactionHashes" }
 func (*NewPooledTransactionHashesPacket) Kind() byte   { return NewPooledTransactionHashesMsg }
@@ -349,8 +448,46 @@ func (*ReceiptsRLPResponse) Kind() byte   { return ReceiptsMsg }
 func (*BlockRangeUpdatePacket) Name() string { return "BlockRangeUpdate" }
 func (*BlockRangeUpdatePacket) Kind() byte   { return BlockRangeUpdateMsg }
 
+// GetNodeDataPacket is the network packet for state trie node retrieval (XDPOS2/eth-63 shape).
+type GetNodeDataPacket []common.Hash
+
+// NodeDataPacket is the network packet for state trie node delivery (XDPOS2/eth-63 shape).
+type NodeDataPacket [][]byte
+
+func (*GetNodeDataPacket) Name() string { return "GetNodeData" }
+func (*GetNodeDataPacket) Kind() byte   { return GetNodeDataMsg }
+
+func (*NodeDataPacket) Name() string { return "NodeData" }
+func (*NodeDataPacket) Kind() byte   { return NodeDataMsg }
+
+// XDPOS2 consensus packets (refs #740). Vote/Timeout/SyncInfo bodies are
+// forwarded as raw RLP — decoding happens inside the XDPoS engine to keep
+// wire-layer code consensus-agnostic.
+
+type VotePacket struct {
+	Vote []byte
+}
+
+func (*VotePacket) Name() string { return "Vote" }
+func (*VotePacket) Kind() byte   { return VoteMsg }
+
+type TimeoutPacket struct {
+	Timeout []byte
+}
+
+func (*TimeoutPacket) Name() string { return "Timeout" }
+func (*TimeoutPacket) Kind() byte   { return TimeoutMsg }
+
+type SyncInfoPacket struct {
+	SyncInfo []byte
+}
+
+func (*SyncInfoPacket) Name() string { return "SyncInfo" }
+func (*SyncInfoPacket) Kind() byte   { return SyncInfoMsg }
+
 func (*GetBlockAccessListsRequest) Name() string { return "GetBlockAccessLists" }
 func (*GetBlockAccessListsRequest) Kind() byte   { return GetBlockAccessListsMsg }
 
 func (*BlockAccessListResponse) Name() string { return "BlockAccessLists" }
 func (*BlockAccessListResponse) Kind() byte   { return BlockAccessListsMsg }
+

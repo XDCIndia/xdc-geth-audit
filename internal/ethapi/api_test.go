@@ -712,6 +712,15 @@ func (b testBackend) HistoryRetention() HistoryRetention {
 	return HistoryRetention{StateScheme: b.chain.TrieDB().Scheme()}
 }
 
+// XDC-specific methods required by the Backend interface.
+func (b testBackend) GetRewardByHash(hash common.Hash) map[string]map[string]map[string]*big.Int {
+	return nil
+}
+func (b testBackend) BlockChain() *core.BlockChain { return b.chain }
+func (b testBackend) SnapHealStatus() *core.SnapHealStatusFields {
+	return nil // not supported in testBackend
+}
+
 func TestEstimateGas(t *testing.T) {
 	t.Parallel()
 	// Initialize test accounts

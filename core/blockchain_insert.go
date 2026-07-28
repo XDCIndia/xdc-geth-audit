@@ -125,10 +125,15 @@ func (it *insertIterator) next() (*types.Block, error) {
 		it.errors = append(it.errors, <-it.results)
 	}
 	if it.errors[it.index] != nil {
+		log.Debug("insertIterator.next: header verification error", "index", it.index, "block", it.chain[it.index].NumberU64(), "err", it.errors[it.index].Error())
 		return it.chain[it.index], it.errors[it.index]
 	}
 	// Block header valid, run body validation and return
-	return it.chain[it.index], it.validator.ValidateBody(it.chain[it.index])
+	bodyErr := it.validator.ValidateBody(it.chain[it.index])
+	if bodyErr != nil {
+		log.Debug("insertIterator.next: body validation error", "index", it.index, "block", it.chain[it.index].NumberU64(), "err", bodyErr.Error())
+	}
+	return it.chain[it.index], bodyErr
 }
 
 // previous returns the previous header that was being processed, or nil.

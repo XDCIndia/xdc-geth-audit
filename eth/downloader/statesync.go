@@ -14,6 +14,11 @@
 // You should have received a copy of the GNU Lesser General Public License
 // along with the go-ethereum library. If not, see <http://www.gnu.org/licenses/>.
 
+// statesync.go implements the minimal stateSync type used by snap sync
+// (processSnapSyncContent). The classical NodeData / fast-sync orchestration
+// (XDPOS2, Phase A.2 of #844) lives in faststatesync.go as fastStateSync so
+// the two paths remain fully isolated.
+
 package downloader
 
 import (

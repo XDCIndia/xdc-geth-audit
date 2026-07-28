@@ -29,7 +29,6 @@ import (
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
-	"github.com/ethereum/go-ethereum/rlp"
 	bloomfilter "github.com/holiman/bloomfilter/v2"
 )
 
@@ -224,8 +223,9 @@ func (dl *diffLayer) Account(hash common.Hash) (*types.SlimAccount, error) {
 	if len(data) == 0 { // can be both nil and []byte{}
 		return nil, nil
 	}
-	account := new(types.SlimAccount)
-	if err := rlp.DecodeBytes(data, account); err != nil {
+	// XDC: BigBalance-aware decode (see disklayer.go for rationale).
+	account, err := types.DecodeSlimAccount(data)
+	if err != nil {
 		panic(err)
 	}
 	return account, nil

@@ -572,6 +572,15 @@ func (s *syncer) Register(peer SyncPeer) error {
 	return nil
 }
 
+// PeerCount returns the number of snap peers currently registered with the
+// syncer. Used by A.97.2 heal-start gate to abort early when no snap-capable
+// peers are available. Refs #894.
+func (s *syncer) PeerCount() int {
+	s.lock.RLock()
+	defer s.lock.RUnlock()
+	return len(s.peers)
+}
+
 // Unregister injects a new data source into the syncer's peerset.
 func (s *syncer) Unregister(id string) error {
 	// Remove all traces of the peer from the registry
