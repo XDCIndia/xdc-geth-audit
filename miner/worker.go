@@ -66,7 +66,12 @@ type environment struct {
 	size     uint64         // size of the block we are building
 	gasPool  *core.GasPool  // available gas used to pack transactions
 	coinbase common.Address
-	evm      *vm.EVM
+	// coinbaseOwner is the XDC TRC21 fee recipient (the masternode's registered
+	// candidate-owner) resolved ONCE per block before tx execution, mirroring
+	// core/state_processor.go Process. Zero address ⇒ fees route to the coinbase
+	// (pre-TIPTRC21Fee behaviour). Set by the XDPoS worker after makeEnv.
+	coinbaseOwner common.Address
+	evm           *vm.EVM
 
 	header   *types.Header
 	txs      []*types.Transaction
@@ -417,19 +422,51 @@ func (miner *Miner) commitBlobTransaction(env *environment, tx *types.Transactio
 }
 
 // applyTransaction runs the transaction. If execution fails, state and gas pool are reverted.
+//
+// XDC: this MUST mirror the special-transaction dispatch in
+// core/state_processor.go Process, or the mine-path and import-path compute
+// different state roots and the producer rejects its own block with
+// "invalid merkle root" (#952 / apothem 83,088,792). Specifically:
+//   - signing txs to BlockSignersBinary (0x89) after TIPSigning run through
+//     ApplySigningTransaction (zero-gas, no EVM), NOT the normal EVM path;
+//   - XDCx notifier txs to 0x92/0x93 in the TIPXDCXReceiver window run through
+//     ApplyEmptyTransaction;
+//   - all other txs route the TRC21 gas fee to env.coinbaseOwner.
 func (miner *Miner) applyTransaction(env *environment, tx *types.Transaction) (*types.Receipt, *bal.ConstructionBlockAccessList, error) {
 	var (
-		snap = env.state.Snapshot()
-		gp   = env.gasPool.Snapshot()
+		snap        = env.state.Snapshot()
+		gp          = env.gasPool.Snapshot()
+		config      = miner.chainConfig
+		blockNumber = env.header.Number
+		// blockHash is tentative (block not sealed yet); it is only stamped into
+		// the receipt's BlockHash (fixed up at assembly) and is NOT part of the
+		// state root or the receipts trie, so a tentative value is safe here.
+		blockHash = env.header.Hash()
+		receipt   *types.Receipt
+		txBAL     *bal.ConstructionBlockAccessList
+		err       error
+		to        = tx.To()
 	)
-	receipt, bal, err := core.ApplyTransaction(env.evm, env.gasPool, env.state, env.header, tx)
+	switch {
+	case to != nil && *to == common.BlockSignersBinary && config.IsTIPSigning(blockNumber):
+		receipt, err = core.ApplySigningTransaction(config, env.state, blockNumber, blockHash, tx, env.gasPool.Used())
+	case config.IsTIPXDCXReceiver(blockNumber) && to != nil &&
+		(*to == common.TradingStateAddrBinary || *to == common.XDCXLendingAddressBinary):
+		receipt, err = core.ApplyEmptyTransaction(config, env.state, blockNumber, blockHash, tx, env.gasPool.Used())
+	default:
+		var msg *core.Message
+		msg, err = core.TransactionToMessage(tx, types.MakeSigner(config, blockNumber, env.header.Time), env.header.BaseFee)
+		if err == nil {
+			receipt, txBAL, err = core.ApplyTransactionWithEVM(msg, env.gasPool, env.state, blockNumber, blockHash, env.header.Time, tx, env.evm, env.coinbaseOwner)
+		}
+	}
 	if err != nil {
 		env.state.RevertToSnapshot(snap)
 		env.gasPool.Set(gp)
 		return nil, nil, err
 	}
 	env.header.GasUsed = env.gasPool.Used()
-	return receipt, bal, nil
+	return receipt, txBAL, nil
 }
 
 func (miner *Miner) commitTransactions(ctx context.Context, env *environment, plainTxs, blobTxs *txorder.TransactionsByPriceAndNonce, interrupt *atomic.Int32) error {

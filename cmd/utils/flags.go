@@ -23,11 +23,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math/big"
 	"net"
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	godebug "runtime/debug"
 	"strconv"
 	"strings"
@@ -162,6 +164,25 @@ var (
 		Usage:    "Hoodi network: pre-configured proof-of-stake test network",
 		Category: flags.EthCategory,
 	}
+	// XDC Network flags (refs #740/#742). Two boolean shortcuts that load
+	// XDCMainnet / XDCApothem chain config + genesis + bootnodes in one
+	// place — equivalent to specifying `--networkid 50` (or 51) + `geth init
+	// genesis.json` + `--bootnodes <fleet>` manually.
+	XDCMainnetFlag = &cli.BoolFlag{
+		Name:     "xdcmainnet",
+		Usage:    "XDC mainnet (network ID 50): XDPoS BFT consensus network",
+		Category: flags.EthCategory,
+	}
+	XDCApothemFlag = &cli.BoolFlag{
+		Name:     "apothem",
+		Usage:    "XDC Apothem testnet (network ID 51): XDPoS BFT consensus test network",
+		Category: flags.EthCategory,
+	}
+	XDCDevnetFlag = &cli.BoolFlag{
+		Name:     "xdcdevnet",
+		Usage:    "XDC devnet (network ID 5551): XDPoS BFT consensus dev network",
+		Category: flags.EthCategory,
+	}
 	// Dev mode
 	DeveloperFlag = &cli.BoolFlag{
 		Name:     "dev",
@@ -282,8 +303,34 @@ var (
 	}
 	SyncModeFlag = &cli.StringFlag{
 		Name:     "syncmode",
-		Usage:    `Blockchain sync mode ("snap" or "full")`,
+		Usage:    `Blockchain sync mode ("snap", "full" or "fast")`,
 		Value:    ethconfig.Defaults.SyncMode.String(),
+		Category: flags.StateCategory,
+	}
+	// Fast Sync operator-pinned trust anchor flags (refs #844 Phase A.6,
+	// FAST_SYNC_IMPLEMENTATION.md §2). All three must be supplied together.
+	FastSyncPivotNumberFlag = &cli.Uint64Flag{
+		Name:     "fastsyncpivotnumber",
+		Usage:    "(Fast Sync only) operator-pinned trust anchor: pivot block number",
+		Category: flags.StateCategory,
+	}
+	FastSyncPivotHashFlag = &cli.StringFlag{
+		Name:     "fastsyncpivothash",
+		Usage:    "(Fast Sync only) operator-pinned trust anchor: pivot block hash (0x...)",
+		Category: flags.StateCategory,
+	}
+	FastSyncPivotRootFlag = &cli.StringFlag{
+		Name:     "fastsyncpivotroot",
+		Usage:    "(Fast Sync only) operator-pinned trust anchor: pivot state root (0x...)",
+		Category: flags.StateCategory,
+	}
+	// NoAutoPivotFlag disables the A.96 automatic pivot selection from
+	// TrustedSyncCheckpoints so chains with checkpoints (Apothem, XDC mainnet)
+	// can exercise the A.97.1 dynamic-pivot path. Primarily for testing.
+	// Refs: A.97 / #894.
+	NoAutoPivotFlag = &cli.BoolFlag{
+		Name:     "no-auto-pivot",
+		Usage:    "(Fast Sync only) disable A.96 auto-pin from TrustedSyncCheckpoints; use dynamic-pivot path with A.97.1 freeze instead",
 		Category: flags.StateCategory,
 	}
 	GCModeFlag = &cli.StringFlag{
@@ -1163,7 +1210,9 @@ var (
 		HoodiFlag,
 	}
 	// NetworkFlags is the flag group of all built-in supported networks.
-	NetworkFlags = append([]cli.Flag{MainnetFlag}, TestnetFlags...)
+	// XDC chains (XDCMainnetFlag, XDCApothemFlag, XDCDevnetFlag) are listed here so
+	// they show up under `geth --help` alongside the upstream networks.
+	NetworkFlags = append([]cli.Flag{MainnetFlag, XDCMainnetFlag, XDCApothemFlag, XDCDevnetFlag}, TestnetFlags...)
 
 	// DatabaseFlags is the flag group of all database flags.
 	DatabaseFlags = []cli.Flag{
@@ -1253,6 +1302,18 @@ func setBootstrapNodes(ctx *cli.Context, cfg *p2p.Config) {
 			return // Already set by config file, don't apply defaults.
 		}
 		switch {
+		case ctx.Bool(XDCMainnetFlag.Name):
+			urls = params.XDCMainnetBootnodes
+		case ctx.Bool(XDCApothemFlag.Name):
+			urls = params.XDCApothemBootnodes
+		case ctx.Bool(XDCDevnetFlag.Name):
+			urls = params.XDCDevnetBootnodes
+		case ctx.Uint64(NetworkIdFlag.Name) == 50:
+			urls = params.XDCMainnetBootnodes
+		case ctx.Uint64(NetworkIdFlag.Name) == 51:
+			urls = params.XDCApothemBootnodes
+		case ctx.Uint64(NetworkIdFlag.Name) == 5551:
+			urls = params.XDCDevnetBootnodes
 		case ctx.Bool(HoleskyFlag.Name):
 			urls = params.HoleskyBootnodes
 		case ctx.Bool(SepoliaFlag.Name):
@@ -1262,6 +1323,55 @@ func setBootstrapNodes(ctx *cli.Context, cfg *p2p.Config) {
 		}
 	}
 	cfg.BootstrapNodes = mustParseBootnodes(urls)
+
+	// A.38: when running --syncmode=fast with explicit --bootnodes, also promote
+	// those nodes to StaticNodes so the p2p dial loop redials them on disconnect.
+	// Without this, a bootnode that drops (e.g. archive bounce during fast-sync)
+	// falls back into the discovery pool with no priority and the operator must
+	// manually `admin.addTrustedPeer(<enode>)` over IPC to nudge reconnection.
+	// Append-only & deduplicated by enode ID to preserve config.toml StaticNodes.
+	// A.38: verify via runtime check that static count > 0 when fast-sync starts with --bootnodes
+	if ctx.IsSet(BootnodesFlag.Name) && ctx.IsSet(SyncModeFlag.Name) {
+		var sm ethconfig.SyncMode
+		if err := sm.UnmarshalText([]byte(ctx.String(SyncModeFlag.Name))); err == nil && sm == ethconfig.FastSync {
+			promoteBootnodesToStatic(cfg)
+		}
+	}
+}
+
+// promoteBootnodesToStatic appends cfg.BootstrapNodes to cfg.StaticNodes,
+// deduplicated by enode ID, and logs a one-line summary at INFO level so
+// operators can see the promotion took effect at startup.
+func promoteBootnodesToStatic(cfg *p2p.Config) {
+	if len(cfg.BootstrapNodes) == 0 {
+		return
+	}
+	have := make(map[enode.ID]bool, len(cfg.StaticNodes))
+	for _, n := range cfg.StaticNodes {
+		have[n.ID()] = true
+	}
+	added := make([]*enode.Node, 0, len(cfg.BootstrapNodes))
+	for _, n := range cfg.BootstrapNodes {
+		if have[n.ID()] {
+			continue
+		}
+		have[n.ID()] = true
+		cfg.StaticNodes = append(cfg.StaticNodes, n)
+		added = append(added, n)
+	}
+	if len(added) == 0 {
+		return
+	}
+	short := make([]string, 0, len(added))
+	for _, n := range added {
+		id := n.ID().String()
+		if len(id) > 8 {
+			id = id[:8]
+		}
+		short = append(short, fmt.Sprintf("enode://%s…@%s:%d", id, n.IP(), n.TCP()))
+	}
+	log.Info("Fast-sync: promoted bootnodes to static peers",
+		"count", len(cfg.StaticNodes), "added", len(added), "peers", strings.Join(short, ","))
 }
 
 func mustParseBootnodes(urls []string) []*enode.Node {
@@ -1475,8 +1585,64 @@ func MakeDatabaseHandles(max int) int {
 	return int(raised / 2) // Leave half for networking and other stuff
 }
 
+// UnlockXDPoSMinerAccount unlocks the XDPoS V2 mining account via keystore.
+// Called when --mine and --password are both set. Re-implements the minimal
+// subset of the deprecated --unlock functionality needed for BFT signing
+// (sendTimeout, sendVote) without exposing the key over HTTP/RPC.
+func UnlockXDPoSMinerAccount(ctx *cli.Context, stack *node.Node) error {
+	// Resolve etherbase address (same logic as setEtherbase / SetEthConfig).
+	var eb common.Address
+	if ctx.IsSet(MinerEtherbaseFlag.Name) {
+		addr := ctx.String(MinerEtherbaseFlag.Name)
+		if !common.IsHexAddress(addr) {
+			return fmt.Errorf("UnlockXDPoSMinerAccount: invalid etherbase %q", addr)
+		}
+		eb = common.HexToAddress(addr)
+	} else if ctx.IsSet(MinerPendingFeeRecipientFlag.Name) {
+		addr := ctx.String(MinerPendingFeeRecipientFlag.Name)
+		if !common.IsHexAddress(addr) {
+			return fmt.Errorf("UnlockXDPoSMinerAccount: invalid pending fee recipient %q", addr)
+		}
+		eb = common.HexToAddress(addr)
+	} else {
+		return nil // nothing to unlock; StartMining will fail with a clear message
+	}
+
+	// Read password from file.
+	pwPath := ctx.Path(PasswordFileFlag.Name)
+	data, err := os.ReadFile(pwPath)
+	if err != nil {
+		return fmt.Errorf("UnlockXDPoSMinerAccount: read password file %s: %w", pwPath, err)
+	}
+	password := strings.TrimRight(string(data), "\r\n")
+
+	// Find the keystore backend and unlock the account.
+	// The accounts.Wallet interface wraps the keystore; we access the raw
+	// keystore via AccountManager.Backends() to call Unlock() directly.
+	acct := accounts.Account{Address: eb}
+	for _, b := range stack.AccountManager().Backends(keystore.KeyStoreType) {
+		ks := b.(*keystore.KeyStore)
+		if err := ks.Unlock(acct, password); err == nil {
+			log.Info("XDPoS miner account unlocked", "address", eb)
+			return nil
+		} else if ks.HasAddress(eb) {
+			return fmt.Errorf("UnlockXDPoSMinerAccount: unlock %s: %w", eb.Hex(), err)
+		}
+	}
+	return fmt.Errorf("UnlockXDPoSMinerAccount: account %s not found in any keystore", eb.Hex())
+}
+
 // setEtherbase retrieves the etherbase from the directly specified command line flags.
 func setEtherbase(ctx *cli.Context, cfg *ethconfig.Config) {
+	if ctx.IsSet(MinerEtherbaseFlag.Name) {
+		log.Warn("Option --miner.etherbase is deprecated as the etherbase is set by the consensus client post-merge")
+		// XDPoS V2 back-compat: --miner.etherbase still feeds PendingFeeRecipient so
+		// XDPoS2 StartMining can resolve the coinbase without requiring the new flag.
+		addr := ctx.String(MinerEtherbaseFlag.Name)
+		if common.IsHexAddress(addr) {
+			cfg.Miner.PendingFeeRecipient = common.HexToAddress(addr)
+		}
+	}
 	if !ctx.IsSet(MinerPendingFeeRecipientFlag.Name) {
 		return
 	}
@@ -1714,6 +1880,14 @@ func setBlobPool(ctx *cli.Context, cfg *blobpool.Config) {
 }
 
 func setMiner(ctx *cli.Context, cfg *miner.Config) {
+	// XDC A.97-M.B Task 7: re-activate --mine for XDPoS V2 block production.
+	// The upstream geth had deprecated this flag (post-merge PoS nodes don't use
+	// it), but XDC is a PoA/BFT chain that uses --mine to start the minter.
+	// Storing Mining=true here lets eth/backend.go startNode call StartMining().
+	if ctx.Bool(MiningEnabledFlag.Name) {
+		cfg.Mining = true
+		log.Info("XDPoS2: --mine flag set, block production will start after sync")
+	}
 	if ctx.IsSet(MinerExtraDataFlag.Name) {
 		cfg.ExtraData = []byte(ctx.String(MinerExtraDataFlag.Name))
 	}
@@ -1757,7 +1931,7 @@ func setRequiredBlocks(ctx *cli.Context, cfg *ethconfig.Config) {
 // SetEthConfig applies eth-related command line flags to the config.
 func SetEthConfig(ctx *cli.Context, stack *node.Node, cfg *ethconfig.Config) {
 	// Avoid conflicting network flags
-	flags.CheckExclusive(ctx, MainnetFlag, DeveloperFlag, SepoliaFlag, HoleskyFlag, HoodiFlag, OverrideGenesisFlag)
+	flags.CheckExclusive(ctx, MainnetFlag, DeveloperFlag, SepoliaFlag, HoleskyFlag, HoodiFlag, XDCMainnetFlag, XDCApothemFlag, XDCDevnetFlag, OverrideGenesisFlag)
 	flags.CheckExclusive(ctx, DeveloperFlag, ExternalSignerFlag) // Can't use both ephemeral unlocked and external signer
 
 	// Set configurations from CLI flags
@@ -1812,6 +1986,45 @@ func SetEthConfig(ctx *cli.Context, stack *node.Node, cfg *ethconfig.Config) {
 		if err := cfg.SyncMode.UnmarshalText([]byte(value)); err != nil {
 			Fatalf("--%v: %v", SyncModeFlag.Name, err)
 		}
+	}
+
+	// Operator-pinned Fast Sync trust anchor validation (refs #844 Phase A.6,
+	// FAST_SYNC_IMPLEMENTATION.md §2.2). All-or-nothing: if any flag is set,
+	// all three must be set and non-empty. pivotnumber == 0 is rejected.
+	// Hash/root are validated via common.Hash.UnmarshalText (not HexToHash,
+	// which silently zero-pads bad input).
+	{
+		num := ctx.Uint64(FastSyncPivotNumberFlag.Name)
+		hashStr := ctx.String(FastSyncPivotHashFlag.Name)
+		rootStr := ctx.String(FastSyncPivotRootFlag.Name)
+		anySet := num != 0 || hashStr != "" || rootStr != ""
+		allSet := num != 0 && hashStr != "" && rootStr != ""
+		if anySet && !allSet {
+			Fatalf("--fastsyncpivot{number,hash,root} must all be set together (and number must be non-zero)")
+		}
+		if allSet {
+			if cfg.SyncMode != ethconfig.FastSync {
+				Fatalf("--fastsyncpivot* requires --syncmode fast")
+			}
+			var pivotHash, pivotRoot common.Hash
+			if err := pivotHash.UnmarshalText([]byte(hashStr)); err != nil {
+				Fatalf("--fastsyncpivothash invalid: %v", err)
+			}
+			if err := pivotRoot.UnmarshalText([]byte(rootStr)); err != nil {
+				Fatalf("--fastsyncpivotroot invalid: %v", err)
+			}
+			cfg.FastSyncPivotNumber = num
+			cfg.FastSyncPivotHash = pivotHash
+			cfg.FastSyncPivotRoot = pivotRoot
+		}
+	}
+	// A.97 (refs #894): --no-auto-pivot disables the A.96 TrustedSyncCheckpoints
+	// auto-pin so the A.97.1 dynamic-pivot-freeze path is exercised.
+	if ctx.IsSet(NoAutoPivotFlag.Name) {
+		if cfg.SyncMode != ethconfig.FastSync {
+			Fatalf("--no-auto-pivot requires --syncmode fast")
+		}
+		cfg.NoAutoPivot = ctx.Bool(NoAutoPivotFlag.Name)
 	}
 
 	if ctx.IsSet(ChainHistoryFlag.Name) {
@@ -1915,13 +2128,13 @@ func SetEthConfig(ctx *cli.Context, stack *node.Node, cfg *ethconfig.Config) {
 		cfg.RangeLimit = ctx.Uint64(RPCGlobalRangeLimitFlag.Name)
 	}
 	if !ctx.Bool(SnapshotFlag.Name) || cfg.SnapshotCache == 0 {
-		// If snap-sync is requested, this flag is also required
-		if cfg.SyncMode == ethconfig.SnapSync {
+		// If snap-sync or fast-sync is requested, the snapshot DB is also required
+		if cfg.SyncMode == ethconfig.SnapSync || cfg.SyncMode == ethconfig.FastSync {
 			if !ctx.Bool(SnapshotFlag.Name) {
-				log.Warn("Snap sync requested, enabling --snapshot")
+				log.Warn("Sync mode requested, enabling --snapshot", "mode", cfg.SyncMode)
 			}
 			if cfg.SnapshotCache == 0 {
-				log.Warn("Snap sync requested, resetting --cache.snapshot")
+				log.Warn("Sync mode requested, resetting --cache.snapshot", "mode", cfg.SyncMode)
 				cfg.SnapshotCache = ctx.Int(CacheFlag.Name) * CacheSnapshotFlag.Value / 100
 			}
 		} else {
@@ -1987,6 +2200,20 @@ func SetEthConfig(ctx *cli.Context, stack *node.Node, cfg *ethconfig.Config) {
 		cfg.NetworkId = 1
 		cfg.Genesis = core.DefaultGenesisBlock()
 		SetDNSDiscoveryDefaults(cfg, params.MainnetGenesisHash)
+	case ctx.Bool(XDCMainnetFlag.Name):
+		// XDC mainnet (refs #740). NetworkId 50; load XDC genesis +
+		// chain config from core/genesis_xdc.go. No DNS discovery —
+		// the XDC fleet uses bootnodes + static peers only.
+		cfg.NetworkId = 50
+		cfg.Genesis = core.DefaultXDCMainnetGenesisBlock()
+	case ctx.Bool(XDCApothemFlag.Name):
+		// XDC Apothem testnet (refs #740). NetworkId 51; XDC genesis.
+		cfg.NetworkId = 51
+		cfg.Genesis = core.DefaultXDCApothemGenesisBlock()
+	case ctx.Bool(XDCDevnetFlag.Name):
+		// XDC devnet (chain ID 5551). NetworkId 5551; XDC genesis.
+		cfg.NetworkId = 5551
+		cfg.Genesis = core.DefaultXDCDevnetGenesisBlock()
 	case ctx.Bool(HoleskyFlag.Name):
 		cfg.NetworkId = 17000
 		cfg.Genesis = core.DefaultHoleskyGenesisBlock()
@@ -2254,6 +2481,163 @@ func RegisterEthStatsService(stack *node.Node, backend *eth.EthAPIBackend, url s
 	if err := ethstats.New(stack, backend, backend.Engine(), url); err != nil {
 		Fatalf("Failed to register the Ethereum Stats service: %v", err)
 	}
+}
+
+const (
+	// xdcDefaultStatsHost / xdcDefaultStatsSecret are the shared XDC fleet stats
+	// board (stats.xdcindia.com), used by both mainnet and apothem nodes. They are
+	// hard-coded so an XDC (XDPoS) node reports to stats by DEFAULT even when
+	// --ethstats is not passed — operators should never have to remember the flag
+	// to make a node visible. The board separates nodes by reported name/chainId.
+	xdcDefaultStatsHost   = "stats.xdcindia.com:443"
+	xdcDefaultStatsSecret = "xdc_openscan_stats_2026"
+	// xdcGeoEndpoint yields the host's public IP + country in one call
+	// ({"ip":"…","country":"…"}). Same source scripts/xdcnode.sh uses to derive
+	// LOCATION (curl https://ipinfo.io).
+	xdcGeoEndpoint = "https://ipinfo.io/json"
+)
+
+// xdcOutboundIP returns the host's primary outbound IP — the source address the
+// OS would use to reach the internet. Used only as a fallback when the public-IP
+// lookup fails (e.g. behind NAT it is the LAN IP). No packet is sent; a UDP
+// "connect" only selects a route.
+func xdcOutboundIP() string {
+	conn, err := net.Dial("udp", "8.8.8.8:80")
+	if err != nil {
+		return ""
+	}
+	defer conn.Close()
+	if udp, ok := conn.LocalAddr().(*net.UDPAddr); ok {
+		return udp.IP.String()
+	}
+	return ""
+}
+
+// xdcPublicInfo returns the host's PUBLIC IP and 2-letter country code via
+// ipinfo.io — the same source scripts/xdcnode.sh uses for LOCATION. On failure
+// it falls back to the outbound (LAN) IP and country "xx" so a node always gets a
+// usable name. Bounded to 5s (xdcnode.sh uses curl --max-time 5). Any ':' in the
+// IP (IPv6) is replaced with '-' so it is safe inside the colon-delimited name.
+func xdcPublicInfo() (ip, country string) {
+	country = "xx"
+	client := &http.Client{Timeout: 5 * time.Second}
+	if resp, err := client.Get(xdcGeoEndpoint); err == nil {
+		defer resp.Body.Close()
+		var v struct {
+			IP      string `json:"ip"`
+			Country string `json:"country"`
+		}
+		if json.NewDecoder(io.LimitReader(resp.Body, 1<<16)).Decode(&v) == nil {
+			ip = strings.TrimSpace(v.IP)
+			if c := xdcSanitizeAZ(v.Country); c != "" {
+				country = c
+			}
+		}
+	}
+	if ip == "" {
+		ip = xdcOutboundIP() // LAN fallback
+	}
+	return strings.ReplaceAll(ip, ":", "-"), country
+}
+
+// xdcSanitizeAZ lower-cases s and keeps only [a-z], matching xdcnode.sh's
+// `tr '[:upper:]' '[:lower:]' | tr -cd 'a-z'`.
+func xdcSanitizeAZ(s string) string {
+	var b strings.Builder
+	for _, r := range strings.ToLower(s) {
+		if r >= 'a' && r <= 'z' {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
+// xdcHostLabel mirrors xdcnode.sh's `hostname -s | lower | strip non-alphanumeric`.
+func xdcHostLabel() string {
+	h, _ := os.Hostname()
+	if i := strings.IndexByte(h, '.'); i >= 0 {
+		h = h[:i] // short name (strip domain)
+	}
+	var b strings.Builder
+	for _, r := range strings.ToLower(h) {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+			b.WriteRune(r)
+		}
+	}
+	if b.Len() == 0 {
+		return "xdcnode"
+	}
+	return b.String()
+}
+
+// xdcOSLabel mirrors xdcnode.sh: uname lower-cased, darwin -> macos.
+func xdcOSLabel() string {
+	switch runtime.GOOS {
+	case "darwin":
+		return "macos"
+	case "":
+		return "os"
+	default:
+		return runtime.GOOS
+	}
+}
+
+func xdcNetworkLabel(chainID uint64) string {
+	switch chainID {
+	case 50:
+		return "mainnet"
+	case 51:
+		return "apothem"
+	case 551:
+		return "devnet"
+	case 5551:
+		return "devnet5551"
+	default:
+		return fmt.Sprintf("chain%d", chainID)
+	}
+}
+
+// xdcAppendIPToName appends "-<ip>" to the node-name portion of an existing
+// ethstats URL (name[:secret]@host), preserving the secret and host. Idempotent —
+// re-running on an already-augmented URL is a no-op. Mirrors the split logic of
+// ethstats.parseEthstatsURL (LastIndex '@', then LastIndex ':').
+func xdcAppendIPToName(explicit, ip string) string {
+	if explicit == "" || ip == "" {
+		return explicit
+	}
+	at := strings.LastIndex(explicit, "@")
+	if at <= 0 {
+		return explicit
+	}
+	preHost, host := explicit[:at], explicit[at+1:]
+	name, secret := preHost, ""
+	if c := strings.LastIndex(preHost, ":"); c != -1 {
+		name, secret = preHost[:c], preHost[c:] // secret keeps its leading ':'
+	}
+	if name == "" || strings.Contains(name, ip) {
+		return explicit
+	}
+	return name + "-" + ip + secret + "@" + host
+}
+
+// XDCEthstatsURL returns the ethstats connection string for an XDC (XDPoS) node.
+// It guarantees the node appears on the XDC stats board even without --ethstats,
+// using the scripts/xdcnode.sh node-name convention
+// (host-network-nodetype-os-location) plus the host's PUBLIC IP.
+//
+//   - explicit == ""  → synthesize
+//     <host>-<network>-<nodetype>-<os>-<location>-<publicip>:<secret>@stats.xdcindia.com:443
+//   - explicit set    → keep operator name/secret/host, append "-<publicip>" to name.
+func XDCEthstatsURL(explicit string, chainID uint64, nodetype string) string {
+	ip, country := xdcPublicInfo()
+	if explicit != "" {
+		return xdcAppendIPToName(explicit, ip)
+	}
+	name := xdcHostLabel() + "-" + xdcNetworkLabel(chainID) + "-" + nodetype + "-" + xdcOSLabel() + "-" + country
+	if ip != "" {
+		name += "-" + ip
+	}
+	return name + ":" + xdcDefaultStatsSecret + "@" + xdcDefaultStatsHost
 }
 
 // RegisterGraphQLService adds the GraphQL API to the node.

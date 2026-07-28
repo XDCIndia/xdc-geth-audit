@@ -50,6 +50,10 @@ type Config struct {
 	GasPrice            *big.Int       // Minimum gas price for mining a transaction
 	Recommit            time.Duration  // The time interval for miner to re-create mining work.
 	MaxBlobsPerBlock    int            // Maximum number of blobs per block (0 for unset uses protocol default)
+
+	// XDC A.97-M.B (Task 7): Mining enables the XDPoS V2 block-production worker
+	// when --mine is passed on the command line.  Set by cmd/utils setMiner.
+	Mining bool `toml:",omitempty"`
 }
 
 // DefaultConfig contains default settings for miner.
