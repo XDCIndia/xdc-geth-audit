@@ -105,3 +105,24 @@ type Engine interface {
 	// Close terminates any background threads maintained by the consensus engine.
 	Close() error
 }
+
+// CacheInvalidator is an optional interface a consensus engine may implement
+// to receive notifications when the local chain head is rewound (e.g. via
+// BlockChain.SetHead). Engines that maintain in-memory caches keyed by block
+// hash — XDPoS V2's snapshots / epochSwitches / verifiedHeaders /
+// round2epochBlockInfo / signatures LRUs — must purge entries that may no
+// longer be authoritative after a rewind, otherwise a subsequent
+// verifyHeader against the canonical post-rewind chain can consult stale
+// snapshot data and reject valid blocks with errors like
+// "not its turn" (refs #802 task 3, #801 follow-up).
+//
+// Engines that do not need this hook (ethash, beacon, clique) simply don't
+// implement the interface; BlockChain.SetHead does a type assertion and
+// no-ops on non-implementors.
+type CacheInvalidator interface {
+	// InvalidateCaches is invoked by BlockChain.SetHead after the rewind has
+	// landed on disk but before sendChainHeadEvent. The engine should
+	// flush any in-memory caches that contain post-newHead state.
+	// newHead is the block number the chain has been rewound to.
+	InvalidateCaches(newHead uint64)
+}
