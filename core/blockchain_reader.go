@@ -24,6 +24,7 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/consensus"
 	"github.com/ethereum/go-ethereum/consensus/misc/eip4844"
+	"github.com/ethereum/go-ethereum/core/history"
 	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/core/state"
 	"github.com/ethereum/go-ethereum/core/state/snapshot"
@@ -378,6 +379,37 @@ func (bc *BlockChain) TxIndexDone() bool {
 	return progress.Done()
 }
 
+// CheckpointSyncNoState returns the current value of the
+// checkpointSyncNoState flag. True means state trie is partial and TX
+// execution is skipped; false means state is complete and normal
+// validation applies. Refs #894.
+func (bc *BlockChain) CheckpointSyncNoState() bool {
+	return bc.checkpointSyncNoState.Load()
+}
+
+// SetCheckpointSyncNoState enables or disables checkpoint-sync-without-state mode.
+// When enabled, ProcessBlock skips TX execution and state-root validation.
+// Persists the flag to DB so it survives node restarts. Refs #886 #740 #742.
+func (bc *BlockChain) SetCheckpointSyncNoState(enabled bool) {
+	bc.storeCheckpointSyncNoState(enabled)
+	if enabled {
+		rawdb.WriteCheckpointSyncNoState(bc.db, true)
+	} else {
+		rawdb.DeleteCheckpointSyncNoState(bc.db)
+	}
+}
+
+// storeCheckpointSyncNoState sets the in-memory checkpointSyncNoState flag AND
+// mirrors it to the CheckpointSyncNoStateActive process-global (core/xdc_sync_opts.go)
+// so the XDPoS consensus engine — which verifies headers without a ChainReader
+// handle to this BlockChain — can gate fullVerify on state-completeness. ALL
+// writers of bc.checkpointSyncNoState must go through this helper to keep the
+// global from drifting. Persistence (rawdb) stays at the individual call sites.
+func (bc *BlockChain) storeCheckpointSyncNoState(v bool) {
+	bc.checkpointSyncNoState.Store(v)
+	CheckpointSyncNoStateActive.Store(v)
+}
+
 // HasState checks if state trie is fully present in the database or not.
 func (bc *BlockChain) HasState(hash common.Hash) bool {
 	_, err := bc.triedb.NodeReader(hash)
@@ -512,6 +544,65 @@ func (bc *BlockChain) HistoryPruningCutoff() (uint64, common.Hash) {
 		return 0, bc.genesisBlock.Hash()
 	}
 	return pt.BlockNumber, pt.BlockHash
+}
+
+// GetTrustedCheckpointAnchor reports the trusted-checkpoint anchor block
+// number and hash, plus a flag indicating whether checkpoint catchup is
+// still active (state hasn't been built yet). Consumed by the XDPoS V2
+// engine via interface assertion to relax round-based QC checks for
+// blocks within 2× epoch of the anchor.
+//
+// A.60.5 (refs #857): when an operator-pinned fast-sync pivot is in play
+// (--fastsyncpivot{number,hash}, stored via SetFastSyncTrustedAnchor),
+// treat the pivot as the trusted anchor and report active=true while the
+// chain head is still below pivot + 2*Epoch. Without this, the V2
+// `verifyQC` path fails on every BeaconSync-delivered header because the
+// epoch-switch info for the QC's round lives in pre-pivot history that
+// hasn't been downloaded — `engine_v2/utils.go:170` returns "failed to
+// get epoch switch info for QC verification", BeaconSync rejects the
+// chain segment with "retrieved hash chain is invalid", and the downloader
+// cancels sync — observed on m1 testbench 2026-06-06 with peer
+// XDC/v2.7.0-stable (162.55.17.224) attached and serving headers cleanly
+// for 32s before this failure.
+func (bc *BlockChain) GetTrustedCheckpointAnchor() (uint64, common.Hash, bool) {
+	pt := bc.historyPrunePoint.Load()
+	if pt == nil {
+		return 0, common.Hash{}, false
+	}
+	// Active while the chain hasn't yet caught up past the anchor + 2*Epoch.
+	// Once head crosses that boundary, the real V2 epoch-switch headers are in
+	// the DB and strict verifyQC takes over. Epoch comes from the XDPoS config;
+	// fall back to 900 (the XDC mainnet default) if the chain doesn't carry
+	// a V2 config slot.
+	epoch := uint64(900)
+	if cfg := bc.chainConfig.XDPoS; cfg != nil && cfg.Epoch != 0 {
+		epoch = cfg.Epoch
+	}
+	head := bc.CurrentBlock()
+	active := head == nil || head.Number.Uint64() < pt.BlockNumber+2*epoch
+	return pt.BlockNumber, pt.BlockHash, active
+}
+
+// SetFastSyncTrustedAnchor installs an operator-pinned fast-sync pivot as
+// the trusted-checkpoint anchor. Called from eth/backend.go init when
+// --fastsyncpivot{number,hash} are configured. Refs #857 A.60.5.
+//
+// This piggy-backs on the existing historyPrunePoint plumbing so the
+// XDPoS V2 engine's `inCheckpointCatchup` check (utils.go:141) finds an
+// active anchor without a separate atomic pointer. The pivot stays
+// installed for the life of the process; `GetTrustedCheckpointAnchor`
+// computes active=false once head climbs past anchor + 2*Epoch.
+func (bc *BlockChain) SetFastSyncTrustedAnchor(number uint64, hash common.Hash) {
+	bc.historyPrunePoint.Store(&history.PrunePoint{
+		BlockNumber: number,
+		BlockHash:   hash,
+	})
+	// Mirror the anchor onto the HeaderChain so header-only verify paths
+	// (BeaconSync's hc.engine.VerifyHeaders(hc, ...) call) see the same
+	// active anchor and skip QC verification within the catchup window.
+	if bc.hc != nil {
+		bc.hc.SetFastSyncTrustedAnchor(number, hash)
+	}
 }
 
 // TrieDB retrieves the low level trie database used for data storage.

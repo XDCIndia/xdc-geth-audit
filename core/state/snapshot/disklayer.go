@@ -25,7 +25,6 @@ import (
 	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/ethdb"
-	"github.com/ethereum/go-ethereum/rlp"
 	"github.com/ethereum/go-ethereum/triedb"
 )
 
@@ -104,8 +103,12 @@ func (dl *diskLayer) Account(hash common.Hash) (*types.SlimAccount, error) {
 	if len(data) == 0 { // can be both nil and []byte{}
 		return nil, nil
 	}
-	account := new(types.SlimAccount)
-	if err := rlp.DecodeBytes(data, account); err != nil {
+	// XDC: use DecodeSlimAccount so balances > uint256 (BigBalance overflow)
+	// are decoded into SlimAccount.BigBalance instead of panicking. Required
+	// for XDC chains where genesis accounts can hold 2^256-1 balances and
+	// reward additions push past uint256 range.
+	account, err := types.DecodeSlimAccount(data)
+	if err != nil {
 		panic(err)
 	}
 	return account, nil

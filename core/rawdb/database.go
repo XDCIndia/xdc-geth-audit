@@ -205,6 +205,43 @@ func resolveChainEraDir(chainFreezerDir string, era string) string {
 }
 
 // NewDatabaseWithFreezer creates a high level database on top of a given key-value store.
+// xdcFillGapAncients writes zero-hash placeholder entries for blocks [from, to) into
+// the ancient (freezer) database in batches. Used by A.88 to resume a partially-completed
+// A.85 gap fill after a node restart without manual intervention.
+func xdcFillGapAncients(ancient ethdb.AncientWriter, from, to uint64) error {
+	const batchSize = 30_000
+	for start := from; start < to; start += batchSize {
+		end := start + batchSize - 1
+		if end >= to {
+			end = to - 1
+		}
+		_, err := ancient.ModifyAncients(func(op ethdb.AncientWriteOp) error {
+			for i := start; i <= end; i++ {
+				if err := op.AppendRaw(ChainFreezerHashTable, i, make([]byte, common.HashLength)); err != nil {
+					return err
+				}
+				if err := op.AppendRaw(ChainFreezerHeaderTable, i, []byte{0x00}); err != nil {
+					return err
+				}
+				if err := op.AppendRaw(ChainFreezerBodiesTable, i, []byte{0x00}); err != nil {
+					return err
+				}
+				if err := op.AppendRaw(ChainFreezerReceiptTable, i, []byte{0x00}); err != nil {
+					return err
+				}
+			}
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+		if end > start+batchSize/2 {
+			log.Info("xdc: A.88 gap fill progress", "block", end, "target", to-1)
+		}
+	}
+	return nil
+}
+
 // The passed ancient indicates the path of root ancient directory where the chain freezer
 // can be opened.
 //
@@ -285,6 +322,32 @@ func Open(db ethdb.KeyValueStore, opts OpenOptions) (ethdb.Database, error) {
 					return nil, fmt.Errorf("could not read header number, hash %v", ReadHeadHeaderHash(db))
 				}
 				if head > frozen-1 {
+					// A.88: XDC fast-sync gap resumption — when a genesis fast-sync node
+					// was killed while A.85 was filling zero-hash placeholder entries into
+					// the ancient store, the next restart finds frozen < firstLDBBlock and
+					// the contiguity check below would fatally exit. Detect this state with
+					// a O(log N) binary search and resume the placeholder fill synchronously
+					// before the check runs, so startup succeeds without manual intervention.
+					if pivot := ReadLastPivotNumber(db); pivot != nil && *pivot > 0 {
+						lo, hi := frozen, head
+						for lo < hi {
+							mid := lo + (hi-lo)/2
+							if present, _ := db.Has(headerHashKey(mid)); present {
+								hi = mid
+							} else {
+								lo = mid + 1
+							}
+						}
+						if lo > frozen {
+							log.Info("xdc: A.88 resuming ancient gap fill on restart",
+								"ancientTop", frozen-1, "firstLDB", lo, "blocks", lo-frozen)
+							if fillErr := xdcFillGapAncients(frdb, frozen, lo); fillErr != nil {
+								printChainMetadata(db)
+								return nil, fmt.Errorf("xdc: A.88 gap fill failed: %v", fillErr)
+							}
+							frozen, _ = frdb.Ancients()
+						}
+					}
 					// Find the smallest block stored in the key-value store
 					// in range of [frozen, head]
 					var number uint64
@@ -293,10 +356,13 @@ func Open(db ethdb.KeyValueStore, opts OpenOptions) (ethdb.Database, error) {
 							break
 						}
 					}
-					// We are about to exit on error. Print database metadata before exiting
-					printChainMetadata(db)
-					return nil, fmt.Errorf("gap in the chain between ancients [0 - #%d] and leveldb [#%d - #%d] ",
-						frozen-1, number, head)
+					if number > frozen {
+						// We are about to exit on error. Print database metadata before exiting
+						printChainMetadata(db)
+						return nil, fmt.Errorf("gap in the chain between ancients [0 - #%d] and leveldb [#%d - #%d] ",
+							frozen-1, number, head)
+					}
+					// Gap closed by A.88 fill above (number == frozen) — contiguous.
 				}
 				// Database contains only older data than the freezer, this happens if the
 				// state was wiped and reinited from an existing freezer.
@@ -313,8 +379,19 @@ func Open(db ethdb.KeyValueStore, opts OpenOptions) (ethdb.Database, error) {
 				// Key-value store contains more data than the genesis block, make sure we
 				// didn't freeze anything yet.
 				if kvblob, _ := db.Get(headerHashKey(1)); len(kvblob) == 0 {
-					printChainMetadata(db)
-					return nil, errors.New("ancient chain segments already extracted, please set --datadir.ancient to the correct path")
+					// XDC fast-sync (operator-pivot mode) never downloads block #1 — the
+					// sync starts from the operator-specified pivot near chain head. When
+					// the ancient freezer is empty and block #1 is absent, this is the
+					// expected state for a pivot-based fast-sync, not evidence that ancient
+					// data was moved to a separate path. Skip the guard when a pivot number
+					// is recorded in the database. Refs #844 (A.73 deploy fix).
+					if pivot := ReadLastPivotNumber(db); pivot != nil && *pivot > 0 {
+						// Legitimate fast-sync state: ancient empty, pivot set, block #1
+						// never fetched. Allow the empty freezer to be used as-is.
+					} else {
+						printChainMetadata(db)
+						return nil, errors.New("ancient chain segments already extracted, please set --datadir.ancient to the correct path")
+					}
 				}
 				// Block #1 is still in the database, we're allowed to init a new freezer
 			}
@@ -710,7 +787,7 @@ func InspectDatabase(db ethdb.Database, keyPrefix, keyStart []byte) error {
 // This is the list of known 'metadata' keys stored in the databasse.
 var knownMetadataKeys = [][]byte{
 	databaseVersionKey, headHeaderKey, headBlockKey, headFastBlockKey, headFinalizedBlockKey,
-	lastPivotKey, fastTrieProgressKey, snapshotDisabledKey, SnapshotRootKey, snapshotJournalKey,
+	lastPivotKey, fastTrieProgressKey, fastSyncCheckpointKey, snapshotDisabledKey, SnapshotRootKey, snapshotJournalKey,
 	snapshotGeneratorKey, snapshotRecoveryKey, txIndexTailKey, fastTxLookupLimitKey,
 	uncleanShutdownKey, badBlockKey, transitionStatusKey, skeletonSyncStatusKey,
 	persistentStateIDKey, trieJournalKey, snapshotSyncStatusKey, snapSyncStatusFlagKey,

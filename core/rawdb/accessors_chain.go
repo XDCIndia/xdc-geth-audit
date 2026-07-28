@@ -202,6 +202,56 @@ func WriteLastPivotNumber(db ethdb.KeyValueWriter, pivot uint64) {
 	}
 }
 
+// FastSyncCheckpoint is the on-disk snapshot of an in-flight XDPOS2 classical
+// fast-sync. The trie.Sync queue itself rebuilds from disk on restart (every
+// committed node is persisted via rawdb.WriteTrieNode and NewStateSync skips
+// already-present nodes), so the load-bearing data is the pivot identity that
+// the partial DB state was downloaded against. Restoring only when the operator
+// cmdline pivot matches prevents resuming a stale checkpoint into a different
+// target. Refs A.42 / #844.
+type FastSyncCheckpoint struct {
+	Number    uint64
+	Hash      common.Hash
+	Root      common.Hash
+	Pending   uint64 // trie.Sync.Pending() at flush time (for log/observability)
+	Processed uint64 // syncStatsState.processed (for stats continuity)
+}
+
+// ReadFastSyncCheckpoint retrieves the persisted fast-sync checkpoint, if any.
+func ReadFastSyncCheckpoint(db ethdb.KeyValueReader) *FastSyncCheckpoint {
+	data, _ := db.Get(fastSyncCheckpointKey)
+	if len(data) == 0 {
+		return nil
+	}
+	cp := new(FastSyncCheckpoint)
+	if err := rlp.DecodeBytes(data, cp); err != nil {
+		log.Error("Invalid fast-sync checkpoint in database", "err", err)
+		return nil
+	}
+	return cp
+}
+
+// WriteFastSyncCheckpoint atomically overwrites the fast-sync checkpoint.
+// db.Put is atomic at the LDB layer, so a partial write cannot corrupt the key.
+func WriteFastSyncCheckpoint(db ethdb.KeyValueWriter, cp *FastSyncCheckpoint) {
+	enc, err := rlp.EncodeToBytes(cp)
+	if err != nil {
+		log.Error("Failed to encode fast-sync checkpoint", "err", err)
+		return
+	}
+	if err := db.Put(fastSyncCheckpointKey, enc); err != nil {
+		log.Error("Failed to store fast-sync checkpoint", "err", err)
+	}
+}
+
+// DeleteFastSyncCheckpoint removes the persisted fast-sync checkpoint. Called
+// after a successful pivot commit so the next sync starts clean.
+func DeleteFastSyncCheckpoint(db ethdb.KeyValueWriter) {
+	if err := db.Delete(fastSyncCheckpointKey); err != nil {
+		log.Error("Failed to delete fast-sync checkpoint", "err", err)
+	}
+}
+
 // ReadTxIndexTail retrieves the number of oldest indexed block
 // whose transaction indices has been indexed.
 func ReadTxIndexTail(db ethdb.KeyValueReader) *uint64 {
@@ -720,25 +770,13 @@ func ReadBlock(db ethdb.Reader, hash common.Hash, number uint64) *types.Block {
 	if body == nil {
 		return nil
 	}
-	block := types.NewBlockWithHeader(header).WithBody(*body)
-
-	// Best-effort assembly of the block access list from the database.
-	if header.BlockAccessListHash != nil {
-		al := ReadAccessList(db, hash, number)
-		block = block.WithAccessListUnsafe(al)
-	}
-	return block
+	return types.NewBlockWithHeader(header).WithBody(*body)
 }
 
 // WriteBlock serializes a block into the database, header and body separately.
 func WriteBlock(db ethdb.KeyValueWriter, block *types.Block) {
-	hash, number := block.Hash(), block.NumberU64()
-	WriteBody(db, hash, number, block.Body())
+	WriteBody(db, block.Hash(), block.NumberU64(), block.Body())
 	WriteHeader(db, block.Header())
-
-	if accessList := block.AccessList(); accessList != nil {
-		WriteAccessList(db, hash, number, accessList)
-	}
 }
 
 // WriteAncientBlocks writes entire block data into ancient store and returns the total written size.
@@ -941,3 +979,4 @@ func ReadHeadBlock(db ethdb.Reader) *types.Block {
 	}
 	return ReadBlock(db, headBlockHash, headBlockNumber)
 }
+

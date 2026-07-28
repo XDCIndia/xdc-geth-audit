@@ -106,6 +106,28 @@ var PrecompiledContractsBerlin = PrecompiledContracts{
 	common.BytesToAddress([]byte{0x9}): &blake2F{},
 }
 
+// PrecompiledContractsXDCBerlin mirrors PrecompiledContractsBerlin but with
+// EIP-2565 (cheaper MODEXP) intentionally disabled. Canonical XDPoSChain keeps
+// bigModExp{eip2565: false} in Berlin/London/Merge/Shanghai and only enables
+// eip2565 at the Eip1559Block fork. Without this set we charge cheaper MODEXP
+// than canonical for the Berlin..pre-EIP1559 stretch, which diverges gas-used
+// (and therefore state root) on every block containing MODEXP. Issue #716.
+//
+// Selected by activePrecompiledContracts when rules.IsXDC is true and the
+// chain has not yet reached EIP-1559. At-and-after Eip1559Block, XDC falls
+// through to the standard PrecompiledContractsBerlin which has eip2565: true.
+var PrecompiledContractsXDCBerlin = PrecompiledContracts{
+	common.BytesToAddress([]byte{0x1}): &ecrecover{},
+	common.BytesToAddress([]byte{0x2}): &sha256hash{},
+	common.BytesToAddress([]byte{0x3}): &ripemd160hash{},
+	common.BytesToAddress([]byte{0x4}): &dataCopy{},
+	common.BytesToAddress([]byte{0x5}): &bigModExp{eip2565: false, eip7823: false, eip7883: false},
+	common.BytesToAddress([]byte{0x6}): &bn256AddIstanbul{},
+	common.BytesToAddress([]byte{0x7}): &bn256ScalarMulIstanbul{},
+	common.BytesToAddress([]byte{0x8}): &bn256PairingIstanbul{},
+	common.BytesToAddress([]byte{0x9}): &blake2F{},
+}
+
 // PrecompiledContractsCancun contains the default set of pre-compiled Ethereum
 // contracts used in the Cancun release.
 var PrecompiledContractsCancun = PrecompiledContracts{
@@ -224,6 +246,12 @@ func activePrecompiledContracts(rules params.Rules) PrecompiledContracts {
 	case rules.IsCancun:
 		return PrecompiledContractsCancun
 	case rules.IsBerlin:
+		// XDC defers EIP-2565 (cheaper MODEXP) from Berlin to Eip1559Block —
+		// canonical XDPoSChain's PrecompiledContractsEIP1559 is the first set
+		// with bigModExp{eip2565: true}. Issue #716.
+		if rules.IsXDC && !rules.IsEIP1559 {
+			return PrecompiledContractsXDCBerlin
+		}
 		return PrecompiledContractsBerlin
 	case rules.IsIstanbul:
 		return PrecompiledContractsIstanbul

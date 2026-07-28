@@ -155,9 +155,10 @@ func (f *chainFreezer) freezeThreshold(db ethdb.KeyValueReader) (uint64, error) 
 // incurring additional data shuffling delays on block propagation.
 func (f *chainFreezer) freeze(db ethdb.KeyValueStore) {
 	var (
-		backoff   bool
-		triggered chan struct{} // Used in tests
-		nfdb      = &nofreezedb{KeyValueStore: db}
+		backoff          bool
+		triggered        chan struct{} // Used in tests
+		nfdb             = &nofreezedb{KeyValueStore: db}
+		xdcGapFillActive bool // A.85: true while writing fast-sync gap placeholders
 	)
 	timer := time.NewTimer(freezerRecheckInterval)
 	defer timer.Stop()
@@ -213,6 +214,20 @@ func (f *chainFreezer) freeze(db ethdb.KeyValueStore) {
 			log.Error("Error in block freeze operation", "err", err)
 			backoff = true
 			continue
+		}
+		// A.85: detect XDC fast-sync gap fill (returned hashes contain zero entries).
+		// Log once when gap fill starts and once when real blocks resume.
+		if len(ancients) > 0 {
+			hasZero := ancients[0] == (common.Hash{})
+			if hasZero && !xdcGapFillActive {
+				xdcGapFillActive = true
+				log.Info("xdc: A.85 fast-sync ancient gap fill started — writing placeholders",
+					"from", first, "target", threshold)
+			} else if !hasZero && xdcGapFillActive {
+				xdcGapFillActive = false
+				log.Info("xdc: A.85 fast-sync ancient gap fill complete — real blocks now being frozen",
+					"block", first)
+			}
 		}
 		// Batch of blocks have been frozen, flush them before wiping from key-value store
 		if err := f.SyncAncient(); err != nil {
@@ -311,10 +326,40 @@ func (f *chainFreezer) freezeRange(nfdb *nofreezedb, number, limit uint64) (hash
 			// Retrieve all the components of the canonical block.
 			hash := ReadCanonicalHash(nfdb, number)
 			if hash == (common.Hash{}) {
-				// A missing canonical mapping at the freeze frontier is almost
-				// always an orphaned block left by an unclean stop (header/body
-				// present by hash, but no number->hash mapping).
-				return fmt.Errorf("canonical hash missing, can't freeze block %d (block data present at height: %v)", number, ReadAllHashes(nfdb, number))
+				// A.85: XDC genesis fast-sync gap — this block was not downloaded
+				// during fast sync (only pivot state is synced; pre-pivot headers
+				// are not written to the canonical chain). Write a zero-hash
+				// placeholder so frozen advances past the gap without error.
+				//
+				// Security: ReadHeaderRLP / ReadBodyRLP / ReadReceiptsRLP use
+				// isCanon(reader, number, hash) which compares the stored zero-hash
+				// against the caller-supplied hash. Callers that pass the real block
+				// hash (non-zero) won't match zero, so placeholder bytes never leak.
+				// ReadCanonicalHash for gap blocks returns zero = "not found", which
+				// is the correct semantics for a state-only fast-sync node.
+				//
+				// Upstream (12241bde2) treats this as a hard error (orphaned block
+				// from an unclean stop); on XDC the gap is expected and permanent,
+				// so we keep upstream's diagnostic as a debug log instead of failing.
+				log.Debug("Freezer: canonical hash missing at frontier, writing XDC fast-sync gap placeholder",
+					"number", number, "present-by-hash", ReadAllHashes(nfdb, number))
+				if err := op.AppendRaw(ChainFreezerHashTable, number, make([]byte, common.HashLength)); err != nil {
+					return fmt.Errorf("xdc: can't write placeholder hash for block %d: %v", number, err)
+				}
+				// Single-byte invalid RLP: ReadHeaderRLP / ReadBodyRLP / ReadReceiptsRLP
+				// return this raw byte, then callers' rlp.Decode fails → nil returned.
+				// Correct semantics: gap blocks are "not available" on fast-sync nodes.
+				if err := op.AppendRaw(ChainFreezerHeaderTable, number, []byte{0x00}); err != nil {
+					return fmt.Errorf("xdc: can't write placeholder header for block %d: %v", number, err)
+				}
+				if err := op.AppendRaw(ChainFreezerBodiesTable, number, []byte{0x00}); err != nil {
+					return fmt.Errorf("xdc: can't write placeholder body for block %d: %v", number, err)
+				}
+				if err := op.AppendRaw(ChainFreezerReceiptTable, number, []byte{0x00}); err != nil {
+					return fmt.Errorf("xdc: can't write placeholder receipts for block %d: %v", number, err)
+				}
+				hashes = append(hashes, common.Hash{})
+				continue
 			}
 			header := ReadHeaderRLP(nfdb, hash, number)
 			if len(header) == 0 {
