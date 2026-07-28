@@ -25,6 +25,7 @@ import (
 	"github.com/ethereum/go-ethereum/core/overlay"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
+	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/rlp"
 	"github.com/ethereum/go-ethereum/trie"
 	"github.com/ethereum/go-ethereum/trie/bintrie"
@@ -106,10 +107,11 @@ func (r *flatReader) Account(addr common.Address) (*types.StateAccount, error) {
 		return nil, nil
 	}
 	acct := &types.StateAccount{
-		Nonce:    account.Nonce,
-		Balance:  account.Balance,
-		CodeHash: account.CodeHash,
-		Root:     common.BytesToHash(account.Root),
+		Nonce:      account.Nonce,
+		Balance:    account.Balance,
+		BigBalance: account.BigBalance, // XDC: preserve overflow balance from snapshot
+		CodeHash:   account.CodeHash,
+		Root:       common.BytesToHash(account.Root),
 	}
 	if len(acct.CodeHash) == 0 {
 		acct.CodeHash = types.EmptyCodeHash.Bytes()
@@ -352,10 +354,23 @@ func newMultiStateReader(readers ...StateReader) (*multiStateReader, error) {
 // - Returns a nil account if it does not exist
 // - Returns an error only if an unexpected issue occurs
 // - The returned account is safe to modify after the call
-func (r *multiStateReader) Account(addr common.Address) (*types.StateAccount, error) {
+func (r *multiStateReader) Account(addr common.Address) (acct *types.StateAccount, err error) {
+	// XDC: wrap each reader call with a recover so a panic from an overflowing
+	// stored balance (rlp: value too large for uint256) on one reader doesn't
+	// kill the entire node. Fall through to next reader.
 	var errs []error
 	for _, reader := range r.readers {
-		acct, err := reader.Account(addr)
+		acct, err = func(rdr StateReader) (*types.StateAccount, error) {
+			defer func() {
+				if rec := recover(); rec != nil {
+					log.Warn("multiStateReader: panic in reader.Account, falling through",
+						"addr", addr.Hex()[:10], "panic", rec)
+					acct = nil
+					err = errors.New("reader panic")
+				}
+			}()
+			return rdr.Account(addr)
+		}(reader)
 		if err == nil {
 			return acct, nil
 		}

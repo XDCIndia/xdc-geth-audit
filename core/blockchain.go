@@ -185,6 +185,21 @@ type BlockChainConfig struct {
 	ArchiveMode       bool   // Whether to enable the archive mode
 	BinTrieGroupDepth int    // Number of levels per serialized group in binary trie (1-8)
 
+	// NoStateMaskingForbidden forbids the XDC A.93/A.94 auto-enable of
+	// checkpointSyncNoState (see the #62 guard in makeEnv / ValidateState).
+	// Set it on any node configured to PRODUCE blocks (--mine, or a miner
+	// etherbase/coinbase configured).
+	//
+	// Masking a missing parent state silently disables state validation and
+	// imports every subsequent block with EmptyRootHash, permanently poisoning
+	// the DB. For a block producer that is strictly worse than a hard error: the
+	// miner is then gated off by Gate 3.1 in miner/xdpos_worker.go and mints
+	// nothing, forever, while still occupying a seat in the masternode set and
+	// timing out its slot every round. The pre-existing exclusion only covered
+	// --gcmode archive, so a `--gcmode full` masternode slipped straight through
+	// (netv12: latched at block 1800, zero blocks minted through 9200+).
+	NoStateMaskingForbidden bool
+
 	// Number of blocks from the chain head for which state histories are retained.
 	// If set to 0, all state histories across the entire chain will be retained;
 	StateHistory uint64
@@ -279,6 +294,17 @@ func (cfg *BlockChainConfig) triedbConfig(isUBT bool) *triedb.Config {
 		}
 	}
 	if cfg.StateScheme == rawdb.PathScheme {
+		// Issue #1046: archive mode requires unbounded state history in pathdb.
+		// StateHistory=0 means "retain full chain history" in pathdb; any non-zero
+		// value caps retention. When --gcmode archive is active we must force it to
+		// 0 regardless of the ethconfig default (params.FullImmutabilityThreshold).
+		// Hash-scheme archive behaviour is unaffected by this field.
+		stateHistory := cfg.StateHistory
+		if cfg.ArchiveMode && stateHistory != 0 {
+			log.Warn("gcmode=archive with state.scheme=path: overriding StateHistory to 0 (full chain retention)",
+				"was", stateHistory)
+			stateHistory = 0
+		}
 		config.PathDB = &pathdb.Config{
 			TrieCleanSize:  cfg.TrieCleanLimit * 1024 * 1024,
 			StateCleanSize: cfg.SnapshotLimit * 1024 * 1024,
@@ -289,7 +315,7 @@ func (cfg *BlockChainConfig) triedbConfig(isUBT bool) *triedb.Config {
 			JournalDirectory: cfg.TrieJournalDirectory,
 
 			// Historical state configurations
-			StateHistory:        cfg.StateHistory,
+			StateHistory:        stateHistory,
 			TrienodeHistory:     cfg.TrienodeHistory,
 			EnableStateIndexing: cfg.ArchiveMode,
 			FullValueCheckpoint: cfg.NodeFullValueCheckpoint,
@@ -369,6 +395,17 @@ type BlockChain struct {
 
 	stopping      atomic.Bool // false if chain is running, true when stopped
 	procInterrupt atomic.Bool // interrupt signaler for block processing
+
+	// checkpointSyncNoState toggles XDC's checkpoint-sync-without-state mode.
+	// When true, the chain assumes the parent state is missing and:
+	//   - ProcessBlock receives EmptyRootHash for the parent root (R4 guard)
+	//   - processor.Process is skipped, returning an empty ProcessResult (R7)
+	//   - validator.ValidateState is skipped (R8)
+	//   - prefetch is forced to NoPrefetch (R5)
+	// Setting this flag silently disables consensus validation, so the gate
+	// at R9 (P1 fast-path) requires the four-conjunct guard preserving the
+	// invariant that an archive node never trips this path. Refs #740/#742.
+	checkpointSyncNoState atomic.Bool
 
 	prefetchLock sync.Mutex     // Orders prefetcher launches against shutdown
 	prefetchWg   sync.WaitGroup // Tracks running block prefetchers
@@ -579,6 +616,15 @@ func NewBlockChain(db ethdb.Database, genesis *Genesis, engine consensus.Engine,
 	// Start tx indexer if it's enabled.
 	if bc.cfg.TxLookupLimit >= 0 {
 		bc.txIndexer = newTxIndexer(uint64(bc.cfg.TxLookupLimit), bc)
+	}
+	// XDC A.93: Restore checkpointSyncNoState from DB on startup so fast-sync
+	// nodes that were mid-flight when the process died resume without state
+	// validation failures. Refs #886 #740 #742.
+	if rawdb.ReadCheckpointSyncNoState(bc.db) {
+		bc.storeCheckpointSyncNoState(true)
+		log.Info("BlockChain: restored checkpointSyncNoState from DB — state validation skipped until state is built")
+	} else {
+		log.Info("XDC: checkpointSyncNoState=false at startup — full state validation active")
 	}
 	return bc, nil
 }
@@ -826,6 +872,13 @@ func (bc *BlockChain) historyPruningRequired(policy history.HistoryPolicy, tail,
 func (bc *BlockChain) SetHead(head uint64) error {
 	if _, err := bc.setHeadBeyondRoot(head, 0, common.Hash{}, false); err != nil {
 		return err
+	}
+	// XDC: notify consensus engine to purge any in-memory caches keyed by
+	// block hash. Otherwise post-rewind verifyHeader can consult stale
+	// snapshot data (refs #802 task 3, #801). No-op for engines that don't
+	// implement the optional CacheInvalidator interface.
+	if inv, ok := bc.engine.(consensus.CacheInvalidator); ok {
+		inv.InvalidateCaches(head)
 	}
 	return bc.sendChainHeadEvent()
 }
@@ -1282,6 +1335,119 @@ func (bc *BlockChain) SnapSyncComplete(hash common.Hash, isSnapV2 bool) error {
 
 	log.Info("Committed new head block", "number", block.Number(), "hash", hash)
 	return nil
+}
+
+// FastSyncCommitHead sets the current head block to the block identified by the
+// given hash after classical fast sync (NodeData trie download) completes.
+// Unlike SnapSyncComplete, this does NOT require SnapSyncStart to have been
+// called first — the NodeData path writes trie nodes directly through the
+// key-value database, so the trie database and snapshots are never paused.
+//
+// Ported from Geth v1.10.13 FastSyncCommitHead, adapted for v1.17.3:
+//   - Drops the trie.NewSecure state-check (v1.14+ uses bc.HasState instead)
+//   - Uses bc.currentBlock.Store(block.Header()) (atomics refactor)
+//   - No triedb.Enable() needed (SnapSyncStart was never called)
+//
+// Refs: #844, Phase A.3.
+func (bc *BlockChain) FastSyncCommitHead(hash common.Hash) error {
+	// Make sure the block and its state trie both exist.
+	block := bc.GetBlockByHash(hash)
+	if block == nil {
+		return fmt.Errorf("non existent block [%x..]", hash[:4])
+	}
+	if !bc.HasState(block.Root()) {
+		return fmt.Errorf("non existent state [%x..]", block.Root().Bytes()[:4])
+	}
+	if !bc.chainmu.TryLock() {
+		return errChainStopped
+	}
+	defer bc.chainmu.Unlock()
+
+	// Rebuild any snapshot layer so that post-pivot full sync can use it.
+	if bc.snaps != nil {
+		bc.snaps.Rebuild(block.Root(), true) // fast sync: always generate snapshot
+	}
+
+	// Manually set the head block.
+	bc.currentBlock.Store(block.Header())
+	headBlockGauge.Update(int64(block.NumberU64()))
+
+	// A.32: persist the new head pointer durably. Without this, currentBlock is
+	// in-memory only; on restart bc.loadLastState() reads HeadBlockHash from
+	// rawdb (still genesis) and head reverts to 0. WriteHeadBlockHash is the
+	// missing durability step in the upstream fast-sync commit path.
+	rawdb.WriteHeadBlockHash(bc.db, hash)
+	rawdb.WriteHeadHeaderHash(bc.db, hash)
+
+	log.Info("Committed new head block", "number", block.Number(), "hash", hash)
+	return nil
+}
+
+// ClearCheckpointSyncNoState clears the A.93 checkpointSyncNoState flag both
+// in memory and in the DB. Call this when XdcBulkSyncMode is flipped to false
+// (i.e. the node has caught up to the canonical tip) so that the miner can load
+// real state for the chain head and begin producing blocks. If this flag is left
+// set after bulk-sync completes, makeEnv fails with "missing trie node" because
+// the miner tries to open the actual head state root rather than EmptyRootHash.
+// A.99.4c — refs #894.
+//
+// The clear REFUSES to proceed when the head state is absent from the trie DB.
+// A node that imported blocks under this flag persisted EmptyRootHash for every
+// one of them, so the state for those heights was never computed. Clearing the
+// flag there does not repair anything — it only converts a silent skip into a
+// hard "missing trie node" on the next block. The only repair is a resync, so
+// this logs a loud ERROR saying exactly that instead of clearing.
+//
+// That guard is also what makes calling this safe again: the call was previously
+// removed from the at-tip transitions (see the NOTE in eth/sync_xdc.go) because
+// an unconditional clear on a devnet-5151 node re-enabled strict validation and
+// immediately re-tripped the unresolved #1800 cross-client parity divergence.
+// Such a node has EmptyRootHash at head, so HasState now fails and the flag stays
+// sticky exactly as before — but visibly, rather than silently.
+//
+// Idempotent: a no-op once the flag is unset, so it is safe to call from
+// heartbeat/at-tip paths that may fire repeatedly.
+func (bc *BlockChain) ClearCheckpointSyncNoState() {
+	if !bc.checkpointSyncNoState.Load() {
+		return
+	}
+	head := bc.CurrentBlock()
+	if head == nil || !bc.HasState(head.Root) {
+		var (
+			num  *big.Int
+			root common.Hash
+		)
+		if head != nil {
+			num, root = head.Number, head.Root
+		}
+		log.Error("BlockChain: cannot clear checkpointSyncNoState — head state is absent; "+
+			"this DB was imported without execution and must be resynced",
+			"block", num, "root", root)
+		return
+	}
+	bc.storeCheckpointSyncNoState(false)
+	rawdb.DeleteCheckpointSyncNoState(bc.db)
+	log.Info("BlockChain: ClearCheckpointSyncNoState — state validation re-enabled after bulk-sync catch-up",
+		"block", head.Number, "root", head.Root)
+}
+
+// canMaskMissingState reports whether the XDC A.93/A.94 auto-enable of
+// checkpointSyncNoState may fire, i.e. whether a missing parent state or a
+// ValidateState mismatch may be masked by importing with EmptyRootHash instead
+// of surfacing as an error.
+//
+// Masking is only ever acceptable for a plain follower that is mid-bulk-sync on
+// an XDC chain. It is excluded for:
+//   - archive nodes, which build state contiguously from genesis, so a miss is a
+//     genuine defect and masking permanently poisons the archive DB; and
+//   - block producers (NoStateMaskingForbidden), which must never mint on
+//     unvalidated state and are rendered permanently mute by the resulting
+//     Gate 3.1 in miner/xdpos_worker.go.
+//
+// Refs #62, #740, #742, #886.
+func (bc *BlockChain) canMaskMissingState() bool {
+	return XdcBulkSyncMode.Load() && bc.chainConfig.IsXDC() &&
+		!bc.cfg.ArchiveMode && !bc.cfg.NoStateMaskingForbidden
 }
 
 // Reset purges the entire blockchain, restoring it to its genesis state.
@@ -1823,12 +1989,43 @@ func (bc *BlockChain) writeBlockWithState(block *types.Block, receipts []*types.
 	}
 	// Garbage collect anything below our required write retention
 	for !bc.triegc.Empty() {
-		root, number := bc.triegc.Pop()
+		r, number := bc.triegc.Pop()
 		if uint64(-number) > chosen {
-			bc.triegc.Push(root, number)
+			bc.triegc.Push(r, number)
 			break
 		}
-		bc.triedb.Dereference(root)
+		bc.triedb.Dereference(r)
+	}
+
+	// XDC P1: Force trie commit at checkpoint blocks (every XDPoS.Epoch).
+	// Ensures checkpoint state (the only state with full tx execution) is
+	// always persisted to disk. On restart, the startup repair code can
+	// rewind to the nearest checkpoint and resume from there. Without this,
+	// trie data stays in memory and is lost on crash/restart. Guard
+	// XDPoS.Epoch > 0 prevents divide-by-zero on misconfigured chain.
+	if bc.chainConfig.IsXDC() && bc.chainConfig.XDPoS != nil && bc.chainConfig.XDPoS.Epoch > 0 &&
+		current%bc.chainConfig.XDPoS.Epoch == 0 {
+		if err := bc.triedb.Commit(root, false); err != nil {
+			log.Error("XDC P1: checkpoint trie commit failed", "block", current, "root", root, "err", err)
+		} else {
+			log.Info("XDC P1: forced trie commit at checkpoint", "block", current, "root", root)
+			bc.lastWrite = current
+			bc.gcproc = 0
+		}
+	}
+	// XDC: Also force-commit at V2 switch block — this is a critical consensus
+	// transition where state must be persisted for restart safety. Apothem
+	// switches at block 56,828,700; Mainnet has its own V2.SwitchBlock.
+	if bc.chainConfig.XDPoS != nil && bc.chainConfig.XDPoS.V2 != nil {
+		if sb := bc.chainConfig.XDPoS.V2.SwitchBlock; sb != nil && current == sb.Uint64() {
+			if err := bc.triedb.Commit(root, false); err != nil {
+				log.Error("XDC: V2 switch block trie commit failed", "block", current, "root", root, "err", err)
+			} else {
+				log.Info("XDC: forced trie commit at V2 switch block", "block", current, "root", root)
+				bc.lastWrite = current
+				bc.gcproc = 0
+			}
+		}
 	}
 	return nil
 }
@@ -2080,7 +2277,15 @@ func (bc *BlockChain) insertChain(ctx context.Context, chain types.Blocks, setHe
 			StatelessSelfValidation: bc.cfg.StatelessSelfValidation,
 			EnableWitnessStats:      bc.cfg.EnableWitnessStats,
 		}
-		res, err := bc.ProcessBlock(ctx, parent.Root, block, config)
+		// XDC R4: during checkpoint-sync-without-state, missing parent state
+		// must coerce to EmptyRootHash so the no-execute path (R7) sees a
+		// valid (empty) statedb instead of erroring on parent-trie lookup.
+		// Refs #740/#742.
+		parentRoot := parent.Root
+		if parentRoot != (common.Hash{}) && bc.checkpointSyncNoState.Load() && !bc.HasState(parentRoot) {
+			parentRoot = types.EmptyRootHash
+		}
+		res, err := bc.ProcessBlock(ctx, parentRoot, block, config)
 		if err != nil {
 			return nil, it.index, err
 		}
@@ -2249,7 +2454,9 @@ func (bc *BlockChain) setupExecutionState(parentRoot common.Hash, block *types.B
 		}
 		return statedb, func(*blockProcessingResult) { stop() }, nil
 
-	case bc.cfg.NoPrefetch || !ok:
+	// XDC R5: checkpoint-sync-without-state forces the simple no-prefetch
+	// path (no parent state to prefetch from). Refs #740/#742.
+	case bc.cfg.NoPrefetch || bc.checkpointSyncNoState.Load() || !ok:
 		statedb, err := state.New(parentRoot, sdb)
 		if err != nil {
 			return nil, nil, err
@@ -2340,8 +2547,46 @@ func (bc *BlockChain) ProcessBlock(ctx context.Context, parentRoot common.Hash, 
 	// Set up the state reader feeding execution, along with a cleanup to run once
 	// processing is complete (stop the prefetcher, upload reader statistics).
 	statedb, cleanup, err := bc.setupExecutionState(parentRoot, block, vmConfig, config, &interrupt, &execIndex)
+	// XDC: sdb backs the EmptyRootHash stand-in used while checkpointSyncNoState
+	// is active (here and in the A.94 recovery below). XDC chains are never UBT.
+	sdb := state.NewMPTDatabase(bc.triedb, bc.codedb).WithSnapshot(bc.snaps)
 	if err != nil {
-		return nil, err
+		// XDC A.93: Auto-enable checkpointSyncNoState when parent state is
+		// missing during bulk sync. This covers fast-sync nodes that restart
+		// mid-flight: the pivot anchor is in DB but the flag was not persisted.
+		// Fixes "invalid merkle root" BAD BLOCK spam. Refs #886 #740 #742.
+		//
+		// #62 guard: NEVER auto-enter no-state mode on a --gcmode archive node.
+		// An archive full-syncer retains every state and builds contiguously from
+		// genesis, so a missing parent state here is a genuine defect (out-of-order
+		// import driven by a bogus far-ahead peer head, or a real execution/fork
+		// divergence). Masking it with checkpointSyncNoState silently disables state
+		// validation and permanently poisons the archive DB (EmptyRootHash for every
+		// block) — the exact failure that left net #62 geth unable to mint. Let the
+		// error surface instead so the divergence is diagnosed, not hidden.
+		// The same reasoning applies verbatim to any node configured to PRODUCE
+		// blocks, which is why canMaskMissingState also excludes those: a masked
+		// masternode is gated off by Gate 3.1 and mints nothing, forever, while
+		// still holding a seat. A `--gcmode full` masternode slipped through the
+		// archive-only exclusion on netv12 and did exactly that.
+		switch {
+		case bc.canMaskMissingState():
+			if block.NumberU64()%500 == 0 {
+				log.Warn("BlockChain: A.93 auto-enable checkpointSyncNoState — parent state missing during bulk sync",
+					"block", block.NumberU64(), "parentRoot", parentRoot.Hex()[:16])
+			}
+			bc.storeCheckpointSyncNoState(true)
+			rawdb.WriteCheckpointSyncNoState(bc.db, true)
+		case bc.checkpointSyncNoState.Load():
+			// Flag was set but state still missing — use empty root (will skip execution/validation).
+		default:
+			return nil, err
+		}
+		statedb, err = state.New(types.EmptyRootHash, sdb)
+		if err != nil {
+			return nil, err
+		}
+		cleanup = func(*blockProcessingResult) {}
 	}
 	defer func() { cleanup(result) }()
 
@@ -2383,24 +2628,63 @@ func (bc *BlockChain) ProcessBlock(ctx context.Context, parentRoot common.Hash, 
 		}
 	}
 
-	// Process block using the parent state as reference point
+	// Process block using the parent state as reference point.
+	// XDC R7: during checkpoint-sync-without-state, skip TX execution and
+	// return an empty receipt set; the parent state is EmptyRootHash
+	// (coerced at R4) so no real execution is possible. Refs #740/#742.
 	pstart := time.Now()
-	pctx, _, spanEnd := telemetry.StartSpan(ctx, "bc.processor.Process")
-	res, err := bc.processor.Process(pctx, block, statedb, bc.jumpDestCache, bc.precompileCache, vmConfig, &execIndex)
-	spanEnd(&err)
-	if err != nil {
-		bc.reportBadBlock(block, res, err)
-		return nil, err
+	var res *ProcessResult
+	if bc.checkpointSyncNoState.Load() {
+		res = &ProcessResult{Receipts: types.Receipts{}}
+	} else {
+		pctx, _, spanEnd := telemetry.StartSpan(ctx, "bc.processor.Process")
+		res, err = bc.processor.Process(pctx, block, statedb, bc.jumpDestCache, bc.precompileCache, vmConfig, &execIndex)
+		spanEnd(&err)
+		if err != nil {
+			bc.reportBadBlock(block, res, err)
+			return nil, err
+		}
 	}
 	ptime := time.Since(pstart)
 
+	// XDC R8: skip state-root validation during checkpoint-sync-without-state.
+	// Parent state was absent so we cannot recompute. Refs #740/#742.
 	vstart := time.Now()
-	_, _, spanEnd = telemetry.StartSpan(ctx, "bc.validator.ValidateState")
-	err = bc.validator.ValidateState(block, statedb, res, false)
-	spanEnd(&err)
-	if err != nil {
-		bc.reportBadBlock(block, res, err)
-		return nil, err
+	if !bc.checkpointSyncNoState.Load() {
+		_, _, spanEnd := telemetry.StartSpan(ctx, "bc.validator.ValidateState")
+		err = bc.validator.ValidateState(block, statedb, res, false)
+		spanEnd(&err)
+		if err != nil {
+			// XDC A.94: Auto-recover from "invalid merkle root" during bulk fast-sync.
+			// When NodeData/snap-sync delivered a partial trie at the pivot, `HasState`
+			// only checks the root node — deeper storage reads silently return zero,
+			// so execution produces a wrong IntermediateRoot even though `state.New`
+			// succeeded. We switch into checkpointSyncNoState mode and discard the
+			// wrong-state for this block; subsequent blocks skip execution+validation
+			// until snap-sync heals the trie. Strictly gated to XDC + XdcBulkSyncMode.
+			// Refs #886.
+			// #62 guard: an archive node or a block producer must surface a ValidateState
+			// mismatch as a bad
+			// block, never mask it (this is what hid the net #62 block-16 fork/gas
+			// divergence and blocked minting). See the A.93 note above.
+			if bc.canMaskMissingState() {
+				log.Warn("BlockChain: A.94 auto-recover on ValidateState mismatch during bulk sync",
+					"block", block.NumberU64(), "err", err)
+				bc.storeCheckpointSyncNoState(true)
+				rawdb.WriteCheckpointSyncNoState(bc.db, true)
+				// Discard the wrong-state statedb and replace with an empty one so
+				// writeBlockAndSetHead persists EmptyRootHash for this block, not the
+				// incorrectly-executed trie.
+				res = &ProcessResult{Receipts: types.Receipts{}}
+				statedb, err = state.New(types.EmptyRootHash, sdb)
+				if err != nil {
+					return nil, err
+				}
+			} else {
+				bc.reportBadBlock(block, res, err)
+				return nil, err
+			}
+		}
 	}
 	vtime := time.Since(vstart)
 

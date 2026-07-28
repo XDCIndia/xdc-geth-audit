@@ -198,7 +198,20 @@ func (p *TxPool) loop(head *types.Header) {
 				// Updates the statedb with the new chain head. The head state may be
 				// unavailable if the initial state sync has not yet completed.
 				if statedb, err := p.chain.StateAt(newHead.Root, newHead.Number, newHead.Time); err != nil {
-					log.Error("Failed to reset txpool state", "err", err)
+					// XDC A.99.6: during fast-sync checkpointSyncNoState mode the
+					// node imports blocks without executing state (statedb is committed
+					// as EmptyRootHash). The real block Header.Root is not present in
+					// the trie DB until snap-heal completes, so StateAt returns
+					// "missing trie node". Downgrade to Debug and keep the existing
+					// statedb to avoid flooding the log. The txpool will resume correct
+					// operation once CheckpointSyncNoStateActive is cleared.
+					// Refs: #1037 fast-sync-validator txpool flood.
+					if core.CheckpointSyncNoStateActive.Load() {
+						log.Debug("txpool: head state not yet available (snap-heal pending), skipping state update",
+							"block", newHead.Number, "root", newHead.Root)
+					} else {
+						log.Error("Failed to reset txpool state", "err", err)
+					}
 				} else {
 					p.stateLock.Lock()
 					p.state = statedb

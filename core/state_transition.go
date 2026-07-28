@@ -296,6 +296,13 @@ type Message struct {
 	// execution after Amsterdam, instead of capping it at params.MaxTxGas and
 	// moving the remainder into the EIP-8037 state gas reservoir.
 	skipExecutionGasCap bool
+
+	// BalanceTokenFee is the fee capacity of the TRC21 token the message is sent
+	// to, or nil when the recipient is not a registered TRC21 token. When set the
+	// fee is paid from that capacity (see UpdateTRC21Fee in state_processor.go),
+	// so the sender is neither charged for gas nor refunded (XDPoSChain
+	// Message.balanceTokenFee).
+	BalanceTokenFee *big.Int
 }
 
 // SkipNonceCheck disables the check of the message nonce against the account
@@ -393,14 +400,22 @@ func TransactionToMessage(tx *types.Transaction, s types.Signer, baseFee *big.In
 // the gas used (which includes gas refunds) and an error if it failed. An error always
 // indicates a core error meaning that the message would always fail for that particular
 // state and would never be accepted within a block.
-func ApplyMessage(evm *vm.EVM, msg *Message, gp *GasPool) (*ExecutionResult, error) {
+//
+// The optional owner parameter (XDC) specifies the coinbase-owner address used for
+// fee routing post-TIPTRC21Fee. When no owner is supplied behaviour is bit-identical
+// to upstream v1.17.3 (refs #740/#742).
+func ApplyMessage(evm *vm.EVM, msg *Message, gp *GasPool, owner ...common.Address) (*ExecutionResult, error) {
 	// Do not panic if the gas pool is nil. This is allowed when executing
 	// a single message via RPC invocation.
 	if gp == nil {
 		gp = NewGasPool(msg.GasLimit)
 	}
 	evm.SetTxContext(NewEVMTxContext(msg))
-	return newStateTransition(evm, msg, gp).execute()
+	var coinbaseOwner common.Address
+	if len(owner) > 0 {
+		coinbaseOwner = owner[0]
+	}
+	return newStateTransition(evm, msg, gp, coinbaseOwner).execute()
 }
 
 // stateTransition represents a state transition.
@@ -431,15 +446,19 @@ type stateTransition struct {
 	gasRemaining vm.GasBudget
 	state        vm.StateDB
 	evm          *vm.EVM
+	// owner is the coinbase-owner address used for XDC TRC21 fee routing
+	// post-TIPTRC21Fee. Zero value means standard coinbase routing (refs #740).
+	owner common.Address
 }
 
 // newStateTransition initialises and returns a new state transition object.
-func newStateTransition(evm *vm.EVM, msg *Message, gp *GasPool) *stateTransition {
+func newStateTransition(evm *vm.EVM, msg *Message, gp *GasPool, owner common.Address) *stateTransition {
 	return &stateTransition{
 		gp:    gp,
 		evm:   evm,
 		msg:   msg,
 		state: evm.StateDB,
+		owner: owner,
 	}
 }
 
@@ -466,6 +485,14 @@ func (st *stateTransition) buyGas() error {
 	_, overflow := mgval.MulOverflow(mgval, st.msg.GasPrice)
 	if overflow {
 		return fmt.Errorf("%w: address %v required balance exceeds 256 bits", ErrInsufficientFunds, st.msg.From.Hex())
+	}
+	// XDC TRC21 token fee: the token's fee capacity must cover the gas; the
+	// sender's balance is not checked or charged (XDPoSChain buyGas).
+	if st.msg.BalanceTokenFee != nil {
+		if st.msg.BalanceTokenFee.Cmp(mgval.ToBig()) < 0 {
+			return ErrInsufficientFunds
+		}
+		return nil
 	}
 	balanceCheck := new(uint256.Int).Set(mgval)
 	if st.msg.GasFeeCap != nil {
@@ -510,7 +537,20 @@ func (st *stateTransition) buyGas() error {
 			}
 		}
 	}
-	if have, want := st.state.GetBalance(st.msg.From), balanceCheck; have.Cmp(want) < 0 {
+	// XDC: if the sender holds a BigBalance overflow (balance > 2^256-1), the
+	// wrapped uint256 returned by GetBalance can be smaller than balanceCheck
+	// even though the true balance is far larger. Skip the wrapped pre-check
+	// in that case; the actual SubBalance below handles BigBalance correctly
+	// (refs #740/#742).
+	hasBigBalance := false
+	if bp, ok := interface{}(st.state).(interface {
+		GetBigBalance(common.Address) *big.Int
+	}); ok {
+		if bb := bp.GetBigBalance(st.msg.From); bb != nil {
+			hasBigBalance = true
+		}
+	}
+	if have, want := st.state.GetBalance(st.msg.From), balanceCheck; !hasBigBalance && have.Cmp(want) < 0 {
 		return fmt.Errorf("%w: address %v have %v want %v", ErrInsufficientFunds, st.msg.From.Hex(), have, want)
 	}
 	// Deduct the gas cost from the sender's balance
@@ -615,7 +655,19 @@ func (st *stateTransition) preCheck(rules params.Rules) error {
 			}
 			// This will panic if baseFee is nil, but basefee presence is verified
 			// as part of header validation.
-			if msg.GasFeeCap.CmpBig(st.evm.Context.BaseFee) < 0 {
+			// XDC: skip the maxFeePerGas-vs-baseFee check for special txs
+			// (signing / XDCX / lending — destinations recognised by
+			// types.IsSpecialTx). These are minted with maxFeePerGas=0 by
+			// the consensus engine and would otherwise fail this check
+			// post-EIP1559 (refs #740/#742).
+			// Additional nil-guard for st.evm.Context.BaseFee: the parallel
+			// statePrefetcher constructs a vm.Context without populating
+			// BaseFee, so post-London non-special txs would deref nil here
+			// (uint256.CmpBig → big.Int.Sign on nil receiver → SIGSEGV).
+			// Crashed xdc04-mainnet-archive-hash reproducibly at block
+			// 76,321,000+. The main execution path is unaffected because
+			// its Context always has BaseFee set from the header. Refs #839.
+			if !types.IsSpecialTx(msg.To) && st.evm.Context.BaseFee != nil && msg.GasFeeCap.CmpBig(st.evm.Context.BaseFee) < 0 {
 				return fmt.Errorf("%w: address %v, maxFeePerGas: %s, baseFee: %s", ErrFeeCapTooLow,
 					msg.From.Hex(), msg.GasFeeCap, st.evm.Context.BaseFee)
 			}
@@ -722,7 +774,17 @@ func (st *stateTransition) execute() (*ExecutionResult, error) {
 	}
 	// Calculate the intrinsic gas of this transaction and make sure the gas limit
 	// is sufficient to cover that.
-	intrinsicGas, err := IntrinsicGas(msg.Data, msg.AccessList, msg.SetCodeAuthorizations, msg.From, msg.To, msg.Value, rules)
+	//
+	// XDC: disable EIP-2028 transaction data pricing to match XDPoSChain v2.6.8.
+	// Canonical XDPoSChain does not implement EIP-2028 and always charges
+	// 68 gas per non-zero byte; forcing IsIstanbul=false here (on a rules copy
+	// fed only to IntrinsicGas, never to preCheck/FloorDataGas/settleGas) keeps
+	// gas accounting consensus-equivalent on XDC chains (refs #740/#742).
+	intrRules := rules
+	if st.evm.ChainConfig().IsXDC() {
+		intrRules.IsIstanbul = false
+	}
+	intrinsicGas, err := IntrinsicGas(msg.Data, msg.AccessList, msg.SetCodeAuthorizations, msg.From, msg.To, msg.Value, intrRules)
 	if err != nil {
 		return nil, err
 	}
@@ -794,28 +856,54 @@ func (st *stateTransition) execute() (*ExecutionResult, error) {
 		return nil, err
 	}
 
-	// Pay the effective transaction fee to the specific coinbase
-	effectiveTip := msg.GasPrice
-	if rules.IsLondon {
-		baseFee, overflow := uint256.FromBig(st.evm.Context.BaseFee)
-		if overflow {
-			return nil, fmt.Errorf("invalid baseFee: %v", st.evm.Context.BaseFee)
+	// XDC: special txs (0x89/0x90) credit no fee and touch no account, matching
+	// XDPoSChain v2.9.2 core/state_transition.go:505. Their gas price is 0, so
+	// after EIP-1559 the tip below would wrap in uint256 (refs #1455).
+	if !types.IsSpecialTx(msg.To) {
+		// Pay the effective transaction fee to the specific coinbase
+		effectiveTip := msg.GasPrice
+		// XDC: pre-EIP1559 blocks can have IsLondon=true with BaseFee==nil
+		// (London is a marker fork on XDC; EIP-1559 activates later). Guard the
+		// Sub to avoid panic on a nil BaseFee (refs #740/#742).
+		if rules.IsLondon && st.evm.Context.BaseFee != nil {
+			baseFee, overflow := uint256.FromBig(st.evm.Context.BaseFee)
+			if overflow {
+				return nil, fmt.Errorf("invalid baseFee: %v", st.evm.Context.BaseFee)
+			}
+			effectiveTip = new(uint256.Int).Sub(msg.GasPrice, baseFee)
 		}
-		effectiveTip = new(uint256.Int).Sub(msg.GasPrice, baseFee)
-	}
-	if st.evm.Config.NoBaseFee && msg.GasFeeCap.Sign() == 0 && msg.GasTipCap.Sign() == 0 {
-		// Zero the tip when NoBaseFee is set and the fee fields are 0. This avoids
-		// a negative effectiveTip when simulating calls, while the coinbase is
-		// still accessed like in a real block.
-		effectiveTip = new(uint256.Int)
-	}
-	fee := new(uint256.Int).SetUint64(gasUsed)
-	fee.Mul(fee, effectiveTip)
-	st.state.AddBalance(st.evm.Context.Coinbase, fee, tracing.BalanceIncreaseRewardTransactionFee)
+		if st.evm.Config.NoBaseFee && msg.GasFeeCap.Sign() == 0 && msg.GasTipCap.Sign() == 0 {
+			// Zero the tip when NoBaseFee is set and the fee fields are 0. This avoids
+			// a negative effectiveTip when simulating calls, while the coinbase is
+			// still accessed like in a real block.
+			effectiveTip = new(uint256.Int)
+		}
+		if st.evm.Context.BlockNumber.Cmp(common.TIPTRC21Fee) > 0 {
+			// XDC TRC21 fee routing (refs #740/#742): after TIPTRC21Fee, the full
+			// gasUsed * gasPrice (no base-fee deduction) is credited to the
+			// coinbase-owner address — matches XDPoSChain v2.6.8 semantics where
+			// the TRC21 owner receives the entire fee rather than the block miner.
+			// With no registered owner canonical credits nothing (XDPoSChain
+			// v2.9.2 core/state_transition.go:507-510); it never falls back to
+			// the coinbase.
+			if st.owner != (common.Address{}) {
+				fee := new(uint256.Int).SetUint64(gasUsed)
+				fee.Mul(fee, msg.GasPrice)
+				st.state.AddBalance(st.owner, fee, tracing.BalanceIncreaseRewardTransactionFee)
+				if rules.IsEIP4762 && fee.Sign() != 0 {
+					st.evm.AccessEvents.AddAccount(st.owner, true, math.MaxUint64)
+				}
+			}
+		} else {
+			fee := new(uint256.Int).SetUint64(gasUsed)
+			fee.Mul(fee, effectiveTip)
+			st.state.AddBalance(st.evm.Context.Coinbase, fee, tracing.BalanceIncreaseRewardTransactionFee)
 
-	// add the coinbase to the witness iff the fee is greater than 0
-	if rules.IsEIP4762 && fee.Sign() != 0 {
-		st.evm.AccessEvents.AddAccount(st.evm.Context.Coinbase, true, math.MaxUint64)
+			// add the coinbase to the witness iff the fee is greater than 0
+			if rules.IsEIP4762 && fee.Sign() != 0 {
+				st.evm.AccessEvents.AddAccount(st.evm.Context.Coinbase, true, math.MaxUint64)
+			}
+		}
 	}
 
 	return &ExecutionResult{
@@ -1092,8 +1180,9 @@ func (st *stateTransition) settleGas(rules params.Rules, floorDataGas uint64) (g
 		}
 	}
 
-	// Refund leftover gas to the sender
-	if gasLeft > 0 {
+	// Refund leftover gas to the sender. A TRC21 token-fee sender paid nothing,
+	// so there is nothing to return (XDPoSChain refundGas).
+	if gasLeft > 0 && st.msg.BalanceTokenFee == nil {
 		refund := new(uint256.Int).Mul(uint256.NewInt(gasLeft), st.msg.GasPrice)
 		st.state.AddBalance(st.msg.From, refund, tracing.BalanceIncreaseGasReturn)
 

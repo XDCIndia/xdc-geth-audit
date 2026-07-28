@@ -17,7 +17,9 @@
 package core
 
 import (
+	"bytes"
 	"context"
+	"encoding/binary"
 	"fmt"
 	"math"
 	"math/big"
@@ -58,6 +60,18 @@ func (p *StateProcessor) chainConfig() *params.ChainConfig {
 	return p.chain.Config()
 }
 
+// getCoinbaseOwner resolves the TRC21 fee recipient for the block. After
+// TIPTRC21Fee (Apothem 23,779,191; mainnet 38,383,838), the masternode's
+// owner — looked up from the validator contract (0x88) via GetCandidateOwner —
+// receives the transaction-fee credit instead of the masternode itself. When
+// no owner is registered the candidate-owner lookup returns the zero address
+// and state_transition.go falls back to the standard coinbase routing.
+// Mirrors XDPoSChain v2.6.8 core/state_processor.go getCoinbaseOwner.
+func getCoinbaseOwner(engine consensus.Engine, statedb *state.StateDB, header *types.Header) common.Address {
+	beneficiary, _ := engine.Author(header)
+	return state.GetCandidateOwner(statedb, beneficiary)
+}
+
 // Process processes the state changes according to the Ethereum rules by running
 // the transaction messages using the statedb and applying any rewards to both
 // the processor (coinbase) and any included uncles.
@@ -69,6 +83,11 @@ func (p *StateProcessor) Process(ctx context.Context, block *types.Block, stated
 	if supportsParallelExecution(block, p.chainConfig(), statedb.Witness() != nil, cfg.Tracer != nil, cfg.DisableParallelExecution) {
 		return p.processParallel(ctx, block, statedb, jumpDestCache, precompileCache, cfg)
 	}
+	// XDC: capture pre-tx state for the XDPoS engine reward calculation.
+	// Reward computation at checkpoint blocks must read account balances
+	// BEFORE tx execution; without this, reward calculation uses post-tx
+	// state and merkle root diverges at every Epoch checkpoint.
+	parentState := statedb.Copy()
 	var (
 		config      = p.chainConfig()
 		receipts    = make(types.Receipts, 0, len(block.Transactions()))
@@ -96,6 +115,34 @@ func (p *StateProcessor) Process(ctx context.Context, block *types.Block, stated
 	if config.DAOForkSupport && config.DAOForkBlock != nil && config.DAOForkBlock.Cmp(block.Number()) == 0 {
 		misc.ApplyDAOHardFork(tracingStateDB)
 	}
+
+	// XDC: at the TIPSigning fork block (mainnet 3,000,000; Apothem
+	// 23,779,191), canonical XDPoSChain wipes the BlockSigners contract
+	// (0x89). After this block, signing transactions are handled by
+	// ApplySigningTransaction without invoking the contract's EVM code,
+	// so the on-chain code+storage at 0x89 is no longer needed and
+	// removing it shrinks the state trie. We MUST match the canonical
+	// behaviour exactly or the state root diverges at the fork block.
+	//
+	// Implementation note: the IntermediateRoot(false) call BEFORE
+	// SelfDestruct is required for pathdb correctness. Modern geth's
+	// pathdb commits mutations against the trie that was opened during
+	// the previous IntermediateRoot. Without first opening the trie here
+	// (against the pre-deletion originalRoot), the subsequent
+	// SelfDestruct + Finalise + IntermediateRoot path leaves the trie in
+	// a state where the deletion is recorded in mutations but does not
+	// produce the canonical post-deletion root.
+	//
+	// This must run in exactly this order, and before the parent-header
+	// lookup below has any chance to matter: IntermediateRoot(false) →
+	// SelfDestruct → Finalise(true) → IntermediateRoot(true).
+	if common.TIPSigning.Cmp(block.Number()) == 0 {
+		_ = statedb.IntermediateRoot(params.Rules{})
+		statedb.SelfDestruct(common.BlockSignersBinary)
+		statedb.Finalise(params.Rules{IsEIP158: true})
+		_ = statedb.IntermediateRoot(params.Rules{IsEIP158: true})
+	}
+
 	parent := p.chain.GetHeader(block.ParentHash(), block.NumberU64()-1)
 	if parent == nil {
 		return nil, fmt.Errorf("missing parent %#x", block.ParentHash())
@@ -117,31 +164,105 @@ func (p *StateProcessor) Process(ctx context.Context, block *types.Block, stated
 	// Run the pre-execution system calls
 	blockAccessList.Merge(PreExecution(ctx, block.BeaconRoot(), parent, config, evm, block.Number(), block.Time()))
 
+	// XDC: resolve TRC21 fee recipient once per block. After TIPTRC21Fee
+	// (Apothem 23,779,191), the masternode's registered candidate-owner —
+	// looked up from the validator contract (0x88) — receives the per-tx
+	// gas-fee credit instead of the masternode. Computed before the loop so
+	// that within-block balance mutations on the owner do not influence the
+	// lookup. Passed through to ApplyTransactionWithEVM where it routes the
+	// fee in state_transition.go.
+	coinbaseOwner := getCoinbaseOwner(p.chain.Engine(), statedb, header)
+
+	// XDC: TRC21 token fees (XDPoSChain core/blockchain.go + Process). Tokens
+	// registered in the TRC21 issuer pay the fees of transactions sent to them
+	// from their fee capacity, read once from the parent state here and drawn
+	// down as the block executes; UpdateTRC21Fee writes it back after the loop.
+	var (
+		tokensFee      = state.GetTRC21FeeCapacityFromState(statedb)
+		balanceUpdated = map[common.Address]*big.Int{}
+		totalFeeUsed   = new(big.Int)
+	)
+
 	// Iterate over and process the individual transactions
 	for i, tx := range block.Transactions() {
 		// Publish the progress, letting the prefetcher skip caught up work.
+		// Must come before the XDC dispatch shortcuts below: a block composed
+		// entirely of special (0x89/0x92/0x93) txs that `continue` past the
+		// normal path would otherwise never publish progress, stalling the
+		// coordinated prefetcher against a never-advancing index.
 		if execIndex != nil {
 			execIndex.Store(int64(i))
 		}
+		statedb.SetTxContext(tx.Hash(), i, uint32(i))
+
+		// XDC: signing transactions at the TIPSigning fork are routed to
+		// ApplySigningTransaction, which bumps the sender's nonce and emits a
+		// minimal receipt without invoking the EVM (zero gas). The contract
+		// at 0x89 (BlockSignersBinary) is wiped at TIPSigning, so dispatching
+		// here through EVM would fail. Canonical XDPoSChain mirrors this exact
+		// dispatch and the parity gates depend on it producing byte-identical
+		// receipts.
+		if to := tx.To(); to != nil && *to == common.BlockSignersBinary && config.IsTIPSigning(blockNumber) {
+			receipt, err := ApplySigningTransaction(config, statedb, blockNumber, blockHash, tx, gp.Used())
+			if err != nil {
+				return nil, fmt.Errorf("could not apply signing tx %d [%v]: %w", i, tx.Hash().Hex(), err)
+			}
+			receipts = append(receipts, receipt)
+			pipeline.feedReceipt(receipt)
+			allLogs = append(allLogs, receipt.Logs...)
+			continue
+		}
+
+		// XDC: between TIPXDCX (Apothem 23,779,191) and TIPXDCXReceiverDisable
+		// (Apothem 66,825,000), transactions targeting TradingStateAddrBinary
+		// (0x92) or XDCXLendingAddressBinary (0x93) are emitted by the XDCx
+		// subsystem as "empty" notifier transactions. Canonical XDPoSChain
+		// routes them to ApplyEmptyTransaction: no EVM execution, zero gas,
+		// minimal receipt with a single log carrying only the To address.
+		// Running them through the normal EVM path produces a non-zero gas
+		// receipt and diverges from canonical at the very first TIPXDCX block.
+		if config.IsTIPXDCXReceiver(blockNumber) {
+			if to := tx.To(); to != nil && (*to == common.TradingStateAddrBinary || *to == common.XDCXLendingAddressBinary) {
+				receipt, err := ApplyEmptyTransaction(config, statedb, blockNumber, blockHash, tx, gp.Used())
+				if err != nil {
+					return nil, fmt.Errorf("could not apply empty tx %d [%v]: %w", i, tx.Hash().Hex(), err)
+				}
+				receipts = append(receipts, receipt)
+				pipeline.feedReceipt(receipt)
+				allLogs = append(allLogs, receipt.Logs...)
+				continue
+			}
+		}
+
 		msg, err := TransactionToMessage(tx, signer, header.BaseFee)
 		if err != nil {
 			return nil, fmt.Errorf("could not apply tx %d [%v]: %w", i, tx.Hash().Hex(), err)
 		}
+		tokenFee := ApplyTRC21TokenFee(config, msg, tokensFee, tx, blockNumber)
 		statedb.SetTxContext(tx.Hash(), i, uint32(i+1))
-		receipt, bal, err := applyTransactionWithEVM(ctx, msg, gp, statedb, blockNumber, blockHash, context.Time, tx, evm, eagerBloom)
+		receipt, bal, err := applyTransactionWithEVM(ctx, msg, gp, statedb, blockNumber, blockHash, context.Time, tx, evm, eagerBloom, coinbaseOwner)
 		if err != nil {
 			return nil, fmt.Errorf("could not apply tx %d [%v]: %w", i, tx.Hash().Hex(), err)
+		}
+		if tokenFee {
+			SettleTRC21TokenFee(config, statedb, msg, tx, receipt, blockNumber, tokensFee, balanceUpdated, totalFeeUsed)
 		}
 		receipts = append(receipts, receipt)
 		pipeline.feedReceipt(receipt)
 		allLogs = append(allLogs, receipt.Logs...)
 		blockAccessList.Merge(bal)
 	}
+	state.UpdateTRC21Fee(statedb, balanceUpdated, totalFeeUsed)
 	requests, bal, err := PostExecution(ctx, config, block.Number(), block.Time(), allLogs, block.Withdrawals(), evm, uint32(len(block.Transactions())+1))
 	if err != nil {
 		return nil, err
 	}
 	blockAccessList.Merge(bal)
+
+	// XDC: Set parentState on the engine for reward calculation.
+	if xdposEngine, ok := p.chain.Engine().(interface{ SetParentState(*state.StateDB) }); ok {
+		xdposEngine.SetParentState(parentState)
+	}
 
 	// Finalize the block, applying any consensus engine specific extras
 	// (e.g. block rewards).
@@ -253,14 +374,18 @@ func ProcessWithdrawals(withdrawals types.Withdrawals, evm *vm.EVM, blockAccessI
 // ApplyTransactionWithEVM attempts to apply a transaction to the given state database
 // and uses the input parameters for its environment similar to ApplyTransaction. However,
 // this method takes an already created EVM instance as input.
-func ApplyTransactionWithEVM(ctx context.Context, msg *Message, gp *GasPool, statedb *state.StateDB, blockNumber *big.Int, blockHash common.Hash, blockTime uint64, tx *types.Transaction, evm *vm.EVM) (*types.Receipt, *bal.ConstructionBlockAccessList, error) {
-	return applyTransactionWithEVM(ctx, msg, gp, statedb, blockNumber, blockHash, blockTime, tx, evm, true)
+//
+// The optional owner parameter (XDC) specifies the coinbase-owner address used for
+// TRC21 fee routing post-TIPTRC21Fee. When no owner is supplied behaviour is
+// bit-identical to upstream (refs #740/#742).
+func ApplyTransactionWithEVM(ctx context.Context, msg *Message, gp *GasPool, statedb *state.StateDB, blockNumber *big.Int, blockHash common.Hash, blockTime uint64, tx *types.Transaction, evm *vm.EVM, owner ...common.Address) (*types.Receipt, *bal.ConstructionBlockAccessList, error) {
+	return applyTransactionWithEVM(ctx, msg, gp, statedb, blockNumber, blockHash, blockTime, tx, evm, true, owner...)
 }
 
 // applyTransactionWithEVM is ApplyTransactionWithEVM with the receipt bloom
 // filter optional. The block processor leaves it out and lets its receipt
 // pipeline hash the logs instead.
-func applyTransactionWithEVM(ctx context.Context, msg *Message, gp *GasPool, statedb *state.StateDB, blockNumber *big.Int, blockHash common.Hash, blockTime uint64, tx *types.Transaction, evm *vm.EVM, withBloom bool) (receipt *types.Receipt, bal *bal.ConstructionBlockAccessList, err error) {
+func applyTransactionWithEVM(ctx context.Context, msg *Message, gp *GasPool, statedb *state.StateDB, blockNumber *big.Int, blockHash common.Hash, blockTime uint64, tx *types.Transaction, evm *vm.EVM, withBloom bool, owner ...common.Address) (receipt *types.Receipt, bal *bal.ConstructionBlockAccessList, err error) {
 	_, _, spanEnd := telemetry.StartSpan(ctx, "core.ApplyTransactionWithEVM",
 		telemetry.StringAttribute("tx.hash", tx.Hash().Hex()),
 		telemetry.IntAttribute("tx.index", statedb.TxIndex()),
@@ -276,7 +401,8 @@ func applyTransactionWithEVM(ctx context.Context, msg *Message, gp *GasPool, sta
 		}
 	}
 	// Apply the transaction to the current state (included in the env).
-	result, err := ApplyMessage(evm, msg, gp)
+	// Thread the optional owner through to ApplyMessage for TRC21 fee routing.
+	result, err := ApplyMessage(evm, msg, gp, owner...)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -410,6 +536,52 @@ func ProcessBeaconBlockRoot(beaconRoot common.Hash, evm *vm.EVM, blockAccessList
 // ProcessParentBlockHash stores the parent block hash in the history storage contract
 // as per EIP-2935/7709.
 func ProcessParentBlockHash(prevHash common.Hash, evm *vm.EVM, blockAccessList *bal.ConstructionBlockAccessList) {
+	// EIP-2935: if the history contract already carries code, it must be the
+	// canonical bytecode. (Guards against a mis-seeded genesis alloc.)
+	code := evm.StateDB.GetCode(params.HistoryStorageAddress)
+	if len(code) > 0 && !bytes.Equal(code, params.HistoryStorageCode) {
+		panic(fmt.Sprintf("history storage code mismatch: have %s want %s",
+			crypto.Keccak256Hash(code), crypto.Keccak256Hash(params.HistoryStorageCode)))
+	}
+
+	// XDC activates Prague by BLOCK number and does NOT ship the history contract
+	// in genesis. So at/after the Prague block, if the contract is absent, deploy
+	// it and backfill the recent block-hash ring buffer directly — this is the
+	// per-block state mutation canonical XDPoSChain applies at the Prague block
+	// (e.g. devnet 5551 block 50,000 → stateRoot c0060c78…). Upstream time-based
+	// Prague chains ship the contract pre-deployed, so len(code) > 0 and this is
+	// skipped. Refs XDCIndia/ethOne#39.
+	blockNumber := evm.Context.BlockNumber
+	if forkBlock := evm.ChainConfig().PragueBlock; len(code) == 0 && forkBlock != nil &&
+		blockNumber != nil && blockNumber.Cmp(forkBlock) >= 0 {
+		if !evm.StateDB.Exist(params.HistoryStorageAddress) {
+			evm.StateDB.CreateAccount(params.HistoryStorageAddress)
+		}
+		if evm.StateDB.GetNonce(params.HistoryStorageAddress) == 0 {
+			evm.StateDB.SetNonce(params.HistoryStorageAddress, 1, tracing.NonceChangeUnspecified)
+		}
+		evm.StateDB.SetCode(params.HistoryStorageAddress, params.HistoryStorageCode, tracing.CodeChangeGenesis)
+		if blockNumber.Sign() > 0 {
+			end := blockNumber.Uint64() - 1
+			start := end
+			if end+1 > params.HistoryServeWindow {
+				start = end + 1 - params.HistoryServeWindow
+			}
+			if forkBlock.Sign() > 0 {
+				if forkStart := forkBlock.Uint64() - 1; forkStart > start {
+					start = forkStart
+				}
+			}
+			for n := start; n <= end; n++ {
+				hash := evm.Context.GetHash(n)
+				if hash == (common.Hash{}) {
+					continue
+				}
+				evm.StateDB.SetState(params.HistoryStorageAddress, historyStorageKey(n), hash)
+			}
+		}
+	}
+
 	if tracer := evm.Config.Tracer; tracer != nil {
 		onSystemCallStart(tracer, evm.GetVMContext())
 		if tracer.OnSystemCallEnd != nil {
@@ -440,6 +612,15 @@ func ProcessParentBlockHash(prevHash common.Hash, evm *vm.EVM, blockAccessList *
 	if evm.GetRules().IsAmsterdam {
 		blockAccessList.Merge(accessList)
 	}
+}
+
+// historyStorageKey maps a block number to its slot in the EIP-2935 history
+// ring buffer (HISTORY_SERVE_WINDOW entries).
+func historyStorageKey(number uint64) common.Hash {
+	ringIndex := number % params.HistoryServeWindow
+	var key common.Hash
+	binary.BigEndian.PutUint64(key[24:], ringIndex)
+	return key
 }
 
 // ProcessWithdrawalQueue calls the EIP-7002 withdrawal queue contract.
@@ -555,4 +736,134 @@ func AssembleBlock(chain consensus.ChainHeaderReader, header *types.Header, stat
 	balHash := bal.Hash()
 	header.BlockAccessListHash = &balHash
 	return types.NewBlock(header, body, receipts, trie.NewStackTrie(nil)).WithAccessListUnsafe(bal)
+}
+
+// ApplySigningTransaction handles XDC signing transactions at the tipSigning
+// fork. Signing transactions to BlockSignersBinary (0x89) are processed without
+// consuming gas — matches XDPoSChain behavior at block >= tipSigning
+// (3,000,000 on mainnet). The EVM is bypassed entirely; only the sender's nonce
+// is bumped and a minimal log is emitted.
+//
+// The optional cumulativeGasUsed parameter (XDC) is the receipt's cumulative
+// gas counter at this index; passed by Process() from gp.CumulativeUsed().
+// usedGas is NOT modified (signing txs consume zero gas). Refs #740/#742.
+func ApplySigningTransaction(config *params.ChainConfig, statedb *state.StateDB, blockNumber *big.Int, blockHash common.Hash, tx *types.Transaction, cumulativeGasUsed uint64) (*types.Receipt, error) {
+	var root []byte
+	if config.IsByzantium(blockNumber) {
+		statedb.Finalise(params.Rules{IsEIP158: true})
+	} else {
+		root = statedb.IntermediateRoot(params.Rules{IsEIP158: config.IsEIP158(blockNumber)}).Bytes()
+	}
+	from, err := types.Sender(types.MakeSigner(config, blockNumber, 0), tx)
+	if err != nil {
+		return nil, err
+	}
+	nonce := statedb.GetNonce(from)
+	if nonce != tx.Nonce() {
+		return nil, fmt.Errorf("signing tx nonce mismatch: state=%d tx=%d", nonce, tx.Nonce())
+	}
+	statedb.SetNonce(from, nonce+1, tracing.NonceChangeUnspecified)
+
+	// Canonical XDPoSChain emits a minimal log with only Address (=
+	// BlockSignersBinary) and BlockNumber set. The signing path short-circuits
+	// EVM execution entirely, so the BlockSigner contract's
+	// Sign(address,uint256,bytes32) event never actually fires on canonical —
+	// only the Address bit contributes to the bloom. PR #654 attempted to mint
+	// the contract's event manually, but canonical does not, so the rich form
+	// caused bloom/receipt-root divergence past TIPSigning.
+	sigLog := &types.Log{
+		Address:     common.BlockSignersBinary,
+		BlockNumber: blockNumber.Uint64(),
+	}
+	statedb.AddLog(sigLog)
+
+	// Build receipt — gasUsed=0, cumulativeGasUsed unchanged.
+	receipt := &types.Receipt{
+		Type:              tx.Type(),
+		PostState:         root,
+		Status:            types.ReceiptStatusSuccessful,
+		CumulativeGasUsed: cumulativeGasUsed,
+		TxHash:            tx.Hash(),
+		GasUsed:           0,
+		BlockHash:         blockHash,
+		BlockNumber:       blockNumber,
+		TransactionIndex:  uint(statedb.TxIndex()),
+	}
+	receipt.Logs = statedb.GetLogs(tx.Hash(), blockNumber.Uint64(), blockHash, 0)
+	receipt.Bloom = types.CreateBloom(receipt)
+	return receipt, nil
+}
+
+// ApplyEmptyTransaction handles XDCx "empty" notifier transactions emitted
+// between TIPXDCX (Apothem 23,779,191; mainnet 38,383,838) and
+// TIPXDCXReceiverDisable (Apothem 66,825,000; mainnet 80,370,900) that target
+// the XDCx trading-state (0x92) or lending-engine (0x93) contracts. Canonical
+// XDPoSChain records the receipt with zero gas, a minimal single log carrying
+// only the To address, and no nonce bump. cumulativeGasUsed is passed through
+// unchanged. Without this dispatch the tx is run through the EVM, the receipt
+// reports non-zero gas, and the state root + receipts root diverge starting
+// at the very first TIPXDCX block.
+func ApplyEmptyTransaction(config *params.ChainConfig, statedb *state.StateDB, blockNumber *big.Int, blockHash common.Hash, tx *types.Transaction, cumulativeGasUsed uint64) (*types.Receipt, error) {
+	var root []byte
+	if config.IsByzantium(blockNumber) {
+		statedb.Finalise(params.Rules{IsEIP158: true})
+	} else {
+		root = statedb.IntermediateRoot(params.Rules{IsEIP158: config.IsEIP158(blockNumber)}).Bytes()
+	}
+
+	emptyLog := &types.Log{
+		BlockNumber: blockNumber.Uint64(),
+	}
+	if to := tx.To(); to != nil {
+		emptyLog.Address = *to
+	}
+	statedb.AddLog(emptyLog)
+
+	receipt := &types.Receipt{
+		Type:              tx.Type(),
+		PostState:         root,
+		Status:            types.ReceiptStatusSuccessful,
+		CumulativeGasUsed: cumulativeGasUsed,
+		TxHash:            tx.Hash(),
+		GasUsed:           0,
+		BlockHash:         blockHash,
+		BlockNumber:       blockNumber,
+		TransactionIndex:  uint(statedb.TxIndex()),
+	}
+	receipt.Logs = statedb.GetLogs(tx.Hash(), blockNumber.Uint64(), blockHash, 0)
+	receipt.Bloom = types.CreateBloom(receipt)
+	return receipt, nil
+}
+
+// ApplyTRC21TokenFee marks msg as a TRC21 token-fee message when tx is sent to a
+// token registered in the TRC21 issuer: the fee is then paid from the token's
+// capacity, at the TRC21 gas price of the block (XDPoSChain tx.AsMessage). It
+// reports whether msg is one. Call it on the normal (non special-tx) path only.
+func ApplyTRC21TokenFee(config *params.ChainConfig, msg *Message, tokensFee map[common.Address]*big.Int, tx *types.Transaction, blockNumber *big.Int) bool {
+	to := tx.To()
+	if to == nil {
+		return false
+	}
+	capacity, ok := tokensFee[*to]
+	if !ok {
+		return false
+	}
+	msg.BalanceTokenFee = capacity
+	msg.GasPrice, _ = uint256.FromBig(params.TRC21GasPriceForBlock(config, blockNumber))
+	return true
+}
+
+// SettleTRC21TokenFee draws the fee of an applied TRC21 token-fee transaction
+// from its token's capacity and, when the transaction failed, charges the
+// token's minFee (in tokens) from the sender to the issuer (XDPoSChain
+// applyTransaction + Process).
+func SettleTRC21TokenFee(config *params.ChainConfig, statedb *state.StateDB, msg *Message, tx *types.Transaction, receipt *types.Receipt, blockNumber *big.Int, tokensFee, balanceUpdated map[common.Address]*big.Int, totalFeeUsed *big.Int) {
+	token := *tx.To()
+	if receipt.Status == types.ReceiptStatusFailed {
+		state.PayFeeWithTRC21TxFail(statedb, msg.From, token)
+	}
+	fee := params.TRC21GasFee(config, blockNumber, receipt.GasUsed)
+	tokensFee[token] = new(big.Int).Sub(tokensFee[token], fee)
+	balanceUpdated[token] = tokensFee[token]
+	totalFeeUsed.Add(totalFeeUsed, fee)
 }

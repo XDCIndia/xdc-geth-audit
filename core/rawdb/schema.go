@@ -52,6 +52,12 @@ var (
 	// fastTrieProgressKey tracks the number of trie entries imported during fast sync.
 	fastTrieProgressKey = []byte("TrieSync")
 
+	// fastSyncCheckpointKey persists the in-flight XDPOS2 classical fast-sync
+	// target (operator-pinned pivot number/hash/root + processed-entry counter)
+	// so a crash-restart can resume against the same target instead of starting
+	// state download from scratch. Refs A.42 / #844.
+	fastSyncCheckpointKey = []byte("FastSyncCheckpointV1")
+
 	// snapshotDisabledKey flags that the snapshot should not be maintained due to initial sync.
 	snapshotDisabledKey = []byte("SnapshotDisabled")
 
@@ -91,6 +97,24 @@ var (
 	// This flag is deprecated, it's kept to avoid reporting errors when inspect
 	// database.
 	fastTxLookupLimitKey = []byte("FastTransactionLookupLimit")
+
+	// checkpointSyncMetadataKey tracks the checkpoint sync metadata
+	// (block number, hash, state root) — needed to resume an interrupted
+	// checkpoint-sync without re-downloading the chain prefix.
+	// XDC P0 hardening — refs #740/#742.
+	checkpointSyncMetadataKey = []byte("CheckpointSyncMetadata")
+
+	// checkpointSyncNoStateKey tracks whether checkpoint sync is operating
+	// without state. When true, blockchain.go skips processor.Process /
+	// validator.ValidateState because the parent state is intentionally
+	// absent. Persisted across restarts.
+	// XDC P0 fix — refs #740/#742.
+	checkpointSyncNoStateKey = []byte("CheckpointSyncNoState")
+
+	// lowestInsertedHeaderKey tracks the lowest header number inserted during
+	// checkpoint sync. Enables resume without re-downloading headers.
+	// XDC P1 hardening — refs #740/#742.
+	lowestInsertedHeaderKey = []byte("LowestInsertedHeader")
 
 	// badBlockKey tracks the list of bad blocks seen by local
 	badBlockKey = []byte("InvalidBlock")
@@ -213,6 +237,11 @@ func blockBodyKey(number uint64, hash common.Hash) []byte {
 // blockReceiptsKey = blockReceiptsPrefix + num (uint64 big endian) + hash
 func blockReceiptsKey(number uint64, hash common.Hash) []byte {
 	return append(append(blockReceiptsPrefix, encodeBlockNumber(number)...), hash.Bytes()...)
+}
+
+// blockAccessListKey = accessListPrefix + num (uint64 big endian) + hash
+func blockAccessListKey(number uint64, hash common.Hash) []byte {
+	return append(append(accessListPrefix, encodeBlockNumber(number)...), hash.Bytes()...)
 }
 
 // accessListKey = accessListPrefix + num (uint64 big endian) + hash

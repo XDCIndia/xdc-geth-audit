@@ -18,6 +18,7 @@ package state
 
 import (
 	"fmt"
+	"math/big"
 	"slices"
 	"sort"
 
@@ -345,12 +346,18 @@ func (j *journal) refundChange(previous uint64) {
 	j.append(refundChange{prev: previous})
 }
 
-func (j *journal) balanceChange(addr common.Address, previous *uint256.Int) {
+func (j *journal) balanceChange(addr common.Address, previous *uint256.Int, previousBig *big.Int) {
 	prev := previous.Clone()
 	j.stashBalance(addr, prev)
+
+	var bigCopy *big.Int
+	if previousBig != nil {
+		bigCopy = new(big.Int).Set(previousBig)
+	}
 	j.append(balanceChange{
-		account: addr,
-		prev:    prev,
+		account:    addr,
+		prev:       prev,
+		prevBigBal: bigCopy,
 	})
 }
 
@@ -418,8 +425,9 @@ type (
 
 	// Changes to individual accounts.
 	balanceChange struct {
-		account common.Address
-		prev    *uint256.Int
+		account    common.Address
+		prev       *uint256.Int
+		prevBigBal *big.Int // non-nil when previous balance exceeded uint256
 	}
 	nonceChange struct {
 		account common.Address
@@ -524,7 +532,8 @@ func (ch touchChange) copy() journalEntry {
 }
 
 func (ch balanceChange) revert(s *StateDB) {
-	s.getStateObject(ch.account).setBalance(ch.prev)
+	obj := s.getStateObject(ch.account)
+	obj.setBigBalance(ch.prev, ch.prevBigBal)
 }
 
 func (ch balanceChange) mutation() (common.Address, journalMutationKind, bool) {
@@ -532,9 +541,14 @@ func (ch balanceChange) mutation() (common.Address, journalMutationKind, bool) {
 }
 
 func (ch balanceChange) copy() journalEntry {
+	var bigCopy *big.Int
+	if ch.prevBigBal != nil {
+		bigCopy = new(big.Int).Set(ch.prevBigBal)
+	}
 	return balanceChange{
-		account: ch.account,
-		prev:    new(uint256.Int).Set(ch.prev),
+		account:    ch.account,
+		prev:       new(uint256.Int).Set(ch.prev),
+		prevBigBal: bigCopy,
 	}
 }
 

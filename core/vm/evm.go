@@ -152,6 +152,17 @@ func NewEVM(blockCtx BlockContext, statedb StateDB, chainConfig *params.ChainCon
 	}
 	evm.precompiles = *activePrecompiledContracts(evm.chainRules)
 
+	// XDC: defer EIP-2929/3529/3860 from Berlin/London/Shanghai to EIP-1559
+	// (refs #740, xdc-network issue #716). On XDC chains:
+	//   - Berlin..Shanghai before EIP-1559 use marker-only xdc*InstructionSet
+	//     (no EIP-2929 access lists / cold-warm gas semantics)
+	//   - IsEIP1559 enables the upstream shanghaiInstructionSet (which is
+	//     equivalent to canonical XDPoSChain's newEip1559InstructionSet:
+	//     Shanghai + enable2929 + enable3529 + enable3860)
+	//   - Cancun and later already match upstream
+	// Without this, every post-Berlin transaction executes with different
+	// gas costs vs canonical and the state root diverges at every block.
+	isXDC := evm.chainConfig.IsXDC()
 	switch {
 	case evm.chainRules.IsBogota:
 		evm.table = &bogotaInstructionSet
@@ -166,14 +177,34 @@ func NewEVM(blockCtx BlockContext, statedb StateDB, chainConfig *params.ChainCon
 		evm.table = &pragueInstructionSet
 	case evm.chainRules.IsCancun:
 		evm.table = &cancunInstructionSet
-	case evm.chainRules.IsShanghai:
+	case isXDC && evm.chainConfig.IsEIP1559(evm.Context.BlockNumber):
+		// XDC at IsEIP1559 (pre-Cancun): upstream Shanghai set carries
+		// enable2929 + enable3529 + enable3860 — matches XDPoSChain canonical.
 		evm.table = &shanghaiInstructionSet
+	case evm.chainRules.IsShanghai:
+		if isXDC {
+			evm.table = &xdcShanghaiInstructionSet
+		} else {
+			evm.table = &shanghaiInstructionSet
+		}
 	case evm.chainRules.IsMerge:
-		evm.table = &mergeInstructionSet
+		if isXDC {
+			evm.table = &xdcMergeInstructionSet
+		} else {
+			evm.table = &mergeInstructionSet
+		}
 	case evm.chainRules.IsLondon:
-		evm.table = &londonInstructionSet
+		if isXDC {
+			evm.table = &xdcLondonInstructionSet
+		} else {
+			evm.table = &londonInstructionSet
+		}
 	case evm.chainRules.IsBerlin:
-		evm.table = &berlinInstructionSet
+		if isXDC {
+			evm.table = &xdcBerlinInstructionSet
+		} else {
+			evm.table = &berlinInstructionSet
+		}
 	case evm.chainRules.IsIstanbul:
 		evm.table = &istanbulInstructionSet
 	case evm.chainRules.IsConstantinople:
@@ -461,8 +492,22 @@ func (evm *EVM) StaticCall(caller common.Address, addr common.Address, input []b
 	// We do an AddBalance of zero here, just in order to trigger a touch.
 	// This doesn't matter on Mainnet, where all empties are gone at the time of Byzantium,
 	// but is the correct thing to do and matters on other networks, in tests, and potential
-	// future scenarios
-	evm.StateDB.AddBalance(addr, new(uint256.Int), tracing.BalanceChangeTouchAccount)
+	// future scenarios.
+	//
+	// XDC #720 / #810: canonical XDPoSChain v2.7.0's StaticCall only does the
+	// zero-value touch on blocks past TIPXDCXCancellationFee (mainnet
+	// 38_383_838 / apothem 23_779_191) — the same fork that flips IsIstanbul
+	// for XDC. On mainnet block 34,059,322 GnosisSafe execTransaction
+	// STATICCALLs ecrecover (0x01): canonical does NOT touch 0x01, leaving
+	// its trie leaf unchanged. An unconditional touch marks 0x01 as
+	// journal-dirty + empty, so per-tx Finalise(true) deletes its leaf and
+	// the world root diverges by exactly one leaf. Gate the touch on the same
+	// fork canonical uses so we match. Non-XDC chains keep upstream behaviour.
+	// First landed in PR #724 (closed #720) on the pre-reset baseline; lost
+	// during the v1.17.3 reset (#740) and restored here.
+	if !evm.chainConfig.IsXDC() || evm.chainConfig.IsIstanbul(evm.Context.BlockNumber) {
+		evm.StateDB.AddBalance(addr, new(uint256.Int), tracing.BalanceChangeTouchAccount)
+	}
 
 	if p, isPrecompile := evm.precompile(addr); isPrecompile {
 		ret, gas, err = RunPrecompiledContract(evm.StateDB, p, addr, input, gas, evm.Config.Tracer, evm.chainRules, evm.precompileCache)

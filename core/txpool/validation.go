@@ -131,8 +131,18 @@ func ValidateTransaction(tx *types.Transaction, head *types.Header, signer types
 		return core.ErrInsufficientFunds
 	}
 	// Ensure the transaction has more gas than the bare minimum needed to cover
-	// the transaction metadata
-	intrGas, err := core.IntrinsicGas(tx.Data(), tx.AccessList(), tx.SetCodeAuthorizations(), from, tx.To(), value, rules)
+	// the transaction metadata.
+	//
+	// XDC: disable EIP-2028 (lower per-non-zero-byte calldata gas) for XDC
+	// chains. Canonical XDPoSChain v2.6.8 keeps 68 gas per non-zero byte at all
+	// times, so enabling EIP-2028 would diverge from canonical intrinsic-gas
+	// calculation on every tx with calldata. This is fed only to IntrinsicGas
+	// below, never to FloorDataGas or the rest of validation.
+	intrRules := rules
+	if opts.Config.IsXDC() {
+		intrRules.IsIstanbul = false
+	}
+	intrGas, err := core.IntrinsicGas(tx.Data(), tx.AccessList(), tx.SetCodeAuthorizations(), from, tx.To(), value, intrRules)
 	if err != nil {
 		return err
 	}
@@ -156,8 +166,20 @@ func ValidateTransaction(tx *types.Transaction, head *types.Header, signer types
 			return fmt.Errorf("%w: intrinsic cost %v, floor: %v", core.ErrFloorDataGas, intrGas, floorDataGas)
 		}
 	}
-	// Ensure the gasprice is high enough to cover the requirement of the calling pool
-	if tx.GasTipCapIntCmp(opts.MinTip) < 0 {
+	// Ensure the gasprice is high enough to cover the requirement of the calling pool.
+	//
+	// XDC parity #928/#188: special transactions to BlockSigners (0x...0089) and
+	// RandomizeSMC (0x...0090) are signed by masternodes with gasPrice=0 by
+	// design and exempt from gas-price validation (canonical XDPoSChain
+	// core/txpool/validation.go). Without this exemption, modern's
+	// --miner.gasprice sanitization (0 → 1,000,000) causes the outer txpool
+	// gate to reject every sign-tx, so they never enter the pool, never
+	// propagate to other validators, and the V2 BFT comeback-from-penalty
+	// signal (per-block sign-tx as liveness proof) never reaches V1 peers.
+	// Observed on xdc04 modern (devnet-5151) where sign-txs were created
+	// (`contracts: masternode signing tx submitted ... nonce=19`) but never
+	// reached V1 node1's txpool (pending=0 queued=0).
+	if !tx.IsSpecialTransaction() && tx.GasTipCapIntCmp(opts.MinTip) < 0 {
 		return fmt.Errorf("%w: gas tip cap %v, minimum needed %v", ErrTxGasPriceTooLow, tx.GasTipCap(), opts.MinTip)
 	}
 	if tx.Type() == types.BlobTxType {

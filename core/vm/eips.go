@@ -220,7 +220,15 @@ func opTstore(pc *uint64, evm *EVM, scope *ScopeContext) ([]byte, error) {
 
 // opBaseFee implements BASEFEE opcode
 func opBaseFee(pc *uint64, evm *EVM, scope *ScopeContext) ([]byte, error) {
-	scope.Stack.get().SetFromBig(evm.Context.BaseFee)
+	baseFee := evm.Context.BaseFee
+	// XDC: BASEFEE is live from London, but XDC headers only carry a base fee
+	// from Eip1559Block on. In between the header has none (nil here, which
+	// SetFromBig cannot take); canonical XDPoSChain reports the Gas50x tier
+	// price there (XinFinOrg/XDPoSChain #2516).
+	if baseFee == nil && evm.chainConfig.IsXDC() {
+		baseFee = params.XDCBaseFeeForOpcode()
+	}
+	scope.Stack.get().SetFromBig(baseFee)
 	return nil, nil
 }
 
@@ -282,8 +290,19 @@ func opBlobHash(pc *uint64, evm *EVM, scope *ScopeContext) ([]byte, error) {
 	return nil, nil
 }
 
-// opBlobBaseFee implements BLOBBASEFEE opcode
+// opBlobBaseFee implements BLOBBASEFEE opcode.
+//
+// XDC mainnet does not activate EIP-4844 (blob transactions); blocks have no
+// ExcessBlobGas so evm.Context.BlobBaseFee remains nil. uint256.SetFromBig(nil)
+// panics. Treat nil as zero — semantically correct (no blob fee) and matches
+// the EIP-7516 specification ("MUST push 0 if blob transactions are not
+// supported by the chain"). Upstream Ethereum mainnet sets BlobBaseFee in
+// every Cancun-era block, so the nil branch is dead code there.
 func opBlobBaseFee(pc *uint64, evm *EVM, scope *ScopeContext) ([]byte, error) {
+	if evm.Context.BlobBaseFee == nil {
+		scope.Stack.get().Clear()
+		return nil, nil
+	}
 	scope.Stack.get().SetFromBig(evm.Context.BlobBaseFee)
 	return nil, nil
 }
