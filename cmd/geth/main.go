@@ -42,13 +42,20 @@ import (
 )
 
 const (
-	clientIdentifier = "geth" // Client identifier to advertise over the network
+	// A.59 (refs #857): XDC mainnet public peers filter inbound connections
+	// by client-name prefix and reject anything that doesn't start with "XDC/".
+	// Side-by-side experiment 2026-06-06: fresh XDPoSChain (name "XDC/...")
+	// attracted 4 peers in 15 min from the same bootnodes that gave fresh
+	// modern (name "Geth/...") zero peers in 50+ minutes.
+	clientIdentifier = "XDC" // was "geth"; renamed for XDC mesh acceptance
 )
 
 var (
 	// flags that configure the node
 	nodeFlags = slices.Concat([]cli.Flag{
 		utils.IdentityFlag,
+		utils.UnlockedAccountFlag, // deprecated; XDPoS minter uses it to select the sealer keystore account
+		utils.InsecureUnlockAllowedFlag, // deprecated; no-op, accepted for XDPoS minter CLI back-compat
 		utils.PasswordFileFlag,
 		utils.BootnodesFlag,
 		utils.MinFreeDiskSpaceFlag,
@@ -78,6 +85,10 @@ var (
 		utils.BlobPoolPriceBumpFlag,
 		utils.BlobPoolFetchProbabilityFlag,
 		utils.SyncModeFlag,
+		utils.FastSyncPivotNumberFlag,
+		utils.FastSyncPivotHashFlag,
+		utils.FastSyncPivotRootFlag,
+		utils.NoAutoPivotFlag,
 		utils.SyncTargetFlag,
 		utils.ExitWhenSyncedFlag,
 		utils.GCModeFlag,
@@ -112,6 +123,8 @@ var (
 		utils.MaxPendingPeersFlag,
 		utils.MinerGasLimitFlag,
 		utils.MinerGasPriceFlag,
+		utils.MinerEtherbaseFlag, // deprecated; XDPoS minter coinbase -> PendingFeeRecipient
+		utils.MiningEnabledFlag,  // deprecated upstream (PoS-only); XDPoS needs --mine to enable sealing (cfg.Mining -> StartMining)
 		utils.MinerExtraDataFlag,
 		utils.MinerMaxBlobsFlag,
 		utils.MinerRecommitIntervalFlag,
@@ -329,6 +342,21 @@ func geth(ctx *cli.Context) error {
 func startNode(ctx *cli.Context, stack *node.Node, isConsole bool) {
 	// Start up the node itself
 	utils.StartNode(ctx, stack, isConsole)
+
+	if ctx.IsSet(utils.UnlockedAccountFlag.Name) {
+		log.Warn(`The "unlock" flag has been deprecated and has no effect`)
+	}
+
+	// XDPoS V2: when --mine is set, unlock the etherbase account via keystore
+	// so BFT signing (sendTimeout, sendVote) works. The standard --unlock flag
+	// was deprecated in go-ethereum but XDPoS validators require keystore signing.
+	// We re-implement the minimal unlock path here: read --password file and call
+	// ks.Unlock() directly — no HTTP exposure of the unlocked key (refs #894).
+	if ctx.Bool(utils.MiningEnabledFlag.Name) && ctx.Path(utils.PasswordFileFlag.Name) != "" {
+		if err := utils.UnlockXDPoSMinerAccount(ctx, stack); err != nil {
+			log.Warn("XDPoS miner account unlock failed", "err", err)
+		}
+	}
 
 	// Register wallet event handlers to open and auto-derive wallets
 	events := make(chan accounts.WalletEvent, 16)

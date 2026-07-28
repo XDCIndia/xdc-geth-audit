@@ -93,6 +93,15 @@ type Backend interface {
 	HistoryPruningCutoff() uint64
 	HistoryRetention() HistoryRetention
 
+	GetRewardByHash(hash common.Hash) map[string]map[string]map[string]*big.Int
+
+	// XDPoS-specific methods
+	BlockChain() *core.BlockChain
+
+	// A.97.2: snap-heal status for xdc_getStateHealStatus RPC. Refs #894.
+	// Returns nil if the backend does not support snap-heal (e.g. light client).
+	SnapHealStatus() *core.SnapHealStatusFields
+
 	// This is copied from filters.Backend
 	// eth/filters needs to be initialized from this backend type, so methods needed by
 	// it must also be included here.

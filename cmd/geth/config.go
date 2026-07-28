@@ -36,6 +36,7 @@ import (
 	"github.com/ethereum/go-ethereum/cmd/utils"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/crypto"
+	ethpkg "github.com/ethereum/go-ethereum/eth"
 	"github.com/ethereum/go-ethereum/eth/catalyst"
 	"github.com/ethereum/go-ethereum/eth/ethconfig"
 	"github.com/ethereum/go-ethereum/eth/syncer"
@@ -257,6 +258,15 @@ func makeFullNode(ctx *cli.Context) *node.Node {
 	// Add Ethereum service.
 	backend, eth := utils.RegisterEthService(stack, &cfg.Eth)
 
+	// XDC A.97-M.B Task 7: start the XDPoS V2 block-production worker if
+	// --mine was passed.  Must run after RegisterEthService (which creates the
+	// eth.Ethereum instance and constructs the xdcWorker) and after stack.Start()
+	// (which registers the lifecycle and opens keystores).  We register a
+	// lifecycle hook here so it fires at the right time.
+	if eth != nil && cfg.Eth.Miner.Mining {
+		stack.RegisterLifecycle(&xdcMiningLifecycle{eth: eth})
+	}
+
 	// Create gauge with geth system and build information
 	if eth != nil { // The 'eth' backend may be nil in light mode
 		var protos []string
@@ -278,8 +288,26 @@ func makeFullNode(ctx *cli.Context) *node.Node {
 	if ctx.Bool(utils.GraphQLEnabledFlag.Name) {
 		utils.RegisterGraphQLService(stack, backend, filterSystem, &cfg.Node)
 	}
-	// Add the Ethereum Stats daemon if requested.
-	if cfg.Ethstats.URL != "" {
+	// Add the Ethereum Stats daemon. XDC: on XDPoS chains the node reports to the
+	// shared XDC stats board by DEFAULT — even without --ethstats — and the host
+	// IP is baked into the reported name (see utils.XDCEthstatsURL). A passed
+	// --ethstats still wins for name/secret/host; the IP is appended to its name.
+	// Non-XDC chains keep upstream behaviour (register only when the flag is set).
+	if eth != nil && eth.BlockChain().Config().XDPoS != nil {
+		chainID := eth.BlockChain().Config().ChainID.Uint64()
+		nodetype := "full" // xdcnode.sh node-name component
+		switch cfg.Eth.SyncMode {
+		case ethconfig.FastSync:
+			nodetype = "fast"
+		case ethconfig.SnapSync:
+			nodetype = "snap"
+		default:
+			if cfg.Eth.NoPruning {
+				nodetype = "archive"
+			}
+		}
+		utils.RegisterEthStatsService(stack, backend, utils.XDCEthstatsURL(cfg.Ethstats.URL, chainID, nodetype))
+	} else if cfg.Ethstats.URL != "" {
 		utils.RegisterEthStatsService(stack, backend, cfg.Ethstats.URL)
 	}
 
@@ -474,5 +502,25 @@ func setAccountManagerBackends(conf *node.Config, am *accounts.Manager, keydir s
 		}
 	}
 
+	return nil
+}
+
+// xdcMiningLifecycle implements node.Lifecycle to start XDPoS V2 mining after
+// the node fully starts (keystores open, p2p connected).
+// XDC A.97-M.B Task 7.
+type xdcMiningLifecycle struct {
+	eth *ethpkg.Ethereum
+}
+
+func (l *xdcMiningLifecycle) Start() error {
+	if err := l.eth.StartMining(); err != nil {
+		// Non-fatal: log loudly and continue (operator can inspect and fix).
+		log.Error("XDPoS2: StartMining failed — no blocks will be minted", "err", err)
+	}
+	return nil
+}
+
+func (l *xdcMiningLifecycle) Stop() error {
+	l.eth.StopMining()
 	return nil
 }

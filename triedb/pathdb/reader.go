@@ -27,7 +27,6 @@ import (
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/log"
-	"github.com/ethereum/go-ethereum/rlp"
 	"github.com/ethereum/go-ethereum/triedb/database"
 )
 
@@ -134,8 +133,12 @@ func (r *reader) Account(hash common.Hash) (*types.SlimAccount, error) {
 	if len(blob) == 0 {
 		return nil, nil
 	}
-	account := new(types.SlimAccount)
-	if err := rlp.DecodeBytes(blob, account); err != nil {
+	// XDC: use DecodeSlimAccount which handles BigBalance overflow.
+	// Raw rlp.DecodeBytes into SlimAccount.Balance (*uint256.Int) panics
+	// on stored balances > 2^256-1 — required for XDC chains where
+	// reward additions push balances past uint256 range.
+	account, err := types.DecodeSlimAccount(blob)
+	if err != nil {
 		panic(err)
 	}
 	return account, nil
@@ -281,8 +284,12 @@ func (r *HistoricalStateReader) Account(address common.Address) (*types.SlimAcco
 	if len(blob) == 0 {
 		return nil, nil
 	}
-	account := new(types.SlimAccount)
-	if err := rlp.DecodeBytes(blob, account); err != nil {
+	// XDC: use DecodeSlimAccount which handles BigBalance overflow.
+	// Raw rlp.DecodeBytes into SlimAccount.Balance (*uint256.Int) panics
+	// on stored balances > 2^256-1 — required for XDC chains where
+	// reward additions push balances past uint256 range.
+	account, err := types.DecodeSlimAccount(blob)
+	if err != nil {
 		panic(err)
 	}
 	return account, nil
