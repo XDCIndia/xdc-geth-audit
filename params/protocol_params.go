@@ -28,6 +28,14 @@ const (
 	MaxGasLimit          uint64 = 0x7fffffffffffffff // Maximum the gas limit (2^63-1).
 	GenesisGasLimit      uint64 = 4712388            // Gas limit of the Genesis block.
 
+	// XDCBlockGasLimit is the fixed block gas-limit plateau XDC mainnet and apothem
+	// run at (verified live: mainnet 103,918,257 / apothem 83,228,214 both report
+	// gasLimit 420,000,000). The XDPoS miner (miner.XdcWorker) hard-pins minted
+	// blocks to this value and IGNORES --miner.gaslimit, so a misconfigured ceiling
+	// can never hone the chain off-plateau (root cause of the #952 apothem halt at
+	// block 83,088,791).
+	XDCBlockGasLimit uint64 = 420_000_000
+
 	MaxTxGas      uint64 = 1 << 24   // Maximum transaction gas limit after eip-7825 (16,777,216).
 	MaxTxTotalGas uint64 = 1<<32 - 1 // Maximum total transaction gas limit after eip-8037 (4,294,967,295).
 
@@ -157,6 +165,14 @@ const (
 	DefaultBaseFeeChangeDenominator = 8          // Bounds the amount the base fee can change between blocks.
 	DefaultElasticityMultiplier     = 2          // Bounds the maximum gas limit an EIP-1559 block may have.
 	InitialBaseFee                  = 1000000000 // Initial base fee for EIP-1559 blocks.
+
+	// XDCBaseFee is the constant base fee used by XDC mainnet/Apothem from
+	// Eip1559Block onward. XDPoSChain implements "EIP-1559" with a fixed
+	// base fee (12.5 gwei) rather than the dynamic Ethereum formula — the
+	// header field and dynamic-fee tx types are supported, but the base
+	// fee itself is not market-driven. Reference: XinFinOrg/XDPoSChain
+	// v2.6.8 common/gas.go (var BaseFee = big.NewInt(12500000000)).
+	XDCBaseFee = 12500000000
 
 	MaxCodeSize              = 24576                    // Maximum bytecode to permit for a contract
 	MaxInitCodeSize          = 2 * MaxCodeSize          // Maximum initcode to permit in a creation transaction and create instructions
