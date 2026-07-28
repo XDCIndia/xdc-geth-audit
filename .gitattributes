@@ -1,3 +1,20 @@
 # Auto detect text files and perform LF normalization
 * text=auto
 *.sol linguist-language=Solidity
+
+# --- XDC audit annotations -------------------------------------------------
+# Machine-generated abigen output. Isolated in its own commit
+# ("xdc: generated abigen bindings"). Verify provenance; do not line-read.
+contracts/**/contract/*.go            linguist-generated=true
+contracts/blocksigner/block_signer.go linguist-generated=true
+contracts/validator/xdc_validator.go  linguist-generated=true
+
+# Generated codecs. NOTE: core/types/gen_header_*.go are generated but
+# CONSENSUS-RELEVANT (they encode the XDPoS header fields) and are deliberately
+# placed in review commit 1/10 to be READ, not skipped. This marker only collapses
+# rendering; it is not licence to skip them.
+*/gen_*.go                            linguist-generated=true
+
+# Documentation and operator material. Present on audit/v2, absent from
+# audit/code-only. Not part of the compiled artefact.
+docs/**                               linguist-documentation=true
