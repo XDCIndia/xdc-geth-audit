@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/eth/ethconfig"
 	"github.com/ethereum/go-ethereum/log"
@@ -153,6 +154,32 @@ func (d *Downloader) BeaconExtend(head *types.Header) error {
 // Internally backfilling and state sync is done the same way, but the header
 // retrieval and scheduling is replaced.
 func (d *Downloader) beaconSync(head *types.Header, final *types.Header, force bool) error {
+	// A.90: for dynamic Fast Sync (no operator pivot), set the skeleton terminate
+	// floor to pivotNum (not pivotNum-1) immediately when the peer head is known.
+	// Without this the skeleton walks all the way back to genesis (82M+ blocks)
+	// instead of stopping at pivot (~1800 back).
+	//
+	// Why pivotNum, not pivotNum-1: skeleton exits walk-back when
+	// Tail ≤ floor+1, so floor=pivotNum → beaconTail stops at pivotNum+1, and
+	// findBeaconAncestor's HasFastBlock checks beaconTail-1 = pivotNum — exactly
+	// the lowest header in the A.90.1 prime window [head-pivotDist..head]. Setting
+	// floor=pivotNum-1 (as the operator path does via SetFastSyncPivot) works
+	// there because the prime starts at the operator pivot block itself, not the
+	// peer's current tip, so pivot-1 is inside the prime range. Here it is not.
+	if d.operatorPivotNumber == 0 {
+		d.pivotGapLock.RLock()
+		hasFn := d.fastSyncAnchorFn != nil
+		d.pivotGapLock.RUnlock()
+		if hasFn && head != nil {
+			pivotDist := d.fastSyncPivotDistance(ethconfig.FastSync)
+			if head.Number.Uint64() > pivotDist {
+				pivotNum := head.Number.Uint64() - pivotDist
+				d.skeleton.SetTerminateFloor(pivotNum)
+				log.Debug("Fast Sync A.90: set dynamic skeleton terminate floor",
+					"pivot", pivotNum, "floor", pivotNum, "head", head.Number.Uint64())
+			}
+		}
+	}
 	// Signal the skeleton sync to switch to a new head, however it wants
 	return d.skeleton.Sync(head, final, force)
 }
@@ -169,7 +196,9 @@ func (d *Downloader) findBeaconAncestor() (uint64, error) {
 	switch d.getMode() {
 	case ethconfig.FullSync:
 		chainHead = d.blockchain.CurrentBlock()
-	case ethconfig.SnapSync:
+	case ethconfig.SnapSync, ethconfig.FastSync:
+		// FastSync (NodeData-based) uses the same snap-block tracking as SnapSync.
+		// Both commit pivot blocks via the snap-block pointer. Refs #844 A.7.
 		chainHead = d.blockchain.CurrentSnapBlock()
 	default:
 		panic("unknown sync mode")
@@ -195,11 +224,31 @@ func (d *Downloader) findBeaconAncestor() (uint64, error) {
 	)
 	switch d.getMode() {
 	case ethconfig.FullSync:
-		linked = d.blockchain.GetCanonicalHash(num) == beaconTail.ParentHash && d.blockchain.HasBlock(beaconTail.ParentHash, num)
-	case ethconfig.SnapSync:
-		linked = d.blockchain.GetCanonicalHash(num) == beaconTail.ParentHash && d.blockchain.HasFastBlock(beaconTail.ParentHash, num)
+		linked = d.blockchain.HasBlock(beaconTail.ParentHash, beaconTail.Number.Uint64()-1)
+	case ethconfig.SnapSync, ethconfig.FastSync:
+		// FastSync uses HasFastBlock like SnapSync — both track via snap-block pointer.
+		// Refs #844 A.7.
+		linked = d.blockchain.HasFastBlock(beaconTail.ParentHash, beaconTail.Number.Uint64()-1)
 	default:
 		panic("unknown sync mode")
+	}
+	// Item A resolution (go-ethereum#1371, option 1): take upstream's
+	// canonical-mapping requirement (12241bde2/76e3dc6b5) but only for a
+	// NON-ZERO mismatch. A non-zero canonical hash that differs from the one
+	// we want is a side chain / stale fork: upstream is right that it must be
+	// re-delivered, and core/blockchain.go's writeLive (skipPresenceCheck
+	// removed by the same upstream change) performs the repair. A ZERO
+	// canonical hash means "no mapping", which on XDC is not necessarily an
+	// orphan: it is also what A.85's fast-sync gap placeholder
+	// (core/rawdb/chain_freezer.go) leaves behind. For zero we keep XDC's
+	// presence-only behaviour, i.e. exactly today's shipped semantics.
+	// See the matching floor-then-canonical resolution in skeleton.linked().
+	if got := d.blockchain.GetCanonicalHash(num); got != beaconTail.ParentHash {
+		log.Debug("Beacon linkup point present by hash but not canonical",
+			"number", num, "want", beaconTail.ParentHash, "canonical", got)
+		if got != (common.Hash{}) {
+			linked = false
+		}
 	}
 	if !linked {
 		// This is a programming error. The chain backfiller was called with a
@@ -235,11 +284,23 @@ func (d *Downloader) findBeaconAncestor() (uint64, error) {
 		var known bool
 		switch d.getMode() {
 		case ethconfig.FullSync:
-			known = d.blockchain.GetCanonicalHash(n) == h.Hash() && d.blockchain.HasBlock(h.Hash(), n)
-		case ethconfig.SnapSync:
-			known = d.blockchain.GetCanonicalHash(n) == h.Hash() && d.blockchain.HasFastBlock(h.Hash(), n)
+			known = d.blockchain.HasBlock(h.Hash(), n)
+		case ethconfig.SnapSync, ethconfig.FastSync:
+			// FastSync uses HasFastBlock like SnapSync. Refs #844 A.7.
+			known = d.blockchain.HasFastBlock(h.Hash(), n)
 		default:
 			panic("unknown sync mode")
+		}
+		// Item A resolution (go-ethereum#1371, option 1) — same rationale as
+		// the link-up check above: a non-zero canonical mismatch is a side
+		// chain and must not be treated as owned; a zero mapping falls back to
+		// XDC's presence-only behaviour (A.85 gap safety valve).
+		if got := d.blockchain.GetCanonicalHash(n); got != h.Hash() {
+			log.Debug("Beacon binary-search probe present by hash but not canonical",
+				"number", n, "want", h.Hash(), "canonical", got)
+			if got != (common.Hash{}) {
+				known = false
+			}
 		}
 		if !known {
 			end = check
@@ -290,7 +351,11 @@ func (d *Downloader) fetchHeaders(from uint64) error {
 		if h == nil {
 			return fmt.Errorf("header at chain cutoff is not available, cutoff: %d", d.chainCutoffNumber)
 		}
-		if h.Hash() != d.chainCutoffHash {
+		// Skip hash validation when chainCutoffHash is zero (sync-from-block
+		// mode where we only know the block number, not the expected hash).
+		// XDC: Also skip when the cutoff hash matches a TrustedSyncCheckpoint —
+		// the checkpoint hash is hardcoded and already validated above.
+		if d.chainCutoffHash != (common.Hash{}) && h.Hash() != d.chainCutoffHash {
 			return fmt.Errorf("header at chain cutoff mismatched, want: %v, got: %v", d.chainCutoffHash, h.Hash())
 		}
 	}
@@ -302,7 +367,93 @@ func (d *Downloader) fetchHeaders(from uint64) error {
 		if err != nil {
 			return err
 		}
+		// If the pivot became stale (older than 2*64-8 (bit of wiggle room)),
+		// move it ahead to HEAD-64.
+		//
+		// XDC: upstream v1.17.7 (#35749) moved this mover into the snap content
+		// loop (downloader.go movePivotIfStale). XDC's NodeData fast sync runs in
+		// processFastSyncContent, which never moves the pivot, so the mover stays
+		// here for fast sync only; snap sync uses movePivotIfStale, which applies
+		// the same beaconPivotMoverDecision. One mover per mode.
+		//
+		// RESOLVED (issue #1371 item B): two independently-implemented
+		// pivot-freeze mechanisms are combined here, deliberately. XDC's A.97.1b
+		// (beaconPivotMoverDecision/refusePivotUpdate/IsPivotFrozen, refs
+		// #894/#886, 12 tests in pivot_freeze_xdc_test.go) answers an
+		// XDC-FastSync/NodeData question: #886's moving-target race during a
+		// multi-hour state download. Upstream's snap/2 FrozenPivot
+		// (81ab8b594/12241bde2) answers a snap/2-internal question: the download
+		// finished and trie generation is local to THIS root. Neither mechanism
+		// can observe the other's state, so both are kept; the combined
+		// refuse-set is the union of the two intended freeze sets and invents no
+		// new refuse state.
+		//
+		// The gates are ANDed INSIDE beaconPivotMoverDecision rather than in
+		// this call site's condition, so the wiring is unit-testable — see
+		// item_b_wiring_xdc_test.go. That matters because the original merge
+		// wired the upstream gate to d.SnapSyncer, which is assigned
+		// snap.NewV1Syncer once and never reassigned and whose FrozenPivot() is
+		// hardwired `return nil` (eth/protocols/snap/syncer.go), making the gate
+		// a compile-time constant true. The live syncer is d.snapSyncer; always
+		// reach it through snapPivotFrozen().
+		//
+		// !d.committed.Load() is NOT a no-op on the operator-pinned path:
+		// downloader.go sets committed=true when operatorPivotNumber <= origin,
+		// so this gate does change that path. It is protective, not obstructive
+		// — the pin itself is enforced elsewhere (downloader.go's pin check and
+		// faststatesync.go), and the mover's "advance" moves the pivot AWAY from
+		// the pin to head-64, so blocking it post-commit preserves the pin.
+		// Once the pivot is committed, or the selected snap syncer has its own
+		// frozen pivot, the chain has a stateful head and the pivot must not
+		// advance by either mechanism.
+		d.pivotLock.Lock()
+		if d.pivotHeader != nil && d.getMode() == ethconfig.FastSync {
+			advance, refused, newNumber := beaconPivotMoverDecision(
+				head.Number.Uint64(),
+				d.pivotHeader.Number.Uint64(),
+				d.operatorPivotNumber,
+				d.IsPivotFrozen(),
+				d.committed.Load(),
+				d.snapPivotFrozen(),
+			)
+			if refused {
+				// Pivot frozen during state download — refuse the advance.
+				// refusePivotUpdate logs a consistent WARN marker so deploy-stage
+				// log greps see one marker regardless of which mover fired.
+				d.refusePivotUpdate(newNumber, d.pivotHeader.Hash())
+				d.pivotLock.Unlock()
+				// Fall through to the normal header-scheduling code below.
+				goto scheduleHeaders
+			}
+			if advance {
+				log.Warn("Pivot seemingly stale, moving", "old", d.pivotHeader.Number, "new", newNumber)
+				if d.pivotHeader = d.skeleton.Header(newNumber); d.pivotHeader == nil {
+					if newNumber < tail.Number.Uint64() {
+						dist := tail.Number.Uint64() - newNumber
 
+						if len(localHeaders) >= int(dist) {
+							d.pivotHeader = localHeaders[dist-1]
+							log.Warn("Retrieved pivot header from local", "number", d.pivotHeader.Number, "hash", d.pivotHeader.Hash(), "latest", head.Number, "oldest", tail.Number)
+						}
+					}
+				}
+				// Print an error log and return directly in case the pivot header
+				// is still not found. It means the skeleton chain is not linked
+				// correctly with local chain.
+				if d.pivotHeader == nil {
+					log.Error("Pivot header is not found", "number", newNumber)
+					d.pivotLock.Unlock()
+					return errNoPivotHeader
+				}
+				// Write out the pivot into the database so a rollback beyond
+				// it can be detected, and update the state root that the
+				// state syncer will be downloading
+				rawdb.WriteLastPivotNumber(d.stateDB, d.pivotHeader.Number.Uint64())
+			}
+		}
+		d.pivotLock.Unlock()
+
+	scheduleHeaders:
 		// Retrieve a batch of headers and feed it to the header processor
 		var (
 			headers = make([]*types.Header, 0, maxHeadersProcess)
@@ -360,4 +511,60 @@ func (d *Downloader) fetchHeaders(from uint64) error {
 			return errCanceled
 		}
 	}
+}
+
+// beaconPivotMoverDecision is the pure decision function for the beacon/skeleton
+// pivot mover. It captures the "should we advance the pivot?" logic so that it
+// can be tested without constructing a live skeleton. Used by fetchHeaders.
+//
+// Returns:
+//   - advance=true, newNumber>0: caller should move pivot to newNumber
+//   - advance=false, frozen=true: pivot is frozen, refuse the advance
+//   - advance=false, frozen=false: stale threshold not reached, no-op
+//
+// Parameters:
+//   - headNumber: current skeleton head block number (from d.skeleton.Bounds())
+//   - pivotNumber: current d.pivotHeader.Number.Uint64()
+//   - operatorPivotNumber: d.operatorPivotNumber (0 = dynamic path)
+//   - pivotFrozen: d.IsPivotFrozen()
+// snapPivotFrozen reports whether the SELECTED snap state syncer (snap/1 or
+// snap/2) has bound itself to a frozen pivot. It must read d.snapSyncer, the
+// syncer the downloader actually drives — NOT the exported d.SnapSyncer
+// accessor, which is unconditionally a snap/1 adapter whose FrozenPivot() is
+// hardwired nil (eth/protocols/snap/syncer.go:140). Reading the wrong field
+// makes the gate a compile-time constant. Refs go-ethereum#1371 item B.
+// Nil-tolerant: the A.97.1b tests construct a bare &Downloader{}.
+func (d *Downloader) snapPivotFrozen() bool {
+	return d.snapSyncer != nil && d.snapSyncer.FrozenPivot() != nil
+}
+
+func beaconPivotMoverDecision(headNumber, pivotNumber, operatorPivotNumber uint64, pivotFrozen, committed, snapPivotFrozen bool) (advance bool, refused bool, newNumber uint64) {
+	// Upstream gates (v1.17.5): once the pivot is committed the chain has a
+	// stateful head, and a snap/2 syncer with its own frozen pivot owns the
+	// target — neither mechanism may move the pivot in those states. These
+	// apply to BOTH the operator-pinned and dynamic paths.
+	if committed || snapPivotFrozen {
+		return false, false, 0
+	}
+	// Operator-pinned path: zero behavior change — skip the XDC freeze guard.
+	if operatorPivotNumber != 0 {
+		if headNumber > pivotNumber+2*uint64(fsMinFullBlocks)-8 {
+			return true, false, headNumber - uint64(fsMinFullBlocks)
+		}
+		return false, false, 0
+	}
+	// Dynamic path: check the staleness threshold first. Only refuse (or advance)
+	// when the head has crossed the threshold. Below the threshold there is nothing
+	// to refuse: return no-op regardless of freeze state.
+	if headNumber <= pivotNumber+2*uint64(fsMinFullBlocks)-8 {
+		return false, false, 0
+	}
+	// Head is past the stale threshold. Compute the would-be new pivot number
+	// regardless of whether we advance or refuse — the caller uses it for logging.
+	target := headNumber - uint64(fsMinFullBlocks)
+	// If frozen, refuse — otherwise advance.
+	if pivotFrozen {
+		return false, true, target
+	}
+	return true, false, target
 }

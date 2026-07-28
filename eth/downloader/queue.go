@@ -411,7 +411,11 @@ func (q *queue) Schedule(headers []*types.Header, hashes []common.Hash, from uin
 			q.blockTaskQueue.Push(header, -int64(header.Number.Uint64()))
 		}
 		// Queue for receipt retrieval
-		if q.mode == ethconfig.SnapSync && !header.EmptyReceipts() {
+		// A.30: FastSync needs receipts too — without this gate, the receipt
+		// task queue stays empty for FastSync mode and the fetcher never runs.
+		// Without receipts, InsertReceiptChain fails the ReceiptHash check and
+		// pivot commit never fires (head stuck at 0 after state-sync drain).
+		if (q.mode == ethconfig.SnapSync || q.mode == ethconfig.FastSync) && !header.EmptyReceipts() {
 			if _, ok := q.receiptTaskPool[hash]; ok {
 				log.Warn("Header already scheduled for receipt fetch", "number", header.Number, "hash", hash)
 			} else {
@@ -719,7 +723,12 @@ func (q *queue) reserveHeaders(p *peerConnection, count int, taskPool map[common
 		}
 		// we can ask the resultcache if this header is within the
 		// "prioritized" segment of blocks. If it is not, we need to throttle
-		stale, throttle, item := q.resultCache.AddFetch(header, q.mode == ethconfig.SnapSync, q.balEligible(header))
+
+		// A.30: also flag the receipt-pending bit for FastSync so a result is
+		// not marked AllDone on body alone — body+receipt are both required
+		// before commitFastSyncData reads it out (otherwise result.Receipts is
+		// nil and InsertReceiptChain fails the ReceiptHash check).
+		stale, throttle, item := q.resultCache.AddFetch(header, q.mode == ethconfig.SnapSync || q.mode == ethconfig.FastSync, q.balEligible(header))
 		if stale {
 			// Don't put back in the task queue, this item has already been
 			// delivered upstream. A task outliving the delivery of its block

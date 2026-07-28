@@ -67,6 +67,9 @@ type Syncer interface {
 	// the pivot may still be chosen and moved freely.
 	FrozenPivot() *types.Header
 
+	// PeerCount returns the number of registered snap peers.
+	PeerCount() int
+
 	// Version is the snap protocol version this syncer implements.
 	Version() uint
 }
@@ -155,6 +158,9 @@ func (s syncerV2Adapter) Progress() Progress {
 		TrieGenPercent:   progress.TrieGenPercent,
 	}
 }
+
+// PeerCount is a no-op for snap/2 (not needed for heal path).
+func (s syncerV2Adapter) PeerCount() int { return 0 }
 
 // OnTrieNodes is a no-op for snap/2, which heals via BALs rather than trie nodes.
 // Stale responses from snap/1 peers are silently ignored.

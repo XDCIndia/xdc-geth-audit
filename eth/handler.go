@@ -20,6 +20,7 @@ import (
 	"cmp"
 	crand "crypto/rand"
 	"errors"
+	"fmt"
 	"maps"
 	"math"
 	"slices"
@@ -29,12 +30,15 @@ import (
 
 	"github.com/dchest/siphash"
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/consensus/XDPoS"
+	"github.com/ethereum/go-ethereum/consensus/XDPoS/engines/engine_v2"
 	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/core/txpool"
 	"github.com/ethereum/go-ethereum/core/txpool/blobpool"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto/kzg4844"
+	"github.com/ethereum/go-ethereum/eth/bft"
 	"github.com/ethereum/go-ethereum/eth/downloader"
 	"github.com/ethereum/go-ethereum/eth/ethconfig"
 	"github.com/ethereum/go-ethereum/eth/fetcher"
@@ -158,6 +162,14 @@ type handler struct {
 
 	handlerStartCh chan struct{}
 	handlerDoneCh  chan struct{}
+
+	// XDC: pre-merge auto-sync trigger (v1.17.3 dropped the upstream chainSyncer).
+	xdcSync *xdcSyncer
+
+	// XDC A.97-M.A Task 2: BFT message dispatcher. Nil until SetBfter is called
+	// (only on nodes that want BFT participation — i.e., have the V2 engine wired).
+	// Gate all dispatch with h.bfter != nil before use.
+	bfter *bft.Bfter
 }
 
 // newHandler returns a handler for all Ethereum chain management protocol.
@@ -179,10 +191,118 @@ func newHandler(config *handlerConfig) (*handler, error) {
 	// Construct the downloader (long sync)
 	h.downloader = downloader.New(config.Database, config.Sync, h.chain, h.removePeer, h.enableSyncedFeatures, config.SnapV2)
 
+	// XDC gap-pivot enumeration — Phase A.5 of #844.
+	// Inject the chain config (for gap formula) and a snapshot callback so
+	// processFastSyncContent can materialise masternode snapshots at each XDPoS
+	// gap block between origin and pivot after downloading their trie state.
+	// Only wired when the engine is XDPoS + V2; other engines are no-ops.
+	h.downloader.SetFastSyncChainConfig(config.Chain.Config())
+	if xdposEngine, ok := config.Chain.Engine().(*XDPoS.XDPoS); ok {
+		if v2, ok2 := xdposEngine.EngineV2.(*engine_v2.XDPoS_v2); ok2 && v2 != nil {
+			chain := config.Chain // capture for closure
+			h.downloader.SetGapSnapshotFn(func(gapNumber uint64, gapRoot [32]byte) error {
+				// Fetch the gap header from the canonical chain.
+				// The header was downloaded during the fast-sync header phase;
+				// the trie state was downloaded by syncFastState immediately before
+				// this callback is invoked by processFastSyncContent.
+				gapHeader := chain.GetHeaderByNumber(gapNumber)
+				if gapHeader == nil {
+					return fmt.Errorf("gap %d: header not found in chain", gapNumber)
+				}
+				// Safety check: the root we downloaded state for matches the header.
+				if gapHeader.Root != common.Hash(gapRoot) {
+					return fmt.Errorf("gap %d: root mismatch (header=%s downloaded=%s)",
+						gapNumber, gapHeader.Root.Hex(), common.Hash(gapRoot).Hex())
+				}
+				// Open trie state at the gap block's root using StateAt so the
+				// correct DB backend (UBT vs MPT) is chosen per chain config.
+				statedb, err := chain.StateAt(gapHeader.Root, gapHeader.Number, gapHeader.Time)
+				if err != nil {
+					return fmt.Errorf("open statedb at gap %d: %w", gapNumber, err)
+				}
+				// UpdateMasternodesFromHeader reads candidates from smart-contract
+				// state and stores the V2 snapshot. It is a no-op if the block is
+				// not a gap block (number % Epoch != Epoch-Gap).
+				return v2.UpdateMasternodesFromHeader(chain, gapHeader, statedb)
+			})
+
+			// A.97.4b (refs #894): embedded-header masternode fallback.
+			// When a gap-block state download fails because pruned mainnet peers
+			// cannot serve that state epoch, seed the masternode snapshot directly
+			// from the EPOCH-SWITCH header's embedded Validators/Penalties.
+			//
+			// Gap blocks (gapNum = epochBoundary − Gap) are NOT epoch-switch headers;
+			// their header.Validators is always empty. The masternode list lives in
+			// the NEXT epoch-switch header at approximately gapNum + Gap (the epoch
+			// boundary). We walk forward from gapNum using chain.GetHeaderByNumber +
+			// v2.IsEpochSwitch, bounded at gapNum + 2×Epoch (matching
+			// findEpochSwitchAfter), to locate the epoch-switch header.
+			//
+			// The epoch-switch header is guaranteed locally available at fallback
+			// time: fast sync downloads ALL headers (pivot+N headers) before any
+			// state download begins; the header phase writes every header to the
+			// canonical chain DB via rawdb, so chain.GetHeaderByNumber is
+			// authoritative. The gap-block state download (which triggers this
+			// fallback) runs after the full header chain is in place.
+			//
+			// Masternode read: GetMasternodesFromEpochSwitchHeader(epochSwitchHeader).
+			// Snapshot key:    gapHeader — mirroring A.70 exactly (sync_xdc.go:2714-2722).
+			chainCfg := chain.Config() // capture once; Config() is stable for chain lifetime
+			h.downloader.SetGapFallbackFn(func(gapHeader *types.Header) (int, error) {
+				gapNum := gapHeader.Number.Uint64()
+				// Derive the epoch-switch header for the epoch that this gap opens.
+				// The epoch-switch is strictly AFTER gapNum (forward direction, same
+				// as getSnapshot's isGapInput seed path — engine.go:918).
+				var epochSwitchHeader *types.Header
+				var searchMax uint64
+				if chainCfg.XDPoS != nil && chainCfg.XDPoS.Epoch > 0 {
+					searchMax = gapNum + 2*chainCfg.XDPoS.Epoch
+				} else {
+					searchMax = gapNum + 1800 // safe upper bound if config unavailable
+				}
+				for n := gapNum + 1; n <= searchMax; n++ {
+					candidate := chain.GetHeaderByNumber(n)
+					if candidate == nil {
+						continue
+					}
+					isSwitch, _, err := v2.IsEpochSwitch(candidate)
+					if err == nil && isSwitch {
+						epochSwitchHeader = candidate
+						break
+					}
+				}
+				if epochSwitchHeader == nil {
+					return 0, fmt.Errorf("gap %d: cannot locate epoch-switch header in [%d..%d]"+
+						" — fast-sync header phase incomplete or chain DB missing"+
+						" (use --fastsyncpivot* or connect an archive peer)",
+						gapNum, gapNum+1, searchMax)
+				}
+				masternodes := v2.GetMasternodesFromEpochSwitchHeader(chain, epochSwitchHeader)
+				if len(masternodes) == 0 {
+					return 0, fmt.Errorf("gap %d: epoch-switch header %d has empty Validators"+
+						" — cannot seed masternodes without state"+
+						" (use --fastsyncpivot* or connect an archive peer)",
+						gapNum, epochSwitchHeader.Number.Uint64())
+				}
+				penalties := extractAddresses(epochSwitchHeader.Penalties)
+				if err := v2.UpdateMasternodesWithPenalties(chain, gapHeader, masternodes, penalties); err != nil {
+					return 0, fmt.Errorf("gap %d: UpdateMasternodesWithPenalties (epochSwitch=%d): %w",
+						gapNum, epochSwitchHeader.Number.Uint64(), err)
+				}
+				return len(masternodes), nil
+			})
+		}
+	}
+
 	// If snap sync is requested but snapshots are disabled, fail loudly
 	if h.downloader.ConfigSyncMode() == ethconfig.SnapSync && (config.Chain.Snapshots() == nil && config.Chain.TrieDB().Scheme() == rawdb.HashScheme) {
 		return nil, errors.New("snap sync not supported with snapshots disabled")
 	}
+	// A.37: register the local state scheme so the XDPOS2 handshake can
+	// advertise it in the XDCCaps trailer. eth/protocols/eth cannot import
+	// core/triedb directly without a cycle, hence the registration hook.
+	// Refs #844 (A.37).
+	eth.SetLocalStateScheme(config.Chain.TrieDB().Scheme())
 	fetchTx := func(peer string, hashes []common.Hash) error {
 		p := h.peers.peer(peer)
 		if p == nil {
@@ -424,6 +544,21 @@ func (h *handler) runSnapExtension(peer *snap.Peer, handler snap.Handler) error 
 
 // removePeer requests disconnection of a peer.
 func (h *handler) removePeer(id string) {
+	// XDC (#807 Phase 6): during snap-sync's SNAP_RUNNING phase, skip the
+	// useless-peer disconnect. The downloader's skeleton-sync calls
+	// removePeer when it can't extend the skeleton via that peer, but the
+	// peer's snap subprotocol may still be actively delivering state.
+	// Disconnecting tears down the snap channel and aborts state download.
+	// During SNAP_RUNNING we keep peers connected; if they truly misbehave,
+	// other layers (banList, taintPeer) will handle them.
+	if h.xdcSync != nil && xdcSnapPhase(h.xdcSync.snapPhase.Load()) == phaseSnapRunning {
+		peerShort := id
+		if len(peerShort) > 12 {
+			peerShort = peerShort[:12]
+		}
+		log.Debug("XDC: skipping useless-peer disconnect during SNAP_RUNNING", "peer", peerShort)
+		return
+	}
 	peer := h.peers.peer(id)
 	if peer != nil {
 		peer.Peer.Disconnect(p2p.DiscUselessPeer)
@@ -487,9 +622,37 @@ func (h *handler) Start(maxPeers int) {
 	// start peer handler tracker
 	h.wg.Add(1)
 	go h.protoTracker()
+
+	// XDC: pre-merge auto-sync trigger. Without this, BeaconDevSync is the
+	// only Synchronise entry point and it requires a consensus-layer to
+	// fire forkchoiceUpdated. XDC is pre-merge, so we drive sync from the
+	// connected peer's reported tip every xdcForceSyncCycle.
+	if h.downloader.ConfigSyncMode() == ethconfig.SnapSync {
+		log.Warn("XDC: --syncmode=snap is not implemented on this fork; running full-sync via xdcSyncer. " +
+			"For fast initial sync, restore a snapshot from https://xdc.network/snapshots/ . " +
+			"Tracker: https://github.com/XDCIndia/go-ethereum/issues/807")
+	}
+	h.xdcSync = newXDCSyncer(h)
+	h.xdcSync.start()
+}
+
+// SetBfter wires the BFT message dispatcher into the handler after construction.
+// Called by eth/backend.go once the V2 engine is fully wired. Must be called
+// before the handler starts accepting BFT packets (i.e., before p2p Start).
+// Safe to call with nil (no-op); subsequent dispatch is gated on h.bfter != nil.
+func (h *handler) SetBfter(b *bft.Bfter) {
+	h.bfter = b
 }
 
 func (h *handler) Stop() {
+	// A.97-M.A Task 2: stop BFT dispatcher before closing peers so any in-flight
+	// vote/timeout/syncInfo goroutines terminate cleanly.
+	if h.bfter != nil {
+		h.bfter.Stop()
+	}
+	if h.xdcSync != nil {
+		h.xdcSync.stop()
+	}
 	h.txsSub.Unsubscribe() // quits txBroadcastLoop
 	h.blockRange.stop()
 	h.txFetcher.Stop()

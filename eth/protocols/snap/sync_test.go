@@ -216,6 +216,9 @@ func (t *testPeer) RequestByteCodes(id uint64, hashes []common.Hash, bytes int) 
 	return nil
 }
 
+// RequestAccessLists is a no-op stub to satisfy SyncPeerV2 (BAL protocol not used by snap/1 tests).
+func (t *testPeer) RequestAccessLists(_ uint64, _ []common.Hash, _ int) error { return nil }
+
 // defaultTrieRequestHandler is a well-behaving handler for trie healing requests
 func defaultTrieRequestHandler(t *testPeer, requestId uint64, root common.Hash, paths []TrieNodePathSet, cap int) error {
 	t.trieLock.Lock()
@@ -2090,6 +2093,55 @@ func TestSlotEstimation(t *testing.T) {
 		if want := tc.want; have != want {
 			t.Errorf("test %d: have %d want %d", i, have, want)
 		}
+	}
+}
+
+// TestPeerCount_A97 verifies the PeerCount accessor added for A.97.2
+// snap-heal peer-gate. Refs #894.
+func TestPeerCount_A97(t *testing.T) {
+	t.Parallel()
+
+	stateDb := rawdb.NewMemoryDatabase()
+	syncer := NewV1Syncer(stateDb, rawdb.HashScheme)
+
+	// No peers registered → PeerCount must be 0.
+	if got := syncer.PeerCount(); got != 0 {
+		t.Fatalf("expected PeerCount 0 before Register, got %d", got)
+	}
+
+	// Build minimal test peers using the test harness helper.
+	// We don't need valid tries — just Register/Unregister round-trips.
+	term1 := func() {}
+	peer1 := newTestPeer("p1", t, term1)
+	term2 := func() {}
+	peer2 := newTestPeer("p2", t, term2)
+
+	if err := syncer.Register(peer1); err != nil {
+		t.Fatalf("Register p1: %v", err)
+	}
+	if got := syncer.PeerCount(); got != 1 {
+		t.Fatalf("expected PeerCount 1 after Register p1, got %d", got)
+	}
+
+	if err := syncer.Register(peer2); err != nil {
+		t.Fatalf("Register p2: %v", err)
+	}
+	if got := syncer.PeerCount(); got != 2 {
+		t.Fatalf("expected PeerCount 2 after Register p2, got %d", got)
+	}
+
+	if err := syncer.Unregister("p1"); err != nil {
+		t.Fatalf("Unregister p1: %v", err)
+	}
+	if got := syncer.PeerCount(); got != 1 {
+		t.Fatalf("expected PeerCount 1 after Unregister p1, got %d", got)
+	}
+
+	if err := syncer.Unregister("p2"); err != nil {
+		t.Fatalf("Unregister p2: %v", err)
+	}
+	if got := syncer.PeerCount(); got != 0 {
+		t.Fatalf("expected PeerCount 0 after Unregister p2, got %d", got)
 	}
 }
 

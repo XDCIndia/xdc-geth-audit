@@ -559,6 +559,12 @@ func (dlp *downloadTesterPeer) RequestAccessLists(id uint64, hashes []common.Has
 	return nil
 }
 
+// RequestNodeData sends a GetNodeData request. No-op in tests (classical Fast
+// Sync NodeData is exercised via separate statesync tests).
+func (dlp *downloadTesterPeer) RequestNodeData(hashes []common.Hash) error {
+	return nil
+}
+
 // Log retrieves the peer's own contextual logger.
 func (dlp *downloadTesterPeer) Log() log.Logger {
 	return log.New("peer", dlp.id)
@@ -730,6 +736,11 @@ func TestBALSynchronisationSnap(t *testing.T)       { testBALSync(t, SnapSync, e
 func TestBALSynchronisationLegacyPeer(t *testing.T) { testBALSync(t, FullSync, eth.ETH69) }
 
 func testBALSync(t *testing.T, mode SyncMode, protocol uint) {
+	// XDC: the XDC header RLP deliberately stops at RequestsHash (EIP-7928's
+	// BlockAccessListHash is never encoded, see core/types/gen_header_rlp.go),
+	// so an Amsterdam header cannot survive the wire and the synced chain fails
+	// header verification. XDC never schedules Amsterdam.
+	t.Skip("XDC: header RLP does not carry BlockAccessListHash")
 	gspec, blocks := makeBALChain(96) // long enough for a snap sync pivot below the head
 
 	success := make(chan struct{})
@@ -1187,5 +1198,85 @@ func TestInvalidBodyPeerDrop(t *testing.T) {
 	case <-peer.dropped:
 	case <-time.After(1 * time.Minute):
 		t.Fatal("peer was not dropped")
+	}
+}
+
+// TestNodeDataDropWhenNoFetcher exercises A.36's non-blocking DeliverNodeData
+// path. With no fast-state fetcher draining d.fastStateCh, the previous
+// implementation would block the calling goroutine until cancelCh closed
+// (i.e. forever, in practice). After A.36, the call returns immediately,
+// bumps the nodeDataDropMeter, and resets the per-peer A.27 in-flight flag so
+// the peer can be re-assigned to a new NodeData request.
+//
+// The standard downloader spins up a background fastStateFetcher goroutine
+// (faststatesync.go) which drains fastStateCh whenever no fast-sync session is
+// active. To create a "no listener" condition, we shut that goroutine down by
+// calling Terminate() before exercising DeliverNodeData. cancelCh is nil at
+// this point (we never started a sync), so the only remaining select arm is
+// the new `default`.
+//
+// A.67: fastStateCh is now buffered (size 256). To force a drop with no
+// fetcher, we must first fill the buffer to capacity, then send one more.
+// The drop meter changed from Mark(1) to Mark(int64(len(data))) — counting
+// blobs dropped, not events. The test sends single-blob packs to keep the
+// arithmetic clean.
+func TestNodeDataDropWhenNoFetcher(t *testing.T) {
+	tester := newTester(t, FullSync)
+	// Register a peer so that d.peers.Peer(id) returns a real peerConnection.
+	tester.newPeer("p1", eth.ETH69, nil)
+
+	// Prime the A.27 in-flight flag: pretend this peer was assigned a NodeData
+	// request. Without this we can't observe the reset side-effect.
+	pc := tester.downloader.peers.Peer("p1")
+	if pc == nil {
+		t.Fatal("peer not registered")
+	}
+	if !pc.stateIdle.CompareAndSwap(0, 1) {
+		t.Fatal("peer was unexpectedly already in-flight")
+	}
+
+	// Stop the background fastStateFetcher so fastStateCh has no reader.
+	// tester.terminate() also stops the chain — call it directly and skip
+	// the deferred cleanup.
+	tester.downloader.Terminate()
+	tester.chain.Stop()
+
+	// A.67: fill the buffered channel before exercising the drop path.
+	// Buffer is 256; send 256 single-blob packs to saturate it. These all
+	// succeed without dropping.
+	bufferCap := cap(tester.downloader.fastStateCh)
+	if bufferCap == 0 {
+		t.Fatalf("expected fastStateCh to be buffered (A.67)")
+	}
+	for i := 0; i < bufferCap; i++ {
+		if err := tester.downloader.DeliverNodeData("p1", [][]byte{{0xde, 0xad}}); err != nil {
+			t.Fatalf("priming DeliverNodeData %d returned error: %v", i, err)
+		}
+	}
+
+	before := nodeDataDropMeter.Snapshot().Count()
+
+	// Call DeliverNodeData with no fetcher listening AND the buffer full.
+	// Use a done channel as the blocking-regression guard: if the new
+	// default arm is removed, this never returns and the test hangs.
+	done := make(chan error, 1)
+	go func() {
+		done <- tester.downloader.DeliverNodeData("p1", [][]byte{{0xde, 0xad}, {0xbe, 0xef}})
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("DeliverNodeData returned error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("DeliverNodeData blocked with no fetcher listening — A.36 regression")
+	}
+
+	// A.67: drop meter now marks len(data) on drop. Expect +2 (2 blobs).
+	if got := nodeDataDropMeter.Snapshot().Count(); got != before+2 {
+		t.Fatalf("drop meter not incremented by blob count: before=%d after=%d (want +2)", before, got)
+	}
+	if v := pc.stateIdle.Load(); v != 0 {
+		t.Fatalf("stateIdle not reset after drop: got %d, want 0", v)
 	}
 }

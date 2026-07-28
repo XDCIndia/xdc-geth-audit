@@ -32,21 +32,66 @@ import (
 	"github.com/ethereum/go-ethereum/log"
 )
 
+// shortPeerID returns at most the first 8 chars of a peer ID for log output.
+// Some test peers use very short IDs (e.g. "peer4"), so a bare peer.id[:8]
+// would panic. Refs A.10/A.50/A.53 (regression-safe logger).
+func shortPeerID(id string) string {
+	if len(id) > 8 {
+		return id[:8]
+	}
+	return id
+}
+
 // scratchHeaders is the number of headers to store in a scratch space to allow
 // concurrent downloads. A header is about 0.5KB in size, so there is no worry
 // about using too much memory. The only catch is that we can only validate gaps
 // after they're linked to the head, so the bigger the scratch space, the larger
 // potential for invalid headers.
 //
-// The current scratch space of 131072 headers is expected to use 64MB RAM.
-const scratchHeaders = 131072
+// The current scratch space of 196608 headers is expected to use 96MB RAM.
+//
+// A.11 (refs #857): bumped from 131072 to 196608 so the scratch space divides
+// evenly by BOTH the eth/66+ batch size (512 → 384 slots) and the XDPOS2
+// MaxHeaderFetch batch size (192 → 1024 slots). The skeleton picks one of the
+// two batch sizes per cycle (see s.cycleBatch) depending on the active peer
+// fleet, and the scratchOwners table is sized accordingly. 131072 % 192 != 0,
+// so the previous value forced an integer-divisibility panic when the cycle
+// chose the XDPOS2 batch size.
+const scratchHeaders = 196608
 
-// requestHeaders is the number of header to request from a remote peer in a single
-// network packet. Although the skeleton downloader takes into consideration peer
-// capacities when picking idlers, the packet size was decided to remain constant
-// since headers are relatively small and it's easier to work with fixed batches
-// vs. dynamic interval fillings.
+// requestHeaders is the default number of headers to request from a remote peer
+// in a single network packet for eth/66+ peers (modern Ethereum fleet, serve cap
+// 1024). For XDPOS2 (XDC) peers, the per-cycle batch is dynamically lowered to
+// requestHeadersXDPOS2 (=192, the XDPoSChain server-side MaxHeaderFetch cap) at
+// sync-cycle start in sync(). See s.cycleBatch.
+//
+// Although the skeleton downloader takes into consideration peer capacities
+// when picking idlers, the packet size remains constant within a sync cycle
+// since headers are relatively small and it's easier to work with fixed
+// batches vs. dynamic interval fillings.
 const requestHeaders = 512
+
+// requestHeadersXDPOS2 is the per-packet header count used when the active
+// peer fleet contains any XDPOS2 (=eth.XDPOS2, version=100) peer. XDPoSChain
+// peers cap their GetBlockHeaders response at MaxHeaderFetch (192) server-side
+// (XDPoSChain/eth/handler.go:445). Asking for 512 returns at most 192 and the
+// strict-equality validator below ("Invalid non-genesis header count") rejects
+// every honest reply, stalling the skeleton indefinitely. Refs #857, see
+// docs/port/XDPOSCHAIN_WIRE_DIFF.md Section 4.1.
+//
+// Note: this is intentionally hard-coded (not pulled from MaxHeaderFetch) so
+// that the skeleton package has no build-time dependency on the downloader
+// package's MaxHeaderFetch constant. The value MUST match
+// XDPoSChain/eth/downloader/downloader.go:45 (and the local mirror at
+// eth/downloader/downloader.go:45) — both are 192 today.
+const requestHeadersXDPOS2 = 192
+
+// A.69 (refs #844 #859): skeleton peer-starvation floor. When the count of
+// idle peers is at or below this threshold, the skeleton's empty-response
+// drop path (XDC fix #131) is bypassed — dropping our only header server
+// leaves the skeleton with no path to recovery. The counter is still bumped
+// + logged; only the drop is suppressed.
+const skeletonEmptyDropPeerFloor = 2
 
 // errSyncLinked is an internal helper error to signal that the current sync
 // cycle linked up to the genesis block, this the skeleton syncer should ping
@@ -90,8 +135,17 @@ var errChainForked = errors.New("chain forked")
 func init() {
 	// Tuning parameters is nice, but the scratch space must be assignable in
 	// full to peers. It's a useless cornercase to support a dangling half-group.
+	//
+	// A.11 (refs #857): scratchHeaders must divide evenly by BOTH possible
+	// cycle batch sizes — eth/66+ requestHeaders (512) and XDPOS2
+	// requestHeadersXDPOS2 (192). The sync cycle picks one of the two at
+	// startup based on the active peer fleet and partitions scratchOwners
+	// accordingly.
 	if scratchHeaders%requestHeaders != 0 {
 		panic("Please make scratchHeaders divisible by requestHeaders")
+	}
+	if scratchHeaders%requestHeadersXDPOS2 != 0 {
+		panic("Please make scratchHeaders divisible by requestHeadersXDPOS2")
 	}
 }
 
@@ -148,6 +202,15 @@ type headerRequest struct {
 	stale   chan struct{}        // Channel to signal the request was dropped
 
 	head uint64 // Head number of the requested batch of headers
+
+	// A.58 Day 2 (refs #857): snapshot of the batch size used when this
+	// request was emitted to the peer. The validator must compare the
+	// response length against this exact value rather than reading a shared
+	// per-cycle global, so that future mixed-fleet support (where different
+	// peers in the same cycle may serve different batch sizes) does not
+	// silently mis-validate honest replies. Today every emitter sets this
+	// from s.cycleBatch, so behavior is unchanged.
+	batch int
 }
 
 // headerResponse is an already verified remote response to a header request.
@@ -213,6 +276,10 @@ type skeleton struct {
 	idles map[string]*peerConnection // Set of idle peers in the current sync cycle
 	drop  peerDropFn                 // Drops a peer for misbehaving
 
+	// XDC fix #131: track consecutive empty-header responses per peer.
+	// Peers that repeatedly return 0 headers get dropped to unblock skeleton sync.
+	emptyResponseCount map[string]int // consecutive empty-header counts per peer ID
+
 	progress *skeletonProgress // Sync progress tracker for resumption and metrics
 	started  time.Time         // Timestamp when the skeleton syncer was created
 	logged   time.Time         // Timestamp when progress was last logged to the user
@@ -230,6 +297,24 @@ type skeleton struct {
 
 	// Callback hooks used during testing
 	syncStarting func() // callback triggered after a sync cycle is inited but before started
+
+	// terminateFloor, when non-zero, causes the reverse skeleton walk-back to
+	// terminate (returning errSyncLinked) as soon as the active subchain tail
+	// reaches floor+1, and causes linked() to short-circuit true at any height
+	// >= floor. Set via SetTerminateFloor from the operator-pinned Fast Sync
+	// path (eth/sync_xdc) so the skeleton does not chase headers below the
+	// operator's pinned anchor — which the v1.17.3 trusted-peer fleet typically
+	// does not have. Refs A.14.
+	terminateFloor uint64
+
+	// cycleBatch is the per-cycle GetBlockHeaders packet size in use for the
+	// current sync cycle. It is chosen at sync-cycle start in sync(): if ANY
+	// peer in the seeded idle pool is XDPOS2 (eth.XDPOS2, version=100), the
+	// cycle uses requestHeadersXDPOS2 (=192) to respect XDPoSChain's
+	// MaxHeaderFetch server-side cap; otherwise it uses requestHeaders (=512).
+	// Mixing batch sizes within a single cycle is not supported because
+	// scratchOwners is partitioned uniformly. A.11 (refs #857).
+	cycleBatch int
 }
 
 // chainReader wraps the method to retrieve the head of the local chain.
@@ -242,18 +327,120 @@ type chainReader interface {
 // header chain until it's linked into an existing set of blocks.
 func newSkeleton(db ethdb.Database, peers *peerSet, drop peerDropFn, filler backfiller, chain chainReader) *skeleton {
 	sk := &skeleton{
-		db:         db,
-		filler:     filler,
-		chain:      chain,
-		peers:      peers,
-		drop:       drop,
-		requests:   make(map[uint64]*headerRequest),
-		headEvents: make(chan *headUpdate),
-		terminate:  make(chan chan error),
-		terminated: make(chan struct{}),
+		db:                 db,
+		filler:             filler,
+		chain:              chain,
+		peers:              peers,
+		drop:               drop,
+		requests:           make(map[uint64]*headerRequest),
+		headEvents:         make(chan *headUpdate),
+		terminate:          make(chan chan error),
+		terminated:         make(chan struct{}),
+		emptyResponseCount: make(map[string]int), // XDC fix #131
 	}
 	go sk.startup()
 	return sk
+}
+
+// SetTerminateFloor configures a height below which the reverse skeleton
+// walk-back will not chase. When set, sync()'s response-processing branch
+// returns errSyncLinked once the active subchain tail reaches floor+1, and
+// linked() short-circuits true at any height >= floor. A zero floor disables
+// the behaviour (default).
+//
+// Used by the operator-pinned Fast Sync path (eth/sync_xdc.fastRunningCheck)
+// to bound the walk-back at the operator's pinned anchor, so the skeleton does
+// not stall trying to fetch headers the v1.17.3 trusted-peer fleet doesn't
+// have. The operator is trusting the source of the pinned header.
+// Refs A.14.
+func (s *skeleton) SetTerminateFloor(floor uint64) {
+	s.terminateFloor = floor
+}
+
+// dropStaleSubchainsBelow inspects any previously persisted skeleton progress
+// on disk and removes subchains whose Head is strictly below `pivotNumber`.
+// Returns the number of subchains dropped.
+//
+// A.71 (refs #844 #859): under operator-pinned Fast Sync the only valid
+// skeleton subchain is the one anchored at (or above) the operator-pinned
+// pivot — every block below the pivot is trusted by operator authority and
+// will be back-filled via processFastSyncContent, never via skeleton walk-back.
+// A stale subchain with Head far below the pivot poisons initSync (which only
+// drops subchains whose Tail >= the new headchain's Tail; with old Tail
+// ≈ 64.9M and new Tail = 103.3M the drop predicate fails). The resulting
+// two-subchain state prevents `linked()` from ever returning true on the
+// re-entry path (len(Subchains) == 1 check), so beaconBackfiller.resume() is
+// never called → synchronise() never runs → SyncCompleted never fires →
+// block-import never engages. Empirical evidence (xdcscan 2026-06-07, 8 min
+// of "GetBlockHeaders SEND origin_num=103,309,268 amount=192 reverse=true"
+// on peer cafdf5e8 with eth_blockNumber stuck at 0) confirms this signature.
+//
+// The cleanup is safe because every subchain below the pivot is by definition
+// out of date relative to the trusted pivot — we'll never use it for linkup.
+// If after pruning no subchains remain, the entire skeleton sync status is
+// deleted so the next initSync starts from a clean slate.
+//
+// Idempotent. Must be called BEFORE any Sync() call so the in-memory
+// `s.progress` (loaded on initSync) reflects the on-disk cleanup.
+//
+// Refs #844 #859 A.71.
+func (s *skeleton) dropStaleSubchainsBelow(pivotNumber uint64) int {
+	if pivotNumber == 0 {
+		return 0
+	}
+	status := rawdb.ReadSkeletonSyncStatus(s.db)
+	if len(status) == 0 {
+		return 0
+	}
+	progress := new(skeletonProgress)
+	if err := json.Unmarshal(status, progress); err != nil {
+		log.Warn("Skeleton: failed to decode persisted progress for stale-subchain prune; deleting status",
+			"err", err)
+		rawdb.DeleteSkeletonSyncStatus(s.db)
+		return 0
+	}
+	if len(progress.Subchains) == 0 {
+		return 0
+	}
+	kept := progress.Subchains[:0]
+	dropped := 0
+	for _, sc := range progress.Subchains {
+		if sc == nil {
+			continue
+		}
+		if sc.Head < pivotNumber {
+			log.Info("Skeleton: dropping stale subchain below operator pivot",
+				"head", sc.Head, "tail", sc.Tail, "pivot", pivotNumber)
+			dropped++
+			continue
+		}
+		kept = append(kept, sc)
+	}
+	if dropped == 0 {
+		return 0
+	}
+	progress.Subchains = kept
+	if len(progress.Subchains) == 0 {
+		// Nothing valid left — clear the persisted status entirely so the next
+		// Sync() reinitialises from the announced head without trying to merge
+		// against ghost subchains.
+		rawdb.DeleteSkeletonSyncStatus(s.db)
+		log.Info("Skeleton: cleared skeleton sync status (all subchains pruned)",
+			"dropped", dropped, "pivot", pivotNumber)
+		return dropped
+	}
+	encoded, err := json.Marshal(progress)
+	if err != nil {
+		// Cannot happen for well-formed Subchains; log defensively and clear.
+		log.Warn("Skeleton: failed to re-encode pruned progress; deleting status",
+			"err", err)
+		rawdb.DeleteSkeletonSyncStatus(s.db)
+		return dropped
+	}
+	rawdb.WriteSkeletonSyncStatus(s.db, encoded)
+	log.Info("Skeleton: rewrote sync status after pruning stale subchains",
+		"dropped", dropped, "kept", len(kept), "pivot", pivotNumber)
+	return dropped
 }
 
 // startup is an initial background loop which waits for an event to start or
@@ -365,6 +552,26 @@ func (s *skeleton) Sync(head *types.Header, final *types.Header, force bool) err
 // linked returns the flag indicating whether the skeleton has been linked with
 // the local chain.
 func (s *skeleton) linked(number uint64, hash common.Hash) bool {
+	// A.14c: floor means "we've reached pivot anchor"; condition fires AT or
+	// BELOW the floor, not above it. The chain at/below the operator-pinned
+	// anchor is implicitly trusted to be provided by the operator (or
+	// backfilled later), so we treat any height at or below the floor as
+	// already linked and do not gate on local body/receipt presence (which is
+	// impossible on a cold chain). The inverted (>=) form regressed cold-start
+	// fast-sync because scratchHead = head-1 (~103M) is always >> floor
+	// (~79.34M), so the short-circuit fired immediately and the walk-back was
+	// skipped entirely, leaving beaconsync.fetchHeaders unable to resolve
+	// headers between origin+1 and pivot.
+	//
+	// This short-circuit MUST run first, before upstream's canonical-mapping
+	// requirement below: at/below the floor a normal chain may still lack a
+	// canonical mapping in the middle of an XDC fast-sync gap (see A.85 in
+	// core/rawdb/chain_freezer.go), so the requirement only makes sense above
+	// the floor. NOT independently verified against A.85 gap interaction on a
+	// live cold fast-sync — flagged in the merge PR for follow-up.
+	if s.terminateFloor != 0 && number <= s.terminateFloor {
+		return true
+	}
 	// Require the canonical mapping, not just presence by hash. A block present
 	// only by hash (side chain or orphan from an unclean shutdown) must not be
 	// used as the link-up point, otherwise it's left in place forever without its
@@ -404,14 +611,34 @@ func (s *skeleton) sync(head *types.Header) (*types.Header, error) {
 		// we're consistent with the newly requested chain head
 		s.initSync(head)
 	}
-	// Create the scratch space to fill with concurrently downloaded headers
+	// A.11 (refs #857): tentatively default the per-cycle batch to the eth/66+
+	// size (512). This is reassigned below once we've seeded s.idles and can
+	// see whether any XDPOS2 peer is in the fleet. We MUST set it before
+	// allocating scratchOwners so the chunking matches the actual request size
+	// every peer in this cycle will use.
+	s.cycleBatch = requestHeaders
+
+	// Create the scratch space to fill with concurrently downloaded headers.
+	// The scratchSpace itself is uniform — chunking only matters for the
+	// scratchOwners book-keeping table below, which is sized after we pick
+	// the per-cycle batch size from the peer fleet.
 	s.scratchSpace = make([]*types.Header, scratchHeaders)
 	defer func() { s.scratchSpace = nil }() // don't hold on to references after sync
 
-	s.scratchOwners = make([]string, scratchHeaders/requestHeaders)
+	// scratchOwners is allocated AFTER the cycle batch is chosen from the
+	// seeded idle pool below (see s.idles seeding). We use a placeholder here
+	// so the defer is registered even if the seed-loop panics; the real
+	// allocation happens in-line after the peer fleet is known.
 	defer func() { s.scratchOwners = nil }() // don't hold on to references after sync
 
 	s.scratchHead = s.progress.Subchains[0].Tail - 1 // tail must not be 0!
+
+	// A.14c: removed the A.14b scratchHead clamp here. With Fix 1 (linked()
+	// fires AT or BELOW the floor) the existing errSyncLinked floor-exit in
+	// the responses case below handles termination properly. The clamp here
+	// caused cold-start to skip the walk-back since Tail-1 (~103M) was always
+	// above the floor — but combined with the broken linked() it also masked
+	// the bug by making sync() exit on the first iteration.
 
 	// If the sync is already done, resume the backfiller. When the loop stops,
 	// terminate the backfiller too.
@@ -475,16 +702,55 @@ func (s *skeleton) sync(head *types.Header) (*types.Header, error) {
 	peeringSub := s.peers.SubscribeEvents(peering)
 	defer peeringSub.Unsubscribe()
 
+	// A.50 (refs #857): seed s.idles from the full peerSet — INCLUDING any
+	// XDPOS2 (version=100) peers that were registered before this Sync cycle
+	// started. The peerSet is shared with the faststatesync loop and is
+	// populated by eth/handler.go:324 for every eth-protocol peer regardless
+	// of subprotocol version. Filtering by version here would silently exclude
+	// the entire XDC mainnet peer fleet from skeleton header download.
+	// Regression test: TestSkeletonAcceptsXDPOS2Peers in skeleton_xdpos2_test.go.
 	s.idles = make(map[string]*peerConnection)
+	var xdpos2Count, ethCount int
 	for _, peer := range s.peers.AllPeers() {
 		s.idles[peer.id] = peer
+		if peer.version == eth.XDPOS2 {
+			xdpos2Count++
+		} else {
+			ethCount++
+		}
 	}
+	if total := xdpos2Count + ethCount; total > 0 {
+		log.Info("Skeleton peer pool seeded", "total", total, "xdpos2", xdpos2Count, "eth", ethCount)
+	}
+
+	// A.11 (refs #857): pick the per-cycle request batch size from the seeded
+	// peer fleet. If ANY peer in the fleet is XDPOS2 (XDC mainnet/testnet),
+	// the cycle uses requestHeadersXDPOS2 (=192) so requests respect XDPoSChain
+	// peers' MaxHeaderFetch server-side cap. ETH peers serve up to 1024 so
+	// requesting 192 from them is correct, just slightly less throughput. In a
+	// pure eth/66+ peer fleet we keep the legacy 512 to preserve throughput.
+	// This MUST be set before s.scratchOwners is allocated (chunking must
+	// match the request size every executeTask will use this cycle) and before
+	// assignTasks runs.
+	if xdpos2Count > 0 {
+		s.cycleBatch = requestHeadersXDPOS2
+	}
+	s.scratchOwners = make([]string, scratchHeaders/s.cycleBatch)
+	log.Debug("Skeleton cycle batch chosen",
+		"batch", s.cycleBatch,
+		"slots", len(s.scratchOwners),
+		"xdpos2_peers", xdpos2Count,
+		"eth_peers", ethCount)
 	// Notify any tester listening for startup events
 	if s.syncStarting != nil {
 		s.syncStarting()
 	}
 	for {
-		// Something happened, try to assign new tasks to any idle peers
+		// Something happened, try to assign new tasks to any idle peers.
+		// A.14c: reverted the A.14b extra floor gate here. With Fix 1
+		// (linked() fires AT or BELOW the floor) `linked` already captures
+		// the floor-reached state and the errSyncLinked exit below in the
+		// responses case terminates the cycle.
 		if !linked {
 			s.assignTasks(responses, requestFails, cancel)
 		}
@@ -501,6 +767,10 @@ func (s *skeleton) sync(head *types.Header) (*types.Header, error) {
 				log.Debug("Leaving skeleton peer", "id", peerid)
 				s.revertRequests(peerid)
 				delete(s.idles, peerid)
+				// XDC fix #131: clear empty-response counter for departed peer
+				if s.emptyResponseCount != nil {
+					delete(s.emptyResponseCount, peerid)
+				}
 			}
 
 		case errc := <-s.terminate:
@@ -562,6 +832,16 @@ func (s *skeleton) sync(head *types.Header) (*types.Header, error) {
 			if merged {
 				log.Debug("Beacon sync merged subchains")
 				return nil, errSyncMerged
+			}
+			// A.14: operator-pinned terminate floor — exit walk-back as soon as
+			// the active subchain tail reaches floor+1 (i.e. there is nothing
+			// useful left to walk back to since the operator is the trust
+			// anchor for everything below the floor).
+			if s.terminateFloor != 0 && len(s.progress.Subchains) > 0 && s.progress.Subchains[0].Tail <= s.terminateFloor+1 {
+				log.Info("skeleton: terminate floor reached — exiting walk-back",
+					"tail", s.progress.Subchains[0].Tail,
+					"floor", s.terminateFloor)
+				return nil, errSyncLinked
 			}
 			// We still have work to do, loop and repeat
 		}
@@ -765,8 +1045,11 @@ func (s *skeleton) assignTasks(success chan *headerResponse, fail chan *headerRe
 		if owner != "" {
 			continue
 		}
-		// If we've reached the genesis, stop assigning tasks
-		if uint64(task*requestHeaders) >= s.scratchHead {
+		// If we've reached the genesis, stop assigning tasks.
+		// A.11 (refs #857): use s.cycleBatch — the per-cycle request size — not
+		// the package default. For XDPOS2 cycles this is 192; for eth/66+ it is
+		// 512.
+		if uint64(task*s.cycleBatch) >= s.scratchHead {
 			return
 		}
 		// Found a task and have peers available, assign it
@@ -795,7 +1078,8 @@ func (s *skeleton) assignTasks(success chan *headerResponse, fail chan *headerRe
 			revert:  fail,
 			cancel:  cancel,
 			stale:   make(chan struct{}),
-			head:    s.scratchHead - uint64(task*requestHeaders),
+			head:    s.scratchHead - uint64(task*s.cycleBatch), // A.11 (refs #857)
+			batch:   s.cycleBatch,                              // A.58 Day 2 (refs #857)
 		}
 		s.requests[reqid] = req
 		delete(s.idles, idle.id)
@@ -819,11 +1103,24 @@ func (s *skeleton) executeTask(peer *peerConnection, req *headerRequest) {
 	// but for the very tail of the chain, trim the request to the number left.
 	// Since nodes may or may not return the genesis header for a batch request,
 	// don't even request it. The parent hash of block #1 is enough to link.
-	requestCount := requestHeaders
-	if req.head < requestHeaders {
+	//
+	// A.11 (refs #857): use s.cycleBatch — the per-cycle, peer-fleet-aware
+	// request size — so XDPOS2 peers receive an amount=192 request that fits
+	// inside their MaxHeaderFetch serve cap, and modern eth/66+ peers in a
+	// pure-ETH fleet still get amount=512.
+	//
+	// A.58 Day 2 (refs #857): the batch the validator compares against is
+	// pinned on req.batch at emit time (assignTasks). Reading it back from
+	// req here, rather than re-reading s.cycleBatch, keeps the in-flight
+	// request and its eventual validation locked to the same size even if
+	// s.cycleBatch is reassigned mid-cycle by some future change. The two
+	// values are identical today.
+	batch := req.batch
+	requestCount := batch
+	if req.head < uint64(batch) {
 		requestCount = int(req.head)
 	}
-	peer.log.Trace("Fetching skeleton headers", "from", req.head, "count", requestCount)
+	peer.log.Info("Fetching skeleton headers", "from", req.head, "count", requestCount, "batch", batch, "peer", shortPeerID(peer.id))
 	netreq, err := peer.peer.RequestHeadersByNumber(req.head, requestCount, 0, true, resCh)
 	if err != nil {
 		peer.log.Trace("Failed to request headers", "err", err)
@@ -871,10 +1168,40 @@ func (s *skeleton) executeTask(peer *peerConnection, req *headerRequest) {
 		// Cross validate the headers with the requests
 		switch {
 		case len(headers) == 0:
-			// No headers were delivered, reject the response and reschedule
-			peer.log.Debug("No headers delivered")
-			res.Done <- errors.New("no headers delivered")
-			s.scheduleRevertRequest(req)
+			// No headers were delivered, reject the response and reschedule.
+			// XDC fix #131: track consecutive empty responses and drop peer
+			// after maxEmptyResponses to unblock snap sync skeleton stall.
+			//
+			// A.69 (refs #844 #859): peer-starvation bypass. When the peer
+			// fleet is at or below skeletonEmptyDropPeerFloor, do NOT drop
+			// the peer even after maxEmptyResponses — losing the only header-
+			// serving peer leaves the skeleton with nowhere to recover from.
+			// We still bump + log the counter for visibility, and keep
+			// rescheduling so the peer gets another chance. On a healthier
+			// fleet (count > floor) the original drop semantics apply.
+			const maxEmptyResponses = 5
+			s.emptyResponseCount[peer.id]++
+			count := s.emptyResponseCount[peer.id]
+			totalIdles := len(s.idles)
+			peerStarved := totalIdles <= skeletonEmptyDropPeerFloor
+			if count >= maxEmptyResponses && !peerStarved {
+				peer.log.Warn("Skeleton: dropping peer after repeated empty header responses",
+					"peer", peer.id, "consecutive", count, "idles", totalIdles)
+				s.emptyResponseCount[peer.id] = 0
+				res.Done <- errors.New("no headers delivered")
+				s.scheduleRevertRequest(req)
+				s.drop(peer.id)
+			} else {
+				if count >= maxEmptyResponses && peerStarved {
+					peer.log.Warn("Skeleton: keeping peer despite empties (peer-starved)",
+						"peer", peer.id, "consecutive", count, "idles", totalIdles)
+					s.emptyResponseCount[peer.id] = 0 // give the peer a fresh budget
+				} else {
+					peer.log.Debug("No headers delivered (will retry)", "consecutive", count)
+				}
+				res.Done <- errors.New("no headers delivered")
+				s.scheduleRevertRequest(req)
+			}
 
 		case headers[0].Number.Uint64() != req.head:
 			// Header batch anchored at non-requested number
@@ -882,13 +1209,17 @@ func (s *skeleton) executeTask(peer *peerConnection, req *headerRequest) {
 			res.Done <- errors.New("invalid header batch anchor")
 			s.scheduleRevertRequest(req)
 
-		case req.head >= requestHeaders && len(headers) != requestHeaders:
-			// Invalid number of non-genesis headers delivered, reject the response and reschedule
-			peer.log.Debug("Invalid non-genesis header count", "have", len(headers), "want", requestHeaders)
+		case req.head >= uint64(batch) && len(headers) != batch:
+			// Invalid number of non-genesis headers delivered, reject the response and reschedule.
+			// A.11 (refs #857): validate against the per-cycle batch size, not
+			// the constant 512. XDPOS2 peers honestly cap at 192 server-side
+			// (XDPoSChain/eth/handler.go:445 MaxHeaderFetch); rejecting their
+			// 192-header replies with want=512 stalled the skeleton indefinitely.
+			peer.log.Debug("Invalid non-genesis header count", "have", len(headers), "want", batch)
 			res.Done <- errors.New("not enough non-genesis headers delivered")
 			s.scheduleRevertRequest(req)
 
-		case req.head < requestHeaders && uint64(len(headers)) != req.head:
+		case req.head < uint64(batch) && uint64(len(headers)) != req.head:
 			// Invalid number of genesis headers delivered, reject the response and reschedule
 			peer.log.Debug("Invalid genesis header count", "have", len(headers), "want", headers[0].Number.Uint64())
 			res.Done <- errors.New("not enough genesis headers delivered")
@@ -971,8 +1302,12 @@ func (s *skeleton) revertRequest(req *headerRequest) {
 	delete(s.requests, req.id)
 
 	// Remove the request from the tracked set and mark the task as not-pending,
-	// ready for rescheduling
-	s.scratchOwners[(s.scratchHead-req.head)/requestHeaders] = ""
+	// ready for rescheduling.
+	// A.11 (refs #857): use s.cycleBatch for the chunk index so XDPOS2 cycles
+	// (cycleBatch=192) recover the correct task slot. Mixing batch sizes within
+	// a single cycle is disallowed by sync()'s startup logic, so cycleBatch is
+	// stable for the lifetime of every request flowing through this path.
+	s.scratchOwners[(s.scratchHead-req.head)/uint64(s.cycleBatch)] = ""
 }
 
 // mergeSubchains is invoked once certain beacon headers have been persisted locally
@@ -1022,6 +1357,11 @@ func (s *skeleton) processResponse(res *headerResponse) (linked bool, merged boo
 	// drop the peer in a bit.
 	s.idles[res.peer.id] = res.peer
 
+	// XDC fix #131: successful header delivery — reset empty-response counter
+	if s.emptyResponseCount != nil {
+		delete(s.emptyResponseCount, res.peer.id)
+	}
+
 	// Ensure the response is for a valid request
 	if _, ok := s.requests[res.reqid]; !ok {
 		// Some internal accounting is broken. A request either times out or it
@@ -1057,7 +1397,9 @@ func (s *skeleton) processResponse(res *headerResponse) (linked bool, merged boo
 			// The peer delivered junk, or at least not the subchain we are
 			// syncing to. Free up the scratch space and assignment, reassign
 			// and drop the original peer.
-			for i := 0; i < requestHeaders; i++ {
+			// A.11 (refs #857): clear only the cycle's batch slot, not the
+			// hard-coded 512.
+			for i := 0; i < s.cycleBatch; i++ {
 				s.scratchSpace[i] = nil
 			}
 			s.drop(s.scratchOwners[0])
@@ -1065,9 +1407,11 @@ func (s *skeleton) processResponse(res *headerResponse) (linked bool, merged boo
 			break
 		}
 		// Scratch delivery matches required subchain, deliver the batch of
-		// headers and push the subchain forward
+		// headers and push the subchain forward.
+		// A.11 (refs #857): iterate over the cycle's batch slot, not the
+		// hard-coded 512.
 		var consumed int
-		for _, header := range s.scratchSpace[:requestHeaders] {
+		for _, header := range s.scratchSpace[:s.cycleBatch] {
 			if header != nil { // nil when the genesis is reached
 				consumed++
 
@@ -1090,6 +1434,15 @@ func (s *skeleton) processResponse(res *headerResponse) (linked bool, merged boo
 				linked = s.linked(header.Number.Uint64()-1, header.ParentHash)
 				if linked {
 					log.Debug("Primary subchain linked", "number", header.Number.Uint64()-1, "hash", header.ParentHash)
+					break
+				}
+				// A.14b: defense-in-depth — treat crossing the operator-pinned
+				// floor as linked so we never decrement Tail past it inside this
+				// inner consumption loop.
+				if s.terminateFloor != 0 && header.Number.Uint64() <= s.terminateFloor+1 {
+					log.Debug("skeleton: floor reached in processResponse — treating as linked",
+						"number", header.Number.Uint64(), "floor", s.terminateFloor)
+					linked = true
 					break
 				}
 			}
@@ -1153,13 +1506,17 @@ func (s *skeleton) processResponse(res *headerResponse) (linked bool, merged boo
 			}
 			break
 		}
-		// Batch of headers consumed, shift the download window forward
-		copy(s.scratchSpace, s.scratchSpace[requestHeaders:])
-		for i := 0; i < requestHeaders; i++ {
+		// Batch of headers consumed, shift the download window forward.
+		// A.11 (refs #857): shift by s.cycleBatch (192 for XDPOS2 cycles, 512
+		// for eth/66+ cycles) and clear that many slots at the tail. The
+		// scratchOwners table is sized scratchHeaders/cycleBatch so the last
+		// slot index is len(s.scratchOwners)-1.
+		copy(s.scratchSpace, s.scratchSpace[s.cycleBatch:])
+		for i := 0; i < s.cycleBatch; i++ {
 			s.scratchSpace[scratchHeaders-i-1] = nil
 		}
 		copy(s.scratchOwners, s.scratchOwners[1:])
-		s.scratchOwners[scratchHeaders/requestHeaders-1] = ""
+		s.scratchOwners[len(s.scratchOwners)-1] = ""
 
 		s.scratchHead -= uint64(consumed)
 

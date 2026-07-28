@@ -144,8 +144,15 @@ func (p *skeletonTestPeer) RequestHeadersByNumber(origin uint64, amount int, ski
 	// To make concurrency easier, the skeleton syncer always requests fixed size
 	// batches of headers. Panic if the peer is requested an amount other than the
 	// configured batch size (apart from the request leading to the genesis).
-	if amount > requestHeaders || (amount < requestHeaders && origin > uint64(amount)) {
-		panic(fmt.Sprintf("non-chunk size header batch requested: requested %d, want %d, origin %d", amount, requestHeaders, origin))
+	//
+	// A.11 (refs #857): the skeleton now picks one of two valid per-cycle batch
+	// sizes — requestHeaders (eth/66+) or requestHeadersXDPOS2 (XDPOS2 cycle).
+	// Accept either here; the tail-of-chain `amount < cycle batch` case still
+	// requires origin <= amount, which both cycle sizes preserve.
+	validBatch := amount == requestHeaders || amount == requestHeadersXDPOS2
+	if (!validBatch && amount > requestHeaders) ||
+		(!validBatch && origin > uint64(amount)) {
+		panic(fmt.Sprintf("non-chunk size header batch requested: requested %d, want %d or %d, origin %d", amount, requestHeaders, requestHeadersXDPOS2, origin))
 	}
 	// Simple reverse header retrieval. Fill from the peer's chain and return.
 	// If the tester has a serve hook set, try to use that before falling back
@@ -210,6 +217,10 @@ func (p *skeletonTestPeer) RequestBodies([]common.Hash, chan *eth.Response) (*et
 
 func (p *skeletonTestPeer) RequestReceipts([]common.Hash, []uint64, []uint64, chan *eth.Response) (*eth.Request, error) {
 	panic("skeleton sync must not request receipts")
+}
+
+func (p *skeletonTestPeer) RequestNodeData([]common.Hash) error {
+	panic("skeleton sync must not request node data")
 }
 
 func (p *skeletonTestPeer) RequestBALs([]common.Hash, chan *eth.Response) (*eth.Request, error) {

@@ -473,6 +473,39 @@ type nodeInfo struct {
 	OsVer    string `json:"os_v"`
 	Client   string `json:"client"`
 	History  bool   `json:"canUpdateHistory"`
+	Coinbase string `json:"coinbase"` // node's own miner/etherbase address, lowercase 0x-hex; full zero address if none configured
+	Role     string `json:"role"`     // "validator" if this node is authorized and actively sealing blocks, else "follower"
+}
+
+// signerProvider is implemented by consensus engines that can report the
+// node's own authorized signer/coinbase address and whether block sealing is
+// actually active (not merely configured). XDPoS implements this; ethash and
+// other non-authoring engines do not, and are treated as followers with no
+// coinbase.
+type signerProvider interface {
+	Signer() (common.Address, bool)
+}
+
+// coinbaseAndRole derives the ethstats "coinbase"/"role" fields from the
+// node's live consensus engine state — never from an operator-set flag, so
+// the dashboard reports ground truth. role is "validator" only when the
+// engine is both authorized with a real signer AND actively sealing
+// (Authorize was called with a signing function); otherwise "follower".
+//
+// Wire convention: an unconfigured node, or one with a zero-address signer,
+// reports coinbase as the full 40-hex-digit zero address
+// (0x0000000000000000000000000000000000000000) — this is a project choice,
+// not an upstream ethstats convention (upstream uses ""). The dashboard
+// matches info.coinbase against a full 40-hex address, so a short sentinel
+// like "0x00" would satisfy neither the wire format nor the dashboard's
+// matcher and would silently never render.
+func coinbaseAndRole(engine any) (string, string) {
+	if sp, ok := engine.(signerProvider); ok {
+		if addr, active := sp.Signer(); active && addr != (common.Address{}) {
+			return strings.ToLower(addr.Hex()), "validator"
+		}
+	}
+	return strings.ToLower((common.Address{}).Hex()), "follower"
 }
 
 // authMsg is the authentication infos needed to login to a monitoring server.
@@ -497,6 +530,7 @@ func (s *Service) login(conn *connWrapper) error {
 	} else {
 		return errors.New("no eth protocol available")
 	}
+	coinbase, role := coinbaseAndRole(s.engine)
 	auth := &authMsg{
 		ID: s.node,
 		Info: nodeInfo{
@@ -510,6 +544,8 @@ func (s *Service) login(conn *connWrapper) error {
 			OsVer:    runtime.GOARCH,
 			Client:   "0.1.1",
 			History:  true,
+			Coinbase: coinbase,
+			Role:     role,
 		},
 		Secret: s.pass,
 	}

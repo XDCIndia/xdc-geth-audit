@@ -62,6 +62,11 @@ var (
 	queueThrottleGauge = metrics.NewRegisteredGauge("eth/downloader/queue/throttle/threshold", nil)
 	queueItemSizeGauge = metrics.NewRegisteredGauge("eth/downloader/queue/itemsize", nil)
 
+	// A.36: counts NodeData responses dropped because no fast-state fetcher is
+	// draining d.fastStateCh (e.g. fast-sync isn't active, or the state-sync
+	// loop is between phases). Replaces a silent blocking send that previously
+	// stalled the peer's reader goroutine indefinitely.
+	nodeDataDropMeter = metrics.NewRegisteredMeter("eth/downloader/nodedata/dropped", nil)
 	// snapPeerSkipMeter tracks snap peers skipped by the state syncer because
 	// they negotiated a version below the one the syncer requires.
 	snapPeerSkipMeter = metrics.NewRegisteredMeter("eth/downloader/snap/peerskip", nil)

@@ -56,6 +56,18 @@ func newSyncModer(mode ethconfig.SyncMode, chain BlockChain, disk ethdb.KeyValue
 			// Grant the full sync mode
 			log.Info("Enabled full-sync", "head", fullBlock.Number, "hash", fullBlock.Hash())
 		}
+	} else if mode == ethconfig.FastSync {
+		// Fast sync uses NodeData (eth66/eth67 GetNodeData) to download trie nodes.
+		// Like snap sync, it runs to a pivot then switches to full sync for the tail.
+		// Do not auto-promote to FullSync here — let the pivot commit logic in
+		// processFastSyncContent / commitFastSyncPivotBlock handle the transition.
+		head := chain.CurrentBlock()
+		if head.Number.Uint64() > 0 && chain.HasState(head.Root) {
+			mode = ethconfig.FullSync
+			log.Info("Switching from fast-sync to full-sync", "reason", "fast-sync complete")
+		} else {
+			log.Info("Enabled fast-sync", "head", head.Number, "hash", head.Hash())
+		}
 	} else {
 		head := chain.CurrentBlock()
 		if head.Number.Uint64() > 0 && chain.HasState(head.Root) {
@@ -82,6 +94,11 @@ func (m *syncModer) get(report bool) ethconfig.SyncMode {
 	// If we're in snap sync mode, return that directly
 	if m.mode == ethconfig.SnapSync {
 		return ethconfig.SnapSync
+	}
+	// If we're in fast sync mode (NodeData-based), return that directly.
+	// Fast sync manages its own pivot transition via FastSyncCommitHead.
+	if m.mode == ethconfig.FastSync {
+		return ethconfig.FastSync
 	}
 	logger := log.Debug
 	if report {
