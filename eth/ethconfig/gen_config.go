@@ -72,6 +72,7 @@ func (c Config) MarshalTOML() (interface{}, error) {
 		TxSyncDefaultTimeout    time.Duration `toml:",omitempty"`
 		TxSyncMaxTimeout        time.Duration `toml:",omitempty"`
 		RangeLimit              uint64        `toml:",omitempty"`
+		NoAutoPivot             bool          `toml:",omitempty"`
 	}
 	var enc Config
 	enc.Genesis = c.Genesis
@@ -129,6 +130,7 @@ func (c Config) MarshalTOML() (interface{}, error) {
 	enc.TxSyncDefaultTimeout = c.TxSyncDefaultTimeout
 	enc.TxSyncMaxTimeout = c.TxSyncMaxTimeout
 	enc.RangeLimit = c.RangeLimit
+	enc.NoAutoPivot = c.NoAutoPivot
 	return &enc, nil
 }
 
@@ -190,6 +192,7 @@ func (c *Config) UnmarshalTOML(unmarshal func(interface{}) error) error {
 		TxSyncDefaultTimeout    *time.Duration `toml:",omitempty"`
 		TxSyncMaxTimeout        *time.Duration `toml:",omitempty"`
 		RangeLimit              *uint64        `toml:",omitempty"`
+		NoAutoPivot             *bool          `toml:",omitempty"`
 	}
 	var dec Config
 	if err := unmarshal(&dec); err != nil {
@@ -359,6 +362,9 @@ func (c *Config) UnmarshalTOML(unmarshal func(interface{}) error) error {
 	}
 	if dec.RangeLimit != nil {
 		c.RangeLimit = *dec.RangeLimit
+	}
+	if dec.NoAutoPivot != nil {
+		c.NoAutoPivot = *dec.NoAutoPivot
 	}
 	return nil
 }

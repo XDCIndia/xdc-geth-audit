@@ -244,3 +244,67 @@ func TestMessages(t *testing.T) {
 		}
 	}
 }
+
+// legacyStatusPacket62 is the exact 5-field shape used by pre-A.37 geth-XDC
+// peers (canonical a119e0b archive fleet). The A.37 regression was that
+// outbound 6-field encodes from our handler tripped legacy peers' strict
+// 5-field decoder ("input list has too many elements"). This local mirror
+// lets us assert the cross-decode goes both ways without importing a
+// historical wire shape.
+type legacyStatusPacket62 struct {
+	ProtocolVersion uint32
+	NetworkID       uint64
+	TD              *big.Int
+	Head            common.Hash
+	Genesis         common.Hash
+}
+
+// TestStatusPacket62LegacyWireCompat pins the on-wire shape of
+// StatusPacket62 to exactly 5 fields. If somebody re-adds an `rlp:"optional"`
+// trailer here, both directions of the cross-decode break against the
+// production XDC fleet — see commit history A.37 regression notes. Refs #844.
+func TestStatusPacket62LegacyWireCompat(t *testing.T) {
+	ours := &StatusPacket62{
+		ProtocolVersion: XDPOS2,
+		NetworkID:       50,
+		TD:              big.NewInt(123),
+		Head:            common.HexToHash("0xaa"),
+		Genesis:         common.HexToHash("0xbb"),
+	}
+	enc, err := rlp.EncodeToBytes(ours)
+	if err != nil {
+		t.Fatalf("encode our StatusPacket62: %v", err)
+	}
+	// A.37 fix invariant: our outbound bytes MUST decode cleanly into a
+	// strict 5-field legacy struct. If this fails, legacy peers will reject
+	// our handshake with "input list has too many elements" and silently
+	// drop the connection.
+	var legacy legacyStatusPacket62
+	if err := rlp.DecodeBytes(enc, &legacy); err != nil {
+		t.Fatalf("LEGACY peer cannot decode our StatusPacket62 (regresses A.37): %v", err)
+	}
+	if legacy.ProtocolVersion != ours.ProtocolVersion || legacy.NetworkID != ours.NetworkID ||
+		legacy.TD.Cmp(ours.TD) != 0 || legacy.Head != ours.Head || legacy.Genesis != ours.Genesis {
+		t.Fatalf("legacy decode field mismatch: %+v vs %+v", legacy, ours)
+	}
+	// Reverse direction: a legacy peer's 5-field encode must also decode
+	// cleanly into our struct.
+	theirs := &legacyStatusPacket62{
+		ProtocolVersion: XDPOS2,
+		NetworkID:       50,
+		TD:              big.NewInt(456),
+		Head:            common.HexToHash("0xcc"),
+		Genesis:         common.HexToHash("0xbb"),
+	}
+	enc2, err := rlp.EncodeToBytes(theirs)
+	if err != nil {
+		t.Fatalf("encode legacy: %v", err)
+	}
+	var got StatusPacket62
+	if err := rlp.DecodeBytes(enc2, &got); err != nil {
+		t.Fatalf("we cannot decode legacy peer's 5-field StatusPacket62: %v", err)
+	}
+	if got.TD.Cmp(theirs.TD) != 0 || got.Head != theirs.Head {
+		t.Fatalf("our decode field mismatch: %+v vs %+v", got, theirs)
+	}
+}

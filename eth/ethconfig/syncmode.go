@@ -25,10 +25,11 @@ type SyncMode uint32
 const (
 	FullSync SyncMode = iota // Synchronise the entire blockchain history from full blocks
 	SnapSync                 // Download the chain and the state via compact snapshots
+	FastSync                 // Download the chain and the state via NodeData (classical Geth fast sync, XDPOS2), refs #844
 )
 
 func (mode SyncMode) IsValid() bool {
-	return mode == FullSync || mode == SnapSync
+	return mode == FullSync || mode == SnapSync || mode == FastSync
 }
 
 // String implements the stringer interface.
@@ -38,6 +39,8 @@ func (mode SyncMode) String() string {
 		return "full"
 	case SnapSync:
 		return "snap"
+	case FastSync:
+		return "fast"
 	default:
 		return "unknown"
 	}
@@ -49,6 +52,8 @@ func (mode SyncMode) MarshalText() ([]byte, error) {
 		return []byte("full"), nil
 	case SnapSync:
 		return []byte("snap"), nil
+	case FastSync:
+		return []byte("fast"), nil
 	default:
 		return nil, fmt.Errorf("unknown sync mode %d", mode)
 	}
@@ -60,8 +65,10 @@ func (mode *SyncMode) UnmarshalText(text []byte) error {
 		*mode = FullSync
 	case "snap":
 		*mode = SnapSync
+	case "fast":
+		*mode = FastSync
 	default:
-		return fmt.Errorf(`unknown sync mode %q, want "full" or "snap"`, text)
+		return fmt.Errorf(`unknown sync mode %q, want "full", "snap" or "fast"`, text)
 	}
 	return nil
 }

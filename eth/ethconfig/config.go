@@ -23,6 +23,7 @@ import (
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/consensus"
+	"github.com/ethereum/go-ethereum/consensus/XDPoS"
 	"github.com/ethereum/go-ethereum/consensus/beacon"
 	"github.com/ethereum/go-ethereum/consensus/clique"
 	"github.com/ethereum/go-ethereum/consensus/ethash"
@@ -94,6 +95,21 @@ type Config struct {
 	// zero, the chain ID is used as network ID.
 	NetworkId uint64
 	SyncMode  SyncMode
+
+	// FastSyncPivot{Number,Hash,Root} optionally pin the Fast Sync trust anchor.
+	// All three must be set together via --fastsyncpivotnumber/hash/root or none.
+	// Set only when SyncMode == FastSync. Refs #844, FAST_SYNC_IMPLEMENTATION.md §2.
+	FastSyncPivotNumber uint64      `toml:",omitempty"`
+	FastSyncPivotHash   common.Hash `toml:",omitempty"`
+	FastSyncPivotRoot   common.Hash `toml:",omitempty"`
+
+	// NoAutoPivot disables the A.96 automatic pivot selection from
+	// TrustedSyncCheckpoints (refs #892). When set, the fast-sync path falls
+	// through to the dynamic-pivot path even on chains that carry checkpoints
+	// (Apothem, XDC mainnet). Primarily useful for testing the dynamic-pivot
+	// path on public chains and for chains with no TrustedSyncCheckpoints.
+	// CLI: --no-auto-pivot. A.97 (refs #894).
+	NoAutoPivot bool `toml:",omitempty"`
 
 	// HistoryMode configures chain history retention.
 	HistoryMode history.HistoryMode
@@ -235,7 +251,14 @@ type Config struct {
 // CreateConsensusEngine creates a consensus engine for the given chain config.
 // Clique is allowed for now to live standalone, but ethash is forbidden and can
 // only exist on already merged networks.
+// XDPoS is the native consensus for XDC Network.
 func CreateConsensusEngine(config *params.ChainConfig, db ethdb.Database) (consensus.Engine, error) {
+	// XDPoS consensus for XDC Network (chain IDs 50 and 51)
+	if config.XDPoS != nil {
+		log.Info("Creating XDPoS consensus engine", "chainID", config.ChainID)
+		return XDPoS.New(config.XDPoS, db), nil
+	}
+
 	if config.TerminalTotalDifficulty == nil {
 		log.Error("Geth only supports PoS networks. Please transition legacy networks using Geth v1.13.x.")
 		return nil, errors.New("'terminalTotalDifficulty' is not set in genesis block")

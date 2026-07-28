@@ -24,6 +24,7 @@ import (
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core"
+	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/crypto/kzg4844"
@@ -34,6 +35,24 @@ import (
 )
 
 func handleGetBlockHeaders(backend Backend, msg Decoder, peer *Peer) error {
+	// XDC XDPOS2 uses the eth/63 message shape — no RequestId wrapper on
+	// data-plane requests. peer.Version() is known here, so we can pick the
+	// right decode target directly (no dual-decode/seek needed).
+	if peer.Version() == XDPOS2 {
+		var legacyQuery GetBlockHeadersRequest
+		if err := msg.Decode(&legacyQuery); err != nil {
+			return err
+		}
+		response := ServiceGetBlockHeadersQuery(backend.Chain(), &legacyQuery, peer)
+		log.Info("XDPOS2 GetBlockHeaders RECEIVED (serving)",
+			"peer", peer.ID()[:8],
+			"origin", legacyQuery.Origin,
+			"amount", legacyQuery.Amount,
+			"skip", legacyQuery.Skip,
+			"reverse", legacyQuery.Reverse,
+			"response_count", len(response))
+		return peer.ReplyBlockHeadersRLPLegacy(response)
+	}
 	// Decode the complex header query
 	var query GetBlockHeadersPacket
 	if err := msg.Decode(&query); err != nil {
@@ -217,6 +236,16 @@ func serviceContiguousBlockHeaderQuery(chain *core.BlockChain, query *GetBlockHe
 }
 
 func handleGetBlockBodies(backend Backend, msg Decoder, peer *Peer) error {
+	// XDPOS2 sends bare GetBlockBodiesRequest (eth/63 wire shape) without
+	// the RequestId wrapper. Mirror of the headers path in handleGetBlockHeaders.
+	if peer.Version() == XDPOS2 {
+		var legacyQuery GetBlockBodiesRequest
+		if err := msg.Decode(&legacyQuery); err != nil {
+			return err
+		}
+		response := ServiceGetBlockBodiesQuery(backend.Chain(), legacyQuery)
+		return peer.ReplyBlockBodiesRLPLegacy(response)
+	}
 	// Decode the block body retrieval message
 	var query GetBlockBodiesPacket
 	if err := msg.Decode(&query); err != nil {
@@ -266,6 +295,52 @@ func handleGetReceipts70(backend Backend, msg Decoder, peer *Peer) error {
 	}
 	response, lastBlockIncomplete := serviceGetReceiptsQuery70(backend.Chain(), query.GetReceiptsRequest, query.FirstBlockReceiptIndex)
 	return peer.ReplyReceiptsRLP70(query.RequestId, response, lastBlockIncomplete)
+}
+
+// handleXDCTradingTxNoop drains XDPoSChain's legacy DEX/lending transaction
+// broadcasts (msg codes 0x08 OrderTxMsg and 0x09 LendingTxMsg) off the wire
+// without decoding their bodies. Refs #857 A.60.3.
+//
+// On modern eth/68+ these two codes mean NewPooledTransactionHashes and
+// GetPooledTransactions; on legacy XDPoSChain they mean OrderTx (XDC DEX)
+// and LendingTx (XDC lending protocol). Both inbound shapes mis-decode
+// when the modern pooled-tx handler tries to read them as
+// `NewPooledTransactionHashesPacket{Types, Sizes, Hashes}` or as the
+// RequestId-wrapped `GetPooledTransactionsPacket`, and the peer drops us.
+//
+// Modern XDC has not yet ported the DEX/lending protocols — when it does,
+// this handler should be replaced with proper decoders. Until then we
+// silently discard so the peer stays connected and other messages flow.
+func handleXDCTradingTxNoop(backend Backend, msg Decoder, peer *Peer) error {
+	// Drain the message bytes off the connection without decoding into a
+	// typed struct. Returning nil signals "handled successfully" so devp2p
+	// keeps the peer attached.
+	var raw rlp.RawValue
+	_ = msg.Decode(&raw)
+	return nil
+}
+
+// handleGetReceiptsXDPOS2 decodes the XDPOS2 / eth-63 bare-list wire shape
+// for GetReceipts (msg code 0x0f). XDPoSChain v2.7.0 sends the request as
+// a flat `[]common.Hash`, NOT the eth/69+ `{RequestId, hashes}` wrapper.
+//
+// A.60.1 (refs #857): without this handler, msg code 0x0f from a legacy
+// XDPOS2 peer was routed through handleGetReceipts70 which tried to decode
+// the leading 32-byte hash as a uint64 RequestId, failed with
+// `rlp: input string too long for uint64`, and disconnected the peer. The
+// symmetric outbound path (peer.RequestReceipts on XDPOS2) already uses
+// the bare shape; this handler closes the loop on the inbound side.
+//
+// The response is sent through ReplyReceiptsRLPLegacy which omits the
+// RequestId and LastBlockIncomplete fields entirely, producing the
+// eth/63 wire shape XDPoSChain expects: `[ list1, list2, ... ]`.
+func handleGetReceiptsXDPOS2(backend Backend, msg Decoder, peer *Peer) error {
+	var query GetReceiptsRequest
+	if err := msg.Decode(&query); err != nil {
+		return err
+	}
+	response := ServiceGetReceiptsQuery69(backend.Chain(), query)
+	return peer.ReplyReceiptsRLPLegacy(response)
 }
 
 // ServiceGetReceiptsQuery69 assembles the response to a receipt query.
@@ -347,6 +422,134 @@ func serviceGetReceiptsQuery70(chain *core.BlockChain, query GetReceiptsRequest,
 }
 
 func handleBlockHeaders(backend Backend, msg Decoder, peer *Peer) error {
+	// XDPOS2 responses arrive without the RequestId wrapper — bare RLP list
+	// of types.Header. The matching request's id was stashed on the peer
+	// by RequestHeadersByXxx for single-flight retrieval here. The legacy
+	// peer may return a batch even when we requested 1, so tracker size
+	// matching can't be applied (the tracker enforces response.Size <=
+	// request.Size). We still want the dispatch so the request sink is
+	// fulfilled and the request is removed from the dispatcher's pending
+	// map — invoke Fulfil with the requested size so the check passes,
+	// then truncate headers to the requested amount before dispatch.
+	if peer.Version() == XDPOS2 {
+		var headers []*types.Header
+		if err := msg.Decode(&headers); err != nil {
+			log.Info("XDPOS2 BlockHeaders decode failed", "peer", peer.ID()[:8], "err", err)
+			return err
+		}
+		log.Info("XDPOS2 BlockHeaders received (pre-req)", "peer", peer.ID()[:8], "count", len(headers))
+
+		// Route 1: push to peer.XDCHeaderResp where xdcSyncer waits.
+		// Non-blocking — if reader isn't ready, drop.
+		select {
+		case peer.XDCHeaderResp <- headers:
+		default:
+		}
+
+		// Route 2 (#807 Phase 9): also bridge to the standard dispatcher
+		// so upstream code paths (downloader.skeleton.Sync, etc.) that
+		// register a sink channel via RequestHeadersBy* receive the
+		// response. Without this bridge, the downloader's request times
+		// out at 60s because XDPOS2 wire has no RequestId for the
+		// dispatcher to match — we fake the match using the last
+		// header-request id stashed on the peer.
+		//
+		// The dispatcher's tracker.Fulfil expects response.Size <=
+		// request.Size; XDC peers may return more headers than
+		// requested (legacy quirk), so truncate before dispatch.
+		// Pop the OLDEST in-flight header request from the per-peer
+		// FIFO. XDPOS2 wire has no RequestId on responses so the
+		// bridge can only match by arrival order — peers serve
+		// requests in roughly FIFO order. Phase 9.3 / Phase 10 also
+		// handles the XDPOS2 server-side quirk where the peer anchors
+		// its response at a different block than what was requested.
+		req := peer.popLegacyHeaderReq()
+		log.Info("XDPOS2 BlockHeaders received",
+			"peer", peer.ID()[:8],
+			"count", len(headers),
+			"req_id", req.id,
+			"req_anchor_num", req.anchorNumber,
+			"req_anchor_hash", req.anchorHash.Hex()[:18],
+			"req_count", req.count)
+		if req.id != 0 {
+			// A.9: revert A.8's Fulfil-on-empty for XDPOS2 exit paths.
+			// A.8's tracker.Fulfil with Size=0 on empty responses unblocked
+			// tracker accumulation but caused a worse failure: the downloader
+			// fired unlimited new requests which XDPOS2 peers throttled by
+			// returning empty batches continuously. Pre-A.8's let-empty-time-out
+			// behavior naturally rate-limited request issuance.
+			// Only the normal-dispatch Fulfil (Size=len(truncated)) is retained.
+
+			// #807 Phase 14.1: an XDPOS2 peer can return count=0 when
+			// it has no headers at the requested anchor. Let the request
+			// time out at 60s to rate-limit re-issuance.
+			if len(headers) == 0 {
+				log.Debug("XDPOS2 bridge: empty response",
+					"peer", peer.ID()[:8], "want_num", req.anchorNumber)
+				return nil
+			}
+			// Phase 10: re-anchor. Find the index in `headers` where
+			// the requested anchor sits. XDPOS2 peers may return more
+			// headers than requested AND start the response at a
+			// different block than the request's origin field. The
+			// skeleton enforces `headers[0].Number == req.head`
+			// strictly, so we slice off the leading offset.
+			anchorIdx := -1
+			if req.anchorHash != (common.Hash{}) {
+				for i, h := range headers {
+					if h.Hash() == req.anchorHash {
+						anchorIdx = i
+						break
+					}
+				}
+			} else if req.anchorNumber != 0 {
+				for i, h := range headers {
+					if h.Number.Uint64() == req.anchorNumber {
+						anchorIdx = i
+						break
+					}
+				}
+			}
+			if anchorIdx < 0 {
+				// Anchor not in this batch; can't safely deliver.
+				// Let the dispatcher request time out and retry through
+				// a different peer. (A.9: no Fulfil here — letting it
+				// time out naturally rate-limits re-issuance.)
+				log.Debug("XDPOS2 bridge: anchor not in response",
+					"peer", peer.ID()[:8], "want_num", req.anchorNumber,
+					"have_first_num", headers[0].Number.Uint64(),
+					"have_last_num", headers[len(headers)-1].Number.Uint64())
+				return nil
+			}
+			// Slice [anchorIdx : anchorIdx+count] and truncate to want.
+			tail := headers[anchorIdx:]
+			truncated := tail
+			if req.count > 0 && len(truncated) > req.count {
+				truncated = truncated[:req.count]
+			}
+			// Fulfil the tracker before dispatching so the pending slot
+			// is freed regardless of whether dispatchResponse succeeds.
+			_ = peer.tracker.Fulfil(tracker.Response{
+				ID:      req.id,
+				MsgCode: BlockHeadersMsg,
+				Size:    len(truncated),
+			})
+			delivered := BlockHeadersRequest(truncated)
+			res := &Response{
+				id:   req.id,
+				code: BlockHeadersMsg,
+				Res:  &delivered,
+			}
+			// Best-effort: run dispatchResponse in a goroutine so a
+			// hung sink doesn't block this handler. Errors mean the
+			// pending request doesn't exist (already cancelled / no
+			// active downloader request), which is fine.
+			go func() {
+				_ = peer.dispatchResponse(res, nil)
+			}()
+		}
+		return nil
+	}
 	// A batch of headers arrived to one of our previous requests
 	res := new(BlockHeadersPacket)
 	if err := msg.Decode(res); err != nil {
@@ -376,6 +579,37 @@ func handleBlockHeaders(backend Backend, msg Decoder, peer *Peer) error {
 }
 
 func handleBlockBodies(backend Backend, msg Decoder, peer *Peer) error {
+	// XDPOS2 legacy: bare list of bodies, no RequestId. The XDPOS2 wire shape
+	// is `[body1, body2, ...]` — a single RLP list, no request-id wrapper.
+	// Matches the in-flight request via stashed legacyBodyReqID (set in
+	// peer.RequestBodies for XDPOS2). A.33: route through the dispatcher so
+	// downloader fast-sync body fetcher (which waits on req.sink) receives
+	// the response. The legacy xdcSyncer.fetchBodiesBatch consumer also goes
+	// through the dispatcher now (it creates a local sink channel).
+	if peer.Version() == XDPOS2 {
+		var bodies []BlockBody
+		if err := msg.Decode(&bodies); err != nil {
+			log.Info("XDPOS2 BlockBodies decode failed", "peer", peer.ID()[:8], "err", err)
+			return err
+		}
+		log.Info("XDPOS2 BlockBodies received", "peer", peer.ID()[:8], "count", len(bodies))
+		// BlockBodiesResponse is []BlockBody — bodies already decoded, no
+		// re-encoding needed. Just wrap and dispatch.
+		reqID := peer.LastXDCBodyReqID()
+		metadata := func() any { return hashBodyParts(bodies) }
+		// Also keep XDCBodyResp as a non-blocking secondary channel for the
+		// legacy xdcSyncer.fetchBodiesBatch consumer (until it migrates to
+		// the dispatcher path).
+		select {
+		case peer.XDCBodyResp <- bodies:
+		default:
+		}
+		return peer.dispatchResponse(&Response{
+			id:   reqID,
+			code: BlockBodiesMsg,
+			Res:  (*BlockBodiesResponse)(&bodies),
+		}, metadata)
+	}
 	// A batch of block bodies arrived to one of our previous requests
 	res := new(BlockBodiesPacket)
 	if err := msg.Decode(res); err != nil {
@@ -537,6 +771,74 @@ func handleReceipts70(backend Backend, msg Decoder, peer *Peer) error {
 	return dispatchReceipts(res.RequestId, receiptLists, peer)
 }
 
+// A.33+A.60.4: handleReceiptsXDPOS2 decodes the bare-list wire shape
+// receipts response sent by production XDPOS2 peers. No RequestId wrapper —
+// the in-flight request is matched via stashed legacyReceiptsReqID, set in
+// peer.RequestReceipts XDPOS2 branch.
+//
+// A.60.4 (refs #857): the inner per-receipt shape XDPoSChain v2.7.0 sends is
+// the EIP-2718-aware "consensus" shape — `[postStateOrStatus,
+// cumulativeGasUsed, bloom, [logs...]]` — exactly what `types.Receipt`'s
+// own RLP encoder produces. The earlier `ReceiptList` decoder assumed the
+// eth/69+ compressed shape `[txType, postStateOrStatus, gasUsed, [logs...]]`,
+// which has different field count, different field order, and no Bloom.
+// Decoding the legacy bytes through that path produced corrupt Receipts
+// whose DeriveSha never matched the block header's ReceiptHash, so the
+// downloader rejected every receipt response with `errInvalidReceipt` and
+// disconnected the peer.
+//
+// Decoding directly into `types.Receipts` (which uses the same consensus
+// RLP shape as XDPoSChain) gives byte-equivalent receipts; `DeriveSha`
+// over `types.Receipts` then produces the receipt-trie root the block
+// header expects.
+func handleReceiptsXDPOS2(backend Backend, msg Decoder, peer *Peer) error {
+	var raw []types.Receipts
+	if err := msg.Decode(&raw); err != nil {
+		log.Info("XDPOS2 Receipts decode failed", "peer", peer.ID()[:8], "err", err)
+		return err
+	}
+	log.Info("XDPOS2 Receipts received", "peer", peer.ID()[:8], "count", len(raw))
+	reqID := peer.legacyReceiptsReqID.Load()
+	return dispatchLegacyReceipts(reqID, raw, peer)
+}
+
+// dispatchLegacyReceipts submits a legacy-shape (XDPOS2 / eth/63) receipt
+// response to the dispatcher. Refs #857 A.60.4.
+//
+// The hash metadata is computed with `types.DeriveSha` directly over
+// `types.Receipts`, which uses the consensus receiptRLP shape — matching
+// what the block producer used to build header.ReceiptHash.
+//
+// The dispatcher's ReceiptsRLPResponse expects each block's encoded
+// receipt list as a single `rlp.RawValue`. We re-encode each
+// `types.Receipts` back to bytes; this is a cheap roundtrip because
+// types.Receipt.EncodeRLP produces the same consensus shape we just
+// decoded.
+func dispatchLegacyReceipts(requestId uint64, receiptLists []types.Receipts, peer *Peer) error {
+	metadata := func() interface{} {
+		hasher := trie.NewStackTrie(nil)
+		hashes := make([]common.Hash, len(receiptLists))
+		for i := range receiptLists {
+			hashes[i] = types.DeriveSha(receiptLists[i], hasher)
+		}
+		return hashes
+	}
+
+	enc := make(ReceiptsRLPResponse, len(receiptLists))
+	for i := range receiptLists {
+		buf, err := rlp.EncodeToBytes(receiptLists[i])
+		if err != nil {
+			return fmt.Errorf("Receipts: invalid list %d: %v", i, err)
+		}
+		enc[i] = buf
+	}
+	return peer.dispatchResponse(&Response{
+		id:   requestId,
+		code: ReceiptsMsg,
+		Res:  &enc,
+	}, metadata)
+}
+
 // dispatchReceipts submits a receipt response to the dispatcher.
 func dispatchReceipts(requestId uint64, receiptLists []*ReceiptList, peer *Peer) error {
 	metadata := func() interface{} {
@@ -688,6 +990,116 @@ func handleBlockRangeUpdate(backend Backend, msg Decoder, peer *Peer) error {
 	return nil
 }
 
+// handleGetNodeData handles a state trie node data retrieval request on XDPOS2
+// (eth/63 shape — no RequestId wrapper). Restored from upstream Geth v1.10.13;
+// HBSS-only: PBSS nodes will return empty data (accepted tradeoff per #845 A.1a).
+func handleGetNodeData(backend Backend, msg Decoder, peer *Peer) error {
+	var query GetNodeDataPacket
+	if err := msg.Decode(&query); err != nil {
+		return fmt.Errorf("decode GetNodeData: %w", err)
+	}
+	response := answerGetNodeDataQuery(backend, query, peer)
+	return peer.ReplyNodeData(response)
+}
+
+// answerGetNodeDataQuery assembles the response to a state trie node query.
+// Reads from the HBSS (hash-based) storage; PBSS nodes will serve empty responses.
+func answerGetNodeDataQuery(backend Backend, query GetNodeDataPacket, peer *Peer) [][]byte {
+	// Gather state data until the fetch or network limits is reached
+	var (
+		bytes int
+		nodes [][]byte
+	)
+	// A.25: NodeReader(EmptyRootHash) bypasses the root-presence check and yields
+	// a reader that consults cleans cache → dirties cache → on-disk legacy HBSS
+	// storage — exactly the lookup chain the trie itself uses. Falling back to
+	// bare ReadLegacyTrieNode (the previous behavior) misses nodes still alive
+	// only in memory caches — the symptom that broke pivot-root serving (the
+	// root is often the most recently-touched node and lives in dirties).
+	// Refs #844 A.25.
+	triedb := backend.Chain().TrieDB()
+	reader, rerr := triedb.NodeReader(types.EmptyRootHash)
+	diskDB := triedb.Disk()
+	for lookups, hash := range query {
+		if bytes >= softResponseLimit || len(nodes) >= maxNodeDataServe ||
+			lookups >= 2*maxNodeDataServe {
+			break
+		}
+		// Retrieve the requested state entry — try cache+disk via the reader
+		// first so in-memory-only nodes (notably the pivot root) are served.
+		var entry []byte
+		if rerr == nil && reader != nil {
+			entry, _ = reader.Node(common.Hash{}, nil, hash)
+		}
+		if len(entry) == 0 {
+			// Fall back to bare on-disk HBSS lookup (preserves prior behavior).
+			entry = rawdb.ReadLegacyTrieNode(diskDB, hash)
+		}
+		if len(entry) == 0 {
+			// Fall back to contract code lookup (code is stored with prefix).
+			entry = backend.Chain().ContractCodeWithPrefix(hash)
+		}
+		if len(entry) > 0 {
+			nodes = append(nodes, entry)
+			bytes += len(entry)
+		}
+	}
+	return nodes
+}
+
+// handleNodeData handles a state trie node delivery on XDPOS2
+// (eth/63 shape — no RequestId wrapper). Forwards the data to the backend.
+//
+// A.36: NodeData intentionally skips the dispatcher's pending/tracker map.
+// The XDPOS2 wire carries no RequestId on either GetNodeData or NodeData, so
+// peer.RequestNodeData (peer.go) uses bare p2p.Send and never calls
+// p.tracker.Track. Consequently there is no synthetic tracker entry to Fulfil
+// here, and attempting to call peer.tracker.Fulfil with an unknown ID would
+// surface a spurious error. Outstanding-request accounting is owned by the
+// downloader's per-peer stateIdle flag (cleared by SetNodeDataIdle on every
+// termination path, incl. the non-blocking drop in Downloader.DeliverNodeData).
+func handleNodeData(backend Backend, msg Decoder, peer *Peer) error {
+	var res NodeDataPacket
+	if err := msg.Decode(&res); err != nil {
+		return fmt.Errorf("decode NodeData: %w", err)
+	}
+	return backend.Handle(peer, &res)
+}
+
+// XDPOS2 consensus message handlers (refs #740). Bodies are forwarded as
+// raw RLP — the XDPoS engine handles decoding inside consensus/XDPoS so the
+// wire layer stays consensus-agnostic.
+
+// handleVoteMsg handles XDPoS V2 vote messages over the xdpos2/100 protocol.
+func handleVoteMsg(backend Backend, msg Decoder, peer *Peer) error {
+	// XDC sends Vote as raw RLP, decode as RawValue to preserve bytes
+	var rawVote rlp.RawValue
+	if err := msg.Decode(&rawVote); err != nil {
+		return fmt.Errorf("failed to decode VoteMsg: %v", err)
+	}
+	return backend.Handle(peer, &VotePacket{Vote: rawVote})
+}
+
+// handleTimeoutMsg handles XDPoS V2 timeout messages over the xdpos2/100 protocol.
+func handleTimeoutMsg(backend Backend, msg Decoder, peer *Peer) error {
+	// XDC sends Timeout as raw RLP
+	var rawTimeout rlp.RawValue
+	if err := msg.Decode(&rawTimeout); err != nil {
+		return fmt.Errorf("failed to decode TimeoutMsg: %v", err)
+	}
+	return backend.Handle(peer, &TimeoutPacket{Timeout: rawTimeout})
+}
+
+// handleSyncInfoMsg handles XDPoS V2 sync-info messages over the xdpos2/100 protocol.
+func handleSyncInfoMsg(backend Backend, msg Decoder, peer *Peer) error {
+	// XDC sends SyncInfo as raw RLP
+	var rawSyncInfo rlp.RawValue
+	if err := msg.Decode(&rawSyncInfo); err != nil {
+		return fmt.Errorf("failed to decode SyncInfoMsg: %v", err)
+	}
+	return backend.Handle(peer, &SyncInfoPacket{SyncInfo: rawSyncInfo})
+}
+
 func handleGetCells(backend Backend, msg Decoder, peer *Peer) error {
 	// Decode the cell retrieval message
 	var query GetCellsRequestPacket
@@ -830,4 +1242,5 @@ func handleBlockAccessLists(backend Backend, msg Decoder, peer *Peer) error {
 		code: BlockAccessListsMsg,
 		Res:  (*BlockAccessListResponse)(&bals),
 	}, metadata)
+
 }

@@ -963,3 +963,93 @@ func encodeRL[T any](slice []T) rlp.RawList[T] {
 	}
 	return rl
 }
+
+// TestGetNodeDataXDPOS2 verifies that GetNodeData / NodeData work on the XDPOS2
+// protocol (eth/63 wire shape — no RequestId wrapper). Ported from upstream
+// Geth v1.10.13 TestGetNodeData66; adapted per #845 Phase A.1:
+//   - Protocol version XDPOS2 (100) instead of eth/66
+//   - Raw GetNodeDataPacket / NodeDataPacket (no 66-style RequestId wrapper)
+//   - HBSS-only: uses rawdb.HashScheme (the default), so ReadLegacyTrieNode serves
+//     state nodes keyed by hash. PBSS nodes would return empty data (accepted tradeoff).
+func TestGetNodeDataXDPOS2(t *testing.T) {
+	t.Parallel()
+
+	// Define two accounts to simulate transactions with.
+	acc1Key, _ := crypto.HexToECDSA("8a1f9a8f95be41cd7ccb6168179afb4504aefe388d1e14474d32c45c72ce7b7a")
+	acc2Key, _ := crypto.HexToECDSA("49a7b37aa6f6645917e7b807e9d1c00d4fa71f18343b0d4122a4d2df64dd6fee")
+	acc1Addr := crypto.PubkeyToAddress(acc1Key.PublicKey)
+	acc2Addr := crypto.PubkeyToAddress(acc2Key.PublicKey)
+
+	signer := types.HomesteadSigner{}
+	// Build a small chain with state changes across 2 blocks.
+	generator := func(i int, block *core.BlockGen) {
+		switch i {
+		case 0:
+			// Block 1: test bank sends acc1 some ether.
+			tx, _ := types.SignTx(types.NewTransaction(block.TxNonce(testAddr), acc1Addr, big.NewInt(10_000_000_000_000_000), params.TxGas, block.BaseFee(), nil), signer, testKey)
+			block.AddTx(tx)
+		case 1:
+			// Block 2: test bank sends more ether to acc1; acc1 passes some to acc2.
+			tx1, _ := types.SignTx(types.NewTransaction(block.TxNonce(testAddr), acc1Addr, big.NewInt(1_000_000_000_000_000), params.TxGas, block.BaseFee(), nil), signer, testKey)
+			tx2, _ := types.SignTx(types.NewTransaction(block.TxNonce(acc1Addr), acc2Addr, big.NewInt(1_000_000_000_000_000), params.TxGas, block.BaseFee(), nil), signer, acc1Key)
+			block.AddTx(tx1)
+			block.AddTx(tx2)
+		}
+	}
+
+	// Assemble the test environment.
+	// newTestBackendWithGenerator commits trie nodes for each block, so the
+	// HBSS (hash-keyed) nodes are present in the memory database.
+	backend := newTestBackendWithGenerator(2, false, false, generator)
+	defer backend.close()
+
+	peer, _ := newTestPeer("peer", XDPOS2, backend)
+	defer peer.close()
+
+	// Collect all hash-keyed (32-byte key) entries written into the database.
+	// In HBSS the state trie nodes are stored keyed by their Keccak hash.
+	var hashes []common.Hash
+	it := backend.db.NewIterator(nil, nil)
+	for it.Next() {
+		if key := it.Key(); len(key) == common.HashLength {
+			hashes = append(hashes, common.BytesToHash(key))
+		}
+	}
+	it.Release()
+
+	if len(hashes) == 0 {
+		t.Fatal("no hash-keyed trie nodes found in the test database — check that HBSS is in use")
+	}
+
+	// Send a GetNodeData request (XDPOS2/eth-63 shape: raw packet, no RequestId).
+	p2p.Send(peer.app, GetNodeDataMsg, GetNodeDataPacket(hashes))
+
+	msg, err := peer.app.ReadMsg()
+	if err != nil {
+		t.Fatalf("failed to read NodeData response: %v", err)
+	}
+	if msg.Code != NodeDataMsg {
+		t.Fatalf("response packet code mismatch: have %#x, want %#x", msg.Code, NodeDataMsg)
+	}
+
+	// Decode the response (bare list, no RequestId wrapper).
+	var res NodeDataPacket
+	if err := msg.Decode(&res); err != nil {
+		t.Fatalf("failed to decode NodeData response: %v", err)
+	}
+
+	// Verify that every returned blob hashes back to the requested hash.
+	// The server may return fewer entries than requested (e.g. code nodes that
+	// need the ContractCodeWithPrefix path), so we verify what we received.
+	for i, blob := range res {
+		if i >= len(hashes) {
+			t.Errorf("received more blobs (%d) than requested (%d)", len(res), len(hashes))
+			break
+		}
+		have := crypto.Keccak256Hash(blob)
+		if have != hashes[i] {
+			t.Errorf("blob %d hash mismatch: have %x, want %x", i, have, hashes[i])
+		}
+	}
+	_ = acc2Addr // suppress unused warning (acc2 receives funds in block 2)
+}
