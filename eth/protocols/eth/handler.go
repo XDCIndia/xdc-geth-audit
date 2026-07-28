@@ -54,6 +54,9 @@ const (
 	// be softResponseLimit.
 	maxReceiptsServe = 1024
 
+	// maxNodeDataServe is the maximum number of state trie nodes returned in a
+	// single GetNodeData query response (XDPOS2). Restored from upstream v1.10.13.
+	maxNodeDataServe = 1024
 	// maxBALsServe is the maximum number of block access lists to serve.
 	maxBALsServe = 1024
 )
@@ -200,6 +203,85 @@ var eth70 = map[uint64]msgHandler{
 	BlockRangeUpdateMsg:           handleBlockRangeUpdate,
 }
 
+// xdpos2 handler map (refs #740). Mirrors eth/70's data-plane handlers and
+// adds the three XDPoS V2 consensus messages. XDC↔XDC peering goes through
+// this protocol so vote/timeout/sync-info gossip stays inside the fleet.
+var xdpos2 = map[uint64]msgHandler{
+	NewBlockHashesMsg:             handleNewBlockhashesXDC,
+	NewBlockMsg:                   handleNewBlockXDC,
+	TransactionsMsg:               handleTransactions,
+	// A.60.3 (refs #857): msg code 0x08 is NewPooledTransactionHashesMsg on
+	// modern eth/68+ but OrderTxMsg on legacy XDPoSChain (XDC DEX order-tx
+	// broadcast). Routing inbound 0x08 from a legacy XDC peer through the
+	// pooled-tx handler decodes the payload as `[]Hash` — but the actual
+	// payload is `[]OrderTransaction`, a richer struct. The mismatch trips
+	// the decoder and disconnects the peer. Route to a no-op consumer
+	// instead: we don't run the XDC DEX, we just need to drain the message
+	// off the wire so the peer stays connected.
+	NewPooledTransactionHashesMsg: handleXDCTradingTxNoop,
+
+	GetBlockHeadersMsg:            handleGetBlockHeaders,
+	BlockHeadersMsg:               handleBlockHeaders,
+	GetBlockBodiesMsg:             handleGetBlockBodies,
+	BlockBodiesMsg:                handleBlockBodies,
+	GetNodeDataMsg:                handleGetNodeData,
+	NodeDataMsg:                   handleNodeData,
+	// A.60.1 (refs #857): GetReceipts on XDPOS2 carries the eth/63 bare-list
+	// wire shape `[]common.Hash`, NOT the eth/69+ {RequestId, hashes} wrapper.
+	// Routing inbound 0x0f through handleGetReceipts70 trips its decoder on
+	// the leading 32-byte hash trying to read a uint64 RequestId, fails with
+	// "rlp: input string too long for uint64", and the remote disconnects us.
+	GetReceiptsMsg:                handleGetReceiptsXDPOS2,
+	// A.33: XDPOS2 ReceiptsMsg uses the bare-list wire shape (no RequestId),
+	// not eth/70's RequestId+FirstBlockReceiptIndex wrapper. Route incoming
+	// receipt responses through handleReceiptsXDPOS2 which decodes the bare
+	// shape and dispatches via stashed legacyReceiptsReqID.
+	ReceiptsMsg:                   handleReceiptsXDPOS2,
+	// A.60.3 (refs #857): msg code 0x09 is GetPooledTransactionsMsg on modern
+	// eth/68+ but LendingTxMsg on legacy XDPoSChain (XDC lending-protocol tx).
+	// Same routing-mismatch story as 0x08 above; drain to no-op.
+	GetPooledTransactionsMsg:      handleXDCTradingTxNoop,
+	PooledTransactionsMsg:         handlePooledTransactions,
+	BlockRangeUpdateMsg:           handleBlockRangeUpdate,
+	VoteMsg:                       handleVoteMsg,
+	TimeoutMsg:                    handleTimeoutMsg,
+	SyncInfoMsg:                   handleSyncInfoMsg,
+}
+
+// handleNewBlockhashesXDC handles the legacy eth/63 NewBlockHashes message
+// that production XDC peers gossip on XDPOS2. The earlier "accept-and-discard"
+// implementation caused at-tip stall: xdcSyncer polls every 500ms and at tip
+// most peers respond count=0 (they expect us to receive the block via the
+// NewBlock broadcast instead). Now we decode + forward to backend.Handle for
+// proper processing.
+func handleNewBlockhashesXDC(backend Backend, msg Decoder, peer *Peer) error {
+	ann := new(NewBlockHashesPacket)
+	if err := msg.Decode(ann); err != nil {
+		return fmt.Errorf("failed to decode NewBlockHashesPacket: %v", err)
+	}
+	return backend.Handle(peer, ann)
+}
+
+// handleNewBlockXDC handles the legacy eth/63 NewBlock message: a fully-mined
+// tip block + the announcing peer's TD. Decodes and dispatches to backend
+// for chain insertion. Without this, the node falls behind tip at the
+// canonical block-production rate (~0.5 blocks/sec on Apothem) because the
+// xdcSyncer's request path returns count=0 from peers that have already
+// gossiped the block via this broadcast.
+func handleNewBlockXDC(backend Backend, msg Decoder, peer *Peer) error {
+	ann := new(NewBlockPacket)
+	if err := msg.Decode(ann); err != nil {
+		return fmt.Errorf("failed to decode NewBlockPacket: %v", err)
+	}
+	if ann.Block == nil {
+		return fmt.Errorf("nil block in NewBlockPacket")
+	}
+	ann.Block.ReceivedAt = time.Now()
+	ann.Block.ReceivedFrom = peer
+	return backend.Handle(peer, ann)
+}
+
+// eth71 handler map (upstream eth/71 additively included for non-XDC peers).
 var eth71 = map[uint64]msgHandler{
 	TransactionsMsg:               handleTransactions,
 	NewPooledTransactionHashesMsg: handleNewPooledTransactionHashes,
@@ -237,6 +319,8 @@ func handleMessage(backend Backend, peer *Peer) error {
 		handlers = eth70
 	case ETH71:
 		handlers = eth71
+	case XDPOS2:
+		handlers = xdpos2
 	default:
 		return fmt.Errorf("unknown eth protocol version: %v", peer.version)
 	}

@@ -154,6 +154,32 @@ func (d *Downloader) BeaconExtend(head *types.Header) error {
 // Internally backfilling and state sync is done the same way, but the header
 // retrieval and scheduling is replaced.
 func (d *Downloader) beaconSync(head *types.Header, final *types.Header, force bool) error {
+	// A.90: for dynamic Fast Sync (no operator pivot), set the skeleton terminate
+	// floor to pivotNum (not pivotNum-1) immediately when the peer head is known.
+	// Without this the skeleton walks all the way back to genesis (82M+ blocks)
+	// instead of stopping at pivot (~1800 back).
+	//
+	// Why pivotNum, not pivotNum-1: skeleton exits walk-back when
+	// Tail ≤ floor+1, so floor=pivotNum → beaconTail stops at pivotNum+1, and
+	// findBeaconAncestor's HasFastBlock checks beaconTail-1 = pivotNum — exactly
+	// the lowest header in the A.90.1 prime window [head-pivotDist..head]. Setting
+	// floor=pivotNum-1 (as the operator path does via SetFastSyncPivot) works
+	// there because the prime starts at the operator pivot block itself, not the
+	// peer's current tip, so pivot-1 is inside the prime range. Here it is not.
+	if d.operatorPivotNumber == 0 {
+		d.pivotGapLock.RLock()
+		hasFn := d.fastSyncAnchorFn != nil
+		d.pivotGapLock.RUnlock()
+		if hasFn && head != nil {
+			pivotDist := d.fastSyncPivotDistance(ethconfig.FastSync)
+			if head.Number.Uint64() > pivotDist {
+				pivotNum := head.Number.Uint64() - pivotDist
+				d.skeleton.SetTerminateFloor(pivotNum)
+				log.Debug("Fast Sync A.90: set dynamic skeleton terminate floor",
+					"pivot", pivotNum, "floor", pivotNum, "head", head.Number.Uint64())
+			}
+		}
+	}
 	// Signal the skeleton sync to switch to a new head, however it wants
 	return d.skeleton.Sync(head, final, force)
 }
@@ -170,7 +196,9 @@ func (d *Downloader) findBeaconAncestor() (uint64, error) {
 	switch d.getMode() {
 	case ethconfig.FullSync:
 		chainHead = d.blockchain.CurrentBlock()
-	case ethconfig.SnapSync:
+	case ethconfig.SnapSync, ethconfig.FastSync:
+		// FastSync (NodeData-based) uses the same snap-block tracking as SnapSync.
+		// Both commit pivot blocks via the snap-block pointer. Refs #844 A.7.
 		chainHead = d.blockchain.CurrentSnapBlock()
 	default:
 		panic("unknown sync mode")
@@ -192,7 +220,9 @@ func (d *Downloader) findBeaconAncestor() (uint64, error) {
 	switch d.getMode() {
 	case ethconfig.FullSync:
 		linked = d.blockchain.HasBlock(beaconTail.ParentHash, beaconTail.Number.Uint64()-1)
-	case ethconfig.SnapSync:
+	case ethconfig.SnapSync, ethconfig.FastSync:
+		// FastSync uses HasFastBlock like SnapSync — both track via snap-block pointer.
+		// Refs #844 A.7.
 		linked = d.blockchain.HasFastBlock(beaconTail.ParentHash, beaconTail.Number.Uint64()-1)
 	default:
 		panic("unknown sync mode")
@@ -230,7 +260,8 @@ func (d *Downloader) findBeaconAncestor() (uint64, error) {
 		switch d.getMode() {
 		case ethconfig.FullSync:
 			known = d.blockchain.HasBlock(h.Hash(), n)
-		case ethconfig.SnapSync:
+		case ethconfig.SnapSync, ethconfig.FastSync:
+			// FastSync uses HasFastBlock like SnapSync. Refs #844 A.7.
 			known = d.blockchain.HasFastBlock(h.Hash(), n)
 		default:
 			panic("unknown sync mode")
@@ -284,7 +315,11 @@ func (d *Downloader) fetchHeaders(from uint64) error {
 		if h == nil {
 			return fmt.Errorf("header at chain cutoff is not available, cutoff: %d", d.chainCutoffNumber)
 		}
-		if h.Hash() != d.chainCutoffHash {
+		// Skip hash validation when chainCutoffHash is zero (sync-from-block
+		// mode where we only know the block number, not the expected hash).
+		// XDC: Also skip when the cutoff hash matches a TrustedSyncCheckpoint —
+		// the checkpoint hash is hardcoded and already validated above.
+		if d.chainCutoffHash != (common.Hash{}) && h.Hash() != d.chainCutoffHash {
 			return fmt.Errorf("header at chain cutoff mismatched, want: %v, got: %v", d.chainCutoffHash, h.Hash())
 		}
 	}
@@ -298,19 +333,32 @@ func (d *Downloader) fetchHeaders(from uint64) error {
 		}
 		// If the pivot became stale (older than 2*64-8 (bit of wiggle room)),
 		// move it ahead to HEAD-64.
-		//
-		// The state syncer is consulted first before the pivot movement.
+		// A.97.1b (refs #894 #886): beaconPivotMoverDecision gates the advance
+		// behind the pivot freeze for the dynamic path (operatorPivotNumber == 0).
+		// The operator-pinned path behavior is byte-identical to the original.
 		d.pivotLock.Lock()
-		if d.pivotHeader != nil && d.snapSyncer.FrozenPivot() == nil {
-			if head.Number.Uint64() > d.pivotHeader.Number.Uint64()+2*uint64(fsMinFullBlocks)-8 {
-				// Retrieve the next pivot header, either from skeleton chain
-				// or the filled chain
-				number := head.Number.Uint64() - uint64(fsMinFullBlocks)
+		if d.pivotHeader != nil {
+			advance, refused, newNumber := beaconPivotMoverDecision(
+				head.Number.Uint64(),
+				d.pivotHeader.Number.Uint64(),
+				d.operatorPivotNumber,
+				d.IsPivotFrozen(),
+			)
+			if refused {
+				// Pivot frozen during state download — refuse the advance.
+				// refusePivotUpdate logs a consistent WARN marker so deploy-stage
+				// log greps see one marker regardless of which mover fired.
+				d.refusePivotUpdate(newNumber, d.pivotHeader.Hash())
+				d.pivotLock.Unlock()
+				// Fall through to the normal header-scheduling code below.
+				goto scheduleHeaders
+			}
+			if advance {
+				log.Warn("Pivot seemingly stale, moving", "old", d.pivotHeader.Number, "new", newNumber)
+				if d.pivotHeader = d.skeleton.Header(newNumber); d.pivotHeader == nil {
+					if newNumber < tail.Number.Uint64() {
+						dist := tail.Number.Uint64() - newNumber
 
-				log.Warn("Pivot seemingly stale, moving", "old", d.pivotHeader.Number, "new", number)
-				if d.pivotHeader = d.skeleton.Header(number); d.pivotHeader == nil {
-					if number < tail.Number.Uint64() {
-						dist := tail.Number.Uint64() - number
 						if len(localHeaders) >= int(dist) {
 							d.pivotHeader = localHeaders[dist-1]
 							log.Warn("Retrieved pivot header from local", "number", d.pivotHeader.Number, "hash", d.pivotHeader.Hash(), "latest", head.Number, "oldest", tail.Number)
@@ -321,7 +369,7 @@ func (d *Downloader) fetchHeaders(from uint64) error {
 				// is still not found. It means the skeleton chain is not linked
 				// correctly with local chain.
 				if d.pivotHeader == nil {
-					log.Error("Pivot header is not found", "number", number)
+					log.Error("Pivot header is not found", "number", newNumber)
 					d.pivotLock.Unlock()
 					return errNoPivotHeader
 				}
@@ -333,6 +381,7 @@ func (d *Downloader) fetchHeaders(from uint64) error {
 		}
 		d.pivotLock.Unlock()
 
+	scheduleHeaders:
 		// Retrieve a batch of headers and feed it to the header processor
 		var (
 			headers = make([]*types.Header, 0, maxHeadersProcess)
@@ -390,4 +439,42 @@ func (d *Downloader) fetchHeaders(from uint64) error {
 			return errCanceled
 		}
 	}
+}
+
+// beaconPivotMoverDecision is the pure decision function for the beacon/skeleton
+// pivot mover. It captures the "should we advance the pivot?" logic so that it
+// can be tested without constructing a live skeleton. Used by fetchHeaders.
+//
+// Returns:
+//   - advance=true, newNumber>0: caller should move pivot to newNumber
+//   - advance=false, frozen=true: pivot is frozen, refuse the advance
+//   - advance=false, frozen=false: stale threshold not reached, no-op
+//
+// Parameters:
+//   - headNumber: current skeleton head block number (from d.skeleton.Bounds())
+//   - pivotNumber: current d.pivotHeader.Number.Uint64()
+//   - operatorPivotNumber: d.operatorPivotNumber (0 = dynamic path)
+//   - pivotFrozen: d.IsPivotFrozen()
+func beaconPivotMoverDecision(headNumber, pivotNumber, operatorPivotNumber uint64, pivotFrozen bool) (advance bool, refused bool, newNumber uint64) {
+	// Operator-pinned path: zero behavior change — skip all guards.
+	if operatorPivotNumber != 0 {
+		if headNumber > pivotNumber+2*uint64(fsMinFullBlocks)-8 {
+			return true, false, headNumber - uint64(fsMinFullBlocks)
+		}
+		return false, false, 0
+	}
+	// Dynamic path: check the staleness threshold first. Only refuse (or advance)
+	// when the head has crossed the threshold. Below the threshold there is nothing
+	// to refuse: return no-op regardless of freeze state.
+	if headNumber <= pivotNumber+2*uint64(fsMinFullBlocks)-8 {
+		return false, false, 0
+	}
+	// Head is past the stale threshold. Compute the would-be new pivot number
+	// regardless of whether we advance or refuse — the caller uses it for logging.
+	target := headNumber - uint64(fsMinFullBlocks)
+	// If frozen, refuse — otherwise advance.
+	if pivotFrozen {
+		return false, true, target
+	}
+	return true, false, target
 }

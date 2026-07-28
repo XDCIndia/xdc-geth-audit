@@ -272,7 +272,11 @@ func (q *queue) Schedule(headers []*types.Header, hashes []common.Hash, from uin
 			q.blockTaskQueue.Push(header, -int64(header.Number.Uint64()))
 		}
 		// Queue for receipt retrieval
-		if q.mode == ethconfig.SnapSync && !header.EmptyReceipts() {
+		// A.30: FastSync needs receipts too — without this gate, the receipt
+		// task queue stays empty for FastSync mode and the fetcher never runs.
+		// Without receipts, InsertReceiptChain fails the ReceiptHash check and
+		// pivot commit never fires (head stuck at 0 after state-sync drain).
+		if (q.mode == ethconfig.SnapSync || q.mode == ethconfig.FastSync) && !header.EmptyReceipts() {
 			if _, ok := q.receiptTaskPool[hash]; ok {
 				log.Warn("Header already scheduled for receipt fetch", "number", header.Number, "hash", hash)
 			} else {
@@ -425,7 +429,11 @@ func (q *queue) reserveHeaders(p *peerConnection, count int, taskPool map[common
 		// we can ask the resultcache if this header is within the
 		// "prioritized" segment of blocks. If it is not, we need to throttle
 
-		stale, throttle, item, err := q.resultCache.AddFetch(header, q.mode == ethconfig.SnapSync)
+		// A.30: also flag the receipt-pending bit for FastSync so a result is
+		// not marked AllDone on body alone — body+receipt are both required
+		// before commitFastSyncData reads it out (otherwise result.Receipts is
+		// nil and InsertReceiptChain fails the ReceiptHash check).
+		stale, throttle, item, err := q.resultCache.AddFetch(header, q.mode == ethconfig.SnapSync || q.mode == ethconfig.FastSync)
 		if stale {
 			// Don't put back in the task queue, this item has already been
 			// delivered upstream
@@ -536,11 +544,13 @@ func (q *queue) ExpireReceipts(peer string) int {
 // lock is not obtained in here is that the parameters already need to access
 // the queue, so they already need a lock anyway.
 func (q *queue) expire(peer string, pendPool map[string]*fetchRequest, taskQueue interface{}) int {
-	// Retrieve the request being expired and log an error if it's non-existent,
-	// as there's no order of events that should lead to such expirations.
+	// A.40: a missing entry is the *normal* case for peers that disconnect
+	// without ever reserving a body/receipt task (header-only, NodeData-only,
+	// or cycled-pre-assignment). Was log.Error → operators drowned in noise
+	// during cross-fleet sync; downgrade to Trace.
 	req := pendPool[peer]
 	if req == nil {
-		log.Error("Expired request does not exist", "peer", peer)
+		log.Trace("Expired request does not exist", "peer", peer)
 		return 0
 	}
 	delete(pendPool, peer)

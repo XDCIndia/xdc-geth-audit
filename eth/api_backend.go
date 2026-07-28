@@ -18,8 +18,11 @@ package eth
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"math/big"
+	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/ethereum/go-ethereum"
@@ -57,6 +60,38 @@ type EthAPIBackend struct {
 // ChainConfig returns the active chain configuration.
 func (b *EthAPIBackend) ChainConfig() *params.ChainConfig {
 	return b.eth.blockchain.Config()
+}
+
+// BlockChain returns the underlying blockchain for XDPoS operations.
+func (b *EthAPIBackend) BlockChain() *core.BlockChain {
+	return b.eth.blockchain
+}
+
+// SnapHealStatus returns the current A.97.2 snap-heal status for
+// xdc_getStateHealStatus RPC. Reads healStatus from xdcSyncer under its mutex.
+// Returns nil if no xdcSyncer is initialised (should not happen for full nodes).
+// Refs #894.
+func (b *EthAPIBackend) SnapHealStatus() *core.SnapHealStatusFields {
+	xdcSync := b.eth.handler.xdcSync
+	if xdcSync == nil {
+		return nil
+	}
+	xdcSync.healStatusMu.Lock()
+	st := xdcSync.healStatus
+	xdcSync.healStatusMu.Unlock()
+
+	return &core.SnapHealStatusFields{
+		// Mirror live checkpointSyncNoState so callers see current value
+		// even if heal has not started yet.
+		Enabled:         b.eth.blockchain.CheckpointSyncNoState(),
+		InProgress:      st.InProgress,
+		Mode:            "snap-heal",
+		TargetRoot:      st.TargetRoot,
+		TrienodePending: st.TrienodePending,
+		BytecodePending: st.BytecodePending,
+		HealStartUnix:   st.HealStartUnix,
+		LastError:       st.LastError,
+	}
 }
 
 func (b *EthAPIBackend) CurrentBlock() *types.Header {
@@ -503,6 +538,30 @@ func (b *EthAPIBackend) NewMatcherBackend() filtermaps.MatcherBackend {
 
 func (b *EthAPIBackend) Engine() consensus.Engine {
 	return b.eth.engine
+}
+
+func (b *EthAPIBackend) GetRewardByHash(hash common.Hash) map[string]map[string]map[string]*big.Int {
+	header := b.eth.blockchain.GetHeaderByHash(hash)
+	if header != nil {
+		data, err := os.ReadFile(filepath.Join(common.StoreRewardFolder, header.Number.String()+"."+header.Hash().Hex()))
+		if err == nil {
+			rewards := make(map[string]map[string]map[string]*big.Int)
+			err = json.Unmarshal(data, &rewards)
+			if err == nil {
+				return rewards
+			}
+		} else {
+			data, err = os.ReadFile(filepath.Join(common.StoreRewardFolder, header.Number.String()+"."+header.HashNoValidator().Hex()))
+			if err == nil {
+				rewards := make(map[string]map[string]map[string]*big.Int)
+				err = json.Unmarshal(data, &rewards)
+				if err == nil {
+					return rewards
+				}
+			}
+		}
+	}
+	return make(map[string]map[string]map[string]*big.Int)
 }
 
 func (b *EthAPIBackend) CurrentHeader() *types.Header {
