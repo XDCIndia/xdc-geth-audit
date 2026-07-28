@@ -82,6 +82,11 @@ type Header struct {
 	MixDigest   common.Hash    `json:"mixHash"`
 	Nonce       BlockNonce     `json:"nonce"`
 
+	// XDPoS fields for validator consensus (always encoded, not optional)
+	Validators []byte `json:"validators"`
+	Validator  []byte `json:"validator"`
+	Penalties  []byte `json:"penalties"`
+
 	// BaseFee was added by EIP-1559 and is ignored in legacy headers.
 	BaseFee *big.Int `json:"baseFeePerGas" rlp:"optional"`
 
@@ -101,9 +106,11 @@ type Header struct {
 	RequestsHash *common.Hash `json:"requestsHash" rlp:"optional"`
 
 	// BlockAccessListHash was added by EIP-7928 and is ignored in legacy headers.
+	// XDC chains never set this; field present for v1.17.4 upstream-package compatibility.
 	BlockAccessListHash *common.Hash `json:"blockAccessListHash" rlp:"optional"`
 
 	// SlotNumber was added by EIP-7843 and is ignored in legacy headers.
+	// XDC chains never set this; field present for v1.17.3 upstream-package compatibility.
 	SlotNumber *uint64 `json:"slotNumber" rlp:"optional"`
 }
 
@@ -119,13 +126,60 @@ type headerMarshaling struct {
 	Hash          common.Hash `json:"hash"` // adds call to Hash() in MarshalJSON
 	BlobGasUsed   *hexutil.Uint64
 	ExcessBlobGas *hexutil.Uint64
-	SlotNumber    *hexutil.Uint64
+	// XDPoS fields
+	Validators hexutil.Bytes
+	Validator  hexutil.Bytes
+	Penalties  hexutil.Bytes
 }
 
 // Hash returns the block hash of the header, which is simply the keccak256 hash of its
 // RLP encoding.
 func (h *Header) Hash() common.Hash {
 	return rlpHash(h)
+}
+
+// HashNoNonce returns the hash which is used as input for the proof-of-work search.
+func (h *Header) HashNoNonce() common.Hash {
+	return rlpHash([]interface{}{
+		h.ParentHash,
+		h.UncleHash,
+		h.Coinbase,
+		h.Root,
+		h.TxHash,
+		h.ReceiptHash,
+		h.Bloom,
+		h.Difficulty,
+		h.Number,
+		h.GasLimit,
+		h.GasUsed,
+		h.Time,
+		h.Extra,
+	})
+}
+
+// HashNoValidator returns the header hash with an empty Validator field.
+// Used in XDPoS double-validation (M2 verification excludes the validator field).
+func (h *Header) HashNoValidator() common.Hash {
+	return rlpHash([]interface{}{
+		h.ParentHash,
+		h.UncleHash,
+		h.Coinbase,
+		h.Root,
+		h.TxHash,
+		h.ReceiptHash,
+		h.Bloom,
+		h.Difficulty,
+		h.Number,
+		h.GasLimit,
+		h.GasUsed,
+		h.Time,
+		h.Extra,
+		h.MixDigest,
+		h.Nonce,
+		h.Validators,
+		[]byte{},
+		h.Penalties,
+	})
 }
 
 var headerSize = common.StorageSize(reflect.TypeFor[Header]().Size())
@@ -137,7 +191,7 @@ func (h *Header) Size() common.StorageSize {
 	if h.BaseFee != nil {
 		baseFeeBits = h.BaseFee.BitLen()
 	}
-	return headerSize + common.StorageSize(len(h.Extra)+(h.Difficulty.BitLen()+h.Number.BitLen()+baseFeeBits)/8)
+	return headerSize + common.StorageSize(len(h.Extra)+len(h.Validators)+len(h.Validator)+len(h.Penalties)+(h.Difficulty.BitLen()+h.Number.BitLen()+baseFeeBits)/8)
 }
 
 // SanityCheck checks a few basic things -- these checks are way beyond what
@@ -325,14 +379,6 @@ func CopyHeader(h *Header) *Header {
 		cpy.RequestsHash = new(common.Hash)
 		*cpy.RequestsHash = *h.RequestsHash
 	}
-	if h.BlockAccessListHash != nil {
-		cpy.BlockAccessListHash = new(common.Hash)
-		*cpy.BlockAccessListHash = *h.BlockAccessListHash
-	}
-	if h.SlotNumber != nil {
-		cpy.SlotNumber = new(uint64)
-		*cpy.SlotNumber = *h.SlotNumber
-	}
 	return &cpy
 }
 
@@ -367,10 +413,9 @@ func (b *Block) Body() *Body {
 // Accessors for body data. These do not return a copy because the content
 // of the body slices does not affect the cached hash/size in block.
 
-func (b *Block) Uncles() []*Header                { return b.uncles }
-func (b *Block) Transactions() Transactions       { return b.transactions }
-func (b *Block) Withdrawals() Withdrawals         { return b.withdrawals }
-func (b *Block) AccessList() *bal.BlockAccessList { return b.accessList }
+func (b *Block) Uncles() []*Header          { return b.uncles }
+func (b *Block) Transactions() Transactions { return b.transactions }
+func (b *Block) Withdrawals() Withdrawals   { return b.withdrawals }
 
 func (b *Block) Transaction(hash common.Hash) *Transaction {
 	for _, transaction := range b.transactions {
@@ -385,6 +430,13 @@ func (b *Block) Transaction(hash common.Hash) *Transaction {
 func (b *Block) Header() *Header {
 	return CopyHeader(b.header)
 }
+
+// Issue #682 Tier 1 #5: SetStateRoot — a primitive that mutated header.Root
+// in place "to bypass state root validation at checkpoint blocks" — was
+// removed here. It had zero callers across the codebase at the time of
+// removal (grep -r "\.SetStateRoot\b"). The very ability to mutate a
+// block's state root in place was a foot-cannon kept around for bypass-era
+// recovery code that no longer exists.
 
 // Header value accessors. These do copy!
 
@@ -416,6 +468,23 @@ func (b *Block) BaseFee() *big.Int {
 func (b *Block) BeaconRoot() *common.Hash          { return b.header.ParentBeaconRoot }
 func (b *Block) RequestsHash() *common.Hash        { return b.header.RequestsHash }
 func (b *Block) BlockAccessListHash() *common.Hash { return b.header.BlockAccessListHash }
+func (b *Block) AccessList() *bal.BlockAccessList   { return b.accessList }
+
+// WithAccessList returns a copy of the block with the given access list embedded.
+func (b *Block) WithAccessList(accessList *bal.BlockAccessList) *Block {
+	return b.WithAccessListUnsafe(accessList.Copy())
+}
+
+// WithAccessListUnsafe returns a copy of the block with the access list embedded without deep copy.
+func (b *Block) WithAccessListUnsafe(accessList *bal.BlockAccessList) *Block {
+	return &Block{
+		header:       b.header,
+		transactions: b.transactions,
+		uncles:       b.uncles,
+		withdrawals:  b.withdrawals,
+		accessList:   accessList,
+	}
+}
 
 func (b *Block) ExcessBlobGas() *uint64 {
 	var excessBlobGas *uint64
@@ -433,15 +502,6 @@ func (b *Block) BlobGasUsed() *uint64 {
 		*blobGasUsed = *b.header.BlobGasUsed
 	}
 	return blobGasUsed
-}
-
-func (b *Block) SlotNumber() *uint64 {
-	var slotNum *uint64
-	if b.header.SlotNumber != nil {
-		slotNum = new(uint64)
-		*slotNum = *b.header.SlotNumber
-	}
-	return slotNum
 }
 
 // Size returns the true RLP encoded storage size of the block, either by encoding
@@ -506,7 +566,6 @@ func (b *Block) WithSeal(header *Header) *Block {
 		transactions: b.transactions,
 		uncles:       b.uncles,
 		withdrawals:  b.withdrawals,
-		accessList:   b.accessList,
 	}
 }
 
@@ -518,30 +577,11 @@ func (b *Block) WithBody(body Body) *Block {
 		transactions: slices.Clone(body.Transactions),
 		uncles:       make([]*Header, len(body.Uncles)),
 		withdrawals:  slices.Clone(body.Withdrawals),
-		accessList:   b.accessList,
 	}
 	for i := range body.Uncles {
 		block.uncles[i] = CopyHeader(body.Uncles[i])
 	}
 	return block
-}
-
-// WithAccessList returns a copy of the block with the given access list embedded.
-func (b *Block) WithAccessList(accessList *bal.BlockAccessList) *Block {
-	return b.WithAccessListUnsafe(accessList.Copy())
-}
-
-// WithAccessListUnsafe returns a copy of the block with the given access list
-// embedded. Note that the access list is not deep-copied; use WithAccessList
-// if the provided list may be modified by other actors.
-func (b *Block) WithAccessListUnsafe(accessList *bal.BlockAccessList) *Block {
-	return &Block{
-		header:       b.header,
-		transactions: b.transactions,
-		uncles:       b.uncles,
-		withdrawals:  b.withdrawals,
-		accessList:   accessList,
-	}
 }
 
 // Hash returns the keccak256 hash of b's header.
@@ -574,3 +614,7 @@ func HeaderParentHashFromRLP(header []byte) common.Hash {
 	}
 	return common.BytesToHash(parentHash)
 }
+
+// SlotNumber returns the block's slot number (EIP-7843). XDC chains never
+// set this; always returns nil. Present for v1.17.3 upstream compatibility.
+func (b *Block) SlotNumber() *uint64 { return b.header.SlotNumber }

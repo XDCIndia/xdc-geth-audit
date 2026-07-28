@@ -18,13 +18,16 @@ package types
 
 import (
 	"bytes"
+	"math/big"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/rlp"
 	"github.com/holiman/uint256"
 )
 
-//go:generate go run ../../rlp/rlpgen -type StateAccount -out gen_account_rlp.go
+// NOTE: go:generate for rlpgen is disabled — EncodeRLP/DecodeRLP are now
+// hand-written in gen_account_rlp.go to support balances > 2^256-1 (XDC).
+// OLD: //go:generate go run ../../rlp/rlpgen -type StateAccount -out gen_account_rlp.go
 
 // StateAccount is the Ethereum consensus representation of accounts.
 // These objects are stored in the main account trie.
@@ -33,6 +36,14 @@ type StateAccount struct {
 	Balance  *uint256.Int
 	Root     common.Hash // merkle root of the storage trie
 	CodeHash []byte
+
+	// BigBalance holds the true balance when it exceeds MaxUint256.
+	// This is needed for XDC chains where genesis accounts have 2^256-1
+	// balance and rewards push the balance beyond uint256 range.
+	// When BigBalance is non-nil, it is used for RLP encoding instead
+	// of Balance. Balance still holds the modular (wrapped) value for
+	// uint256-based operations.
+	BigBalance *big.Int `rlp:"-"`
 }
 
 // NewEmptyStateAccount constructs an empty state account.
@@ -50,11 +61,16 @@ func (acct *StateAccount) Copy() *StateAccount {
 	if acct.Balance != nil {
 		balance = new(uint256.Int).Set(acct.Balance)
 	}
+	var bigBal *big.Int
+	if acct.BigBalance != nil {
+		bigBal = new(big.Int).Set(acct.BigBalance)
+	}
 	return &StateAccount{
-		Nonce:    acct.Nonce,
-		Balance:  balance,
-		Root:     acct.Root,
-		CodeHash: common.CopyBytes(acct.CodeHash),
+		Nonce:      acct.Nonce,
+		Balance:    balance,
+		Root:       acct.Root,
+		CodeHash:   common.CopyBytes(acct.CodeHash),
+		BigBalance: bigBal,
 	}
 }
 
@@ -62,14 +78,43 @@ func (acct *StateAccount) Copy() *StateAccount {
 // with a byte slice. This format can be used to represent full-consensus format
 // or slim format which replaces the empty root and code hash as nil byte slice.
 type SlimAccount struct {
+	Nonce      uint64
+	Balance    *uint256.Int
+	BigBalance *big.Int `rlp:"-"` // Holds true balance when it exceeds 2^256-1 (XDC overflow) - NOT encoded in RLP
+	Root       []byte   // Nil if root equals to types.EmptyRootHash
+	CodeHash   []byte   // Nil if hash equals to types.EmptyCodeHash
+}
+
+// slimAccountBigBal is a helper struct for encoding SlimAccount with big.Int balance.
+// Used when the balance exceeds uint256 (XDC overflow scenario).
+type slimAccountBigBal struct {
 	Nonce    uint64
-	Balance  *uint256.Int
-	Root     []byte // Nil if root equals to types.EmptyRootHash
-	CodeHash []byte // Nil if hash equals to types.EmptyCodeHash
+	Balance  *big.Int
+	Root     []byte
+	CodeHash []byte
 }
 
 // SlimAccountRLP encodes the state account in 'slim RLP' format.
 func SlimAccountRLP(account StateAccount) []byte {
+	// If BigBalance is set (overflow), encode with big.Int to preserve full value
+	if account.BigBalance != nil {
+		slim := slimAccountBigBal{
+			Nonce:   account.Nonce,
+			Balance: account.BigBalance,
+		}
+		if account.Root != EmptyRootHash {
+			slim.Root = account.Root[:]
+		}
+		if !bytes.Equal(account.CodeHash, EmptyCodeHash[:]) {
+			slim.CodeHash = account.CodeHash
+		}
+		data, err := rlp.EncodeToBytes(slim)
+		if err != nil {
+			panic(err)
+		}
+		return data
+	}
+
 	slim := SlimAccount{
 		Nonce:   account.Nonce,
 		Balance: account.Balance,
@@ -87,26 +132,46 @@ func SlimAccountRLP(account StateAccount) []byte {
 	return data
 }
 
+// slimAccountBigBalDecode is a helper struct for decoding slim accounts
+// where the balance might exceed uint256 (XDC overflow scenario).
+type slimAccountBigBalDecode struct {
+	Nonce    uint64
+	Balance  *big.Int
+	Root     []byte
+	CodeHash []byte
+}
+
 // FullAccount decodes the data on the 'slim RLP' format and returns
 // the consensus format account.
 func FullAccount(data []byte) (*StateAccount, error) {
-	var slim SlimAccount
-	if err := rlp.DecodeBytes(data, &slim); err != nil {
+	// First try decoding with big.Int balance to handle >256-bit values
+	var slimBig slimAccountBigBalDecode
+	if err := rlp.DecodeBytes(data, &slimBig); err != nil {
 		return nil, err
 	}
 	var account StateAccount
-	account.Nonce, account.Balance = slim.Nonce, slim.Balance
+	account.Nonce = slimBig.Nonce
+
+	// Check if the balance fits in uint256
+	bal, overflow := uint256.FromBig(slimBig.Balance)
+	if overflow {
+		// Balance exceeds uint256 — store in BigBalance
+		account.Balance = bal // modular value
+		account.BigBalance = slimBig.Balance
+	} else {
+		account.Balance = bal
+	}
 
 	// Interpret the storage root and code hash in slim format.
-	if len(slim.Root) == 0 {
+	if len(slimBig.Root) == 0 {
 		account.Root = EmptyRootHash
 	} else {
-		account.Root = common.BytesToHash(slim.Root)
+		account.Root = common.BytesToHash(slimBig.Root)
 	}
-	if len(slim.CodeHash) == 0 {
+	if len(slimBig.CodeHash) == 0 {
 		account.CodeHash = EmptyCodeHash[:]
 	} else {
-		account.CodeHash = slim.CodeHash
+		account.CodeHash = slimBig.CodeHash
 	}
 	return &account, nil
 }
@@ -118,4 +183,29 @@ func FullAccountRLP(data []byte) ([]byte, error) {
 		return nil, err
 	}
 	return rlp.EncodeToBytes(account)
+}
+
+// ToSlimAccount converts a StateAccount to a SlimAccount, preserving BigBalance.
+func (a *StateAccount) ToSlimAccount() *SlimAccount {
+	slim := &SlimAccount{
+		Nonce:      a.Nonce,
+		Balance:    a.Balance,
+		BigBalance: a.BigBalance, // Preserve overflow balance
+	}
+	if a.Root != EmptyRootHash {
+		slim.Root = a.Root[:]
+	}
+	if !bytes.Equal(a.CodeHash, EmptyCodeHash[:]) {
+		slim.CodeHash = a.CodeHash
+	}
+	return slim
+}
+
+// DecodeSlimAccount decodes slim RLP data handling >256-bit balances (XDC).
+func DecodeSlimAccount(data []byte) (*SlimAccount, error) {
+	full, err := FullAccount(data)
+	if err != nil {
+		return nil, err
+	}
+	return full.ToSlimAccount(), nil
 }
