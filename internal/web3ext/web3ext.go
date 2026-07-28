@@ -27,6 +27,7 @@ var Modules = map[string]string{
 	"rpc":    RpcJs,
 	"txpool": TxpoolJs,
 	"dev":    DevJs,
+	"xdpos":  XDPoSJs,
 }
 
 const CliqueJs = `

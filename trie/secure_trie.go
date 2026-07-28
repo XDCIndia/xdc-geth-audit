@@ -17,6 +17,8 @@
 package trie
 
 import (
+	"fmt"
+
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
@@ -108,12 +110,23 @@ func (t *StateTrie) MustGet(key []byte) []byte {
 // GetAccount attempts to retrieve an account with provided account address.
 // If the specified account is not in the trie, nil will be returned.
 // If a trie node is not found in the database, a MissingNodeError is returned.
-func (t *StateTrie) GetAccount(address common.Address) (*types.StateAccount, error) {
+func (t *StateTrie) GetAccount(address common.Address) (ret *types.StateAccount, err error) {
 	res, err := t.trie.Get(crypto.Keccak256(address.Bytes()))
 	if res == nil || err != nil {
 		return nil, err
 	}
-	ret := new(types.StateAccount)
+	// XDC: wrap rlp.DecodeBytes in recover. Stored data on disk for some
+	// historical XDC accounts may encode balance > uint256 via big.Int RLP;
+	// the custom StateAccount.DecodeRLP handles it via slimAccountBigBalDecode,
+	// but if anything along the decode path panics, surface as an error so
+	// the caller (multiStateReader) can fall through to a different reader.
+	ret = new(types.StateAccount)
+	defer func() {
+		if rec := recover(); rec != nil {
+			ret = nil
+			err = fmt.Errorf("StateTrie.GetAccount: decode panic for %s: %v", address.Hex(), rec)
+		}
+	}()
 	err = rlp.DecodeBytes(res, ret)
 	return ret, err
 }
