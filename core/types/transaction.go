@@ -705,3 +705,16 @@ func copyAddressPtr(a *common.Address) *common.Address {
 	cpy := *a
 	return &cpy
 }
+
+// IsSpecialTx returns true if the transaction destination is a special XDC
+// contract (BlockSigners or RandomizeSMC) that requires special handling
+// (no signature verification, no gas charge, no fee deduction).
+// Required for state_transition.go XDC consensus paths (refs #740/#742).
+func IsSpecialTx(to *common.Address) bool {
+	return to != nil && (*to == common.BlockSignersBinary || *to == common.RandomizeSMCBinary)
+}
+
+// IsSpecialTransaction returns true if this transaction is a special XDC tx.
+func (tx *Transaction) IsSpecialTransaction() bool {
+	return tx != nil && IsSpecialTx(tx.To())
+}
