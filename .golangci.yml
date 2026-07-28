@@ -76,6 +76,11 @@ linters:
         text: 'SA1019: strings.Title has been deprecated since Go 1.18 and an alternative has been available since Go 1.0: The rule Title uses for word boundaries does not handle Unicode punctuation properly. Use golang.org/x/text/cases instead.'
       - path: (.+)\.go$
         text: 'SA1029: should not use built-in type string as key for value'
+      # TrustedSyncCheckpoints is Deprecated (A.97/#894); these are the
+      # intentional transitional fallback uses retained until the dynamic
+      # header-derived pivot lands. See params/config.go.
+      - path: (.+)\.go$
+        text: 'SA1019: .*TrustedSyncCheckpoint.* is deprecated: superseded by dynamic header-derived QC-verified pivot selection'
     paths:
       - core/genesis_alloc.go
       - third_party$
