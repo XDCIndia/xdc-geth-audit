@@ -1044,6 +1044,14 @@ func (p *BlobPool) Reset(oldHead, newHead *types.Header) {
 
 	statedb, err := p.chain.StateAt(newHead)
 	if err != nil {
+		// XDC A.99.6: fast-sync checkpointSyncNoState — real head state root not yet
+		// in trie DB. Keep old state and skip reset rather than flooding ERROR log.
+		// Refs: #1037.
+		if core.CheckpointSyncNoStateActive.Load() {
+			log.Debug("blobpool: head state not yet available (snap-heal pending), skipping reset",
+				"block", newHead.Number, "root", newHead.Root)
+			return
+		}
 		log.Error("Failed to reset blobpool state", "err", err)
 		return
 	}

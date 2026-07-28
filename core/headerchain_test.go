@@ -23,6 +23,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/consensus"
 	"github.com/ethereum/go-ethereum/consensus/ethash"
 	"github.com/ethereum/go-ethereum/core/rawdb"
@@ -108,4 +109,89 @@ func TestHeaderInsertion(t *testing.T) {
 
 	// And B becomes even longer
 	testInsert(t, hc, chainB[107:128], CanonStatTy, nil)
+}
+
+// TestGetTrustedCheckpointAnchorActiveAtGenesis is the A.68 regression guard
+// for the fresh-start fast-sync case: when the operator pivot is installed
+// (via SetFastSyncTrustedAnchor) on a chain whose header head is still at
+// genesis (headNum=0), the gate MUST return active=true so the XDPoS V2
+// engine's `inCheckpointCatchup` check fires and BeaconSync's verifyQC path
+// skips strict round-based QC verification (which would otherwise crash on
+// "parent header X not in DB (bulk sync?)" because the pre-pivot epoch-
+// switch ancestors haven't been backfilled yet).
+//
+// The pre-A.68 implementation used a symmetric ±2*Epoch window with a
+// `headNum >= pt.BlockNumber - 2*Epoch` lower bound that failed for headNum
+// =0 against any sufficiently high pivot. This test pins the corrected
+// semantics: active stays true until head climbs PAST pt.BlockNumber+2*Epoch.
+// Refs #844 A.68.
+func TestGetTrustedCheckpointAnchorActiveAtGenesis(t *testing.T) {
+	var (
+		db    = rawdb.NewMemoryDatabase()
+		gspec = &Genesis{BaseFee: big.NewInt(params.InitialBaseFee), Config: params.AllEthashProtocolChanges}
+	)
+	gspec.Commit(db, triedb.NewDatabase(db, nil), nil)
+	hc, err := NewHeaderChain(db, gspec.Config, ethash.NewFaker(), func() bool { return false })
+	if err != nil {
+		t.Fatal(err)
+	}
+	// No anchor installed yet — gate returns inactive.
+	if _, _, active := hc.GetTrustedCheckpointAnchor(); active {
+		t.Fatalf("anchor active before installation: want false, got true")
+	}
+	// Install an operator pivot far above genesis (matches XDC mainnet pivot
+	// at block 103,309,269 — head is still at genesis = 0 at this point).
+	const pivotNum = uint64(103_309_269)
+	pivotHash := common.HexToHash("0x32a2aeb22957a7526498a2c2b447762ea2708c42fa43b03ac83d2e3be3d9eea9")
+	hc.SetFastSyncTrustedAnchor(pivotNum, pivotHash)
+	num, hash, active := hc.GetTrustedCheckpointAnchor()
+	if num != pivotNum {
+		t.Fatalf("anchor number mismatch: want %d, got %d", pivotNum, num)
+	}
+	if hash != pivotHash {
+		t.Fatalf("anchor hash mismatch: want %s, got %s", pivotHash.Hex(), hash.Hex())
+	}
+	if !active {
+		t.Fatalf("anchor inactive with head at genesis: want active=true (catchup window open); got false — this is the A.60.5c bug A.68 fixed")
+	}
+}
+
+// TestGetTrustedCheckpointAnchorInactivePastCatchupWindow guards the upper
+// bound: once the header chain head has climbed past anchor + 2*Epoch the
+// gate MUST return active=false so the V2 engine re-engages strict QC
+// verification. This is the opposite of the regression A.68 fixed — the
+// upper-bound termination of the catchup window is the real consensus-
+// correctness invariant and must remain intact. Refs #844 A.68.
+func TestGetTrustedCheckpointAnchorInactivePastCatchupWindow(t *testing.T) {
+	var (
+		db    = rawdb.NewMemoryDatabase()
+		gspec = &Genesis{BaseFee: big.NewInt(params.InitialBaseFee), Config: params.AllEthashProtocolChanges}
+	)
+	gspec.Commit(db, triedb.NewDatabase(db, nil), nil)
+	hc, err := NewHeaderChain(db, gspec.Config, ethash.NewFaker(), func() bool { return false })
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Install anchor and simulate head having climbed well past pivot+2*Epoch.
+	const (
+		pivotNum = uint64(1_000_000)
+		epoch    = uint64(900) // default when XDPoS config absent
+	)
+	pivotHash := common.HexToHash("0xdeadbeef")
+	hc.SetFastSyncTrustedAnchor(pivotNum, pivotHash)
+	// Fake a head WAY past pivot + 2*Epoch.
+	hc.currentHeader.Store(&types.Header{Number: big.NewInt(int64(pivotNum + 2*epoch + 1))})
+	if _, _, active := hc.GetTrustedCheckpointAnchor(); active {
+		t.Fatalf("anchor active past catchup window: want false, got true — strict QC must re-engage")
+	}
+	// Head exactly at the upper boundary — still NOT active (strict check kicks in).
+	hc.currentHeader.Store(&types.Header{Number: big.NewInt(int64(pivotNum + 2*epoch))})
+	if _, _, active := hc.GetTrustedCheckpointAnchor(); active {
+		t.Fatalf("anchor active at exact upper boundary head=pivot+2*epoch: want false, got true")
+	}
+	// Head one below upper boundary — active (still inside the catchup window).
+	hc.currentHeader.Store(&types.Header{Number: big.NewInt(int64(pivotNum + 2*epoch - 1))})
+	if _, _, active := hc.GetTrustedCheckpointAnchor(); !active {
+		t.Fatalf("anchor inactive at head=pivot+2*epoch-1: want true (still catching up), got false")
+	}
 }

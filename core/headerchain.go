@@ -25,6 +25,7 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/lru"
 	"github.com/ethereum/go-ethereum/consensus"
+	"github.com/ethereum/go-ethereum/core/history"
 	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/ethdb"
@@ -65,8 +66,78 @@ type HeaderChain struct {
 	headerCache *lru.Cache[common.Hash, *types.Header]
 	numberCache *lru.Cache[common.Hash, uint64] // most recent block numbers
 
+	// A.60.5c (refs #857): mirror BlockChain.historyPrunePoint here so the
+	// XDPoS V2 engine's `inCheckpointCatchup` finds the trusted anchor when
+	// header verification happens through HeaderChain (BeaconSync header
+	// import calls hc.engine.VerifyHeaders(hc, chain)). Without this, the
+	// engine's interface assertion `chain.(ckptAware)` failed on *HeaderChain
+	// and QC verification ran on every pre-pivot header during fast-sync.
+	fastSyncAnchor atomic.Pointer[history.PrunePoint]
+
 	procInterrupt func() bool
 	engine        consensus.Engine
+}
+
+// SetFastSyncTrustedAnchor mirrors BlockChain.SetFastSyncTrustedAnchor onto
+// the HeaderChain, so header-only verify paths see the same anchor.
+// Refs #857 A.60.5c.
+func (hc *HeaderChain) SetFastSyncTrustedAnchor(number uint64, hash common.Hash) {
+	hc.fastSyncAnchor.Store(&history.PrunePoint{
+		BlockNumber: number,
+		BlockHash:   hash,
+	})
+}
+
+// GetTrustedCheckpointAnchor satisfies the ckptAware interface that the XDPoS
+// V2 engine uses to detect operator-pinned fast-sync. Returns active=true
+// while the header chain head has NOT yet climbed past the anchor + 2*Epoch
+// upper boundary — i.e. while the chain is still ingesting headers around or
+// before the operator-pinned pivot.
+//
+// A.60.5c (refs #857) originally used a symmetric ±2*Epoch window around the
+// anchor and a `headNum >= lo` lower-bound check. That logic mis-fired for
+// the fresh-start fast-sync case (e.g. xdcscan 2026-06-07 with operator pivot
+// 103,309,269): `hc.CurrentHeader()` returns the genesis (headNum=0) until
+// BeaconSync's skeleton has imported the first batch of headers via
+// `InsertHeaderChain`, but verification of THAT first batch is exactly what
+// `inCheckpointCatchup` must relax. With headNum=0 the `0 >= pt.BlockNumber-
+// 2*Epoch` lower bound failed, the gate returned active=false, strict
+// `verifyQC` ran, and the V2 engine's `getEpochSwitchInfo` recursion crashed
+// on "parent header X not in DB (bulk sync?)" because the parent epoch-switch
+// header for blocks just below the pivot had not yet been backfilled by the
+// reverse-walking skeleton.
+//
+// A.68 (refs #844 #859): drop the lower-bound — match `BlockChain.
+// GetTrustedCheckpointAnchor` semantics. The catchup gate stays active while
+// `headNum < anchor + 2*Epoch`, including the entire range from genesis up
+// through the pivot+1800 boundary. Once the chain catches up past that
+// boundary the gate flips to inactive and strict V2 verification resumes —
+// which is the correct invariant regardless of fast-sync direction (the
+// skeleton walks backwards from pivot before forwards from pivot, so
+// `hc.CurrentHeader()` does NOT linearly approach the pivot — it can stay
+// near genesis through most of the backfill phase).
+//
+// Refs #857 A.60.5c, #844 #859 A.68.
+func (hc *HeaderChain) GetTrustedCheckpointAnchor() (uint64, common.Hash, bool) {
+	pt := hc.fastSyncAnchor.Load()
+	if pt == nil {
+		return 0, common.Hash{}, false
+	}
+	epoch := uint64(900)
+	if cfg := hc.config.XDPoS; cfg != nil && cfg.Epoch != 0 {
+		epoch = cfg.Epoch
+	}
+	head := hc.CurrentHeader()
+	// nil header means the chain has not initialised — definitely still in
+	// catchup, return active=true so the engine relaxes QC checks.
+	if head == nil {
+		return pt.BlockNumber, pt.BlockHash, true
+	}
+	// Active until head climbs past anchor + 2*Epoch. Mirrors the BlockChain
+	// version's check exactly; the original A.60.5c lower-bound was wrong for
+	// the genesis-head case BeaconSync reverse-walk exhibits.
+	active := head.Number.Uint64() < pt.BlockNumber+2*epoch
+	return pt.BlockNumber, pt.BlockHash, active
 }
 
 // NewHeaderChain creates a new HeaderChain structure. ProcInterrupt points
