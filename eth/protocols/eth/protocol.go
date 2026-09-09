@@ -25,7 +25,7 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/forkid"
 	"github.com/ethereum/go-ethereum/core/types"
-	"github.com/ethereum/go-ethereum/core/types/bal"
+	"github.com/ethereum/go-ethereum/crypto/kzg4844"
 	"github.com/ethereum/go-ethereum/rlp"
 )
 
@@ -35,6 +35,7 @@ const (
 	ETH69  = 69
 	ETH70  = 70
 	ETH71  = 71  // upstream eth/71 (additively included)
+	ETH72  = 72  // upstream eth/72 (sparse blobpool cells; not advertised on XDC, see below)
 	XDPOS2 = 100 // XDC consensus protocol (refs #740)
 )
 
@@ -42,7 +43,6 @@ const (
 // devp2p capability negotiation.
 const ProtocolName = "eth"
 
-// ProtocolVersions are the supported versions of the `eth` protocol (first
 // is primary). XDPOS2 is offered first so XDC peers prefer it over the
 // upstream ETH/* family; stock-geth peers fall back to ETH/70 or ETH/69.
 //
@@ -55,6 +55,14 @@ const ProtocolName = "eth"
 // Side-by-side experiment 2026-06-06 showed fresh XDPoSChain v2.7.0 with
 // `caps=[xdpos2,eth/63]` attracted 2 peers in 7 min while fresh modern
 // without ETH63 sat at 0 peers for 50+ min on the same bootnodes.
+//
+// ETH71 and ETH72 are deliberately NOT advertised here even though both are
+// fully implemented below (upstream sparse-blobpool / eth-72 support). XDC
+// has no blob transactions, so eth/72 cells are dead code on every XDC
+// network, and ProtocolVersions is the empirically-tuned devp2p cap set from
+// A.59 above — perturbing it (by adding versions XDC peers don't speak and
+// gains nothing from) is a separate, unjustified change from defining the
+// constants/handlers upstream code needs to compile.
 var ProtocolVersions = []uint{XDPOS2, ETH70, ETH69, ETH63}
 
 // protocolLengths are the number of implemented message corresponding to
@@ -62,8 +70,8 @@ var ProtocolVersions = []uint{XDPOS2, ETH70, ETH69, ETH63}
 // per the legacy go-ethereum eth/63 protocol definition; this is advertised
 // for cap negotiation only and never runs at runtime on XDC peers because
 // XDPOS2/100 always wins highest-common-version selection.
-// ETH71 included additively for upstream compat.
-var protocolLengths = map[uint]uint64{ETH63: 17, ETH69: 18, ETH70: 18, ETH71: 20, XDPOS2: 229}
+// ETH71/ETH72 included additively for upstream compat (not advertised, see above).
+var protocolLengths = map[uint]uint64{ETH63: 17, ETH69: 18, ETH70: 18, ETH71: 20, ETH72: 22, XDPOS2: 229}
 
 // maxMessageSize is the maximum cap on the size of a protocol message.
 const maxMessageSize = 10 * 1024 * 1024
@@ -94,6 +102,8 @@ const (
 	BlockRangeUpdateMsg           = 0x11
 	GetBlockAccessListsMsg        = 0x12
 	BlockAccessListsMsg           = 0x13
+	GetCellsMsg                   = 0x14
+	CellsMsg                      = 0x15
 
 	// XDPOS2 consensus messages (refs #740). Numeric codes preserved from XDC
 	// fork to keep wire compatibility with existing XDC fleet nodes.
@@ -339,11 +349,21 @@ type ReceiptsPacket70 struct {
 // ReceiptsRLPResponse is used for receipts, when we already have it encoded
 type ReceiptsRLPResponse []rlp.RawValue
 
-// NewPooledTransactionHashesPacket represents a transaction announcement packet on eth/68 and newer.
-type NewPooledTransactionHashesPacket struct {
+// NewPooledTransactionHashesPacket71 represents a transaction announcement packet on protocol version
+// less than or equal to 71.
+type NewPooledTransactionHashesPacket71 struct {
 	Types  []byte
 	Sizes  []uint32
 	Hashes []common.Hash
+}
+
+// NewPooledTransactionHashesPacket72 represents a transaction announcement packet on ETH/72
+// with an additional custody bitmap field for cell-based blob data availability.
+type NewPooledTransactionHashesPacket72 struct {
+	Types  []byte
+	Sizes  []uint32
+	Hashes []common.Hash
+	Mask   types.CustodyBitmap
 }
 
 // GetPooledTransactionsRequest represents a transaction query.
@@ -382,6 +402,31 @@ type BlockRangeUpdatePacket struct {
 	LatestBlockHash common.Hash
 }
 
+// GetCellsRequest represents a request for cells of blob transactions.
+type GetCellsRequest struct {
+	Hashes []common.Hash
+	Mask   types.CustodyBitmap
+}
+
+// GetCellsRequestPacket represents a cell request with request ID wrapping.
+type GetCellsRequestPacket struct {
+	RequestId uint64
+	GetCellsRequest
+}
+
+// CellsResponse represents a response containing cells for blob transactions.
+type CellsResponse struct {
+	Hashes []common.Hash
+	Cells  rlp.RawList[rlp.RawList[kzg4844.Cell]]
+	Mask   types.CustodyBitmap
+}
+
+// CellsPacket represents a cells response with request ID wrapping.
+type CellsPacket struct {
+	RequestId uint64
+	CellsResponse
+}
+
 type GetBlockAccessListsRequest []common.Hash
 
 type GetBlockAccessListsPacket struct {
@@ -389,15 +434,14 @@ type GetBlockAccessListsPacket struct {
 	GetBlockAccessListsRequest
 }
 
-type RawBlockAccessList struct {
-	rlp.RawList[bal.AccountAccess]
-}
-
-type BlockAccessListResponse []RawBlockAccessList
+// BlockAccessListResponse holds one raw entry per requested hash. Entries are
+// kept as raw values because, per EIP-8159, the RLP empty string signals an
+// unavailable BAL (an empty list is itself a valid BAL).
+type BlockAccessListResponse []rlp.RawValue
 
 type BlockAccessListPacket struct {
 	RequestId uint64
-	List      rlp.RawList[RawBlockAccessList]
+	List      rlp.RawList[rlp.RawValue]
 }
 
 func (*StatusPacket) Name() string { return "Status" }
@@ -427,8 +471,11 @@ func (*NewBlockHashesPacket) Kind() byte   { return NewBlockHashesMsg }
 func (*NewBlockPacket) Name() string { return "NewBlock" }
 func (*NewBlockPacket) Kind() byte   { return NewBlockMsg }
 
-func (*NewPooledTransactionHashesPacket) Name() string { return "NewPooledTransactionHashes" }
-func (*NewPooledTransactionHashesPacket) Kind() byte   { return NewPooledTransactionHashesMsg }
+func (*NewPooledTransactionHashesPacket71) Name() string { return "NewPooledTransactionHashes" }
+func (*NewPooledTransactionHashesPacket71) Kind() byte   { return NewPooledTransactionHashesMsg }
+
+func (*NewPooledTransactionHashesPacket72) Name() string { return "NewPooledTransactionHashes" }
+func (*NewPooledTransactionHashesPacket72) Kind() byte   { return NewPooledTransactionHashesMsg }
 
 func (*GetPooledTransactionsRequest) Name() string { return "GetPooledTransactions" }
 func (*GetPooledTransactionsRequest) Kind() byte   { return GetPooledTransactionsMsg }
@@ -491,3 +538,8 @@ func (*GetBlockAccessListsRequest) Kind() byte   { return GetBlockAccessListsMsg
 func (*BlockAccessListResponse) Name() string { return "BlockAccessLists" }
 func (*BlockAccessListResponse) Kind() byte   { return BlockAccessListsMsg }
 
+func (*GetCellsRequest) Name() string { return "GetCells" }
+func (*GetCellsRequest) Kind() byte   { return GetCellsMsg }
+
+func (*CellsResponse) Name() string { return "Cells" }
+func (*CellsResponse) Kind() byte   { return CellsMsg }

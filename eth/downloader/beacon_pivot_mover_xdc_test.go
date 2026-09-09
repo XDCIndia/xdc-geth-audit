@@ -60,7 +60,7 @@ func TestBeaconPivotMoverDecision_FreezeRefuses(t *testing.T) {
 	)
 
 	// WITHOUT freeze: would advance — this proves the race is real.
-	advance, refused, newNum := beaconPivotMoverDecision(headNum, pivotNum, operatorNum, false)
+	advance, refused, newNum := beaconPivotMoverDecision(headNum, pivotNum, operatorNum, false, false, false)
 	if !advance {
 		t.Fatalf("without freeze: expected advance=true to confirm the race exists, got advance=false")
 	}
@@ -73,7 +73,7 @@ func TestBeaconPivotMoverDecision_FreezeRefuses(t *testing.T) {
 	}
 
 	// WITH freeze: must refuse — this is the A.97.1b invariant.
-	advance, refused, _ = beaconPivotMoverDecision(headNum, pivotNum, operatorNum, true)
+	advance, refused, _ = beaconPivotMoverDecision(headNum, pivotNum, operatorNum, true, false, false)
 	if advance {
 		t.Fatalf("with freeze: expected advance=false (pivot must not move), got true")
 	}
@@ -94,7 +94,7 @@ func TestBeaconPivotMoverDecision_OperatorPinnedUnaffected(t *testing.T) {
 	)
 
 	// frozen=false: should advance (original behavior).
-	advance, refused, newNum := beaconPivotMoverDecision(headNum, pivotNum, operatorNum, false)
+	advance, refused, newNum := beaconPivotMoverDecision(headNum, pivotNum, operatorNum, false, false, false)
 	if !advance || refused {
 		t.Fatalf("operator-pinned unfrozen: expected advance=true refused=false, got advance=%v refused=%v", advance, refused)
 	}
@@ -103,7 +103,7 @@ func TestBeaconPivotMoverDecision_OperatorPinnedUnaffected(t *testing.T) {
 	}
 
 	// frozen=true: must ALSO advance (freeze does not affect operator-pinned).
-	advance, refused, newNum = beaconPivotMoverDecision(headNum, pivotNum, operatorNum, true)
+	advance, refused, newNum = beaconPivotMoverDecision(headNum, pivotNum, operatorNum, true, false, false)
 	if !advance || refused {
 		t.Fatalf("operator-pinned frozen: expected advance=true refused=false (freeze irrelevant), got advance=%v refused=%v", advance, refused)
 	}
@@ -122,7 +122,7 @@ func TestBeaconPivotMoverDecision_BelowThreshold(t *testing.T) {
 	)
 
 	for _, frozen := range []bool{false, true} {
-		advance, refused, _ := beaconPivotMoverDecision(headNum, pivotNum, operatorNum, frozen)
+		advance, refused, _ := beaconPivotMoverDecision(headNum, pivotNum, operatorNum, frozen, false, false)
 		if advance || refused {
 			t.Fatalf("below threshold frozen=%v: expected advance=false refused=false, got advance=%v refused=%v", frozen, advance, refused)
 		}
@@ -138,13 +138,13 @@ func TestBeaconPivotMoverDecision_ExactThresholdBoundary(t *testing.T) {
 		headNum     = pivotNum + 2*uint64(fsMinFullBlocks) - 8 // exactly at boundary
 		operatorNum = uint64(0)
 	)
-	advance, _, _ := beaconPivotMoverDecision(headNum, pivotNum, operatorNum, false)
+	advance, _, _ := beaconPivotMoverDecision(headNum, pivotNum, operatorNum, false, false, false)
 	if advance {
 		t.Fatalf("exactly at boundary: expected advance=false (strictly greater required), got true")
 	}
 
 	// One above boundary must advance.
-	advance, _, _ = beaconPivotMoverDecision(headNum+1, pivotNum, operatorNum, false)
+	advance, _, _ = beaconPivotMoverDecision(headNum+1, pivotNum, operatorNum, false, false, false)
 	if !advance {
 		t.Fatalf("one above boundary: expected advance=true, got false")
 	}
@@ -169,6 +169,8 @@ func simulatedBeaconMoverIteration(d *Downloader, headNumber uint64) uint64 {
 		d.pivotHeader.Number.Uint64(),
 		d.operatorPivotNumber,
 		d.IsPivotFrozen(),
+		d.committed.Load(),
+		d.snapPivotFrozen(),
 	)
 	if refused {
 		// This is the branch under test — freeze gate fires.

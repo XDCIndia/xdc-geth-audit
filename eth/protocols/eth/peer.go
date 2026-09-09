@@ -27,6 +27,7 @@ import (
 	mapset "github.com/deckarep/golang-set/v2"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/crypto/kzg4844"
 	"github.com/ethereum/go-ethereum/p2p"
 	"github.com/ethereum/go-ethereum/p2p/tracker"
 	"github.com/ethereum/go-ethereum/params"
@@ -112,7 +113,8 @@ type Peer struct {
 	XDCHeaderResp chan []*types.Header // BlockHeaders responses on XDPOS2
 	XDCBodyResp   chan []BlockBody     // BlockBodies responses on XDPOS2
 
-	txpool      TxPool             // Transaction pool used by the broadcasters for liveness checks
+	txpool      TxPool // Transaction pool used by the broadcasters for liveness checks
+	blobpool    BlobPool
 	knownTxs    *knownCache        // Set of transaction hashes known to be known by this peer
 	knownNodes  *knownCache        // Set of state-trie node hashes the peer has served us (A.41, refs #844)
 	txBroadcast chan []common.Hash // Channel used to queue transaction propagation requests
@@ -145,11 +147,11 @@ type Peer struct {
 
 // NewPeer creates a wrapper for a network connection and negotiated  protocol
 // version.
-func NewPeer(version uint, p *p2p.Peer, rw p2p.MsgReadWriter, txpool TxPool, chainConfig *params.ChainConfig) *Peer {
+func NewPeer(version uint, p *p2p.Peer, rw p2p.MsgReadWriter, txpool TxPool, blobpool BlobPool, chainConfig *params.ChainConfig) *Peer {
 	cap := p2p.Cap{Name: ProtocolName, Version: version}
 	id := p.ID().String()
 	peer := &Peer{
-		id:            p.ID().String(),
+		id:            id,
 		Peer:          p,
 		rw:            rw,
 		version:       version,
@@ -162,6 +164,7 @@ func NewPeer(version uint, p *p2p.Peer, rw p2p.MsgReadWriter, txpool TxPool, cha
 		reqCancel:     make(chan *cancel),
 		resDispatch:   make(chan *response),
 		txpool:        txpool,
+		blobpool:      blobpool,
 		chainConfig:   chainConfig,
 		receiptBuffer: make(map[uint64]*receiptRequest),
 		term:          make(chan struct{}),
@@ -364,20 +367,34 @@ func (p *Peer) AsyncSendTransactions(hashes []common.Hash) {
 // This method is a helper used by the async transaction announcer. Don't call it
 // directly as the queueing (memory) and transmission (bandwidth) costs should
 // not be managed directly.
-func (p *Peer) sendPooledTransactionHashes(hashes []common.Hash, types []byte, sizes []uint32) error {
+func (p *Peer) sendPooledTransactionHashes(hashes []common.Hash, types []byte, sizes []uint32, cells types.CustodyBitmap) error {
 	// A.60.2 (refs #857): XDPoSChain v2.7.0 uses msg code 0x08 for OrderTxMsg
 	// (the XDC DEX order-tx broadcast), not NewPooledTransactionHashes which
 	// modern eth/68+ introduced. Sending NPTH to an XDPOS2 peer hands them a
 	// payload they decode as `[]OrderTransaction` — garbage — and they
 	// disconnect us with a generic subprotocol error. We mark the txs as
-	// known so the announcer doesn't retry, but skip the wire send.
+	// known so the announcer doesn't retry, but skip the wire send. This
+	// early return must come first: p.version == XDPOS2 (100) would also
+	// satisfy p.version >= ETH72 below, so without the early return the
+	// XDPOS2 case would fall through into the upstream send path.
 	// Transactions still propagate to XDPOS2 peers via the full TransactionsMsg
 	// (0x02) gossip path, matching XDPoSChain's own tx-propagation behaviour.
-	p.knownTxs.Add(hashes...)
 	if p.version == XDPOS2 {
+		p.knownTxs.Add(hashes...) // suppress retries; no wire send on XDPOS2
 		return nil
 	}
-	return p2p.Send(p.rw, NewPooledTransactionHashesMsg, NewPooledTransactionHashesPacket{Types: types, Sizes: sizes, Hashes: hashes})
+	var err error
+	if p.version >= ETH72 {
+		err = p2p.Send(p.rw, NewPooledTransactionHashesMsg, NewPooledTransactionHashesPacket72{Types: types, Sizes: sizes, Hashes: hashes, Mask: cells})
+	} else {
+		err = p2p.Send(p.rw, NewPooledTransactionHashesMsg, NewPooledTransactionHashesPacket71{Types: types, Sizes: sizes, Hashes: hashes})
+	}
+	if err != nil {
+		return err
+	}
+	// Mark all the transactions as known, but ensure we don't overflow our limits
+	p.knownTxs.Add(hashes...)
+	return nil
 }
 
 // AsyncSendPooledTransactionHashes queues a list of transactions hashes to eventually
@@ -459,6 +476,53 @@ func (p *Peer) ReplyReceiptsRLP69(id uint64, receipts rlp.RawList[*ReceiptList])
 	})
 }
 
+// ReplyCells is the response to GetCells.
+func (p *Peer) ReplyCells(id uint64, hashes []common.Hash, cells [][]kzg4844.Cell, mask types.CustodyBitmap) error {
+	inner := make([]rlp.RawList[kzg4844.Cell], len(cells))
+	for i, c := range cells {
+		raw, err := rlp.EncodeToRawList(c)
+		if err != nil {
+			return err
+		}
+		inner[i] = raw
+	}
+	rawCells, err := rlp.EncodeToRawList(inner)
+	if err != nil {
+		return err
+	}
+	return p2p.Send(p.rw, CellsMsg, &CellsPacket{
+		RequestId: id,
+		CellsResponse: CellsResponse{
+			Hashes: hashes,
+			Cells:  rawCells,
+			Mask:   mask,
+		},
+	})
+}
+
+// RequestPayload fetches a batch of cells from a remote node.
+func (p *Peer) RequestPayload(hashes []common.Hash, cell types.CustodyBitmap) error {
+	p.Log().Debug("Fetching batch of cells", "txcount", len(hashes), "cellcount", cell.OneCount())
+	id := rand.Uint64()
+
+	err := p.tracker.Track(tracker.Request{
+		ID:       id,
+		ReqCode:  GetCellsMsg,
+		RespCode: CellsMsg,
+		Size:     len(hashes),
+	})
+	if err != nil {
+		return err
+	}
+	return p2p.Send(p.rw, GetCellsMsg, &GetCellsRequestPacket{
+		RequestId: id,
+		GetCellsRequest: GetCellsRequest{
+			Hashes: hashes,
+			Mask:   cell,
+		},
+	})
+}
+
 // ReplyReceiptsRLP70 is the response to GetReceipts.
 func (p *Peer) ReplyReceiptsRLP70(id uint64, receipts rlp.RawList[*ReceiptList], lastBlockIncomplete bool) error {
 	return p2p.Send(p.rw, ReceiptsMsg, &ReceiptsPacket70{
@@ -480,7 +544,7 @@ func (p *Peer) ReplyReceiptsRLPLegacy(receipts rlp.RawList[*ReceiptList]) error 
 }
 
 // ReplyBlockAccessLists is the response to GetBlockAccessLists (EIP-8159).
-func (p *Peer) ReplyBlockAccessLists(id uint64, list rlp.RawList[RawBlockAccessList]) error {
+func (p *Peer) ReplyBlockAccessLists(id uint64, list rlp.RawList[rlp.RawValue]) error {
 	return p2p.Send(p.rw, BlockAccessListsMsg, &BlockAccessListPacket{
 		RequestId: id,
 		List:      list,

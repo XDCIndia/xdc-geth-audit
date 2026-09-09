@@ -337,6 +337,12 @@ func (f *chainFreezer) freezeRange(nfdb *nofreezedb, number, limit uint64) (hash
 				// hash (non-zero) won't match zero, so placeholder bytes never leak.
 				// ReadCanonicalHash for gap blocks returns zero = "not found", which
 				// is the correct semantics for a state-only fast-sync node.
+				//
+				// Upstream (12241bde2) treats this as a hard error (orphaned block
+				// from an unclean stop); on XDC the gap is expected and permanent,
+				// so we keep upstream's diagnostic as a debug log instead of failing.
+				log.Debug("Freezer: canonical hash missing at frontier, writing XDC fast-sync gap placeholder",
+					"number", number, "present-by-hash", ReadAllHashes(nfdb, number))
 				if err := op.AppendRaw(ChainFreezerHashTable, number, make([]byte, common.HashLength)); err != nil {
 					return fmt.Errorf("xdc: can't write placeholder hash for block %d: %v", number, err)
 				}
