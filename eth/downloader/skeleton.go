@@ -562,10 +562,23 @@ func (s *skeleton) linked(number uint64, hash common.Hash) bool {
 	// (~79.34M), so the short-circuit fired immediately and the walk-back was
 	// skipped entirely, leaving beaconsync.fetchHeaders unable to resolve
 	// headers between origin+1 and pivot.
+	//
+	// This short-circuit MUST run first, before upstream's canonical-mapping
+	// requirement below: at/below the floor a normal chain may still lack a
+	// canonical mapping in the middle of an XDC fast-sync gap (see A.85 in
+	// core/rawdb/chain_freezer.go), so the requirement only makes sense above
+	// the floor. NOT independently verified against A.85 gap interaction on a
+	// live cold fast-sync — flagged in the merge PR for follow-up.
 	if s.terminateFloor != 0 && number <= s.terminateFloor {
 		return true
 	}
-	linked := rawdb.HasHeader(s.db, hash, number) &&
+	// Require the canonical mapping, not just presence by hash. A block present
+	// only by hash (side chain or orphan from an unclean shutdown) must not be
+	// used as the link-up point, otherwise it's left in place forever without its
+	// canonical mapping ever being rewritten. Keep descending to a real canonical
+	// block.
+	linked := rawdb.ReadCanonicalHash(s.db, number) == hash &&
+		rawdb.HasHeader(s.db, hash, number) &&
 		rawdb.HasBody(s.db, hash, number) &&
 		rawdb.HasReceipts(s.db, hash, number)
 

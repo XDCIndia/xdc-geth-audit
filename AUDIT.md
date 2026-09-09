@@ -15,12 +15,12 @@ incident when "corrected".
 
 | | |
 |---|---|
-| Upstream base | `ethereum/go-ethereum` **v1.17.4** = `36a7dc72e96b3f42846be925cfeb2fad18489917` |
-| Upstream tree SHA | `3ce5a3428afb5961dd1c7bb3b4cc6bfb4c718770` |
-| Upstream commits below the base | 17,113, with their **original SHAs** |
-| XDC source reviewed | `XDCIndia/go-ethereum` @ `adf46fc9c0de63a49880476e2f7338ea359e56b2` |
-| Corresponding release | `v-xdc-geth-mint-20260727` |
-| Published binary sha256 | `705406e8c5b7339b0f429d841a7ba6d5568f2956a5d46d12fa3fcd09798f8d31` |
+| Upstream base | `ethereum/go-ethereum` **v1.17.5** = `9621c6ad10934a01b5514886fb6fbd87640b6c05` |
+| Upstream tree SHA | `ce7dded85f82c2bd3998aa8a8a51932d7c6682b2` |
+| Upstream commits below the base | 17,223, with their **original SHAs** |
+| XDC source reviewed | `XDCIndia/go-ethereum` @ `f39bb0769d0c142a1d50d34476055c4b9b1caaf3` |
+| Corresponding release | **none** — the source is 113 commits past `v-xdc-geth-mint-20260727` |
+| Published binary sha256 | **n/a** — no binary has been published from this source |
 
 ### Integrity check
 
@@ -28,18 +28,18 @@ The base is unmodified upstream. Verify it yourself — these use explicit SHAs 
 than relative refs like `~11`, which drift whenever the review history is re-cut:
 
 ```sh
-UP=36a7dc72e96b3f42846be925cfeb2fad18489917
+UP=9621c6ad10934a01b5514886fb6fbd87640b6c05
 
-git rev-parse $UP^{tree}                    # -> 3ce5a3428afb5961dd1c7bb3b4cc6bfb4c718770
-git rev-list --count $UP                    # -> 17113
-git merge-base --is-ancestor $UP audit/v2           # succeeds
-git merge-base --is-ancestor $UP audit/code-only    # succeeds
+git rev-parse $UP^{tree}                    # -> ce7dded85f82c2bd3998aa8a8a51932d7c6682b2
+git rev-list --count $UP                    # -> 17223
+git merge-base --is-ancestor $UP audit/v2-1175         # succeeds
+git merge-base --is-ancestor $UP audit/code-only-1175  # succeeds
 
 # confirm that SHA is genuinely upstream's, not ours:
-git ls-remote https://github.com/ethereum/go-ethereum refs/tags/v1.17.4
+git ls-remote https://github.com/ethereum/go-ethereum refs/tags/v1.17.5
 ```
 
-Everything at `$UP` and below is byte-identical to upstream v1.17.4, with upstream's
+Everything at `$UP` and below is byte-identical to upstream v1.17.5, with upstream's
 original commit SHAs. Immediately above it sits one commit removing 3 upstream GitHub
 Actions workflow files — the token used to publish this repository lacks the `workflow`
 scope, so those files cannot be pushed — and above that the XDC delta, split across the
@@ -50,8 +50,8 @@ Only the 3 workflow paths, this file, `.gitattributes`, and the dropped detritus
 under [Disclosure](#disclosure-status--partial-stated-honestly) may differ:
 
 ```sh
-git fetch <source-remote> adf46fc9c0de63a49880476e2f7338ea359e56b2
-git diff --name-only FETCH_HEAD audit/v2
+git fetch <source-remote> f39bb0769d0c142a1d50d34476055c4b9b1caaf3
+git diff --name-only FETCH_HEAD audit/v2-1175
 ```
 
 ### Reproducibility limit — read this
@@ -65,10 +65,12 @@ can regenerate here.
 
 Two further limits on independent verification:
 
-- `XDCIndia/go-ethereum` is **private**, so `adf46fc9c` cannot be resolved externally
+- `XDCIndia/go-ethereum` is **private**, so `f39bb0769` cannot be resolved externally
   without being granted read access.
-- Release `v-xdc-geth-mint-20260727` carries **no attached assets**; the binary lives at
-  an unversioned, mutable, unsigned URL.
+- This source carries **no release and no published binary at all**. The last tagged
+  release, `v-xdc-geth-mint-20260727`, is 113 commits behind it and itself carried no
+  attached assets — its binary lived at an unversioned, mutable, unsigned URL. There is
+  therefore nothing to bit-compare against for the tree reviewed here.
 
 ---
 
@@ -76,20 +78,65 @@ Two further limits on independent verification:
 
 | Ref | Contents | Use |
 |---|---|---|
-| **`audit/code-only`** | code, tests, contracts, genesis fixtures, this guide | **read this one** |
-| **`audit/v2`** | the same history plus one final commit adding `docs/`, `scripts/`, `docker/`, `build/`, `tools/` | provenance anchor |
+| **`audit/code-only-1175`** | code, tests, contracts, genesis fixtures, this guide | **read this one** |
+| **`audit/v2-1175`** | the same history plus one final commit adding `docs/`, `scripts/`, `docker/`, `build/`, `tools/` | provenance anchor |
+| `1175` | the pristine upstream v1.17.5 base alone, no XDC content | base integrity check |
 
-`audit/code-only` is a strict **ancestor** of `audit/v2` — the operator and
+`audit/code-only-1175` is a strict **ancestor** of `audit/v2-1175` — the operator and
 documentation material is never introduced on it, rather than deleted from it. The
 difference is therefore provable by construction:
 
 ```sh
-git merge-base --is-ancestor audit/code-only audit/v2   # succeeds
-git diff --name-only audit/code-only audit/v2           # docs/, scripts/, docker/, build/, tools/
+git merge-base --is-ancestor audit/code-only-1175 audit/v2-1175  # succeeds
+git diff --name-only audit/code-only-1175 audit/v2-1175          # docs/, scripts/, docker/, build/, tools/
 ```
 
 This gives a clean review surface without weakening provenance: no history was
 rewritten and no audited file was deleted to produce it.
+
+---
+
+## The v1.17.5 uplift
+
+These refs are the **same review stack re-cut onto a newer upstream base**. The
+previously reviewed refs — `audit/code-only` and `audit/v2` on upstream **v1.17.4**
+(`36a7dc72e`) — are untouched and still published. Nothing was force-pushed.
+
+Both cuts are a presentation of the same fork, so the honest way to state what changed
+is to compare each cut against *its own* source and check that the leftover is the same.
+It is:
+
+| | 1.17.4 cut | 1.17.5 cut |
+|---|---|---|
+| source | `adf46fc9c` | `f39bb0769` |
+| upstream base | v1.17.4 `36a7dc72e` | v1.17.5 `9621c6ad1` |
+| paths differing from source, `code-only` | 172 | **172** |
+| paths differing from source, `v2` | 34 | **34** |
+
+Same path sets, not merely the same counts — no path gained, none lost. The leftover is
+exactly the disclosed set: this file, `.gitattributes`, the 7 workflow files, and the 25
+dropped paths under [Disclosure](#disclosure-status--partial-stated-honestly).
+
+**If you already reviewed the v1.17.4 stack, one commit is new to you:**
+`xdc: v1.17.5 merge adaptation`. Everything the uplift required is in it — nothing was
+folded into the slices you have already signed off. It carries 6 paths:
+
+- 3 XDC-authored tests: `core/gate6_merge_1175_test.go`,
+  `eth/downloader/item_b_wiring_xdc_test.go`,
+  `eth/protocols/eth/protocol_xdc_versions_test.go`
+- 3 upstream test files that are **new in v1.17.5** and do not compile against XDC's
+  `newStateTransition`, which carries an extra coinbase argument (see the core
+  integration slice): `core/eip2780_test.go`, `core/eip8037_test.go`,
+  `core/eip8038_test.go`. Added argument only, no behavioural change.
+
+Every number in [Review tiers](#review-tiers--the-mandatory-read-is-far-smaller-than-the-diff)
+moves by exactly those 6 paths: modified 92 -> 95, added 178 -> 181, tests 68 -> 74.
+
+The 10 XDC slices themselves were replayed, not re-authored. Where upstream v1.17.5 had
+touched the same file (47 files did collide), the conflict was resolved by taking the
+fork's own content verbatim — never by re-deciding the merge here. Each slice is then
+asserted byte-identical to `f39bb0769` for every path in it, which is what makes the
+172/34 figures above provable rather than asserted.
 
 ---
 
@@ -110,21 +157,22 @@ reading order.
 | 8 | `xdc: generated abigen bindings` | **skip — verify provenance, do not line-read** |
 | 9 | `xdc: genesis fixtures` | operator fixtures + embedded genesis |
 | 9b | `xdc: XDCx / XDCxlending, version stamp, XDPoS integration test` | DEX/lending services, version stamp |
-| 10 | `ops+docs` | *`audit/v2` only* |
+| 10 | `xdc: v1.17.5 merge adaptation` | the whole v1.17.4 -> v1.17.5 uplift, isolated — see [The v1.17.5 uplift](#the-v1175-uplift) |
+| 11 | `ops+docs` | *`audit/v2-1175` only* |
 
 ### Review tiers — the mandatory read is far smaller than the diff
 
-Measured on this branch against upstream v1.17.4:
+Measured on this branch against upstream v1.17.5:
 
 | Tier | Files | Lines | Read it? |
 |---|---|---|---|
-| **Modified upstream files** | **92** | **11,315** | **yes — this is the real audit surface** |
-| Added XDC files | 178 | 61,759 | yes, but new code in isolation |
+| **Modified upstream files** | **95** | **11,438** | **yes — this is the real audit surface** |
+| Added XDC files | 181 | 62,209 | yes, but new code in isolation |
 | ↳ of which generated bindings | 13 | 18,339 | no — verify provenance only |
-| ↳ of which tests | 68 | 13,425 | as coverage evidence |
-| ops+docs (`audit/v2` only) | 138 | 29,085 | no |
+| ↳ of which tests | 74 | 13,885 | as coverage evidence |
+| ops+docs (`audit/v2-1175` only) | 138 | 29,085 | no |
 
-The 92 modified files are the point. They are surgical edits to battle-tested upstream
+The 95 modified files are the point. They are surgical edits to battle-tested upstream
 logic, and that is where fork bugs live. Highest-deletion files, i.e. where upstream
 behaviour was most altered:
 
@@ -133,10 +181,10 @@ core/blockchain.go             -49
 params/config.go               -47
 eth/downloader/skeleton.go     -43
 core/types/block.go            -43
-eth/protocols/eth/peer.go      -29
 eth/downloader/downloader.go   -28
-core/rawdb/accessors_chain.go  -17
-core/state_transition.go       -14
+eth/protocols/eth/peer.go      -24
+eth/downloader/beaconsync.go   -22
+core/types/gen_header_rlp.go   -22
 ```
 
 ---
@@ -220,6 +268,12 @@ markers; nine `docs/**/*.html` renders each duplicating a sibling `.md`; two
 byte-identical duplicates of the apothem genesis; and two **executable** operator
 scripts carrying root-SSH host inventories. No other scrubbing was performed —
 partial redaction would invite a false "sanitised" impression.
+
+**Also absent for the same token-scope reason as the 3 upstream workflows:** four
+XDC-authored workflow files — `.github/workflows/xdc-build.yml`, `xdc-test.yml`,
+`upstream-tracker.yml` and `upstream-alpha-validate.yml`. They are CI definitions, not
+client code, but they *are* part of the XDC delta and are not presented here. Read them
+in the source repository if CI configuration is in scope for you.
 
 ---
 

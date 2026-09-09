@@ -78,7 +78,7 @@ func (bc *BlockChain) ReexecuteAndValidateRange(nBlocks uint64) error {
 			return fmt.Errorf("ReexecuteAndValidateRange: StateAt block %d parent: %w", num, err)
 		}
 
-		res, err := bc.processor.Process(context.Background(), blk, statedb, bc.jumpDestCache, vm.Config{})
+		res, err := bc.processor.Process(context.Background(), blk, statedb, bc.jumpDestCache, vm.Config{}, nil)
 		if err != nil {
 			return fmt.Errorf("ReexecuteAndValidateRange: Process block %d: %w", num, err)
 		}

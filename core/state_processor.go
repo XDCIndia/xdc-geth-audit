@@ -22,6 +22,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"math/big"
+	"sync/atomic"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/consensus"
@@ -77,7 +78,7 @@ func getCoinbaseOwner(engine consensus.Engine, statedb *state.StateDB, header *t
 // Process returns the receipts and logs accumulated during the process and
 // returns the amount of gas that was used in the process. If any of the
 // transactions failed to execute due to insufficient gas it will return an error.
-func (p *StateProcessor) Process(ctx context.Context, block *types.Block, statedb *state.StateDB, jumpDestCache vm.JumpDestCache, cfg vm.Config) (*ProcessResult, error) {
+func (p *StateProcessor) Process(ctx context.Context, block *types.Block, statedb *state.StateDB, jumpDestCache vm.JumpDestCache, cfg vm.Config, execIndex *atomic.Int64) (*ProcessResult, error) {
 	// XDC: capture pre-tx state for the XDPoS engine reward calculation.
 	// Reward computation at checkpoint blocks must read account balances
 	// BEFORE tx execution; without this, reward calculation uses post-tx
@@ -117,6 +118,10 @@ func (p *StateProcessor) Process(ctx context.Context, block *types.Block, stated
 	// SelfDestruct + Finalise + IntermediateRoot path leaves the trie in
 	// a state where the deletion is recorded in mutations but does not
 	// produce the canonical post-deletion root.
+	//
+	// This must run in exactly this order, and before the parent-header
+	// lookup below has any chance to matter: IntermediateRoot(false) →
+	// SelfDestruct → Finalise(true) → IntermediateRoot(true).
 	if common.TIPSigning.Cmp(block.Number()) == 0 {
 		_ = statedb.IntermediateRoot(false)
 		statedb.SelfDestruct(common.BlockSignersBinary)
@@ -124,6 +129,10 @@ func (p *StateProcessor) Process(ctx context.Context, block *types.Block, stated
 		_ = statedb.IntermediateRoot(true)
 	}
 
+	parent := p.chain.GetHeader(block.ParentHash(), block.NumberU64()-1)
+	if parent == nil {
+		return nil, fmt.Errorf("missing parent %#x", block.ParentHash())
+	}
 	var (
 		context         = NewEVMBlockContext(header, p.chain, nil)
 		signer          = types.MakeSigner(config, header.Number, header.Time)
@@ -131,12 +140,12 @@ func (p *StateProcessor) Process(ctx context.Context, block *types.Block, stated
 		blockAccessList = bal.NewConstructionBlockAccessList()
 	)
 	defer evm.Release()
+
 	if jumpDestCache != nil {
 		evm.SetJumpDestCache(jumpDestCache)
 	}
-
 	// Run the pre-execution system calls
-	blockAccessList.Merge(PreExecution(ctx, block.BeaconRoot(), block.ParentHash(), config, evm, block.Number(), block.Time()))
+	blockAccessList.Merge(PreExecution(ctx, block.BeaconRoot(), parent, config, evm, block.Number(), block.Time()))
 
 	// XDC: resolve TRC21 fee recipient once per block. After TIPTRC21Fee
 	// (Apothem 23,779,191), the masternode's registered candidate-owner —
@@ -149,6 +158,14 @@ func (p *StateProcessor) Process(ctx context.Context, block *types.Block, stated
 
 	// Iterate over and process the individual transactions
 	for i, tx := range block.Transactions() {
+		// Publish the progress, letting the prefetcher skip caught up work.
+		// Must come before the XDC dispatch shortcuts below: a block composed
+		// entirely of special (0x89/0x92/0x93) txs that `continue` past the
+		// normal path would otherwise never publish progress, stalling the
+		// coordinated prefetcher against a never-advancing index.
+		if execIndex != nil {
+			execIndex.Store(int64(i))
+		}
 		statedb.SetTxContext(tx.Hash(), i, uint32(i))
 
 		// XDC: signing transactions at the TIPSigning fork are routed to
@@ -231,14 +248,20 @@ func (p *StateProcessor) Process(ctx context.Context, block *types.Block, stated
 	}, nil
 }
 
-// PreExecution processes pre-execution system calls.
-func PreExecution(ctx context.Context, beaconRoot *common.Hash, parent common.Hash, config *params.ChainConfig, evm *vm.EVM, number *big.Int, time uint64) *bal.ConstructionBlockAccessList {
+// PreExecution processes pre-execution state changes and system calls.
+func PreExecution(ctx context.Context, beaconRoot *common.Hash, parent *types.Header, config *params.ChainConfig, evm *vm.EVM, number *big.Int, time uint64) *bal.ConstructionBlockAccessList {
 	_, _, spanEnd := telemetry.StartSpan(ctx, "core.preExecution")
 	defer spanEnd(nil)
 
 	var blockAccessList *bal.ConstructionBlockAccessList
 	if config.IsAmsterdam(number, time) {
 		blockAccessList = bal.NewConstructionBlockAccessList()
+
+		// EIP-7997: insert the deterministic deployment factory at the Amsterdam
+		// activation block via an irregular state transition.
+		if !config.IsAmsterdam(parent.Number, parent.Time) {
+			misc.ApplyEIP7997(evm.StateDB)
+		}
 	}
 	// EIP-4788
 	if beaconRoot != nil {
@@ -246,7 +269,7 @@ func PreExecution(ctx context.Context, beaconRoot *common.Hash, parent common.Ha
 	}
 	// EIP-2935
 	if config.IsPrague(number, time) || config.IsUBT(number, time) {
-		ProcessParentBlockHash(parent, evm, blockAccessList)
+		ProcessParentBlockHash(parent.Hash(), evm, blockAccessList)
 	}
 	return blockAccessList
 }
@@ -261,10 +284,9 @@ func PostExecution(ctx context.Context, config *params.ChainConfig, number *big.
 	if config.IsAmsterdam(number, time) {
 		blockAccessList = bal.NewConstructionBlockAccessList()
 	}
+	rules := config.Rules(number, true, time) // IsMerge is always true
 	// Read requests if Prague is enabled.
 	if config.IsPrague(number, time) {
-		rules := config.Rules(number, true, time) // IsMerge is always true
-
 		requests = [][]byte{}
 		// EIP-6110
 		if err := ParseDepositLogs(&requests, allLogs, config); err != nil {
@@ -277,6 +299,16 @@ func PostExecution(ctx context.Context, config *params.ChainConfig, number *big.
 		// EIP-7251
 		if err := ProcessConsolidationQueue(&requests, rules, evm, blockAccessIndex, blockAccessList); err != nil {
 			return nil, nil, fmt.Errorf("failed to process consolidation queue: %w", err)
+		}
+	}
+
+	if config.IsAmsterdam(number, time) {
+		// EIP-8282
+		if err := ProcessBuilderDepositQueue(&requests, rules, evm, blockAccessIndex, blockAccessList); err != nil {
+			return nil, nil, fmt.Errorf("failed to process builder deposit queue: %w", err)
+		}
+		if err := ProcessBuilderExitQueue(&requests, rules, evm, blockAccessIndex, blockAccessList); err != nil {
+			return nil, nil, fmt.Errorf("failed to process builder exit queue: %w", err)
 		}
 	}
 	return requests, blockAccessList, nil
@@ -513,6 +545,18 @@ func ProcessWithdrawalQueue(requests *[][]byte, rules params.Rules, evm *vm.EVM,
 // It returns the opaque request data returned by the contract.
 func ProcessConsolidationQueue(requests *[][]byte, rules params.Rules, evm *vm.EVM, blockAccessIndex uint32, blockAccessList *bal.ConstructionBlockAccessList) error {
 	return processRequestsSystemCall(requests, rules, evm, 0x02, params.ConsolidationQueueAddress, blockAccessIndex, blockAccessList)
+}
+
+// ProcessBuilderDepositQueue calls the EIP-8282 builder deposit contract.
+// It returns the opaque request data returned by the contract.
+func ProcessBuilderDepositQueue(requests *[][]byte, rules params.Rules, evm *vm.EVM, blockAccessIndex uint32, blockAccessList *bal.ConstructionBlockAccessList) error {
+	return processRequestsSystemCall(requests, rules, evm, 0x03, params.BuilderDepositAddress, blockAccessIndex, blockAccessList)
+}
+
+// ProcessBuilderExitQueue calls the EIP-8282 builder exit contract.
+// It returns the opaque request data returned by the contract.
+func ProcessBuilderExitQueue(requests *[][]byte, rules params.Rules, evm *vm.EVM, blockAccessIndex uint32, blockAccessList *bal.ConstructionBlockAccessList) error {
+	return processRequestsSystemCall(requests, rules, evm, 0x04, params.BuilderExitAddress, blockAccessIndex, blockAccessList)
 }
 
 func processRequestsSystemCall(requests *[][]byte, rules params.Rules, evm *vm.EVM, requestType byte, addr common.Address, blockAccessIndex uint32, blockAccessList *bal.ConstructionBlockAccessList) error {
