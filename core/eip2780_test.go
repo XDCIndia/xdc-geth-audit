@@ -256,7 +256,7 @@ func applyMsgCoinbase(t *testing.T, sdb *state.StateDB, tx *types.Transaction, c
 	}
 	gp := NewGasPool(evm.Context.GasLimit)
 	evm.SetTxContext(NewEVMTxContext(msg))
-	res, err := newStateTransition(evm, msg, gp).execute()
+	res, err := newStateTransition(evm, msg, gp, common.Address{}).execute()
 	return res, gp, err
 }
 
@@ -653,7 +653,7 @@ func TestEIP2780DelegationWarmth(t *testing.T) {
 		recipient: {Code: types.AddressToDelegation(recipient)},
 	}))
 	to := recipient
-	st := newStateTransition(amsterdamCoreEVM(sdb), &Message{To: &to, Value: new(uint256.Int)}, NewGasPool(100_000))
+	st := newStateTransition(amsterdamCoreEVM(sdb), &Message{To: &to, Value: new(uint256.Int)}, NewGasPool(100_000), common.Address{})
 	st.gasRemaining = vm.NewGasBudget(1_000, 0)
 	sdb.AddAddressToAccessList(recipient)
 	if !st.chargeCallRecipientEIP2780(new(uint256.Int)) || st.gasRemaining.UsedExecutionGas != warm {

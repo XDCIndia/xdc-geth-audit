@@ -32,7 +32,7 @@ import (
 // newAuthTestTransition builds a minimal stateTransition with a runtime gas
 // budget, suitable for calling applyAuthorization directly.
 func newAuthTestTransition(sdb *state.StateDB) *stateTransition {
-	st := newStateTransition(amsterdamCoreEVM(sdb), &Message{}, NewGasPool(30_000_000))
+	st := newStateTransition(amsterdamCoreEVM(sdb), &Message{}, NewGasPool(30_000_000), common.Address{})
 	st.gasRemaining = vm.NewGasBudget(1_000_000, 1_000_000)
 	return st
 }
