@@ -141,7 +141,7 @@ func applyMsg(t *testing.T, sdb *state.StateDB, tx *types.Transaction) (*Executi
 	gp := NewGasPool(evm.Context.GasLimit)
 
 	evm.SetTxContext(NewEVMTxContext(msg))
-	st := newStateTransition(evm, msg, gp)
+	st := newStateTransition(evm, msg, gp, common.Address{})
 	res, err := st.execute()
 	if err == nil && res != nil {
 		floor, ferr := FloorDataGas(rules8037, msg.From, msg.To, msg.Value, msg.Data, msg.AccessList)
@@ -524,7 +524,7 @@ func TestPrechargeOOGEmitsTopFrame(t *testing.T) {
 				t.Fatalf("to message: %v", err)
 			}
 			evm.SetTxContext(NewEVMTxContext(msg))
-			res, err := newStateTransition(evm, msg, NewGasPool(evm.Context.GasLimit)).execute()
+			res, err := newStateTransition(evm, msg, NewGasPool(evm.Context.GasLimit), common.Address{}).execute()
 			if err != nil {
 				t.Fatal(err)
 			}
