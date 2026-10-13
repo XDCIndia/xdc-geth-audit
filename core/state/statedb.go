@@ -613,7 +613,7 @@ func (s *StateDB) GetTransientState(addr common.Address, key common.Hash) common
 func (s *StateDB) updateStateObject(obj *stateObject) {
 	// Encode the account and update the account trie
 	if err := s.trie.UpdateAccount(obj.Address(), &obj.data, len(obj.code)); err != nil {
-		s.setError(fmt.Errorf("updateStateObject (%x) error: %v", obj.Address(), err))
+		s.setError(fmt.Errorf("updateStateObject (%x) error: %w", obj.Address(), err))
 	}
 	if obj.dirtyCode {
 		s.trie.UpdateContractCode(obj.Address(), common.BytesToHash(obj.CodeHash()), obj.code)
@@ -623,7 +623,7 @@ func (s *StateDB) updateStateObject(obj *stateObject) {
 // deleteStateObject removes the given object from the state trie.
 func (s *StateDB) deleteStateObject(addr common.Address) {
 	if err := s.trie.DeleteAccount(addr); err != nil {
-		s.setError(fmt.Errorf("deleteStateObject (%x) error: %v", addr[:], err))
+		s.setError(fmt.Errorf("deleteStateObject (%x) error: %w", addr[:], err))
 	}
 }
 
