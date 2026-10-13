@@ -2364,12 +2364,14 @@ func (s *xdcSyncer) fullSyncOnce() {
 		// gated forever. Clear XdcBulkSyncMode here so the producer can seal the valid
 		// successor and unwedge the chain (e.g. apothem halted at 83,088,791 by an
 		// out-of-bound 420M gas limit above our 419,589,845 head — #952). NON-MAINNET
-		// only: mainnet must never relax on a validation error. Guard on fromBlock being
-		// at/just above head so a deep-history invalid block cannot trip it.
+		// only: mainnet must never relax on a validation error. Guard on the peer being
+		// at the tip: fromBlock is always head+1, so it cannot tell "at tip" from "far
+		// behind" (#1427). A short header batch can: the peer has nothing past it, so
+		// the invalid block really sits at the network tip.
 		if !errors.Is(err, consensus.ErrUnknownAncestor) &&
 			s.handler.chain.Config().ChainID != nil &&
 			s.handler.chain.Config().ChainID.Uint64() != 50 {
-			if cur := s.handler.chain.CurrentBlock(); cur != nil && fromBlock <= cur.Number.Uint64()+1 {
+			if cur := s.handler.chain.CurrentBlock(); cur != nil && len(res.headers) < xdpos2MaxHeaderFetch {
 				if core.XdcBulkSyncMode.Load() {
 					log.Warn("xdcSyncer: #952 next block invalid at tip — clearing XdcBulkSyncMode so miner can seal the valid successor",
 						"from", fromBlock, "head", cur.Number.Uint64(), "err", err)
