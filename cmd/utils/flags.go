@@ -23,13 +23,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"math/big"
 	"net"
 	"net/http"
 	"os"
 	"path/filepath"
-	"runtime"
 	godebug "runtime/debug"
 	"strconv"
 	"strings"
@@ -2461,163 +2459,6 @@ func RegisterEthStatsService(stack *node.Node, backend *eth.EthAPIBackend, url s
 	if err := ethstats.New(stack, backend, backend.Engine(), url); err != nil {
 		Fatalf("Failed to register the Ethereum Stats service: %v", err)
 	}
-}
-
-const (
-	// xdcDefaultStatsHost / xdcDefaultStatsSecret are the shared XDC fleet stats
-	// board (stats.xdcindia.com), used by both mainnet and apothem nodes. They are
-	// hard-coded so an XDC (XDPoS) node reports to stats by DEFAULT even when
-	// --ethstats is not passed — operators should never have to remember the flag
-	// to make a node visible. The board separates nodes by reported name/chainId.
-	xdcDefaultStatsHost   = "stats.xdcindia.com:443"
-	xdcDefaultStatsSecret = "xdc_openscan_stats_2026"
-	// xdcGeoEndpoint yields the host's public IP + country in one call
-	// ({"ip":"…","country":"…"}). Same source scripts/xdcnode.sh uses to derive
-	// LOCATION (curl https://ipinfo.io).
-	xdcGeoEndpoint = "https://ipinfo.io/json"
-)
-
-// xdcOutboundIP returns the host's primary outbound IP — the source address the
-// OS would use to reach the internet. Used only as a fallback when the public-IP
-// lookup fails (e.g. behind NAT it is the LAN IP). No packet is sent; a UDP
-// "connect" only selects a route.
-func xdcOutboundIP() string {
-	conn, err := net.Dial("udp", "8.8.8.8:80")
-	if err != nil {
-		return ""
-	}
-	defer conn.Close()
-	if udp, ok := conn.LocalAddr().(*net.UDPAddr); ok {
-		return udp.IP.String()
-	}
-	return ""
-}
-
-// xdcPublicInfo returns the host's PUBLIC IP and 2-letter country code via
-// ipinfo.io — the same source scripts/xdcnode.sh uses for LOCATION. On failure
-// it falls back to the outbound (LAN) IP and country "xx" so a node always gets a
-// usable name. Bounded to 5s (xdcnode.sh uses curl --max-time 5). Any ':' in the
-// IP (IPv6) is replaced with '-' so it is safe inside the colon-delimited name.
-func xdcPublicInfo() (ip, country string) {
-	country = "xx"
-	client := &http.Client{Timeout: 5 * time.Second}
-	if resp, err := client.Get(xdcGeoEndpoint); err == nil {
-		defer resp.Body.Close()
-		var v struct {
-			IP      string `json:"ip"`
-			Country string `json:"country"`
-		}
-		if json.NewDecoder(io.LimitReader(resp.Body, 1<<16)).Decode(&v) == nil {
-			ip = strings.TrimSpace(v.IP)
-			if c := xdcSanitizeAZ(v.Country); c != "" {
-				country = c
-			}
-		}
-	}
-	if ip == "" {
-		ip = xdcOutboundIP() // LAN fallback
-	}
-	return strings.ReplaceAll(ip, ":", "-"), country
-}
-
-// xdcSanitizeAZ lower-cases s and keeps only [a-z], matching xdcnode.sh's
-// `tr '[:upper:]' '[:lower:]' | tr -cd 'a-z'`.
-func xdcSanitizeAZ(s string) string {
-	var b strings.Builder
-	for _, r := range strings.ToLower(s) {
-		if r >= 'a' && r <= 'z' {
-			b.WriteRune(r)
-		}
-	}
-	return b.String()
-}
-
-// xdcHostLabel mirrors xdcnode.sh's `hostname -s | lower | strip non-alphanumeric`.
-func xdcHostLabel() string {
-	h, _ := os.Hostname()
-	if i := strings.IndexByte(h, '.'); i >= 0 {
-		h = h[:i] // short name (strip domain)
-	}
-	var b strings.Builder
-	for _, r := range strings.ToLower(h) {
-		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
-			b.WriteRune(r)
-		}
-	}
-	if b.Len() == 0 {
-		return "xdcnode"
-	}
-	return b.String()
-}
-
-// xdcOSLabel mirrors xdcnode.sh: uname lower-cased, darwin -> macos.
-func xdcOSLabel() string {
-	switch runtime.GOOS {
-	case "darwin":
-		return "macos"
-	case "":
-		return "os"
-	default:
-		return runtime.GOOS
-	}
-}
-
-func xdcNetworkLabel(chainID uint64) string {
-	switch chainID {
-	case 50:
-		return "mainnet"
-	case 51:
-		return "apothem"
-	case 551:
-		return "devnet"
-	case 5551:
-		return "devnet5551"
-	default:
-		return fmt.Sprintf("chain%d", chainID)
-	}
-}
-
-// xdcAppendIPToName appends "-<ip>" to the node-name portion of an existing
-// ethstats URL (name[:secret]@host), preserving the secret and host. Idempotent —
-// re-running on an already-augmented URL is a no-op. Mirrors the split logic of
-// ethstats.parseEthstatsURL (LastIndex '@', then LastIndex ':').
-func xdcAppendIPToName(explicit, ip string) string {
-	if explicit == "" || ip == "" {
-		return explicit
-	}
-	at := strings.LastIndex(explicit, "@")
-	if at <= 0 {
-		return explicit
-	}
-	preHost, host := explicit[:at], explicit[at+1:]
-	name, secret := preHost, ""
-	if c := strings.LastIndex(preHost, ":"); c != -1 {
-		name, secret = preHost[:c], preHost[c:] // secret keeps its leading ':'
-	}
-	if name == "" || strings.Contains(name, ip) {
-		return explicit
-	}
-	return name + "-" + ip + secret + "@" + host
-}
-
-// XDCEthstatsURL returns the ethstats connection string for an XDC (XDPoS) node.
-// It guarantees the node appears on the XDC stats board even without --ethstats,
-// using the scripts/xdcnode.sh node-name convention
-// (host-network-nodetype-os-location) plus the host's PUBLIC IP.
-//
-//   - explicit == ""  → synthesize
-//     <host>-<network>-<nodetype>-<os>-<location>-<publicip>:<secret>@stats.xdcindia.com:443
-//   - explicit set    → keep operator name/secret/host, append "-<publicip>" to name.
-func XDCEthstatsURL(explicit string, chainID uint64, nodetype string) string {
-	ip, country := xdcPublicInfo()
-	if explicit != "" {
-		return xdcAppendIPToName(explicit, ip)
-	}
-	name := xdcHostLabel() + "-" + xdcNetworkLabel(chainID) + "-" + nodetype + "-" + xdcOSLabel() + "-" + country
-	if ip != "" {
-		name += "-" + ip
-	}
-	return name + ":" + xdcDefaultStatsSecret + "@" + xdcDefaultStatsHost
 }
 
 // RegisterGraphQLService adds the GraphQL API to the node.
