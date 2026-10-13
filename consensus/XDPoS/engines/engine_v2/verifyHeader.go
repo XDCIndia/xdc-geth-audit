@@ -144,6 +144,9 @@ func (x *XDPoS_v2) verifyHeader(chain consensus.ChainReader, header *types.Heade
 	}
 
 	var masterNodes []common.Address
+	// localList: masterNodes was computed locally by calcMasternodes and matched
+	// header.Validators, i.e. it does not come from a header (#1413).
+	localList := false
 	isEpochSwitch, _, err := x.IsEpochSwitch(header)
 	if err != nil {
 		log.Error("[verifyHeader] error when checking if header is epoch switch header", "Hash", header.Hash(), "Number", header.Number, "Error", err)
@@ -162,6 +165,7 @@ func (x *XDPoS_v2) verifyHeader(chain consensus.ChainReader, header *types.Heade
 
 		localMasterNodes, localPenalties, _, err := x.calcMasternodes(chain, header.Number, header.ParentHash, round, parents)
 		masterNodes = localMasterNodes
+		localList = err == nil
 		if err != nil {
 			// Canonical XDPoSChain (verifyHeader.go:137-143): under fullVerify any
 			// calcMasternodes failure is fatal, including a missing gap snapshot
@@ -246,6 +250,7 @@ func (x *XDPoS_v2) verifyHeader(chain consensus.ChainReader, header *types.Heade
 					"hookPenaltyNil", x.HookPenalty == nil,
 					"snapshotMissing", err != nil && errors.Is(err, utils.ErrV2SnapshotMissing))
 				masterNodes = validatorsAddress
+				localList = false
 				localPenalties = contracts.ExtractAddressFromBytes(header.Penalties)
 			} else {
 				log.Warn("[verifyHeader DIAG]",
@@ -350,7 +355,9 @@ func (x *XDPoS_v2) verifyHeader(chain consensus.ChainReader, header *types.Heade
 		// gap-N and the next epoch switch. The pivot hash chain already establishes
 		// canonicality; the proposer's signature was verified above. Hard-fail only in
 		// fullVerify (steady-state tip processing) where HookPenalty has full state.
-		if !fullVerify {
+		// #1413: the tolerance only covers lists taken from headers; a list computed
+		// locally (localList) is checked as in canonical (verifyHeader.go:199-204).
+		if !fullVerify && !localList {
 			log.Warn("[verifyHeader] A.87 leader mismatch tolerated during bulk sync",
 				"block", header.Number, "curIndex", curIndex, "leaderIndex", leaderIndex,
 				"expected", masterNodes[leaderIndex], "actual", validatorAddress)
@@ -360,6 +367,11 @@ func (x *XDPoS_v2) verifyHeader(chain consensus.ChainReader, header *types.Heade
 		}
 	}
 
-	x.verifiedHeaders.Add(header.Hash(), struct{}{})
+	// #1413: only a full verification is worth remembering. The cache short-circuits
+	// every later call, so caching a header whose leader check was skipped would let a
+	// later fullVerify pass accept it unchecked (canonical verifyHeader.go:206-212).
+	if fullVerify {
+		x.verifiedHeaders.Add(header.Hash(), struct{}{})
+	}
 	return nil
 }
