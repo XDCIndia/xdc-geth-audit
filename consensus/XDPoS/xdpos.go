@@ -144,6 +144,12 @@ var (
 	// errInvalidCheckpointPenalties is returned if penalties list is invalid
 	errInvalidCheckpointPenalties = errors.New("invalid penalty list on checkpoint block")
 
+	// ErrPenaltyDataUnavailable is wrapped by the V1 penalty hooks when this node
+	// lacks the data to compute a checkpoint's penalties (state pruned after a
+	// rewind, block bodies of a batch not written yet). Verification then skips
+	// the penalties compare instead of failing.
+	ErrPenaltyDataUnavailable = errors.New("v1 penalty data unavailable")
+
 	// errInvalidMixDigest is returned if a block's mix digest is non-zero.
 	errInvalidMixDigest = errors.New("non-zero mix digest")
 
@@ -298,9 +304,12 @@ type XDPoS struct {
 
 	// Hook functions for XDC-specific logic
 	// These hooks integrate with the XDC smart contracts for rewards, penalties, etc.
-	HookReward            func(chain consensus.ChainHeaderReader, stateBlock *state.StateDB, parentState *state.StateDB, header *types.Header) (map[string]interface{}, error)
-	HookPenalty           func(chain consensus.ChainHeaderReader, blockNumberEpoc uint64) ([]common.Address, error)
-	HookPenaltyTIPSigning func(chain consensus.ChainHeaderReader, header *types.Header, candidate []common.Address) ([]common.Address, error)
+	HookReward func(chain consensus.ChainHeaderReader, stateBlock *state.StateDB, parentState *state.StateDB, header *types.Header) (map[string]interface{}, error)
+	// The V1 penalty hooks take the verify batch's parents (oldest first, ending
+	// at the header's parent; nil outside verification) so headers not written
+	// yet are found, as canonical's batch chain reader serves them.
+	HookPenalty           func(chain consensus.ChainHeaderReader, blockNumberEpoc uint64, parents []*types.Header) ([]common.Address, error)
+	HookPenaltyTIPSigning func(chain consensus.ChainHeaderReader, header *types.Header, candidate []common.Address, parents []*types.Header) ([]common.Address, error)
 	HookValidator         func(header *types.Header, signers []common.Address) ([]byte, error)
 	HookVerifyMNs         func(header *types.Header, signers []common.Address) error
 
@@ -910,14 +919,14 @@ func (c *XDPoS) verifyCascadingFields(chain consensus.ChainHeaderReader, header 
 	// written into the snapshot here: verifySeal must authorize the sealer against
 	// the parent's signer set, not against the list the checkpoint names (#1418).
 	if number%c.config.Epoch == 0 && v1FullVerifyChain(chain) {
-		err := c.checkSignersOnCheckpoint(chain, header, c.checkpointSigners(chain, header, parents, snap))
+		err := c.checkSignersOnCheckpoint(chain, header, c.checkpointSigners(chain, header, parents, snap), parents)
 		if err != nil && c.HookGetSignersFromContract != nil {
 			log.Debug("checkSignersOnCheckpoint failed, fallback to smart contract check", "number", number, "err", err)
 			var signers []common.Address
 			if signers, err = c.getSignersFromContract(chain, header, parents); err != nil {
 				return err
 			}
-			err = c.checkSignersOnCheckpoint(chain, header, signers)
+			err = c.checkSignersOnCheckpoint(chain, header, signers, parents)
 		}
 		if err != nil {
 			return err
@@ -931,7 +940,7 @@ func (c *XDPoS) verifyCascadingFields(chain consensus.ChainHeaderReader, header 
 // checkSignersOnCheckpoint mirrors canonical engine_v1 checkSignersOnCheckpoint
 // (engine.go:300-345): the checkpoint's signer list must equal signers minus the
 // penalties of this epoch and of the previous LimitPenaltyEpoch epochs.
-func (c *XDPoS) checkSignersOnCheckpoint(chain consensus.ChainHeaderReader, header *types.Header, signers []common.Address) error {
+func (c *XDPoS) checkSignersOnCheckpoint(chain consensus.ChainHeaderReader, header *types.Header, signers []common.Address, parents []*types.Header) error {
 	number := header.Number.Uint64()
 	var chainID uint64
 	if cfg := chain.Config(); cfg != nil && cfg.ChainID != nil {
@@ -941,21 +950,32 @@ func (c *XDPoS) checkSignersOnCheckpoint(chain consensus.ChainHeaderReader, head
 	if IsIgnoreSignerCheckBlock(chainID, number) {
 		return nil
 	}
-	penPenalties := []common.Address{}
-
-	// Get penalties if hook is configured
-	if c.HookPenalty != nil || c.HookPenaltyTIPSigning != nil {
-		var penErr error
-		if c.HookPenaltyTIPSigning != nil {
-			penPenalties, penErr = c.HookPenaltyTIPSigning(chain, header, signers)
-		} else if c.HookPenalty != nil {
-			penPenalties, penErr = c.HookPenalty(chain, number)
-		}
-		if penErr != nil {
-			return penErr
-		}
+	// Get penalties with the hook canonical selects by IsTIPSigning
+	// (engine_v1/engine.go:306-326) and reject a checkpoint whose Penalties differ
+	// from the computed list. Penalties are not in the V1 seal hash (canonical
+	// too), so this compare is what binds them (#1422).
+	penPenalties, ok, penErr := c.v1CheckpointPenalties(chain, header, signers, parents)
+	if errors.Is(penErr, ErrPenaltyDataUnavailable) {
+		// Same policy as a missing parent state: a node without the data
+		// (e.g. non-archive after a rewind) must not wedge. Use the header's
+		// list for the signer check below and skip the compare.
+		log.Warn("Skipping v1 checkpoint penalties check", "number", number, "err", penErr)
+		penPenalties, ok, penErr = extractAddressFromBytes(header.Penalties), false, nil
+	}
+	if penErr != nil {
+		return penErr
+	}
+	if ok {
 		for _, address := range penPenalties {
 			log.Debug("Penalty Info", "address", address, "number", number)
+		}
+		var penBytes []byte
+		for _, addr := range penPenalties {
+			penBytes = append(penBytes, addr[:]...)
+		}
+		if !bytes.Equal(header.Penalties, penBytes) {
+			log.Error("Penalties in checkpoint header differ from the computed list", "number", number, "header", len(header.Penalties)/common.AddressLength, "computed", len(penPenalties))
+			return errInvalidCheckpointPenalties
 		}
 	}
 
@@ -1093,6 +1113,24 @@ func (c *XDPoS) getSignersFromContract(chain consensus.ChainHeaderReader, checkp
 func v1FullVerifyChain(chain consensus.ChainHeaderReader) bool {
 	cfg := chain.Config()
 	return cfg == nil || cfg.ChainID == nil || cfg.ChainID.Cmp(params.XDCApothemChainConfig.ChainID) != 0
+}
+
+// v1CheckpointPenalties computes the penalties of a V1 checkpoint with the hook
+// canonical selects by IsTIPSigning (engine_v1/engine.go:309-313, 764-768).
+// ok is false when that hook is not configured.
+func (c *XDPoS) v1CheckpointPenalties(chain consensus.ChainHeaderReader, header *types.Header, signers []common.Address, parents []*types.Header) (penalties []common.Address, ok bool, err error) {
+	if cfg := chain.Config(); cfg != nil && cfg.IsTIPSigning(header.Number) {
+		if c.HookPenaltyTIPSigning == nil {
+			return nil, false, nil
+		}
+		penalties, err = c.HookPenaltyTIPSigning(chain, header, signers, parents)
+		return penalties, true, err
+	}
+	if c.HookPenalty == nil {
+		return nil, false, nil
+	}
+	penalties, err = c.HookPenalty(chain, header.Number.Uint64(), parents)
+	return penalties, true, err
 }
 
 // verifySeal checks whether the signature contained in the header satisfies the
@@ -1263,11 +1301,7 @@ func (c *XDPoS) Prepare(chain consensus.ChainHeaderReader, header *types.Header)
 			var penMasternodes []common.Address
 			var penErr error
 
-			if c.HookPenaltyTIPSigning != nil {
-				penMasternodes, penErr = c.HookPenaltyTIPSigning(chain, header, masternodes)
-			} else if c.HookPenalty != nil {
-				penMasternodes, penErr = c.HookPenalty(chain, number)
-			}
+			penMasternodes, _, penErr = c.v1CheckpointPenalties(chain, header, masternodes, nil)
 			if penErr != nil {
 				return penErr
 			}

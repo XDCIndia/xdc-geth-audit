@@ -110,52 +110,188 @@ func AttachConsensusV1Hooks(adaptor *XDPoS.XDPoS, bc *core.BlockChain, chainConf
 		return nil
 	}
 
-	// Fix #97: Wire V1 HookPenalty.
-	// Walks through the epoch, checks which masternodes signed blocks via block signers.
-	// Masternodes that never signed are penalized (removed from next epoch list).
-	adaptor.HookPenalty = func(chain consensus.ChainHeaderReader, blockNumberEpoch uint64) ([]common.Address, error) {
-		epoch := uint64(900)
-		if xdposConf != nil && xdposConf.Epoch > 0 {
-			epoch = xdposConf.Epoch
+	// HookPenalty (before TIPSigning): masternodes of the previous epoch that
+	// signed none of the blocks it checks in the 0x89 block-signer state are
+	// penalized. Port of canonical XDPoSChain eth/hooks/engine_v1_hooks.go
+	// HookPenalty (#1422), including its in-place list removal.
+	adaptor.HookPenalty = func(chain consensus.ChainHeaderReader, blockNumberEpoch uint64, parents []*types.Header) ([]common.Address, error) {
+		if xdposConf == nil {
+			return []common.Address{}, nil
 		}
+		epoch := xdposConf.Epoch
 		if blockNumberEpoch < epoch {
 			return []common.Address{}, nil
 		}
+		// Canonical reads the 0x89 block-signer mapping at the canonical head
+		// (bc.State()) and log.Crit's without it. A non-archive node can lack it
+		// after a rewind: report it as unavailable so the compare is skipped.
+		canonicalState, err := bc.State()
+		if canonicalState == nil || err != nil {
+			return nil, fmt.Errorf("%w: v1 HookPenalty: no state at the canonical head: %v", XDPoS.ErrPenaltyDataUnavailable, err)
+		}
+		byNumber := batchHeaderByNumber(chain, parents)
 		prevEpoch := blockNumberEpoch - epoch
-		prevHeader := chain.GetHeaderByNumber(prevEpoch)
+		prevHeader := byNumber(prevEpoch)
 		if prevHeader == nil {
+			return nil, fmt.Errorf("v1 HookPenalty: no header at %d", prevEpoch)
+		}
+		// Copy: the removal below works in place.
+		penSigners := append([]common.Address(nil), adaptor.GetMasternodes(chain, prevHeader)...)
+		if len(penSigners) > 0 {
+			for i := prevEpoch; i < blockNumberEpoch; i++ {
+				if i%common.MergeSignRange == 0 || !chainConfig.IsTIP2019(new(big.Int).SetUint64(i)) {
+					bheader := byNumber(i)
+					if bheader == nil {
+						return nil, fmt.Errorf("v1 HookPenalty: no header at %d", i)
+					}
+					// The signer mapping is keyed by block hash only, so the
+					// header is enough (the batch has no bodies).
+					block := types.NewBlockWithHeader(bheader)
+					if len(penSigners) > 0 {
+						signedMasternodes, err := contracts.GetSignersFromContract(canonicalState, block)
+						if err != nil {
+							return nil, err
+						}
+						for _, signed := range signedMasternodes {
+							for j, addr := range penSigners {
+								if signed == addr {
+									penSigners = append(penSigners[:j], penSigners[j+1:]...)
+								}
+							}
+						}
+					} else {
+						break
+					}
+				}
+			}
+		}
+		return penSigners, nil
+	}
+
+	// HookPenaltyTIPSigning (from TIPSigning): masternodes of the previous epoch
+	// that mined no block in it, plus (from TIPRandomize) penalized nodes coming
+	// back that signed none of the recent MergeSignRange blocks. Port of
+	// canonical XDPoSChain eth/hooks/engine_v1_hooks.go HookPenaltyTIPSigning (#1422).
+	adaptor.HookPenaltyTIPSigning = func(chain consensus.ChainHeaderReader, header *types.Header, candidates []common.Address, parents []*types.Header) ([]common.Address, error) {
+		number := header.Number.Uint64()
+		if xdposConf == nil {
 			return []common.Address{}, nil
 		}
-
-		// Get masternode list at previous epoch
-		masternodes := adaptor.GetMasternodes(chain, prevHeader)
-		if len(masternodes) == 0 {
+		epoch := xdposConf.Epoch
+		if number < epoch {
 			return []common.Address{}, nil
 		}
-
-		// Track which masternodes signed at least one block
-		signed := make(map[common.Address]bool)
-		for i := prevEpoch + 1; i < blockNumberEpoch; i++ {
-			h := chain.GetHeaderByNumber(i)
-			if h == nil {
-				continue
+		byNumber := batchHeaderByNumber(chain, parents)
+		inBatch := make(map[common.Hash]*types.Header, len(parents))
+		for _, p := range parents {
+			if p != nil {
+				inBatch[p.Hash()] = p
 			}
-			// Recover signer from header
-			signer, err := adaptor.RecoverSigner(h)
-			if err == nil {
-				signed[signer] = true
+		}
+		prevEpoch := number - epoch
+		combackEpoch := uint64(0)
+		comebackLength := (common.LimitPenaltyEpoch + 1) * epoch
+		if number > comebackLength {
+			combackEpoch = number - comebackLength
+		}
+
+		// Hashes of the epoch's blocks, newest first, and blocks mined per miner.
+		listBlockHash := make([]common.Hash, epoch)
+		statMiners := make(map[common.Address]int)
+		listBlockHash[0] = header.ParentHash
+		parentNumber := number - 1
+		parentHash := header.ParentHash
+		for i := uint64(1); i < epoch; i++ {
+			parentHeader := inBatch[parentHash]
+			if parentHeader == nil || parentHeader.Number.Uint64() != parentNumber {
+				parentHeader = chain.GetHeader(parentHash, parentNumber)
+			}
+			if parentHeader == nil {
+				return nil, fmt.Errorf("v1 HookPenaltyTIPSigning: no header at %d", parentNumber)
+			}
+			miner, _ := adaptor.RecoverSigner(parentHeader)
+			statMiners[miner]++
+			parentHash = parentHeader.ParentHash
+			parentNumber--
+			listBlockHash[i] = parentHash
+		}
+
+		prevHeader := byNumber(prevEpoch)
+		if prevHeader == nil {
+			return nil, fmt.Errorf("v1 HookPenaltyTIPSigning: no header at %d", prevEpoch)
+		}
+		penalties := []common.Address{}
+		for miner, total := range statMiners {
+			if total < common.MinimunMinerBlockPerEpoch {
+				penalties = append(penalties, miner)
+			}
+		}
+		for _, addr := range adaptor.GetMasternodes(chain, prevHeader) {
+			if _, exist := statMiners[addr]; !exist {
+				penalties = append(penalties, addr)
 			}
 		}
 
-		// Penalize masternodes that never signed
-		var penalties []common.Address
-		for _, mn := range masternodes {
-			if !signed[mn] {
-				penalties = append(penalties, mn)
+		// Penalized LimitPenaltyEpoch+1 epochs ago and candidates again.
+		penComebacks := []common.Address{}
+		if combackEpoch > 0 {
+			combackHeader := byNumber(combackEpoch)
+			if combackHeader == nil {
+				return nil, fmt.Errorf("v1 HookPenaltyTIPSigning: no header at %d", combackEpoch)
+			}
+			for _, penalty := range contracts.ExtractAddressFromBytes(combackHeader.Penalties) {
+				for _, addr := range candidates {
+					if penalty == addr {
+						penComebacks = append(penComebacks, penalty)
+					}
+				}
 			}
 		}
-		log.Info("[V1 HookPenalty] Calculated penalties", "block", blockNumberEpoch, "penalized", len(penalties), "total", len(masternodes))
-		return penalties, nil
+
+		// Comeback nodes that signed one of the recent MergeSignRange blocks are cleared.
+		mapBlockHash := map[common.Hash]bool{}
+		for i := common.RangeReturnSigner - 1; i >= 0; i-- {
+			if len(penComebacks) == 0 {
+				break
+			}
+			blockNumber := number - uint64(i) - 1
+			bhash := listBlockHash[i]
+			if blockNumber%common.MergeSignRange == 0 {
+				mapBlockHash[bhash] = true
+			}
+			signingTxs, ok := adaptor.GetCachedSigningTxs(bhash)
+			if !ok {
+				block := bc.GetBlock(bhash, blockNumber)
+				if block == nil {
+					// Header verification gets no bodies; a block of the
+					// batch is not written yet.
+					return nil, fmt.Errorf("%w: v1 HookPenaltyTIPSigning: no block at %d", XDPoS.ErrPenaltyDataUnavailable, blockNumber)
+				}
+				signingTxs = adaptor.CacheSigner(bhash, block.Transactions())
+			}
+			signer := types.MakeSigner(chainConfig, new(big.Int).SetUint64(blockNumber), 0)
+			for _, tx := range signingTxs {
+				blkHash := common.BytesToHash(tx.Data()[len(tx.Data())-32:])
+				from, err := types.Sender(signer, tx)
+				if err != nil {
+					continue
+				}
+				if mapBlockHash[blkHash] {
+					for j, addr := range penComebacks {
+						if from == addr {
+							penComebacks = append(penComebacks[:j], penComebacks[j+1:]...)
+							break
+						}
+					}
+				}
+			}
+		}
+
+		penalties = append(penalties, penComebacks...)
+		if chainConfig.IsTIPRandomize(header.Number) {
+			return penalties, nil
+		}
+		return penComebacks, nil
 	}
 
 	// HookGetSignersFromContract: the candidates of the gap block's state, by stake
@@ -225,4 +361,22 @@ func validatorsFromState(statedb *state.StateDB, masternodes []common.Address) (
 		return nil, err
 	}
 	return contracts.BuildValidatorFromM2(m2), nil
+}
+
+// batchHeaderByNumber looks a header up among the verify batch's parents first,
+// then in the chain, as canonical's batch chain reader does
+// (consensus/XDPoS/verify_chain_reader.go, core/blockchain.go:2583-2585).
+func batchHeaderByNumber(chain consensus.ChainHeaderReader, parents []*types.Header) func(uint64) *types.Header {
+	byNumber := make(map[uint64]*types.Header, len(parents))
+	for _, p := range parents {
+		if p != nil && p.Number != nil {
+			byNumber[p.Number.Uint64()] = p
+		}
+	}
+	return func(n uint64) *types.Header {
+		if h, ok := byNumber[n]; ok {
+			return h
+		}
+		return chain.GetHeaderByNumber(n)
+	}
 }
