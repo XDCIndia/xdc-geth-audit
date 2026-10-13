@@ -57,11 +57,9 @@ func (x *XDPoS_v2) VerifyTimeoutMessage(chain consensus.ChainReader, timeoutMsg 
 		return false, err
 	}
 
-	// Use CandidatePool() (active set ∪ penalties) rather than NextEpochCandidates
-	// alone so a currently-penalized masternode is still accepted for its own
-	// timeout/comeback checks (matches canonical XDPoSChain).
-	pool := snap.CandidatePool()
-	if len(pool) == 0 {
+	// Canonical XDPoSChain (engine.go VerifyTimeoutMessage) checks the signer
+	// against NextEpochCandidates only, without the penalty union.
+	if len(snap.NextEpochCandidates) == 0 {
 		log.Error("[VerifyTimeoutMessage] Empty masternode list",
 			"gapNumber", timeoutMsg.GapNumber)
 		return false, errors.New("empty masternode list")
@@ -74,7 +72,7 @@ func (x *XDPoS_v2) VerifyTimeoutMessage(chain consensus.ChainReader, timeoutMsg 
 			GapNumber: timeoutMsg.GapNumber,
 		}),
 		timeoutMsg.Signature,
-		pool,
+		snap.NextEpochCandidates,
 	)
 	if err != nil {
 		log.Warn("[VerifyTimeoutMessage] Signature verification failed", "error", err)
@@ -293,7 +291,7 @@ func (x *XDPoS_v2) getTCEpochInfo(chain consensus.ChainReader, timeoutCert *type
 	}
 	log.Info("[getTCEpochInfo] init", "epochRound", epochRound, "tcRound", timeoutCert.Round, "tempTCEpoch", tempTCEpoch)
 
-	for epochBlockInfo.Round > timeoutCert.Round {
+	for epochBlockInfo.Round > timeoutCert.Round && tempTCEpoch > 0 {
 		tempTCEpoch--
 		epochBlockInfo, err = x.GetBlockByEpochNumber(chain, tempTCEpoch)
 		if err != nil {
@@ -328,16 +326,10 @@ func (x *XDPoS_v2) verifyTC(chain consensus.ChainReader, timeoutCert *types.Time
 		return fmt.Errorf("unable to get snapshot: %s", err)
 	}
 
-	if snap == nil {
-		log.Error("[verifyTC] Empty snapshot",
-			"gapNumber", timeoutCert.GapNumber)
-		return errors.New("empty masternode list")
-	}
-	// Use CandidatePool() (active set ∪ penalties) rather than NextEpochCandidates
-	// alone so a currently-penalized masternode is still accepted for its own
-	// timeout-certificate checks (matches canonical XDPoSChain).
-	pool := snap.CandidatePool()
-	if len(pool) == 0 {
+	// The gap snapshot is only a sanity check, as in canonical XDPoSChain
+	// (timeout.go verifyTC). Signers are checked against the TC round's epoch
+	// masternodes below, so penalized or old-epoch keys do not count.
+	if snap == nil || len(snap.NextEpochCandidates) == 0 {
 		log.Error("[verifyTC] Empty snapshot",
 			"gapNumber", timeoutCert.GapNumber)
 		return errors.New("empty masternode list")
@@ -357,12 +349,8 @@ func (x *XDPoS_v2) verifyTC(chain consensus.ChainReader, timeoutCert *types.Time
 	})
 	signatures, duplicates, err := RecoverUniqueSigners(signedTimeoutObj, timeoutCert.Signatures)
 	if err != nil {
-		log.Error("[verifyTC] Error while recovering unique signers from TC",
-			"tcRound", timeoutCert.Round,
-			"tcGapNumber", timeoutCert.GapNumber,
-			"tcSignLen", len(timeoutCert.Signatures),
-			"error", err)
-		return utils.ErrInvalidTCSignatures
+		log.Error("[verifyTC] Failed to recover TC signers", "tcRound", timeoutCert.Round, "error", err)
+		return err
 	}
 	if len(duplicates) > 0 {
 		for _, d := range duplicates {
@@ -374,13 +362,7 @@ func (x *XDPoS_v2) verifyTC(chain consensus.ChainReader, timeoutCert *types.Time
 	epochInfo, err := x.getTCEpochInfo(chain, timeoutCert)
 	if err != nil {
 		log.Error("[verifyTC] Failed to get TC epoch info", "tcRound", timeoutCert.Round, "error", err)
-		// Fallback to current header epoch if getTCEpochInfo fails (e.g. during initial sync)
-		currentHeader := chain.CurrentHeader()
-		epochInfo, err = x.getEpochSwitchInfo(chain, currentHeader, currentHeader.Hash())
-		if err != nil {
-			return fmt.Errorf("[verifyTC] unable to get epoch info: %s", err)
-		}
-		log.Warn("[verifyTC] Using fallback current epoch info", "tcRound", timeoutCert.Round)
+		return err
 	}
 
 	// Use per-round config for cert threshold (fix #63 benefit)
@@ -409,7 +391,7 @@ func (x *XDPoS_v2) verifyTC(chain consensus.ChainReader, timeoutCert *types.Time
 	for _, signature := range signatures {
 		go func(sig types.Signature) {
 			defer wg.Done()
-			verified, _, err := x.verifyMsgSignature(signedTimeoutObj, sig, pool)
+			verified, _, err := x.verifyMsgSignature(signedTimeoutObj, sig, epochInfo.Masternodes)
 			if err != nil || !verified {
 				mutex.Lock()
 				if verifyError == nil {
