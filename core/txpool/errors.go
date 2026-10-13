@@ -82,4 +82,9 @@ var (
 
 	// ErrSidecarFormatError is returned when sidecar is malformed
 	ErrSidecarFormatError = errors.New("Wrong sidecar format")
+
+	// ErrSpecialTxNotFromSigner is returned if a special transaction (to
+	// BlockSigners/RandomizeSMC) is submitted by an address that is not a
+	// current masternode signer. Mirrors XDPoSChain core/txpool/errors.go.
+	ErrSpecialTxNotFromSigner = errors.New("special transaction sender is not a signer")
 )
