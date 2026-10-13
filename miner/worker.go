@@ -666,6 +666,18 @@ func (miner *Miner) fillTransactions(ctx context.Context, interrupt *atomic.Int3
 		telemetry.IntAttribute("pending.blob.count", blobTxCount),
 	)
 
+	// XDC: special txs (0x89 signing, 0x90 randomize) are built with gasPrice 0
+	// and are price-exempt. Fed through the price heap with a base fee set, a
+	// 0-price tx fails ErrGasFeeCapTooLow and its whole account is dropped
+	// (#1428). Commit them first, outside the base-fee check, as canonical
+	// XDPoSChain does (miner/ordering.go:137-160, miner/worker.go:1088).
+	if specialTxs := splitSpecialTxs(pendingPlainTxs); len(specialTxs) > 0 {
+		txs := txorder.NewTransactionsByPriceAndNonce(env.signer, specialTxs, nil)
+		noBlobs := txorder.NewTransactionsByPriceAndNonce(env.signer, nil, nil)
+		if err := miner.commitTransactions(ctx, env, txs, noBlobs, interrupt); err != nil {
+			return err
+		}
+	}
 	// Split the pending transactions into locals and remotes.
 	prioPlainTxs, normalPlainTxs := make(map[common.Address][]*txpool.LazyTransaction), pendingPlainTxs
 	prioBlobTxs, normalBlobTxs := make(map[common.Address][]*txpool.LazyTransaction), pendingBlobTxs
@@ -698,6 +710,28 @@ func (miner *Miner) fillTransactions(ctx context.Context, interrupt *atomic.Int3
 		}
 	}
 	return nil
+}
+
+// splitSpecialTxs moves the special txs out of pending, keeping each account's
+// nonce order, and returns them. Accounts left without txs are removed.
+func splitSpecialTxs(pending map[common.Address][]*txpool.LazyTransaction) map[common.Address][]*txpool.LazyTransaction {
+	special := make(map[common.Address][]*txpool.LazyTransaction)
+	for from, txs := range pending {
+		var normal []*txpool.LazyTransaction
+		for _, ltx := range txs {
+			if tx := ltx.Resolve(); tx != nil && tx.IsSpecialTransaction() {
+				special[from] = append(special[from], ltx)
+			} else {
+				normal = append(normal, ltx)
+			}
+		}
+		if len(normal) == 0 {
+			delete(pending, from)
+		} else {
+			pending[from] = normal
+		}
+	}
+	return special
 }
 
 // totalFees computes total consumed miner fees in Wei. Block transactions and receipts have to have the same order.
