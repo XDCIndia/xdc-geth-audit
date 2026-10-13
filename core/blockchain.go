@@ -54,6 +54,7 @@ import (
 	"github.com/ethereum/go-ethereum/metrics"
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/rlp"
+	"github.com/ethereum/go-ethereum/trie"
 	"github.com/ethereum/go-ethereum/triedb"
 	"github.com/ethereum/go-ethereum/triedb/hashdb"
 	"github.com/ethereum/go-ethereum/triedb/pathdb"
@@ -2667,7 +2668,14 @@ func (bc *BlockChain) ProcessBlock(ctx context.Context, parentRoot common.Hash, 
 			// mismatch as a bad
 			// block, never mask it (this is what hid the net #62 block-16 fork/gas
 			// divergence and blocked minting). See the A.93 note above.
-			if bc.canMaskMissingState() {
+			//
+			// #1426: mask only when execution actually hit a missing trie node,
+			// i.e. the parent trie is genuinely incomplete. A mismatch on a
+			// complete state is a real divergence (or a forged root) and, as
+			// in canonical XDPoSChain, a bad block: masking it would canonize
+			// the block and latch no-state mode for every block after it.
+			var missing *trie.MissingNodeError
+			if bc.canMaskMissingState() && errors.As(statedb.Error(), &missing) {
 				log.Warn("BlockChain: A.94 auto-recover on ValidateState mismatch during bulk sync",
 					"block", block.NumberU64(), "err", err)
 				bc.storeCheckpointSyncNoState(true)
