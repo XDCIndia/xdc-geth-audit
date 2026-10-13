@@ -150,6 +150,11 @@ var (
 	// errInvalidUncleHash is returned if a block contains an non-empty uncle list.
 	errInvalidUncleHash = errors.New("non empty uncle hash")
 
+	// errUnsealedHeaderFields is returned if a header sets a post-London
+	// optional field (WithdrawalsHash .. SlotNumber). They change the block
+	// hash without being sealed, and canonical XDPoSChain headers lack them.
+	errUnsealedHeaderFields = errors.New("header sets post-London fields not allowed in XDPoS")
+
 	// errInvalidDifficulty is returned if the difficulty of a block is not either
 	// of 1 or 2, or if the value does not match the turn of the signer.
 	errInvalidDifficulty = errors.New("invalid difficulty")
@@ -596,6 +601,9 @@ func (c *XDPoS) verifyHeaderLightV1(chain consensus.ChainHeaderReader, header *t
 	if header.Number == nil {
 		return errUnknownBlock
 	}
+	if err := verifyNoUnsealedFields(header); err != nil {
+		return err
+	}
 	number := header.Number.Uint64()
 
 	// Don't waste time checking blocks from the future
@@ -705,10 +713,33 @@ func (c *XDPoS) verifyHeaderWithCache(chain consensus.ChainHeaderReader, header 
 	return err
 }
 
+// verifyNoUnsealedFields rejects headers that set any post-London optional
+// field. Header.Hash() covers them but the V2 seal hash (and, for some, the V1
+// seal hash) does not, so anyone could add e.g. an empty WithdrawalsHash to a
+// sealed block and get a different-hash twin with a valid seal (#1417).
+// Canonical XDPoSChain headers have only BaseFee as an optional field, so no
+// canonical block carries these. Genesis is exempt: it is fixed by the local
+// config (a custom genesis with a Shanghai/Cancun time sets them) and is never
+// verified against peers.
+func verifyNoUnsealedFields(header *types.Header) error {
+	if header.Number.Sign() == 0 {
+		return nil
+	}
+	if header.WithdrawalsHash != nil || header.BlobGasUsed != nil || header.ExcessBlobGas != nil ||
+		header.ParentBeaconRoot != nil || header.RequestsHash != nil ||
+		header.BlockAccessListHash != nil || header.SlotNumber != nil {
+		return errUnsealedHeaderFields
+	}
+	return nil
+}
+
 // verifyHeader checks whether a header conforms to the consensus rules.
 func (c *XDPoS) verifyHeader(chain consensus.ChainHeaderReader, header *types.Header, parents []*types.Header) error {
 	if header.Number == nil {
 		return errUnknownBlock
+	}
+	if err := verifyNoUnsealedFields(header); err != nil {
+		return err
 	}
 	number := header.Number.Uint64()
 
