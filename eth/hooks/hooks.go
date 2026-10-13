@@ -5,11 +5,16 @@ package hooks
 
 import (
 	"bytes"
+	"errors"
+	"fmt"
+	"math/big"
 
 	"github.com/ethereum/go-ethereum/common"
+	xdc_sort "github.com/ethereum/go-ethereum/common/sort"
 	"github.com/ethereum/go-ethereum/consensus"
 	"github.com/ethereum/go-ethereum/consensus/XDPoS"
 	"github.com/ethereum/go-ethereum/core"
+	"github.com/ethereum/go-ethereum/core/state"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/params"
@@ -142,5 +147,46 @@ func AttachConsensusV1Hooks(adaptor *XDPoS.XDPoS, bc *core.BlockChain, chainConf
 		return penalties, nil
 	}
 
+	// HookGetSignersFromContract: the candidates of the gap block's state, by stake
+	// descending, at most 150. Port of canonical XDPoSChain
+	// eth/hooks/engine_v1_hooks.go HookGetSignersFromContract (#1418).
+	adaptor.HookGetSignersFromContract = func(gapHeader *types.Header) ([]common.Address, error) {
+		if gapHeader == nil {
+			return nil, errors.New("nil gap block header in HookGetSignersFromContract")
+		}
+		statedb, err := bc.StateAt(gapHeader.Root, gapHeader.Number, gapHeader.Time)
+		if err != nil {
+			return nil, err
+		}
+		return signersFromState(statedb)
+	}
+
 	log.Info("[XDPoS] V1 consensus hooks attached (#72, #97)")
+}
+
+// signersFromState returns the candidates of the 0x88 validator contract, sorted
+// by stake descending with canonical's frozen sort, at most 150.
+func signersFromState(statedb *state.StateDB) ([]common.Address, error) {
+	type candidate struct {
+		addr  common.Address
+		stake *big.Int
+	}
+	var candidates []candidate
+	for _, addr := range state.GetCandidates(statedb) {
+		candidates = append(candidates, candidate{addr, state.GetCandidateCap(statedb, addr)})
+	}
+	if err := statedb.Error(); err != nil {
+		return nil, fmt.Errorf("reading the signers from state: %w", err)
+	}
+	xdc_sort.Slice(candidates, func(i, j int) bool {
+		return candidates[i].stake.Cmp(candidates[j].stake) >= 0
+	})
+	if len(candidates) > 150 {
+		candidates = candidates[:150]
+	}
+	signers := make([]common.Address, 0, len(candidates))
+	for _, c := range candidates {
+		signers = append(signers, c.addr)
+	}
+	return signers, nil
 }
