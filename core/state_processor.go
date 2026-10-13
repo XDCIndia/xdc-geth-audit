@@ -195,14 +195,20 @@ func (p *StateProcessor) Process(ctx context.Context, block *types.Block, stated
 		}
 		statedb.SetTxContext(tx.Hash(), i, uint32(i))
 
-		// XDC: signing transactions at the TIPSigning fork are routed to
-		// ApplySigningTransaction, which bumps the sender's nonce and emits a
-		// minimal receipt without invoking the EVM (zero gas). The contract
-		// at 0x89 (BlockSignersBinary) is wiped at TIPSigning, so dispatching
-		// here through EVM would fail. Canonical XDPoSChain mirrors this exact
-		// dispatch and the parity gates depend on it producing byte-identical
-		// receipts.
-		if to := tx.To(); to != nil && *to == common.BlockSignersBinary && config.IsTIPSigning(blockNumber) {
+		// XDC: sender recovery comes before the special-tx dispatch, as in
+		// canonical XDPoSChain (TransactionToMessage, then routeTransaction
+		// inside ApplyTransactionWithEVM), so a tx with a bad signature is
+		// rejected on every route, the 0x91-0x94 empty route included.
+		msg, err := TransactionToMessage(tx, signer, header.BaseFee)
+		if err != nil {
+			return nil, fmt.Errorf("could not apply tx %d [%v]: %w", i, tx.Hash().Hex(), err)
+		}
+		// XDC: signing txs (0x89, from TIPSigning) and XDCx empty txs
+		// (0x91-0x94, in the TIPXDCXReceiver window) bypass the EVM; see
+		// RouteTransaction. Canonical XDPoSChain produces byte-identical
+		// receipts on these paths and the parity gates depend on it.
+		switch RouteTransaction(config, blockNumber, tx) {
+		case TxRouteSign:
 			receipt, err := ApplySigningTransaction(config, statedb, blockNumber, blockHash, tx, gp.Used())
 			if err != nil {
 				return nil, fmt.Errorf("could not apply signing tx %d [%v]: %w", i, tx.Hash().Hex(), err)
@@ -211,32 +217,15 @@ func (p *StateProcessor) Process(ctx context.Context, block *types.Block, stated
 			pipeline.feedReceipt(receipt)
 			allLogs = append(allLogs, receipt.Logs...)
 			continue
-		}
-
-		// XDC: between TIPXDCX (Apothem 23,779,191) and TIPXDCXReceiverDisable
-		// (Apothem 66,825,000), transactions targeting TradingStateAddrBinary
-		// (0x92) or XDCXLendingAddressBinary (0x93) are emitted by the XDCx
-		// subsystem as "empty" notifier transactions. Canonical XDPoSChain
-		// routes them to ApplyEmptyTransaction: no EVM execution, zero gas,
-		// minimal receipt with a single log carrying only the To address.
-		// Running them through the normal EVM path produces a non-zero gas
-		// receipt and diverges from canonical at the very first TIPXDCX block.
-		if config.IsTIPXDCXReceiver(blockNumber) {
-			if to := tx.To(); to != nil && (*to == common.TradingStateAddrBinary || *to == common.XDCXLendingAddressBinary) {
-				receipt, err := ApplyEmptyTransaction(config, statedb, blockNumber, blockHash, tx, gp.Used())
-				if err != nil {
-					return nil, fmt.Errorf("could not apply empty tx %d [%v]: %w", i, tx.Hash().Hex(), err)
-				}
-				receipts = append(receipts, receipt)
-				pipeline.feedReceipt(receipt)
-				allLogs = append(allLogs, receipt.Logs...)
-				continue
+		case TxRouteEmpty:
+			receipt, err := ApplyEmptyTransaction(config, statedb, blockNumber, blockHash, tx, gp.Used())
+			if err != nil {
+				return nil, fmt.Errorf("could not apply empty tx %d [%v]: %w", i, tx.Hash().Hex(), err)
 			}
-		}
-
-		msg, err := TransactionToMessage(tx, signer, header.BaseFee)
-		if err != nil {
-			return nil, fmt.Errorf("could not apply tx %d [%v]: %w", i, tx.Hash().Hex(), err)
+			receipts = append(receipts, receipt)
+			pipeline.feedReceipt(receipt)
+			allLogs = append(allLogs, receipt.Logs...)
+			continue
 		}
 		tokenFee := ApplyTRC21TokenFee(config, msg, tokensFee, tx, blockNumber)
 		statedb.SetTxContext(tx.Hash(), i, uint32(i+1))
@@ -738,6 +727,44 @@ func AssembleBlock(chain consensus.ChainHeaderReader, header *types.Header, stat
 	return types.NewBlock(header, body, receipts, trie.NewStackTrie(nil)).WithAccessListUnsafe(bal)
 }
 
+// TxRoute says which handler a transaction goes through while a block is
+// processed or built.
+type TxRoute uint8
+
+const (
+	// TxRouteEVM is an ordinary transaction executed by the EVM.
+	TxRouteEVM TxRoute = iota
+	// TxRouteSign is a signing tx handled by ApplySigningTransaction.
+	TxRouteSign
+	// TxRouteEmpty is an XDCx tx handled by ApplyEmptyTransaction.
+	TxRouteEmpty
+)
+
+// RouteTransaction is the single place that decides the handler of a
+// transaction, shared by block processing (Process) and block building
+// (miner) so the two can never drift apart. It mirrors canonical XDPoSChain
+// core/state_processor.go routeTransaction, order of checks included:
+// 0x89 after TIPSigning is a signing tx; 0x92 (trading state), 0x93
+// (lending), 0x91 (trading) and 0x94 (lending finalized trade) inside the
+// TIPXDCXReceiver window are empty txs.
+func RouteTransaction(config *params.ChainConfig, blockNumber *big.Int, tx *types.Transaction) TxRoute {
+	to := tx.To()
+	if to == nil {
+		return TxRouteEVM
+	}
+	if *to == common.BlockSignersBinary && config.IsTIPSigning(blockNumber) {
+		return TxRouteSign
+	}
+	switch *to {
+	case common.TradingStateAddrBinary, common.XDCXLendingAddressBinary,
+		common.XDCXAddrBinary, common.XDCXLendingFinalizedTradeAddressBinary:
+		if config.IsTIPXDCXReceiver(blockNumber) {
+			return TxRouteEmpty
+		}
+	}
+	return TxRouteEVM
+}
+
 // ApplySigningTransaction handles XDC signing transactions at the tipSigning
 // fork. Signing transactions to BlockSignersBinary (0x89) are processed without
 // consuming gas — matches XDPoSChain behavior at block >= tipSigning
@@ -797,7 +824,7 @@ func ApplySigningTransaction(config *params.ChainConfig, statedb *state.StateDB,
 // ApplyEmptyTransaction handles XDCx "empty" notifier transactions emitted
 // between TIPXDCX (Apothem 23,779,191; mainnet 38,383,838) and
 // TIPXDCXReceiverDisable (Apothem 66,825,000; mainnet 80,370,900) that target
-// the XDCx trading-state (0x92) or lending-engine (0x93) contracts. Canonical
+// the XDCx contracts 0x91-0x94 (see RouteTransaction). Canonical
 // XDPoSChain records the receipt with zero gas, a minimal single log carrying
 // only the To address, and no nonce bump. cumulativeGasUsed is passed through
 // unchanged. Without this dispatch the tx is run through the EVM, the receipt
