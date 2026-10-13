@@ -13,6 +13,7 @@ import (
 	xdc_sort "github.com/ethereum/go-ethereum/common/sort"
 	"github.com/ethereum/go-ethereum/consensus"
 	"github.com/ethereum/go-ethereum/consensus/XDPoS"
+	"github.com/ethereum/go-ethereum/contracts"
 	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/core/state"
 	"github.com/ethereum/go-ethereum/core/types"
@@ -69,33 +70,43 @@ func AttachConsensusV1Hooks(adaptor *XDPoS.XDPoS, bc *core.BlockChain, chainConf
 		return result, nil
 	}
 
-	// HookVerifyMNs: verifies the Validators field at epoch checkpoints. (#72)
-	// Cross-checks computed validators against header.Validators.
+	// HookVerifyMNs: verifies the Validators field at epoch checkpoints against
+	// the M2 list recomputed from the 0x90 randomize values in the parent's
+	// state. Port of canonical XDPoSChain eth/hooks/engine_v1_hooks.go
+	// HookVerifyMNs (#1412). It never writes to the header under verification.
 	adaptor.HookVerifyMNs = func(header *types.Header, signers []common.Address) error {
-		if xdposConf == nil {
-			return nil
-		}
 		number := header.Number.Uint64()
-		if number == 0 || number%xdposConf.Epoch != 0 {
+		if number == 0 || number%common.EpocBlockRandomize != 0 {
 			return nil
 		}
-
-		expected, err := adaptor.HookValidator(header, signers)
+		// Canonical runs this check only under fullVerify, which is off on
+		// chain 51, and not at all on the ignore-listed checkpoints.
+		var chainID uint64
+		if chainConfig.ChainID != nil {
+			chainID = chainConfig.ChainID.Uint64()
+		}
+		if chainID == params.XDCApothemChainConfig.ChainID.Uint64() || XDPoS.IsIgnoreSignerCheckBlock(chainID, number) {
+			return nil
+		}
+		// Enforce only when the parent's state is here. Without it the
+		// randomize values cannot be read (e.g. a checkpoint-synced node).
+		parent := bc.GetHeaderByHash(header.ParentHash)
+		if parent == nil {
+			log.Debug("[V1 HookVerifyMNs] parent unknown, skipping", "number", number)
+			return nil
+		}
+		statedb, err := bc.StateAt(parent.Root, parent.Number, parent.Time)
+		if err != nil {
+			log.Debug("[V1 HookVerifyMNs] parent state unavailable, skipping", "number", number, "err", err)
+			return nil
+		}
+		validators, err := validatorsFromState(statedb, signers)
 		if err != nil {
 			return err
 		}
-
-		if len(expected) > 0 && len(header.Validators) > 0 {
-			if !bytes.Equal(header.Validators, expected) {
-				log.Warn("[V1 HookVerifyMNs] Validators field mismatch (non-fatal in sync mode)",
-					"number", number,
-					"expectedAddrCount", len(expected)/common.AddressLength,
-					"gotAddrCount", len(header.Validators)/common.AddressLength)
-				// Non-fatal: in sync mode the network's Validators takes precedence.
-				// Full enforcement only makes sense when actively producing blocks.
-			}
+		if !bytes.Equal(header.Validators, validators) {
+			return XDPoS.ErrInvalidCheckpointValidators
 		}
-
 		return nil
 	}
 
@@ -189,4 +200,29 @@ func signersFromState(statedb *state.StateDB) ([]common.Address, error) {
 		signers = append(signers, c.addr)
 	}
 	return signers, nil
+}
+
+// validatorsFromState derives the next epoch's M2 list (header.Validators) from
+// the 0x90 randomize values of masternodes in statedb. Port of canonical
+// XDPoSChain eth/hooks/engine_v1_hooks.go getValidatorsAtNumber.
+func validatorsFromState(statedb *state.StateDB, masternodes []common.Address) ([]byte, error) {
+	if len(masternodes) == 0 {
+		return nil, errors.New("list M1 not found")
+	}
+	var candidates []int64
+	for _, addr := range masternodes {
+		random, err := contracts.DecryptRandomizeFromSecretsAndOpening(state.GetSecret(statedb, addr), state.GetOpening(statedb, addr))
+		if err != nil {
+			return nil, err
+		}
+		candidates = append(candidates, random)
+	}
+	if err := statedb.Error(); err != nil {
+		return nil, fmt.Errorf("reading the randomize values from state: %w", err)
+	}
+	m2, err := contracts.GenM2FromRandomize(candidates, int64(len(masternodes)))
+	if err != nil {
+		return nil, err
+	}
+	return contracts.BuildValidatorFromM2(m2), nil
 }
