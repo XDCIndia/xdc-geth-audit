@@ -8,6 +8,7 @@
 package legacypool
 
 import (
+	"errors"
 	"math/big"
 	"testing"
 
@@ -554,5 +555,61 @@ func TestXDCFreshSigningTxNotReplaced(t *testing.T) {
 	// (fast-path) or ErrReplaceUnderpriced (normal path).  Either is correct.
 	if errs[0] == nil {
 		t.Fatal("second signing tx at same nonce must be rejected")
+	}
+}
+
+// TestXDCSpecialTxFullPoolCap verifies that special txs are subject to the
+// global slot cap and that only signers may send them (#1409). Canonical
+// XDPoSChain applies the pool-full check to every tx except a signer's special
+// tx at its pending nonce (core/txpool/legacypool/legacypool.go:765-770) and
+// rejects special txs from non-signers (core/txpool/validation.go:130-134).
+func TestXDCSpecialTxFullPoolCap(t *testing.T) {
+	t.Parallel()
+
+	cpy := *params.TestChainConfig
+	statedb, _ := state.New(types.EmptyRootHash, state.NewDatabaseForTesting())
+	bc := newTestBlockChain(&cpy, 10_000_000, statedb, new(event.Feed))
+
+	cfg := DefaultConfig
+	cfg.Journal = ""
+	cfg.NoLocals = true
+	cfg.GlobalSlots = 4
+	cfg.GlobalQueue = 1
+
+	pool := New(cfg, bc)
+	if err := pool.Init(cfg.PriceLimit, bc.CurrentBlock(), newReserver()); err != nil {
+		t.Fatalf("pool init: %v", err)
+	}
+	defer pool.Close()
+	<-pool.initDoneCh
+
+	// Fill the pool with ordinary priced txs from distinct accounts.
+	for i := 0; i < int(cfg.GlobalSlots+cfg.GlobalQueue); i++ {
+		key, _ := crypto.GenerateKey()
+		testAddBalance(pool, crypto.PubkeyToAddress(key.PublicKey), big.NewInt(1_000_000_000_000_000_000))
+		if err := pool.addRemoteSync(pricedTransaction(0, 100000, big.NewInt(1), key)); err != nil {
+			t.Fatalf("filler tx %d rejected: %v", i, err)
+		}
+	}
+
+	signerKey, _ := crypto.GenerateKey()
+	signer := crypto.PubkeyToAddress(signerKey.PublicKey)
+
+	// No signer callback (non-XDPoS): a 0-price special tx must not bypass the cap.
+	freshKey, _ := crypto.GenerateKey()
+	if err := pool.addRemoteSync(makeSpecialTx(0, common.BlockSignersBinary, freshKey)); err == nil {
+		t.Fatal("special tx from fresh key accepted into a full pool")
+	}
+
+	pool.SetIsSigner(func(addr common.Address) bool { return addr == signer })
+
+	// Fresh non-signer key: rejected.
+	freshKey, _ = crypto.GenerateKey()
+	if err := pool.addRemoteSync(makeSpecialTx(0, common.BlockSignersBinary, freshKey)); !errors.Is(err, txpool.ErrSpecialTxNotFromSigner) {
+		t.Fatalf("special tx from non-signer: have %v, want %v", err, txpool.ErrSpecialTxNotFromSigner)
+	}
+	// Signer at its pending nonce: accepted despite the full pool.
+	if err := pool.addRemoteSync(makeSpecialTx(0, common.BlockSignersBinary, signerKey)); err != nil {
+		t.Fatalf("signer special tx rejected: %v", err)
 	}
 }

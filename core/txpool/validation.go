@@ -47,6 +47,11 @@ type ValidationOptions struct {
 	MaxSize      uint64   // Maximum size of a transaction that the caller can meaningfully handle
 	MaxBlobCount int      // Maximum number of blobs allowed per transaction
 	MinTip       *big.Int // Minimum gas tip needed to allow a transaction into the caller pool
+
+	// NotSigner, if set, reports whether an address is NOT a current masternode
+	// signer. Special transactions from such senders are rejected (XDPoSChain
+	// core/txpool/validation.go:130-134).
+	NotSigner func(addr common.Address) bool
 }
 
 // ValidationFunction is an method type which the pools use to perform the tx-validations which do not
@@ -124,6 +129,11 @@ func ValidateTransaction(tx *types.Transaction, head *types.Header, signer types
 	// Limit nonce to 2^64-1 per EIP-2681
 	if tx.Nonce()+1 < tx.Nonce() {
 		return core.ErrNonceMax
+	}
+	// XDC: special transactions are price-exempt, so only masternode signers
+	// may send them (XDPoSChain core/txpool/validation.go:130-134).
+	if tx.IsSpecialTransaction() && opts.NotSigner != nil && opts.NotSigner(from) {
+		return fmt.Errorf("%w: %s", ErrSpecialTxNotFromSigner, from.Hex())
 	}
 	// Sanity check for extremely large numbers (supported by RLP or RPC)
 	value, overflow := uint256.FromBig(tx.Value())
