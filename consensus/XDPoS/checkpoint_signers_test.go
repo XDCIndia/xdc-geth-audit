@@ -98,13 +98,13 @@ func TestIgnoreListedCheckpointSkipsSignerCheck(t *testing.T) {
 	const ignored = 1032300 // mainnet IgnoreSignerCheckBlocksMainnet
 	engine, chain, parent, cp := cpSignersSetup(t, ignored, signer, other, signerKey)
 	snap, _ := engine.recents.Get(parent.Hash())
-	if err := engine.checkSignersOnCheckpoint(chain, cp, snap.GetSigners()); err != nil {
+	if err := engine.checkSignersOnCheckpoint(chain, cp, snap.GetSigners(), nil); err != nil {
 		t.Fatalf("ignore-listed checkpoint %d: got %v, want nil", ignored, err)
 	}
 	// The same mismatch one epoch earlier is not ignore-listed.
 	engine, chain, parent, cp = cpSignersSetup(t, ignored-testConfig.Epoch, signer, other, signerKey)
 	snap, _ = engine.recents.Get(parent.Hash())
-	if err := engine.checkSignersOnCheckpoint(chain, cp, snap.GetSigners()); !errors.Is(err, errInvalidCheckpointSigners) {
+	if err := engine.checkSignersOnCheckpoint(chain, cp, snap.GetSigners(), nil); !errors.Is(err, errInvalidCheckpointSigners) {
 		t.Fatalf("checkpoint %d: got %v, want %v", ignored-testConfig.Epoch, err, errInvalidCheckpointSigners)
 	}
 }
