@@ -1167,33 +1167,29 @@ func (c *XDPoS) verifySeal(chain consensus.ChainHeaderReader, header *types.Head
 		}
 	}
 
-	// #951 Defect 1c: V1 double-validation (M1/M2) — DIAGNOSTIC (non-enforcing) phase.
-	// Legacy (engine_v1/engine.go:164-167,638-655) rejects, for Number>Epoch under
-	// fullVerify: an empty header.Validator (ErrNoValidatorSignature) and a
-	// RecoverValidator(header.Validator) != GetValidator(creator) mismatch
-	// (ErrFailedDoubleValidation). Modern did neither. Before enforcing — a wrong M2
-	// computation would reject the entire chain past the first epoch and wedge the node
-	// — we LOG agreement/disagreement against canonical blocks to validate the M2 map.
-	// fullVerify mirrors verifyHeaderV2: only at-tip (not bulk sync). Flip [DIAG-1c] to a
-	// hard reject once the live chain shows zero mismatches.
-	fullVerify := xdcFullVerify()
-	if fullVerify && number > c.config.Epoch {
-		switch {
-		case len(header.Validator) == 0:
-			log.Warn("[DIAG-1c] empty header.Validator past epoch (legacy→ErrNoValidatorSignature)", "number", number, "creator", creator)
-		default:
-			validator, vErr := c.RecoverValidator(header)
-			assigned, aErr := c.GetValidator(creator, chain, header)
-			switch {
-			case vErr != nil:
-				log.Warn("[DIAG-1c] RecoverValidator failed", "number", number, "err", vErr)
-			case aErr != nil:
-				log.Warn("[DIAG-1c] GetValidator(M2) failed", "number", number, "creator", creator, "err", aErr)
-			case validator != assigned:
-				log.Warn("[DIAG-1c] M2 MISMATCH (legacy→ErrFailedDoubleValidation)", "number", number, "creator", creator, "recovered", validator, "assignedM2", assigned)
-			default:
-				log.Debug("[DIAG-1c] M2 double-validation OK", "number", number, "creator", creator, "m2", assigned)
-			}
+	// V1 double validation (M1/M2), #951 Defect 1c / #1421. Canonical
+	// (engine_v1/engine.go:185-188, 667-680) rejects, for Number > Epoch under
+	// fullVerify, an empty header.Validator (ErrNoValidatorSignature) and a
+	// co-signer other than the creator's assigned M2 (ErrFailedDoubleValidation).
+	// fullVerify mirrors verifyHeaderV2 (not during bulk sync); canonical turns it
+	// off on chain 51 (engine.go:162-167).
+	cfg := chain.Config()
+	testnet := cfg != nil && cfg.ChainID != nil && cfg.ChainID.Cmp(params.XDCApothemChainConfig.ChainID) == 0
+	if xdcFullVerify() && !testnet && number > c.config.Epoch {
+		if len(header.Validator) == 0 {
+			return errNoValidatorSignature
+		}
+		validator, err := c.RecoverValidator(header)
+		if err != nil {
+			return err
+		}
+		assigned, err := c.getValidatorWithParents(creator, chain, header, parents)
+		if err != nil {
+			return err
+		}
+		if validator != assigned {
+			log.Debug("Bad block detected. Header contains wrong pair of creator-validator", "number", number, "creator", creator, "assigned validator", assigned, "wrong validator", validator)
+			return errFailedDoubleValidation
 		}
 	}
 
