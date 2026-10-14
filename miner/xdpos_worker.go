@@ -581,6 +581,7 @@ func (w *XdcWorker) commitNewWork() {
 	// will — without it the minted block's state root diverges and the producer
 	// rejects its own block (#952 / apothem 83,088,792 "invalid merkle root").
 	env.coinbaseOwner = state.GetCandidateOwner(env.state, w.coinbase)
+	env.initTRC21Fee()
 
 	if !isEpochSwitch {
 		// Fill transactions from the txpool (fork's EIP-1559/4844-aware path).
@@ -611,6 +612,7 @@ func (w *XdcWorker) commitNewWork() {
 		log.Error("XDPoS2: StateAtForkBoundary for parentState failed", "err", psErr)
 		return
 	}
+	env.finalizeTRC21Fee()
 	assembled, finErr := w.v2engine.Finalize(
 		chainReader, header, env.state, parentState,
 		env.txs, nil, env.receipts,
@@ -712,10 +714,13 @@ func (w *XdcWorker) commitV1Work(parent *types.Block) {
 	}
 	w.lastParentBlockCommit = parentHex
 
-	// Build execution env on the parent state. Pass header.Coinbase (set by
-	// Prepare) so the COINBASE opcode + any coinbase crediting match what
-	// InsertChain's re-execution will see (consensus invariant).
-	env, err := w.miner.makeEnv(parent.Header(), header, header.Coinbase, false)
+	// Build execution env on the parent state. Pass w.coinbase, NOT
+	// header.Coinbase: V1 Prepare zeroes Coinbase (or sets a vote address),
+	// while InsertChain's re-execution resolves the beneficiary via
+	// Engine().Author = ecrecover(seal) = this signer. Any mismatch credits
+	// fees (even 0 wei) to a different account, and an EIP-158 touch of an
+	// existing empty account then diverges the state root (#1383/#1385).
+	env, err := w.miner.makeEnv(parent.Header(), header, w.coinbase, false)
 	if err != nil {
 		log.Error("XDPoS V1: makeEnv failed", "err", err, "block", header.Number)
 		return
@@ -726,6 +731,7 @@ func (w *XdcWorker) commitV1Work(parent *types.Block) {
 	// core/state_processor.go Process) so applyTransaction routes fees/special
 	// txs identically to InsertChain re-execution (#952).
 	env.coinbaseOwner = state.GetCandidateOwner(env.state, w.coinbase)
+	env.initTRC21Fee()
 
 	// Fill transactions from the pool. V1 includes txs in every block (rewards
 	// are applied in Finalize at rCheckpoint blocks, not gated on tx presence).
@@ -746,6 +752,7 @@ func (w *XdcWorker) commitV1Work(parent *types.Block) {
 	// FinalizeAndAssemble (wrapper V1 path): applies HookReward at reward
 	// checkpoints, computes state root, returns the assembled block.
 	body := &types.Body{Transactions: env.txs}
+	env.finalizeTRC21Fee()
 	assembled, finErr := w.engine.FinalizeAndAssemble(chain, header, env.state, body, env.receipts)
 	if finErr != nil {
 		log.Error("XDPoS V1: FinalizeAndAssemble failed", "err", finErr, "block", header.Number)
@@ -930,7 +937,7 @@ func (c chainStateNonces) ConfirmedNonce(addr common.Address) (uint64, bool) {
 	if head == nil || !c.chain.HasState(head.Root) {
 		return 0, false
 	}
-	statedb, err := c.chain.StateAt(head)
+	statedb, err := c.chain.StateAt(head.Root, head.Number, head.Time)
 	if err != nil || statedb == nil {
 		return 0, false
 	}

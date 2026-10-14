@@ -7,14 +7,12 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
-	"slices"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
 	commonmath "github.com/ethereum/go-ethereum/common/math"
 	"github.com/ethereum/go-ethereum/consensus"
 	"github.com/ethereum/go-ethereum/consensus/XDPoS"
-	"github.com/ethereum/go-ethereum/consensus/XDPoS/utils"
 	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/core/state"
@@ -73,13 +71,12 @@ func AttachConsensusV2Hooks(adaptor *XDPoS.XDPoS, bc *core.BlockChain, chainConf
 			// TIERED REWARD GATE (XDPoSChain v2.8.0 / TIPUpgradeReward).
 			//
 			// FALSE branch (below): the EXISTING flat-reward path, byte-identical
-			// to pre-Stage-C behaviour. For apothem, TIPUpgradeRewardBlock is nil
-			// (disabled), so this gate is always FALSE and the live path is the
-			// one already in production.
+			// to pre-Stage-C behaviour. It is the live path below
+			// TIPUpgradeRewardBlock (apothem 83,600,000; mainnet unscheduled).
 			//
 			// TRUE branch (here): the tiered masternode/protector/observer path
-			// ported verbatim from the reference HookReward else-branch. DEAD CODE
-			// until the fork value is flipped.
+			// ported from the reference HookReward else-branch, live from
+			// TIPUpgradeRewardBlock.
 			if chainConfig.IsTIPUpgradeReward(header.Number) {
 				// Round drives the V2 config selection and epoch numbering.
 				// Our EngineV2 has NO Config(round) method (unlike the reference
@@ -93,7 +90,7 @@ func AttachConsensusV2Hooks(adaptor *XDPoS.XDPoS, bc *core.BlockChain, chainConf
 				epochNum := chainConfig.XDPoS.V2.SwitchEpoch + uint64(round)/chainConfig.XDPoS.Epoch
 
 				// Get per-tier signers + burned fees for the rewarded epoch.
-				tierSigners, burnedInOneEpoch, terr := GetSigningTxCountTiered(adaptor, bc, header, chainConfig, parentState, currentConfig)
+				tierSigners, burnedInOneEpoch, terr := GetSigningTxCountTiered(adaptor, bc, header, chainConfig, currentConfig)
 				if terr != nil {
 					log.Error("[HookReward] Fail to get tiered signers count", "error", terr)
 					return nil, terr
@@ -792,9 +789,9 @@ func GetSigningTxCount(c *XDPoS.XDPoS, chain *core.BlockChain, header *types.Hea
 //   - Candidate zero-check uses `!= (common.Address{})`; our common.Address has
 //     no IsZero() method (reference uses candidate.IsZero()).
 //
-// DEAD CODE until TIPUpgradeReward is enabled (apothem TIPUpgradeRewardBlock is
-// nil = disabled), so it cannot affect live behaviour.
-func GetSigningTxCountTiered(c *XDPoS.XDPoS, chain *core.BlockChain, header *types.Header, chainConfig *params.ChainConfig, parentState *state.StateDB, currentConfig *params.V2Config) (map[Beneficiary]map[common.Address]*XDPoS.RewardLog, *big.Int, error) {
+// Live from TIPUpgradeReward (apothem TIPUpgradeRewardBlock = 83,600,000;
+// mainnet unscheduled).
+func GetSigningTxCountTiered(c *XDPoS.XDPoS, chain *core.BlockChain, header *types.Header, chainConfig *params.ChainConfig, currentConfig *params.V2Config) (map[Beneficiary]map[common.Address]*XDPoS.RewardLog, *big.Int, error) {
 	number := header.Number.Uint64()
 	rewardEpochCount := 2
 	signEpochCount := 1
@@ -850,59 +847,29 @@ func GetSigningTxCountTiered(c *XDPoS.XDPoS, chain *core.BlockChain, header *typ
 				// In reward upgrade, add protector and observer nodes. This path is
 				// only reached when IsTIPUpgradeReward is true (the caller gates it),
 				// so we always build the tiers here.
-				candidates := state.GetCandidates(parentState)
-				var ms []utils.Masternode
-				for _, candidate := range candidates {
-					// ignore the zero address "0x0000...0000"
-					if candidate != (common.Address{}) {
-						v := state.GetCandidateCap(parentState, candidate)
-						ms = append(ms, utils.Masternode{Address: candidate, Stake: v})
-					}
-				}
-				slices.SortStableFunc(ms, func(a, b utils.Masternode) int {
-					return b.Stake.Cmp(a.Stake)
-				})
-				// find penalty and filter them out (penalties ∪ masternodes)
-				penalties := common.ExtractAddressFromBytes(h.Penalties)
-				filterMap := make(map[common.Address]struct{})
-				for _, addr := range penalties {
-					filterMap[addr] = struct{}{}
-				}
-				for _, addr := range nodesToKeep[MasterNodeBeneficiary] {
-					filterMap[addr] = struct{}{}
-				}
-				// find top candidates: MaxProtectorNodes, then MaxObserverNodes.
-				// NOTE: our V2Config field is MaxObserverNodes (correct spelling);
-				// the XDPoSChain reference has a typo `MaxObverserNodes`. Same value.
-				protector := []common.Address{}
-				observer := []common.Address{}
-				for _, node := range ms {
-					if _, ok := filterMap[node.Address]; ok {
-						continue
-					}
-					if len(protector) < currentConfig.MaxProtectorNodes {
-						protector = append(protector, node.Address)
-					} else if len(observer) < currentConfig.MaxObserverNodes {
-						observer = append(observer, node.Address)
-					}
-				}
-				nodesToKeep[ProtectorNodeBeneficiary] = protector
-				nodesToKeep[ObserverNodeBeneficiary] = observer
+				//
+				// XinFinOrg/XDPoSChain #2612: the protector/observer membership is
+				// that of the rewarded epoch, read from h's own historical epoch
+				// snapshot (stake-sorted, already filtered of h's masternodes and
+				// penalties) - not from the candidates of the current parent state.
+				standbyPool := c.GetStandbynodes(chain, h)
+				protectorEnd := min(currentConfig.MaxProtectorNodes, len(standbyPool))
+				observerEnd := min(protectorEnd+currentConfig.MaxObserverNodes, len(standbyPool))
+				nodesToKeep[ProtectorNodeBeneficiary] = standbyPool[:protectorEnd]
+				nodesToKeep[ObserverNodeBeneficiary] = standbyPool[protectorEnd:observerEnd]
 				break
 			}
 		}
 		mapBlkHash[i] = h.Hash()
 		signingTxs, ok := c.GetCachedSigningTxs(h.Hash())
 		if !ok {
-			block := rawdb.ReadBlock(c.GetDb(), h.Hash(), i)
-			if block != nil {
-				if chainConfig.IsTIPSigning(h.Number) {
-					signingTxs = c.CacheSigner(h.Hash(), block.Transactions())
-				} else {
-					receipts := rawdb.ReadRawReceipts(c.GetDb(), h.Hash(), i)
-					signingTxs = c.CacheData(h, block.Transactions(), receipts)
-				}
-			}
+			// Same cache-miss resolution as GetSigningTxCount (#1364/#1365):
+			// presence/method-signature only, never receipts. The
+			// ReadRawReceipts+CacheData branch this replaces dropped every
+			// signing tx (raw receipts carry no TxHash), so a restart near the
+			// tip paid no rewards and wedged on "invalid merkle root". Live
+			// since TIPUpgradeReward is scheduled on apothem (#1366).
+			signingTxs, _, _ = resolveMissedSigningTxs(c, h.Hash(), i)
 		}
 		signer := types.MakeSigner(chainConfig, h.Number, h.Time)
 		for _, tx := range signingTxs {

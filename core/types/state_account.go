@@ -85,51 +85,43 @@ type SlimAccount struct {
 	CodeHash   []byte   // Nil if hash equals to types.EmptyCodeHash
 }
 
-// slimAccountBigBal is a helper struct for encoding SlimAccount with big.Int balance.
-// Used when the balance exceeds uint256 (XDC overflow scenario).
-type slimAccountBigBal struct {
-	Nonce    uint64
-	Balance  *big.Int
-	Root     []byte
-	CodeHash []byte
-}
-
 // SlimAccountRLP encodes the state account in 'slim RLP' format.
 func SlimAccountRLP(account StateAccount) []byte {
-	// If BigBalance is set (overflow), encode with big.Int to preserve full value
-	if account.BigBalance != nil {
-		slim := slimAccountBigBal{
-			Nonce:   account.Nonce,
-			Balance: account.BigBalance,
-		}
-		if account.Root != EmptyRootHash {
-			slim.Root = account.Root[:]
-		}
-		if !bytes.Equal(account.CodeHash, EmptyCodeHash[:]) {
-			slim.CodeHash = account.CodeHash
-		}
-		data, err := rlp.EncodeToBytes(slim)
-		if err != nil {
-			panic(err)
-		}
-		return data
-	}
+	buf := rlp.NewEncoderBuffer(nil)
+	defer buf.Flush()
 
-	slim := SlimAccount{
-		Nonce:   account.Nonce,
-		Balance: account.Balance,
+	return SlimAccountRLPInto(&buf, account)
+}
+
+// SlimAccountRLPInto encodes the state account in 'slim RLP' format into the
+// given buffer, returning the encoded bytes.
+func SlimAccountRLPInto(w *rlp.EncoderBuffer, account StateAccount) []byte {
+	w.Reset(nil)
+
+	list := w.List()
+	w.WriteUint64(account.Nonce)
+	// XDC: a balance that overflowed uint256 is carried in BigBalance and
+	// must be encoded in full. The item is still a plain RLP big integer, so
+	// the encoding is byte-identical to upstream for balances <= 2^256-1.
+	if account.BigBalance != nil {
+		w.WriteBigInt(account.BigBalance)
+	} else if account.Balance != nil {
+		w.WriteUint256(account.Balance)
+	} else {
+		w.WriteUint64(0)
 	}
 	if account.Root != EmptyRootHash {
-		slim.Root = account.Root[:]
+		w.WriteBytes(account.Root[:])
+	} else {
+		w.WriteBytes(nil)
 	}
 	if !bytes.Equal(account.CodeHash, EmptyCodeHash[:]) {
-		slim.CodeHash = account.CodeHash
+		w.WriteBytes(account.CodeHash)
+	} else {
+		w.WriteBytes(nil)
 	}
-	data, err := rlp.EncodeToBytes(slim)
-	if err != nil {
-		panic(err)
-	}
-	return data
+	w.ListEnd(list)
+	return w.ToBytes()
 }
 
 // slimAccountBigBalDecode is a helper struct for decoding slim accounts

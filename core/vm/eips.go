@@ -220,7 +220,15 @@ func opTstore(pc *uint64, evm *EVM, scope *ScopeContext) ([]byte, error) {
 
 // opBaseFee implements BASEFEE opcode
 func opBaseFee(pc *uint64, evm *EVM, scope *ScopeContext) ([]byte, error) {
-	scope.Stack.get().SetFromBig(evm.Context.BaseFee)
+	baseFee := evm.Context.BaseFee
+	// XDC: BASEFEE is live from London, but XDC headers only carry a base fee
+	// from Eip1559Block on. In between the header has none (nil here, which
+	// SetFromBig cannot take); canonical XDPoSChain reports the Gas50x tier
+	// price there (XinFinOrg/XDPoSChain #2516).
+	if baseFee == nil && evm.chainConfig.IsXDC() {
+		baseFee = params.XDCBaseFeeForOpcode()
+	}
+	scope.Stack.get().SetFromBig(baseFee)
 	return nil, nil
 }
 
@@ -381,8 +389,8 @@ func opExtCodeCopyEIP4762(pc *uint64, evm *EVM, scope *ScopeContext) ([]byte, er
 	addr := common.Address(a.Bytes20())
 	code := evm.StateDB.GetCode(addr)
 	paddedCodeCopy, copyOffset, nonPaddedCopyLength := getDataAndAdjustedBounds(code, uint64CodeOffset, length.Uint64())
-	consumed, wanted := evm.AccessEvents.CodeChunksRangeGas(addr, copyOffset, nonPaddedCopyLength, uint64(len(code)), false, scope.Contract.Gas.RegularGas)
-	scope.Contract.chargeRegular(consumed, evm.Config.Tracer, tracing.GasChangeUnspecified)
+	consumed, wanted := evm.AccessEvents.CodeChunksRangeGas(addr, copyOffset, nonPaddedCopyLength, uint64(len(code)), false, scope.Contract.Gas.ExecutionGas)
+	scope.Contract.chargeExecution(consumed, evm.Config.Tracer, tracing.GasChangeUnspecified)
 	if consumed < wanted {
 		return nil, ErrOutOfGas
 	}
@@ -407,8 +415,8 @@ func opPush1EIP4762(pc *uint64, evm *EVM, scope *ScopeContext) ([]byte, error) {
 			// touch next chunk if PUSH1 is at the boundary. if so, *pc has
 			// advanced past this boundary.
 			contractAddr := scope.Contract.Address()
-			consumed, wanted := evm.AccessEvents.CodeChunksRangeGas(contractAddr, *pc+1, uint64(1), uint64(len(scope.Contract.Code)), false, scope.Contract.Gas.RegularGas)
-			scope.Contract.chargeRegular(wanted, evm.Config.Tracer, tracing.GasChangeUnspecified)
+			consumed, wanted := evm.AccessEvents.CodeChunksRangeGas(contractAddr, *pc+1, uint64(1), uint64(len(scope.Contract.Code)), false, scope.Contract.Gas.ExecutionGas)
+			scope.Contract.chargeExecution(wanted, evm.Config.Tracer, tracing.GasChangeUnspecified)
 			if consumed < wanted {
 				return nil, ErrOutOfGas
 			}
@@ -434,8 +442,8 @@ func makePushEIP4762(size uint64, pushByteSize int) executionFunc {
 
 		if !scope.Contract.IsDeployment && !scope.Contract.IsSystemCall {
 			contractAddr := scope.Contract.Address()
-			consumed, wanted := evm.AccessEvents.CodeChunksRangeGas(contractAddr, uint64(start), uint64(pushByteSize), uint64(len(scope.Contract.Code)), false, scope.Contract.Gas.RegularGas)
-			scope.Contract.chargeRegular(consumed, evm.Config.Tracer, tracing.GasChangeUnspecified)
+			consumed, wanted := evm.AccessEvents.CodeChunksRangeGas(contractAddr, uint64(start), uint64(pushByteSize), uint64(len(scope.Contract.Code)), false, scope.Contract.Gas.ExecutionGas)
+			scope.Contract.chargeExecution(consumed, evm.Config.Tracer, tracing.GasChangeUnspecified)
 			if consumed < wanted {
 				return nil, ErrOutOfGas
 			}

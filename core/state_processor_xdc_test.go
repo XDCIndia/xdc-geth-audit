@@ -34,9 +34,9 @@ func TestRegression802Task3_SetHeadInvalidatesCaches(t *testing.T) {
 		t.Fatalf("read %s: %v", src, err)
 	}
 	if !strings.Contains(data, "consensus.CacheInvalidator") {
-		t.Errorf("blockchain.go missing reference to consensus.CacheInvalidator — refs #802 task 3."+
-			" SetHead must notify the consensus engine to purge in-memory caches above the new head;"+
-			" without it, post-rewind verifyHeader can consult stale snapshot data and reject canonical"+
+		t.Errorf("blockchain.go missing reference to consensus.CacheInvalidator — refs #802 task 3." +
+			" SetHead must notify the consensus engine to purge in-memory caches above the new head;" +
+			" without it, post-rewind verifyHeader can consult stale snapshot data and reject canonical" +
 			" blocks with ErrNotItsTurn (observed live on xdc04 after deep rollback).")
 	}
 	if !strings.Contains(data, "InvalidateCaches(head)") {
@@ -96,7 +96,7 @@ func TestRegression798_CoinbaseOwnerThreaded(t *testing.T) {
 
 		// Walk Process body looking for:
 		//   - assignment: coinbaseOwner := getCoinbaseOwner(...)
-		//   - call:       ApplyTransactionWithEVM(... , coinbaseOwner)
+		//   - call:       (a|A)pplyTransactionWithEVM(... , coinbaseOwner)
 		ast.Inspect(fn.Body, func(inner ast.Node) bool {
 			if as, ok := inner.(*ast.AssignStmt); ok {
 				for _, lhs := range as.Lhs {
@@ -106,7 +106,9 @@ func TestRegression798_CoinbaseOwnerThreaded(t *testing.T) {
 				}
 			}
 			if call, ok := inner.(*ast.CallExpr); ok {
-				if id, ok := call.Fun.(*ast.Ident); ok && id.Name == "ApplyTransactionWithEVM" {
+				// v1.17.6 moved the loop onto the unexported applyTransactionWithEVM
+				// (the receipt-pipeline variant); either name threads the owner.
+				if id, ok := call.Fun.(*ast.Ident); ok && (id.Name == "ApplyTransactionWithEVM" || id.Name == "applyTransactionWithEVM") {
 					foundCallSite = true
 					if len(call.Args) > 0 {
 						lastArg := call.Args[len(call.Args)-1]

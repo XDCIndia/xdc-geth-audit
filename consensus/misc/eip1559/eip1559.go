@@ -24,7 +24,6 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/consensus/misc"
 	"github.com/ethereum/go-ethereum/core/types"
-	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/params"
 )
 
@@ -84,25 +83,18 @@ func VerifyEIP1559Header(config *params.ChainConfig, parent, header *types.Heade
 	if header.BaseFee == nil {
 		return errors.New("header is missing baseFee")
 	}
-	// XDC: at the fork boundary, the parent (pre-fork) block carries
-	// BaseFee=nil on canonical chain. Tolerate that exact case but still
-	// require header.BaseFee to be positive.
-	if config.XDPoS != nil && parent.BaseFee == nil && !config.IsEIP1559(parent.Number) {
-		if header.BaseFee.Sign() <= 0 {
-			return fmt.Errorf("invalid baseFee at fork boundary: have %s, want positive value", header.BaseFee)
+	// XDC: the base fee is a pure function of the block number (the gas price
+	// tier active at header.Number, params.XDCBaseFeeForBlock), so it is checked
+	// exactly and without consulting the parent. This also covers the two cases
+	// that used to be special-cased here: the EIP-1559 fork boundary (the parent
+	// has no base fee) and checkpoint-sync parents with a synthetic GasUsed=0
+	// (#541). Both were only needed while the check derived the fee from the
+	// parent, and both would have accepted a Gas2500x fork block still carrying
+	// the previous tier's price.
+	if config.XDPoS != nil {
+		if want := params.XDCBaseFeeForBlock(config, header.Number); header.BaseFee.Cmp(want) != 0 {
+			return fmt.Errorf("invalid baseFee: have %s, want %s", header.BaseFee, want)
 		}
-		return nil
-	}
-	// XDC: during checkpoint sync the parent header may have GasUsed=0
-	// (synthetic from ancient store insertion) while canonically GasUsed was
-	// at target. When the post-checkpoint child maintains the same base fee
-	// as the parent, skip strict expected-base-fee comparison — checkpoint
-	// header is trusted. Issue #541, PR #542.
-	if config.XDPoS != nil && parent.GasUsed == 0 && parent.BaseFee != nil &&
-		header.BaseFee.Cmp(parent.BaseFee) == 0 {
-		log.Debug("[eip1559] Skipping baseFee validation at checkpoint boundary",
-			"block", header.Number.Uint64(), "parentGasUsed", parent.GasUsed,
-			"baseFee", header.BaseFee)
 		return nil
 	}
 	// Verify the parent header is not malformed
@@ -120,14 +112,17 @@ func VerifyEIP1559Header(config *params.ChainConfig, parent, header *types.Heade
 
 // CalcBaseFee calculates the basefee of the header.
 //
-// XDC: on XDC chains the base fee is a fixed constant (params.XDCBaseFee =
-// 12.5 gwei) for every post-fork block, ignoring parent gas inputs. The
-// standard Ethereum dynamic formula applies on non-XDC chains.
+// XDC: on XDC chains the base fee is the gas price tier of the block being
+// built or verified (params.XDCBaseFeeForBlock: 12.5 gwei, 625 gwei from
+// Gas2500x), ignoring parent gas inputs. The tier is resolved at the child's
+// number, parent.Number+1, so the block that activates a tier fork already
+// carries the new price (XinFinOrg/XDPoSChain #2516). The standard Ethereum
+// dynamic formula applies on non-XDC chains.
 func CalcBaseFee(config *params.ChainConfig, parent *types.Header) *big.Int {
 	if config.XDPoS != nil {
 		// Pre-fork callers (txpool, miner) may consult this with a pre-fork
-		// parent; returning XDCBaseFee preserves the non-nil contract.
-		return new(big.Int).SetUint64(params.XDCBaseFee)
+		// parent; returning the tier price preserves the non-nil contract.
+		return params.XDCBaseFeeForBlock(config, new(big.Int).Add(parent.Number, common.Big1))
 	}
 	// Upstream Ethereum chains use the standard dynamic formula.
 	//

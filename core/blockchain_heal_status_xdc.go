@@ -73,12 +73,12 @@ func (bc *BlockChain) ReexecuteAndValidateRange(nBlocks uint64) error {
 			return fmt.Errorf("ReexecuteAndValidateRange: parent of block %d not found", num)
 		}
 
-		statedb, err := bc.StateAt(parent.Header())
+		statedb, err := bc.StateAt(parent.Root(), parent.Number(), parent.Time())
 		if err != nil {
 			return fmt.Errorf("ReexecuteAndValidateRange: StateAt block %d parent: %w", num, err)
 		}
 
-		res, err := bc.processor.Process(context.Background(), blk, statedb, bc.jumpDestCache, vm.Config{}, nil)
+		res, err := bc.processor.Process(context.Background(), blk, statedb, bc.jumpDestCache, bc.precompileCache, vm.Config{}, nil)
 		if err != nil {
 			return fmt.Errorf("ReexecuteAndValidateRange: Process block %d: %w", num, err)
 		}

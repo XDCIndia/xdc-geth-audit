@@ -347,13 +347,16 @@ func (j *journal) refundChange(previous uint64) {
 }
 
 func (j *journal) balanceChange(addr common.Address, previous *uint256.Int, previousBig *big.Int) {
+	prev := previous.Clone()
+	j.stashBalance(addr, prev)
+
 	var bigCopy *big.Int
 	if previousBig != nil {
 		bigCopy = new(big.Int).Set(previousBig)
 	}
 	j.append(balanceChange{
 		account:    addr,
-		prev:       previous.Clone(),
+		prev:       prev,
 		prevBigBal: bigCopy,
 	})
 }

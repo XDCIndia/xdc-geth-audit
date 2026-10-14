@@ -21,6 +21,7 @@ package downloader
 
 import (
 	"errors"
+	"math"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -75,6 +76,12 @@ const (
 	// entries/min with 0% duplicate rate vs modern's 519K/min with 67% dup
 	// rate at the same peer count. Refs A.67 / #859.
 	maxParallelInflightSlots = 1
+
+	// rangeUpdateSlack is how far past a peer's announced latest block it is
+	// still asked for bodies and receipts. Peers only announce their range
+	// every few dozen blocks, so the announced latest trails the real head
+	// most of the time. Only a peer that is clearly behind is skipped.
+	rangeUpdateSlack = 64
 )
 
 var (
@@ -86,8 +93,9 @@ var (
 type peerConnection struct {
 	id string // Unique identifier of the peer
 
-	rates   *msgrate.Tracker         // Tracker to hone in on the number of items retrievable per second
-	lacking map[common.Hash]struct{} // Set of hashes not to request (didn't have previously)
+	rates      *msgrate.Tracker         // Tracker to hone in on the number of items retrievable per second
+	lacking    map[common.Hash]struct{} // Set of hashes not to request (didn't have previously)
+	lackingBAL map[common.Hash]struct{} // Set of hashes not to request the access lists for (didn't have previously)
 
 	peer Peer
 
@@ -147,11 +155,19 @@ type Peer interface {
 
 	RequestBodies([]common.Hash, chan *eth.Response) (*eth.Request, error)
 	RequestReceipts([]common.Hash, []uint64, []uint64, chan *eth.Response) (*eth.Request, error)
+	RequestBALs([]common.Hash, chan *eth.Response) (*eth.Request, error)
 
 	// RequestNodeData sends a GetNodeData request. Used only on the XDPOS2
 	// classical Fast Sync path (Phase A.2 / #844). Returns immediately on error
 	// since the caller wraps in a goroutine.
 	RequestNodeData([]common.Hash) error
+
+	// BlockRange returns the range of blocks the peer announced to serve
+	// (bodies and receipts), nil if it never announced one.
+	//
+	// Headers are always assumed to be available for the full range of
+	// blocks from genesis.
+	BlockRange() *eth.BlockRangeUpdatePacket
 }
 
 // xdcCapsPeer is the optional A.37 capabilities accessor implemented by
@@ -167,11 +183,12 @@ type xdcCapsPeer interface {
 // newPeerConnection creates a new downloader peer.
 func newPeerConnection(id string, version uint, peer Peer, logger log.Logger) *peerConnection {
 	pc := &peerConnection{
-		id:      id,
-		lacking: make(map[common.Hash]struct{}),
-		peer:    peer,
-		version: version,
-		log:     logger,
+		id:         id,
+		lacking:    make(map[common.Hash]struct{}),
+		lackingBAL: make(map[common.Hash]struct{}),
+		peer:       peer,
+		version:    version,
+		log:        logger,
 	}
 	// A.37: seed proactive scheme/legacy flags from the peer's advertised
 	// XDCCaps trailer (read once at registration; never refreshed). Peers
@@ -198,6 +215,7 @@ func (p *peerConnection) Reset() {
 	defer p.lock.Unlock()
 
 	p.lacking = make(map[common.Hash]struct{})
+	p.lackingBAL = make(map[common.Hash]struct{})
 }
 
 // UpdateHeaderRate updates the peer's estimated header retrieval throughput with
@@ -216,6 +234,12 @@ func (p *peerConnection) UpdateBodyRate(delivered int, elapsed time.Duration) {
 // with the current measurement.
 func (p *peerConnection) UpdateReceiptRate(delivered int, elapsed time.Duration) {
 	p.rates.Update(eth.ReceiptsMsg, elapsed, delivered)
+}
+
+// UpdateBALRate updates the peer's estimated block access list retrieval
+// throughput with the current measurement.
+func (p *peerConnection) UpdateBALRate(delivered int, elapsed time.Duration) {
+	p.rates.Update(eth.BlockAccessListsMsg, elapsed, delivered)
 }
 
 // HeaderCapacity retrieves the peer's header download allowance based on its
@@ -410,6 +434,47 @@ func (p *peerConnection) NodeDataCapacity(targetRTT time.Duration) int {
 	return cap
 }
 
+// BALCapacity retrieves the peer's block access list download allowance based
+// on its previously discovered throughput.
+func (p *peerConnection) BALCapacity(targetRTT time.Duration) int {
+	cap := p.rates.Capacity(eth.BlockAccessListsMsg, targetRTT)
+	if cap > MaxBALFetch {
+		cap = MaxBALFetch
+	}
+	return cap
+}
+
+// servedRange returns the range of blocks the peer is asked bodies and receipts
+// for, everything if it never announced a range. Headers are always assumed
+// available and not subject to the announced range.
+//
+// The lower bound is exact, a peer never has blocks below its earliest. The
+// upper bound is loose by rangeUpdateSlack: an announcement is a snapshot that
+// trails the peer's real head until the next one, so a peer merely late with
+// its announcement is still asked, and a miss is handled by the usual lacking
+// bookkeeping like any other empty reply.
+func (p *peerConnection) servedRange() (earliest, latest uint64) {
+	r := p.peer.BlockRange()
+	// XDC: an XDPOS2 handshake carries no block range. Its BlockRange slot holds
+	// the peer's total difficulty, taken once at handshake (eth/protocols/eth
+	// readStatus62), so it is not a block number and goes stale. Treat it as
+	// never announced, or long-connected XDC peers stop being asked for bodies.
+	if r == nil || p.version == eth.XDPOS2 {
+		return 0, math.MaxUint64
+	}
+	latest = r.LatestBlock + rangeUpdateSlack
+	if latest < r.LatestBlock {
+		latest = math.MaxUint64 // announced latest close to the type limit
+	}
+	return r.EarliestBlock, latest
+}
+
+// serves returns whether the given block is within the peer's served range.
+func (p *peerConnection) serves(number uint64) bool {
+	earliest, latest := p.servedRange()
+	return earliest <= number && number <= latest
+}
+
 // MarkLacking appends a new entity to the set of items (blocks, receipts, states)
 // that a peer is known not to have (i.e. have been requested before). If the
 // set reaches its maximum allowed capacity, items are randomly dropped off.
@@ -436,6 +501,34 @@ func (p *peerConnection) Lacks(hash common.Hash) bool {
 	return ok
 }
 
+// MarkLackingBAL appends a new block hash to the set of blocks whose access
+// list the peer is known not to have. Access lists are tracked separately from
+// the other block components, since a peer missing a block's access list may
+// well possess its body and receipts. If the set reaches its maximum allowed
+// capacity, items are randomly dropped off.
+func (p *peerConnection) MarkLackingBAL(hash common.Hash) {
+	p.lock.Lock()
+	defer p.lock.Unlock()
+
+	for len(p.lackingBAL) >= maxLackingHashes {
+		for drop := range p.lackingBAL {
+			delete(p.lackingBAL, drop)
+			break
+		}
+	}
+	p.lackingBAL[hash] = struct{}{}
+}
+
+// LacksBAL retrieves whether the access list of a block is on the peer's
+// lacking list (i.e. whether we know that the peer does not have it).
+func (p *peerConnection) LacksBAL(hash common.Hash) bool {
+	p.lock.RLock()
+	defer p.lock.RUnlock()
+
+	_, ok := p.lackingBAL[hash]
+	return ok
+}
+
 // peeringEvent is sent on the peer event feed when a remote peer connects or
 // disconnects.
 type peeringEvent struct {
@@ -454,10 +547,15 @@ type peerSet struct {
 }
 
 // newPeerSet creates a new peer set top track the active download sources.
+// minRoundTrip is the floor applied to the round trip estimate of the chain
+// download requests. Their replies are capped in size by the remote, making
+// them cheap to serve, so the real latency is a few hundred milliseconds.
+const minRoundTrip = 500 * time.Millisecond
+
 func newPeerSet() *peerSet {
 	return &peerSet{
 		peers: make(map[string]*peerConnection),
-		rates: msgrate.NewTrackers(log.New("proto", "eth")),
+		rates: msgrate.NewTrackers(log.New("proto", "eth"), minRoundTrip),
 	}
 }
 

@@ -521,7 +521,15 @@ func (x *XDPoS_v2) VerifySyncInfoMessage(chain consensus.ChainReader, syncInfo *
 		return false, err
 	}
 
-	// Verify TC
+	// Verify TC. A sender that has not seen a timeout since it (re)started
+	// still carries the blank bootstrap TC; rejecting it would discard the QC
+	// this SyncInfo carries (XinFinOrg/XDPoSChain #2525).
+	if isBlankTC(syncInfo.HighestTimeoutCert) {
+		log.Debug("[VerifySyncInfoMessage] Blank TC, sender has no TC yet; skipping TC verification",
+			"qcRound", syncInfo.HighestQuorumCert.ProposedBlockInfo.Round,
+			"qcNumber", syncInfo.HighestQuorumCert.ProposedBlockInfo.Number)
+		return true, nil
+	}
 	if err := x.verifyTC(chain, syncInfo.HighestTimeoutCert); err != nil {
 		log.Warn("[VerifySyncInfoMessage] TC verification failed",
 			"round", syncInfo.HighestTimeoutCert.Round,
@@ -530,6 +538,13 @@ func (x *XDPoS_v2) VerifySyncInfoMessage(chain consensus.ChainReader, syncInfo *
 	}
 
 	return true, nil
+}
+
+// isBlankTC reports whether timeoutCert is the bootstrap TC a node holds before
+// any round has timed out: round 0 without signatures. TCs live in memory only,
+// so every node restarts with one; it is not a real certificate.
+func isBlankTC(timeoutCert *types.TimeoutCert) bool {
+	return timeoutCert != nil && timeoutCert.Round == types.Round(0) && len(timeoutCert.Signatures) == 0
 }
 
 // SyncInfoHandler processes a sync info message

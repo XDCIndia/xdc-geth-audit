@@ -117,6 +117,22 @@ var (
 	// Before this: fee goes to coinbase; After this: fee goes to coinbase owner
 	TIPTRC21Fee = big.NewInt(38383838)
 
+	// TRC21IssuerSMC is the TRC21 issuer contract: tokens registered there
+	// have their transaction fees paid from the issuer's deposit (their fee
+	// capacity) instead of the sender's XDC balance. XDPoSChain
+	// common/constants.{mainnet,testnet,devnet,local}.go trc21IssuerSMC.
+	TRC21IssuerSMC = HexToAddress("0x8c0faeb5C6bEd2129b8674F262Fd45c4e9468bee")
+
+	// BlockNumberGas50x mirrors consensus/XDPoS BlockNumberGas50x for the
+	// packages below consensus (core imports common, not consensus/XDPoS).
+	BlockNumberGas50x = big.NewInt(80370000)
+
+	// Gas prices of TRC21 token-fee transactions (XDPoSChain common/constants.all.go
+	// and common/gas.go).
+	TRC21GasPriceBefore = big.NewInt(2500)
+	TRC21GasPrice       = big.NewInt(250000000)
+	GasPrice50x         = big.NewInt(12500000000)
+
 	// BlackListHFNumber is the block number at which the transaction blacklist
 	// enforcement activates. Matches XDPoSChain v2.6.8 constants.mainnet.go.
 	BlackListHFNumber = uint64(38383838)
@@ -194,6 +210,8 @@ var (
 func CopyXDCConstants(chainID uint64) {
 	switch chainID {
 	case 51: // Apothem testnet
+		TRC21IssuerSMC = HexToAddress("0x0E2C88753131CE01c7551B726b28BFD04e44003F")
+		BlockNumberGas50x = big.NewInt(56828700)
 		TIPSigning = big.NewInt(3000000)
 		TIPTRC21Fee = big.NewInt(23779191)
 		TIPNoHalvingMNReward = big.NewInt(23779191)
@@ -208,6 +226,8 @@ func CopyXDCConstants(chainID uint64) {
 		// explicitly so the per-chain semantics are visible. (issue #694 §B)
 		TIP2019Block = big.NewInt(1)
 	case 50: // XDC mainnet
+		TRC21IssuerSMC = HexToAddress("0x8c0faeb5C6bEd2129b8674F262Fd45c4e9468bee")
+		BlockNumberGas50x = big.NewInt(80370000)
 		TIPSigning = big.NewInt(3000000)
 		TIPTRC21Fee = big.NewInt(38383838)
 		TIPNoHalvingMNReward = big.NewInt(38383838)
@@ -220,6 +240,8 @@ func CopyXDCConstants(chainID uint64) {
 		// Canonical XDPoSChain v2.6.8 common/constants.mainnet.go: tip2019Block=1.
 		TIP2019Block = big.NewInt(1)
 	case 551: // Active devnet (XDPoSChain main)
+		TRC21IssuerSMC = HexToAddress("0x8c0faeb5C6bEd2129b8674F262Fd45c4e9468bee")
+		BlockNumberGas50x = big.NewInt(21600)
 		TIPSigning = big.NewInt(0)
 		TIPTRC21Fee = big.NewInt(10800)
 		TIPNoHalvingMNReward = big.NewInt(0)
@@ -262,6 +284,7 @@ func CopyXDCConstants(chainID uint64) {
 		// legacy node. Refs Opus RCA Step 3.
 		TIPRandomize = big.NewInt(0)
 	case 5050: // net5050 (XDCIndia stress-net) — V2 switch at block 2700
+		BlockNumberGas50x = big.NewInt(0) // consensus/XDPoS devnet/private constants
 		// Gasless block-signer txs from genesis: the canonical oracle runs
 		// TIPSigning=0, so block-1 signer txs have gasUsed=0. Without this case the
 		// default (3,000,000) keeps the gasless path OFF -> block 1 charges gas ->
@@ -286,6 +309,7 @@ func CopyXDCConstants(chainID uint64) {
 		BlackListHFNumber = 0
 		TIP2019Block = big.NewInt(0)
 	case 5551: // Legacy devnet (V2 switch at block 2700)
+		BlockNumberGas50x = big.NewInt(0) // consensus/XDPoS devnet/private constants
 		TIPSigning = big.NewInt(0)
 		TIPTRC21Fee = big.NewInt(0)
 		TIPNoHalvingMNReward = big.NewInt(0)
@@ -330,6 +354,7 @@ func CopyXDCConstants(chainID uint64) {
 		BlackListHFNumber = 38383838
 		TIP2019Block = big.NewInt(1)
 	case 99999: // Private dev chain generated via cmd/puppeth.
+		BlockNumberGas50x = big.NewInt(0) // consensus/XDPoS devnet/private constants
 		// Without this case, package-level defaults (mainnet's 38,383,838+
 		// thresholds) gate every TIP — which means V2 BFT consensus never
 		// activates inside any realistic demo timeline on a private chain

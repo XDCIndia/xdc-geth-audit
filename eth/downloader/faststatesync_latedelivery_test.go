@@ -32,6 +32,7 @@ import (
 	"github.com/ethereum/go-ethereum/core/tracing"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/eth/ethconfig"
+	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/trie"
 	"github.com/ethereum/go-ethereum/triedb"
 	"github.com/holiman/uint256"
@@ -69,7 +70,7 @@ func newLateDeliveryTestSync(t *testing.T) (*fastStateSync, common.Hash, func(pa
 			codeMap[codeHash] = code
 		}
 	}
-	root, err := srcState.Commit(0, false, false)
+	root, err := srcState.Commit(params.Rules{}, 0)
 	if err != nil {
 		t.Fatalf("commit src state: %v", err)
 	}

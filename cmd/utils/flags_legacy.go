@@ -48,6 +48,7 @@ var DeprecatedFlags = []cli.Flag{
 	EnablePersonal,
 	UnlockedAccountFlag,
 	InsecureUnlockAllowedFlag,
+	StateSizeTrackingFlag,
 }
 
 var (
@@ -150,6 +151,15 @@ var (
 		Name:     "allow-insecure-unlock",
 		Hidden:   true,
 		Usage:    "Allow insecure account unlocking when account-related RPCs are exposed by http (deprecated)",
+		Category: flags.DeprecatedCategory,
+	}
+	// Deprecated August 2026, state size tracking was removed along with the
+	// debug_stateSize endpoint it fed. Kept registered so that nodes carrying
+	// the flag in their startup scripts do not fail to boot.
+	StateSizeTrackingFlag = &cli.BoolFlag{
+		Name:     "state.size-tracking",
+		Hidden:   true,
+		Usage:    "Enable state size tracking (deprecated)",
 		Category: flags.DeprecatedCategory,
 	}
 )

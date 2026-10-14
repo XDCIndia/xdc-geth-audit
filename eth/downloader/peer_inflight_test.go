@@ -36,6 +36,8 @@ func (noopFetchPeer) RequestHeadersByHash(common.Hash, int, int, bool, chan *eth
 func (noopFetchPeer) RequestHeadersByNumber(uint64, int, int, bool, chan *eth.Response) (*eth.Request, error) {
 	return nil, nil
 }
+func (noopFetchPeer) BlockRange() *eth.BlockRangeUpdatePacket { return nil }
+
 func (noopFetchPeer) RequestBodies([]common.Hash, chan *eth.Response) (*eth.Request, error) {
 	return nil, nil
 }
@@ -43,6 +45,9 @@ func (noopFetchPeer) RequestReceipts([]common.Hash, []uint64, []uint64, chan *et
 	return nil, nil
 }
 func (noopFetchPeer) RequestNodeData([]common.Hash) error { return nil }
+func (noopFetchPeer) RequestBALs([]common.Hash, chan *eth.Response) (*eth.Request, error) {
+	return nil, nil
+}
 
 // newDispatchTestPeerConn returns a peerConnection wired with a no-op Peer and
 // a real msgrate.Tracker so FetchNodeData / SetNodeDataIdle can update RTT

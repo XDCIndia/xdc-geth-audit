@@ -21,6 +21,7 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
+	"math"
 	"math/big"
 	"sync/atomic"
 
@@ -78,7 +79,10 @@ func getCoinbaseOwner(engine consensus.Engine, statedb *state.StateDB, header *t
 // Process returns the receipts and logs accumulated during the process and
 // returns the amount of gas that was used in the process. If any of the
 // transactions failed to execute due to insufficient gas it will return an error.
-func (p *StateProcessor) Process(ctx context.Context, block *types.Block, statedb *state.StateDB, jumpDestCache vm.JumpDestCache, cfg vm.Config, execIndex *atomic.Int64) (*ProcessResult, error) {
+func (p *StateProcessor) Process(ctx context.Context, block *types.Block, statedb *state.StateDB, jumpDestCache vm.JumpDestCache, precompileCache *vm.PrecompileCache, cfg vm.Config, execIndex *atomic.Int64) (*ProcessResult, error) {
+	if supportsParallelExecution(block, p.chainConfig(), statedb.Witness() != nil, cfg.Tracer != nil, cfg.DisableParallelExecution) {
+		return p.processParallel(ctx, block, statedb, jumpDestCache, precompileCache, cfg)
+	}
 	// XDC: capture pre-tx state for the XDPoS engine reward calculation.
 	// Reward computation at checkpoint blocks must read account balances
 	// BEFORE tx execution; without this, reward calculation uses post-tx
@@ -92,7 +96,17 @@ func (p *StateProcessor) Process(ctx context.Context, block *types.Block, stated
 		blockNumber = block.Number()
 		allLogs     []*types.Log
 		gp          = NewGasPool(block.GasLimit())
+
+		// The receipts are digested on a pipeline of their own, fed as the
+		// transactions finish, so the block bloom and the receipt root are
+		// ready when the validator asks. With a tracer attached the blooms
+		// stay in the loop, it is handed every receipt through OnTxEnd.
+		eagerBloom = cfg.Tracer != nil
+		pipeline   = newDigestPipeline(len(block.Transactions()), eagerBloom)
 	)
+	// Run out the pipeline on the paths that abandon the block half way through.
+	defer pipeline.abandon()
+
 	var tracingStateDB = vm.StateDB(statedb)
 	if hooks := cfg.Tracer; hooks != nil {
 		tracingStateDB = state.NewHookedState(statedb, hooks)
@@ -123,10 +137,10 @@ func (p *StateProcessor) Process(ctx context.Context, block *types.Block, stated
 	// lookup below has any chance to matter: IntermediateRoot(false) →
 	// SelfDestruct → Finalise(true) → IntermediateRoot(true).
 	if common.TIPSigning.Cmp(block.Number()) == 0 {
-		_ = statedb.IntermediateRoot(false)
+		_ = statedb.IntermediateRoot(params.Rules{})
 		statedb.SelfDestruct(common.BlockSignersBinary)
-		statedb.Finalise(true)
-		_ = statedb.IntermediateRoot(true)
+		statedb.Finalise(params.Rules{IsEIP158: true})
+		_ = statedb.IntermediateRoot(params.Rules{IsEIP158: true})
 	}
 
 	parent := p.chain.GetHeader(block.ParentHash(), block.NumberU64()-1)
@@ -144,6 +158,9 @@ func (p *StateProcessor) Process(ctx context.Context, block *types.Block, stated
 	if jumpDestCache != nil {
 		evm.SetJumpDestCache(jumpDestCache)
 	}
+	if precompileCache != nil {
+		evm.SetPrecompileCache(precompileCache)
+	}
 	// Run the pre-execution system calls
 	blockAccessList.Merge(PreExecution(ctx, block.BeaconRoot(), parent, config, evm, block.Number(), block.Time()))
 
@@ -155,6 +172,16 @@ func (p *StateProcessor) Process(ctx context.Context, block *types.Block, stated
 	// lookup. Passed through to ApplyTransactionWithEVM where it routes the
 	// fee in state_transition.go.
 	coinbaseOwner := getCoinbaseOwner(p.chain.Engine(), statedb, header)
+
+	// XDC: TRC21 token fees (XDPoSChain core/blockchain.go + Process). Tokens
+	// registered in the TRC21 issuer pay the fees of transactions sent to them
+	// from their fee capacity, read once from the parent state here and drawn
+	// down as the block executes; UpdateTRC21Fee writes it back after the loop.
+	var (
+		tokensFee      = state.GetTRC21FeeCapacityFromState(statedb)
+		balanceUpdated = map[common.Address]*big.Int{}
+		totalFeeUsed   = new(big.Int)
+	)
 
 	// Iterate over and process the individual transactions
 	for i, tx := range block.Transactions() {
@@ -181,6 +208,7 @@ func (p *StateProcessor) Process(ctx context.Context, block *types.Block, stated
 				return nil, fmt.Errorf("could not apply signing tx %d [%v]: %w", i, tx.Hash().Hex(), err)
 			}
 			receipts = append(receipts, receipt)
+			pipeline.feedReceipt(receipt)
 			allLogs = append(allLogs, receipt.Logs...)
 			continue
 		}
@@ -200,6 +228,7 @@ func (p *StateProcessor) Process(ctx context.Context, block *types.Block, stated
 					return nil, fmt.Errorf("could not apply empty tx %d [%v]: %w", i, tx.Hash().Hex(), err)
 				}
 				receipts = append(receipts, receipt)
+				pipeline.feedReceipt(receipt)
 				allLogs = append(allLogs, receipt.Logs...)
 				continue
 			}
@@ -209,22 +238,22 @@ func (p *StateProcessor) Process(ctx context.Context, block *types.Block, stated
 		if err != nil {
 			return nil, fmt.Errorf("could not apply tx %d [%v]: %w", i, tx.Hash().Hex(), err)
 		}
+		tokenFee := ApplyTRC21TokenFee(config, msg, tokensFee, tx, blockNumber)
 		statedb.SetTxContext(tx.Hash(), i, uint32(i+1))
-		_, _, spanEnd := telemetry.StartSpan(ctx, "core.ApplyTransactionWithEVM",
-			telemetry.StringAttribute("tx.hash", tx.Hash().Hex()),
-			telemetry.IntAttribute("tx.index", i),
-		)
-		receipt, bal, err := ApplyTransactionWithEVM(msg, gp, statedb, blockNumber, blockHash, context.Time, tx, evm, coinbaseOwner)
+		receipt, bal, err := applyTransactionWithEVM(ctx, msg, gp, statedb, blockNumber, blockHash, context.Time, tx, evm, eagerBloom, coinbaseOwner)
 		if err != nil {
-			spanEnd(&err)
 			return nil, fmt.Errorf("could not apply tx %d [%v]: %w", i, tx.Hash().Hex(), err)
 		}
+		if tokenFee {
+			SettleTRC21TokenFee(config, statedb, msg, tx, receipt, blockNumber, tokensFee, balanceUpdated, totalFeeUsed)
+		}
 		receipts = append(receipts, receipt)
+		pipeline.feedReceipt(receipt)
 		allLogs = append(allLogs, receipt.Logs...)
 		blockAccessList.Merge(bal)
-		spanEnd(nil)
 	}
-	requests, bal, err := PostExecution(ctx, config, block.Number(), block.Time(), allLogs, evm, uint32(len(block.Transactions())+1))
+	state.UpdateTRC21Fee(statedb, balanceUpdated, totalFeeUsed)
+	requests, bal, err := PostExecution(ctx, config, block.Number(), block.Time(), allLogs, block.Withdrawals(), evm, uint32(len(block.Transactions())+1))
 	if err != nil {
 		return nil, err
 	}
@@ -237,14 +266,22 @@ func (p *StateProcessor) Process(ctx context.Context, block *types.Block, stated
 
 	// Finalize the block, applying any consensus engine specific extras
 	// (e.g. block rewards).
-	p.chain.Engine().Finalize(p.chain, header, tracingStateDB, block.Body(), uint32(len(block.Transactions())+1), blockAccessList)
+	p.chain.Engine().Finalize(p.chain, header, tracingStateDB, block.Body())
+
+	// The access list is final, let the pipeline encode it while the block is
+	// validated.
+	pipeline.feedBAL(blockAccessList)
+
+	// Join the receipts. They are only complete, and safe to hand back, once
+	// the pipeline has filled in their blooms.
+	pipeline.joinReceipts()
 
 	return &ProcessResult{
 		Receipts: receipts,
 		Requests: requests,
 		Logs:     allLogs,
 		GasUsed:  gp.Used(),
-		Bal:      blockAccessList,
+		pipeline: pipeline,
 	}, nil
 }
 
@@ -256,12 +293,6 @@ func PreExecution(ctx context.Context, beaconRoot *common.Hash, parent *types.He
 	var blockAccessList *bal.ConstructionBlockAccessList
 	if config.IsAmsterdam(number, time) {
 		blockAccessList = bal.NewConstructionBlockAccessList()
-
-		// EIP-7997: insert the deterministic deployment factory at the Amsterdam
-		// activation block via an irregular state transition.
-		if !config.IsAmsterdam(parent.Number, parent.Time) {
-			misc.ApplyEIP7997(evm.StateDB)
-		}
 	}
 	// EIP-4788
 	if beaconRoot != nil {
@@ -274,10 +305,10 @@ func PreExecution(ctx context.Context, beaconRoot *common.Hash, parent *types.He
 	return blockAccessList
 }
 
-// PostExecution processes post-execution system calls when Prague is enabled.
-// If Prague is not activated, it returns null requests to differentiate from
-// empty requests.
-func PostExecution(ctx context.Context, config *params.ChainConfig, number *big.Int, time uint64, allLogs []*types.Log, evm *vm.EVM, blockAccessIndex uint32) (requests [][]byte, blockAccessList *bal.ConstructionBlockAccessList, err error) {
+// PostExecution processes the withdrawals and then the post-execution system
+// calls when Prague is enabled. If Prague is not activated, it returns null
+// requests to differentiate from empty requests.
+func PostExecution(ctx context.Context, config *params.ChainConfig, number *big.Int, time uint64, allLogs []*types.Log, withdrawals types.Withdrawals, evm *vm.EVM, blockAccessIndex uint32) (requests [][]byte, blockAccessList *bal.ConstructionBlockAccessList, err error) {
 	_, _, spanEnd := telemetry.StartSpan(ctx, "core.postExecution")
 	defer spanEnd(&err)
 
@@ -285,8 +316,13 @@ func PostExecution(ctx context.Context, config *params.ChainConfig, number *big.
 		blockAccessList = bal.NewConstructionBlockAccessList()
 	}
 	rules := config.Rules(number, true, time) // IsMerge is always true
+
+	// Withdrawals are applied before the system calls
+	if rules.IsShanghai {
+		ProcessWithdrawals(withdrawals, evm, blockAccessIndex, blockAccessList)
+	}
 	// Read requests if Prague is enabled.
-	if config.IsPrague(number, time) {
+	if rules.IsPrague {
 		requests = [][]byte{}
 		// EIP-6110
 		if err := ParseDepositLogs(&requests, allLogs, config); err != nil {
@@ -302,7 +338,7 @@ func PostExecution(ctx context.Context, config *params.ChainConfig, number *big.
 		}
 	}
 
-	if config.IsAmsterdam(number, time) {
+	if rules.IsAmsterdam {
 		// EIP-8282
 		if err := ProcessBuilderDepositQueue(&requests, rules, evm, blockAccessIndex, blockAccessList); err != nil {
 			return nil, nil, fmt.Errorf("failed to process builder deposit queue: %w", err)
@@ -314,14 +350,48 @@ func PostExecution(ctx context.Context, config *params.ChainConfig, number *big.
 	return requests, blockAccessList, nil
 }
 
+// ProcessWithdrawals credits the given withdrawals to their recipients.
+func ProcessWithdrawals(withdrawals types.Withdrawals, evm *vm.EVM, blockAccessIndex uint32, blockAccessList *bal.ConstructionBlockAccessList) {
+	rules := evm.GetRules()
+	evm.StateDB.Prepare(rules, common.Address{}, common.Address{}, nil, nil, nil)
+	evm.StateDB.SetTxContext(common.Hash{}, 0, blockAccessIndex)
+	for _, w := range withdrawals {
+		// Convert amount from gwei to wei.
+		amount := new(uint256.Int).SetUint64(w.Amount)
+		amount = amount.Mul(amount, uint256.NewInt(params.GWei))
+		evm.StateDB.AddBalance(w.Address, amount, tracing.BalanceIncreaseWithdrawal)
+
+		if rules.IsEIP4762 {
+			evm.StateDB.AccessEvents().AddAccount(w.Address, true, math.MaxUint64)
+		}
+	}
+	accessList := evm.StateDB.Finalise(rules)
+	if rules.IsAmsterdam {
+		blockAccessList.Merge(accessList)
+	}
+}
+
 // ApplyTransactionWithEVM attempts to apply a transaction to the given state database
 // and uses the input parameters for its environment similar to ApplyTransaction. However,
 // this method takes an already created EVM instance as input.
 //
 // The optional owner parameter (XDC) specifies the coinbase-owner address used for
 // TRC21 fee routing post-TIPTRC21Fee. When no owner is supplied behaviour is
-// bit-identical to upstream v1.17.4 (refs #740/#742).
-func ApplyTransactionWithEVM(msg *Message, gp *GasPool, statedb *state.StateDB, blockNumber *big.Int, blockHash common.Hash, blockTime uint64, tx *types.Transaction, evm *vm.EVM, owner ...common.Address) (receipt *types.Receipt, bal *bal.ConstructionBlockAccessList, err error) {
+// bit-identical to upstream (refs #740/#742).
+func ApplyTransactionWithEVM(ctx context.Context, msg *Message, gp *GasPool, statedb *state.StateDB, blockNumber *big.Int, blockHash common.Hash, blockTime uint64, tx *types.Transaction, evm *vm.EVM, owner ...common.Address) (*types.Receipt, *bal.ConstructionBlockAccessList, error) {
+	return applyTransactionWithEVM(ctx, msg, gp, statedb, blockNumber, blockHash, blockTime, tx, evm, true, owner...)
+}
+
+// applyTransactionWithEVM is ApplyTransactionWithEVM with the receipt bloom
+// filter optional. The block processor leaves it out and lets its receipt
+// pipeline hash the logs instead.
+func applyTransactionWithEVM(ctx context.Context, msg *Message, gp *GasPool, statedb *state.StateDB, blockNumber *big.Int, blockHash common.Hash, blockTime uint64, tx *types.Transaction, evm *vm.EVM, withBloom bool, owner ...common.Address) (receipt *types.Receipt, bal *bal.ConstructionBlockAccessList, err error) {
+	_, _, spanEnd := telemetry.StartSpan(ctx, "core.ApplyTransactionWithEVM",
+		telemetry.StringAttribute("tx.hash", tx.Hash().Hex()),
+		telemetry.IntAttribute("tx.index", statedb.TxIndex()),
+	)
+	defer spanEnd(&err)
+
 	if hooks := evm.Config.Tracer; hooks != nil {
 		if hooks.OnTxStart != nil {
 			hooks.OnTxStart(evm.GetVMContext(), tx, msg.From)
@@ -339,20 +409,32 @@ func ApplyTransactionWithEVM(msg *Message, gp *GasPool, statedb *state.StateDB, 
 	// Update the state with pending changes.
 	var root []byte
 	if evm.ChainConfig().IsByzantium(blockNumber) {
-		bal = evm.StateDB.Finalise(true)
+		bal = evm.StateDB.Finalise(evm.GetRules())
 	} else {
-		root = statedb.IntermediateRoot(evm.ChainConfig().IsEIP158(blockNumber)).Bytes()
+		root = statedb.IntermediateRoot(evm.GetRules()).Bytes()
 	}
 	// Merge the tx-local access event into the "block-local" one, in order to collect
 	// all values, so that the witness can be built.
 	if statedb.Database().Type().Is(state.TypeUBT) {
 		statedb.AccessEvents().Merge(evm.AccessEvents)
 	}
-	return MakeReceipt(evm, result, statedb, blockNumber, blockHash, blockTime, tx, gp.CumulativeUsed(), root), bal, nil
+	receipt = makeReceipt(evm, result, statedb, blockNumber, blockHash, blockTime, tx, gp.CumulativeUsed(), root)
+	if withBloom {
+		receipt.Bloom = types.CreateBloom(receipt)
+	}
+	return receipt, bal, nil
 }
 
 // MakeReceipt generates the receipt object for a transaction given its execution result.
 func MakeReceipt(evm *vm.EVM, result *ExecutionResult, statedb *state.StateDB, blockNumber *big.Int, blockHash common.Hash, blockTime uint64, tx *types.Transaction, cumulativeGas uint64, root []byte) *types.Receipt {
+	receipt := makeReceipt(evm, result, statedb, blockNumber, blockHash, blockTime, tx, cumulativeGas, root)
+	receipt.Bloom = types.CreateBloom(receipt)
+	return receipt
+}
+
+// makeReceipt generates the receipt object without its bloom filter, which the
+// caller either computes itself or leaves to the receipt pipeline.
+func makeReceipt(evm *vm.EVM, result *ExecutionResult, statedb *state.StateDB, blockNumber *big.Int, blockHash common.Hash, blockTime uint64, tx *types.Transaction, cumulativeGas uint64, root []byte) *types.Receipt {
 	// Create a new receipt for the transaction, storing the intermediate root
 	// and gas used by the tx.
 	//
@@ -380,9 +462,8 @@ func MakeReceipt(evm *vm.EVM, result *ExecutionResult, statedb *state.StateDB, b
 		receipt.ContractAddress = crypto.CreateAddress(evm.TxContext.Origin, tx.Nonce())
 	}
 
-	// Set the receipt logs and create the bloom filter.
+	// Set the receipt logs.
 	receipt.Logs = statedb.GetLogs(tx.Hash(), blockNumber.Uint64(), blockHash, blockTime)
-	receipt.Bloom = types.CreateBloom(receipt)
 	receipt.BlockHash = blockHash
 	receipt.BlockNumber = blockNumber
 	receipt.TransactionIndex = uint(statedb.TxIndex())
@@ -393,13 +474,13 @@ func MakeReceipt(evm *vm.EVM, result *ExecutionResult, statedb *state.StateDB, b
 // and uses the input parameters for its environment. It returns the receipt
 // for the transaction and an error if the transaction failed,
 // indicating the block was invalid.
-func ApplyTransaction(evm *vm.EVM, gp *GasPool, statedb *state.StateDB, header *types.Header, tx *types.Transaction) (*types.Receipt, *bal.ConstructionBlockAccessList, error) {
+func ApplyTransaction(ctx context.Context, evm *vm.EVM, gp *GasPool, statedb *state.StateDB, header *types.Header, tx *types.Transaction) (*types.Receipt, *bal.ConstructionBlockAccessList, error) {
 	msg, err := TransactionToMessage(tx, types.MakeSigner(evm.ChainConfig(), header.Number, header.Time), header.BaseFee)
 	if err != nil {
 		return nil, nil, err
 	}
 	// Create a new context to be used in the EVM environment
-	return ApplyTransactionWithEVM(msg, gp, statedb, header.Number, header.Hash(), header.Time, tx, evm)
+	return ApplyTransactionWithEVM(ctx, msg, gp, statedb, header.Number, header.Hash(), header.Time, tx, evm)
 }
 
 // systemCallGasBudget returns the gas budget for system calls.
@@ -440,11 +521,16 @@ func ProcessBeaconBlockRoot(beaconRoot common.Hash, evm *vm.EVM, blockAccessList
 	evm.StateDB.Prepare(evm.GetRules(), common.Address{}, common.Address{}, nil, nil, nil)
 	evm.StateDB.SetTxContext(common.Hash{}, 0, 0)
 	evm.StateDB.AddAddressToAccessList(params.BeaconRootsAddress)
+
+	// Unchecked system call (EIP-4788), failures are ignored as spec
 	_, _, _ = evm.Call(msg.From, *msg.To, msg.Data, gasBudget, common.U2560)
 	if evm.StateDB.AccessEvents() != nil {
 		evm.StateDB.AccessEvents().Merge(evm.AccessEvents)
 	}
-	blockAccessList.Merge(evm.StateDB.Finalise(true))
+	accessList := evm.StateDB.Finalise(evm.GetRules())
+	if evm.GetRules().IsAmsterdam {
+		blockAccessList.Merge(accessList)
+	}
 }
 
 // ProcessParentBlockHash stores the parent block hash in the history storage contract
@@ -516,14 +602,16 @@ func ProcessParentBlockHash(prevHash common.Hash, evm *vm.EVM, blockAccessList *
 	evm.StateDB.Prepare(evm.GetRules(), common.Address{}, common.Address{}, nil, nil, nil)
 	evm.StateDB.SetTxContext(common.Hash{}, 0, 0)
 	evm.StateDB.AddAddressToAccessList(params.HistoryStorageAddress)
-	_, _, err := evm.Call(msg.From, *msg.To, msg.Data, gasBudget, common.U2560)
-	if err != nil {
-		panic(err)
-	}
+
+	// Unchecked system call (EIP-2935), failures are ignored as spec
+	_, _, _ = evm.Call(msg.From, *msg.To, msg.Data, gasBudget, common.U2560)
 	if evm.StateDB.AccessEvents() != nil {
 		evm.StateDB.AccessEvents().Merge(evm.AccessEvents)
 	}
-	blockAccessList.Merge(evm.StateDB.Finalise(true))
+	accessList := evm.StateDB.Finalise(evm.GetRules())
+	if evm.GetRules().IsAmsterdam {
+		blockAccessList.Merge(accessList)
+	}
 }
 
 // historyStorageKey maps a block number to its slot in the EIP-2935 history
@@ -560,6 +648,9 @@ func ProcessBuilderExitQueue(requests *[][]byte, rules params.Rules, evm *vm.EVM
 }
 
 func processRequestsSystemCall(requests *[][]byte, rules params.Rules, evm *vm.EVM, requestType byte, addr common.Address, blockAccessIndex uint32, blockAccessList *bal.ConstructionBlockAccessList) error {
+	if evm.StateDB.GetCodeSize(addr) == 0 {
+		return fmt.Errorf("empty system contract: no code at %v", addr)
+	}
 	if tracer := evm.Config.Tracer; tracer != nil {
 		onSystemCallStart(tracer, evm.GetVMContext())
 		if tracer.OnSystemCallEnd != nil {
@@ -576,19 +667,20 @@ func processRequestsSystemCall(requests *[][]byte, rules params.Rules, evm *vm.E
 		To:        &addr,
 	}
 	evm.SetTxContext(NewEVMTxContext(msg))
-	evm.StateDB.Prepare(rules, common.Address{}, common.Address{}, nil, nil, nil)
+	evm.StateDB.Prepare(evm.GetRules(), common.Address{}, common.Address{}, nil, nil, nil)
 	evm.StateDB.SetTxContext(common.Hash{}, 0, blockAccessIndex)
 	evm.StateDB.AddAddressToAccessList(addr)
 	ret, _, err := evm.Call(msg.From, *msg.To, msg.Data, gasBudget, common.U2560)
 	if evm.StateDB.AccessEvents() != nil {
 		evm.StateDB.AccessEvents().Merge(evm.AccessEvents)
 	}
-	bal := evm.StateDB.Finalise(true)
+	bal := evm.StateDB.Finalise(evm.GetRules())
 	if err != nil {
 		return fmt.Errorf("system call failed to execute: %v", err)
 	}
-	blockAccessList.Merge(bal)
-
+	if rules.IsAmsterdam {
+		blockAccessList.Merge(bal)
+	}
 	if len(ret) == 0 {
 		return nil // skip empty output
 	}
@@ -633,9 +725,10 @@ func onSystemCallStart(tracer *tracing.Hooks, ctx *tracing.VMContext) {
 // body and receipts.
 func AssembleBlock(chain consensus.ChainHeaderReader, header *types.Header, state *state.StateDB, body *types.Body, receipts []*types.Receipt, blockAccessList *bal.ConstructionBlockAccessList) *types.Block {
 	// Assign the post-transition state root
-	header.Root = state.IntermediateRoot(chain.Config().IsEIP158(header.Number))
+	rules := chain.Config().Rules(header.Number, header.Difficulty.Sign() == 0, header.Time)
+	header.Root = state.IntermediateRoot(rules)
 
-	if !chain.Config().IsAmsterdam(header.Number, header.Time) {
+	if !rules.IsAmsterdam {
 		return types.NewBlock(header, body, receipts, trie.NewStackTrie(nil))
 	}
 	// Assign the BlockAccessListHash if Amsterdam has been enabled
@@ -657,9 +750,9 @@ func AssembleBlock(chain consensus.ChainHeaderReader, header *types.Header, stat
 func ApplySigningTransaction(config *params.ChainConfig, statedb *state.StateDB, blockNumber *big.Int, blockHash common.Hash, tx *types.Transaction, cumulativeGasUsed uint64) (*types.Receipt, error) {
 	var root []byte
 	if config.IsByzantium(blockNumber) {
-		statedb.Finalise(true)
+		statedb.Finalise(params.Rules{IsEIP158: true})
 	} else {
-		root = statedb.IntermediateRoot(config.IsEIP158(blockNumber)).Bytes()
+		root = statedb.IntermediateRoot(params.Rules{IsEIP158: config.IsEIP158(blockNumber)}).Bytes()
 	}
 	from, err := types.Sender(types.MakeSigner(config, blockNumber, 0), tx)
 	if err != nil {
@@ -713,9 +806,9 @@ func ApplySigningTransaction(config *params.ChainConfig, statedb *state.StateDB,
 func ApplyEmptyTransaction(config *params.ChainConfig, statedb *state.StateDB, blockNumber *big.Int, blockHash common.Hash, tx *types.Transaction, cumulativeGasUsed uint64) (*types.Receipt, error) {
 	var root []byte
 	if config.IsByzantium(blockNumber) {
-		statedb.Finalise(true)
+		statedb.Finalise(params.Rules{IsEIP158: true})
 	} else {
-		root = statedb.IntermediateRoot(config.IsEIP158(blockNumber)).Bytes()
+		root = statedb.IntermediateRoot(params.Rules{IsEIP158: config.IsEIP158(blockNumber)}).Bytes()
 	}
 
 	emptyLog := &types.Log{
@@ -740,4 +833,37 @@ func ApplyEmptyTransaction(config *params.ChainConfig, statedb *state.StateDB, b
 	receipt.Logs = statedb.GetLogs(tx.Hash(), blockNumber.Uint64(), blockHash, 0)
 	receipt.Bloom = types.CreateBloom(receipt)
 	return receipt, nil
+}
+
+// ApplyTRC21TokenFee marks msg as a TRC21 token-fee message when tx is sent to a
+// token registered in the TRC21 issuer: the fee is then paid from the token's
+// capacity, at the TRC21 gas price of the block (XDPoSChain tx.AsMessage). It
+// reports whether msg is one. Call it on the normal (non special-tx) path only.
+func ApplyTRC21TokenFee(config *params.ChainConfig, msg *Message, tokensFee map[common.Address]*big.Int, tx *types.Transaction, blockNumber *big.Int) bool {
+	to := tx.To()
+	if to == nil {
+		return false
+	}
+	capacity, ok := tokensFee[*to]
+	if !ok {
+		return false
+	}
+	msg.BalanceTokenFee = capacity
+	msg.GasPrice, _ = uint256.FromBig(params.TRC21GasPriceForBlock(config, blockNumber))
+	return true
+}
+
+// SettleTRC21TokenFee draws the fee of an applied TRC21 token-fee transaction
+// from its token's capacity and, when the transaction failed, charges the
+// token's minFee (in tokens) from the sender to the issuer (XDPoSChain
+// applyTransaction + Process).
+func SettleTRC21TokenFee(config *params.ChainConfig, statedb *state.StateDB, msg *Message, tx *types.Transaction, receipt *types.Receipt, blockNumber *big.Int, tokensFee, balanceUpdated map[common.Address]*big.Int, totalFeeUsed *big.Int) {
+	token := *tx.To()
+	if receipt.Status == types.ReceiptStatusFailed {
+		state.PayFeeWithTRC21TxFail(statedb, msg.From, token)
+	}
+	fee := params.TRC21GasFee(config, blockNumber, receipt.GasUsed)
+	tokensFee[token] = new(big.Int).Sub(tokensFee[token], fee)
+	balanceUpdated[token] = tokensFee[token]
+	totalFeeUsed.Add(totalFeeUsed, fee)
 }

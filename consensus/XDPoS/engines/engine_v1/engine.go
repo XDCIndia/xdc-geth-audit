@@ -14,19 +14,19 @@ import (
 	"sync"
 	"time"
 
+	"github.com/ethereum/go-ethereum/accounts"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/lru"
 	"github.com/ethereum/go-ethereum/consensus"
 	"github.com/ethereum/go-ethereum/consensus/XDPoS/engines"
 	"github.com/ethereum/go-ethereum/consensus/clique"
+	"github.com/ethereum/go-ethereum/core/state"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/ethdb"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/rlp"
-	"github.com/ethereum/go-ethereum/accounts"
-	"github.com/ethereum/go-ethereum/core/state"
 
 	"golang.org/x/crypto/sha3"
 )
@@ -75,11 +75,11 @@ type SnapshotV1 struct {
 	config   *params.XDPoSConfig                     `json:"-"`
 	sigcache *lru.Cache[common.Hash, common.Address] `json:"-"`
 
-	Number  uint64                     `json:"number"`
-	Hash    common.Hash                `json:"hash"`
-	Signers map[common.Address]struct{} `json:"signers"`
-	Recents map[uint64]common.Address  `json:"recents"`
-	Votes   []*clique.Vote             `json:"votes"`
+	Number  uint64                          `json:"number"`
+	Hash    common.Hash                     `json:"hash"`
+	Signers map[common.Address]struct{}     `json:"signers"`
+	Recents map[uint64]common.Address       `json:"recents"`
+	Votes   []*clique.Vote                  `json:"votes"`
 	Tally   map[common.Address]clique.Tally `json:"tally"`
 }
 
@@ -868,7 +868,6 @@ func position(list []common.Address, x common.Address) int {
 	return -1
 }
 
-
 // CalcDifficulty is the difficulty adjustment algorithm. It returns the difficulty
 // that a new block should have when created at time given the parent block's time
 // and difficulty.
@@ -896,7 +895,7 @@ func (x *XDPoS_v1) Prepare(chain consensus.ChainReader, header *types.Header) er
 // and assembles the final block.
 func (x *XDPoS_v1) Finalize(chain consensus.ChainReader, header *types.Header, state *state.StateDB, parentState *state.StateDB, txs []*types.Transaction, uncles []*types.Header, receipts []*types.Receipt) (*types.Block, error) {
 	// No block rewards in XDPoS v1, just assemble the block
-	header.Root = state.IntermediateRoot(chain.Config().IsEIP158(header.Number))
+	header.Root = state.IntermediateRoot(params.Rules{IsEIP158: chain.Config().IsEIP158(header.Number)})
 	header.UncleHash = types.CalcUncleHash(nil)
 	return types.NewBlockWithHeader(header).WithBody(types.Body{Transactions: txs}), nil
 }
@@ -984,4 +983,3 @@ func (x *XDPoS_v1) RecoverValidator(header *types.Header) (common.Address, error
 	}
 	return crypto.PubkeyToAddress(*pub), nil
 }
-

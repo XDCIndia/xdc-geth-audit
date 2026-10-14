@@ -531,7 +531,23 @@ func (s *xdcSyncer) loop() {
 				// cannot fire on a healthy chain — there the head advances every block
 				// (~2s) so the stall counter resets long before haltedTipStallTicks.
 				const haltedTipStallTicks = 4
-				if phase == phaseFullSync && cur > 0 &&
+				// genesis-bootstrap (#1382): cur==0 with every peer also at genesis is the
+				// same halted-tip deadlock as #199, one block earlier (no miner can ever
+				// produce block 1). Only fire at genesis when every peer's advertised head
+				// IS our genesis, so a new follower of a live chain that is merely slow to
+				// fetch block 1 keeps its bulk-sync mode.
+				stallable := cur > 0
+				if cur == 0 {
+					genesis := s.handler.chain.Genesis().Hash()
+					stallable = true
+					for _, p := range s.handler.peers.peers {
+						if rng := p.BlockRange(); rng == nil || rng.LatestBlockHash != genesis {
+							stallable = false
+							break
+						}
+					}
+				}
+				if phase == phaseFullSync && stallable &&
 					s.handler.peers.len() > 0 && cur == s.lastFullSyncHead {
 					s.fullSyncStallTicks++
 					if s.fullSyncStallTicks >= haltedTipStallTicks {

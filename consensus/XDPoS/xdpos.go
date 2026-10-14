@@ -56,7 +56,6 @@ import (
 	"github.com/ethereum/go-ethereum/consensus"
 	"github.com/ethereum/go-ethereum/consensus/XDPoS/engines/engine_v2"
 	"github.com/ethereum/go-ethereum/core"
-	cbal "github.com/ethereum/go-ethereum/core/types/bal"
 	"github.com/ethereum/go-ethereum/core/state"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/core/vm"
@@ -331,6 +330,7 @@ type EngineV2Iface interface {
 	GetMasternodesByHash(chain consensus.ChainReader, hash common.Hash) []common.Address                                    // (#402) post-penalty active masternodes
 	GetPreviousPenaltyByHash(chain consensus.ChainReader, hash common.Hash, limitPenaltyEpoch int) []common.Address         // (#412) comeback seeding
 	GetMasternodesFromEpochSwitchHeader(chain consensus.ChainReader, header *types.Header) []common.Address                 // V2 era epoch-switch masternode list (reads header.Validators, falls back to Extra at switch block)
+	GetStandbynodes(chain consensus.ChainReader, header *types.Header) []common.Address                                     // Reward 2.0 standby pool of an epoch, from its historical snapshot (#2612)
 	GetMasternodesV2(chain consensus.ChainReader, header *types.Header) []common.Address                                    // active masternode set for any V2-era header via getEpochSwitchInfo
 
 	// Mining-side wrapper dispatch surface (audit IDs M-1..M-7).
@@ -1209,9 +1209,7 @@ func (c *XDPoS) Prepare(chain consensus.ChainHeaderReader, header *types.Header)
 }
 
 // Finalize implements consensus.Engine.
-// Finalize implements consensus.Engine. The blockAccessIndex and bal parameters are
-// ignored for XDC chains (Amsterdam/EIP-7928 is disabled in XDC consensus).
-func (c *XDPoS) Finalize(chain consensus.ChainHeaderReader, header *types.Header, statedb vm.StateDB, body *types.Body, blockAccessIndex uint32, bal *cbal.ConstructionBlockAccessList) {
+func (c *XDPoS) Finalize(chain consensus.ChainHeaderReader, header *types.Header, statedb vm.StateDB, body *types.Body) {
 	number := header.Number.Uint64()
 	rCheckpoint := c.config.RewardCheckpoint
 	if rCheckpoint == 0 {
@@ -1334,7 +1332,7 @@ func (c *XDPoS) Finalize(chain consensus.ChainHeaderReader, header *types.Header
 
 	// Compute state root after reward application.
 	if sdb, ok := statedb.(*state.StateDB); ok {
-		header.Root = sdb.IntermediateRoot(chain.Config().IsEIP158(header.Number))
+		header.Root = sdb.IntermediateRoot(params.Rules{IsEIP158: chain.Config().IsEIP158(header.Number)})
 		// XDC-PARITY-PROBE: per Opus advisory for devnet-5151 #1800 divergence RCA.
 		// Emit post-Finalize state-root for every block <= 1800 plus checkpoints
 		// (every 50 blocks) so we can pinpoint which block first diverges from V1's
@@ -1431,7 +1429,7 @@ func (c *XDPoS) FinalizeAndAssemble(chain consensus.ChainHeaderReader, header *t
 		}
 	}
 
-	header.Root = statedb.IntermediateRoot(chain.Config().IsEIP158(header.Number))
+	header.Root = statedb.IntermediateRoot(params.Rules{IsEIP158: chain.Config().IsEIP158(header.Number)})
 	header.UncleHash = types.CalcUncleHash(nil)
 
 	return types.NewBlock(header, body, receipts, trie.NewStackTrie(nil)), nil
@@ -1815,6 +1813,17 @@ func (c *XDPoS) GetMasternodesWithParents(chain consensus.ChainHeaderReader, hea
 		}
 	}
 
+	return []common.Address{}
+}
+
+// GetStandbynodes returns the standby pool of the epoch of the given (epoch
+// switch) header: stake-sorted and already filtered of that epoch's masternodes
+// and penalties. V1 has no standby tier, so it returns empty. Mirrors
+// XinFinOrg/XDPoSChain XDPoS.GetStandbynodes (#2612).
+func (c *XDPoS) GetStandbynodes(chain consensus.ChainReader, header *types.Header) []common.Address {
+	if c.IsV2Block(header) && c.EngineV2 != nil {
+		return c.EngineV2.GetStandbynodes(chain, header)
+	}
 	return []common.Address{}
 }
 
