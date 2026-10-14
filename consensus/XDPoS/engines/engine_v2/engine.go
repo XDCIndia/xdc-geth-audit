@@ -2826,6 +2826,25 @@ func (x *XDPoS_v2) setNewRound(chain consensus.ChainReader, round types.Round) {
 	log.Info("[setNewRound] new round", "round", round)
 	x.currentRound = round
 	x.timeoutCount = 0
+
+	// Update per-round config so the timeout timer uses the correct period for this
+	// round, not the round-0 initial value. Canonical XDPoSChain does this via
+	// UpdateParams on each core.CheckpointCh signal; our fork wires it here instead
+	// because we have no CheckpointCh. Fixes #1477 (F-2026-19726).
+	x.config.V2.UpdateConfig(uint64(round))
+	cfg := x.config.V2.CurrentConfig
+	if err := x.timeoutWorker.SetParams(
+		time.Duration(cfg.TimeoutPeriod)*time.Second,
+		cfg.ExpTimeoutConfig.Base,
+		int(cfg.ExpTimeoutConfig.MaxExponent),
+	); err != nil {
+		log.Error("[setNewRound] timeoutWorker.SetParams failed", "round", round, "err", err)
+	}
+	// Notify the miner of the updated mine period for this config row.
+	if x.minePeriodCh != nil {
+		go func() { x.minePeriodCh <- cfg.MinePeriod }()
+	}
+
 	x.timeoutWorker.Reset(chain, uint64(x.currentRound), uint64(x.highestQuorumCert.ProposedBlockInfo.Round))
 	x.timeoutPool.Clear()
 
