@@ -303,7 +303,16 @@ func (l *list) Contains(nonce uint64) bool {
 func (l *list) Add(tx *types.Transaction, priceBump uint64) (bool, *types.Transaction) {
 	// If there's an older better transaction, abort
 	old := l.txs.Get(tx.Nonce())
-	if old != nil {
+	// XDC (XinFinOrg/XDPoSChain #2363): a special transaction (block signing,
+	// randomize) is zero-priced, so it could never win its nonce back from a
+	// regular transaction under the price-bump rule. It claims the nonce
+	// unconditionally, and a regular transaction never evicts it (any price
+	// beats zero). Special-for-special replacement keeps the priced path here;
+	// the pool admits it only once the incumbent signing tx has expired.
+	if old != nil && old.IsSpecialTransaction() && !tx.IsSpecialTransaction() {
+		return false, nil
+	}
+	if old != nil && !(tx.IsSpecialTransaction() && !old.IsSpecialTransaction()) {
 		if old.GasFeeCapCmp(tx) >= 0 || old.GasTipCapCmp(tx) >= 0 {
 			return false, nil
 		}
