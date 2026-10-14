@@ -107,6 +107,10 @@ type XDPoS_v2 struct {
 	// Wire this to blockchain.SetFinalized() so eth_getFinalizedBlock reflects real BFT finality. (#95)
 	HookCommitBlock func(header *types.Header)
 
+	// ForensicsProcessor detects double-signing and vote equivocation.
+	// Runs exclusively in goroutines — never blocks or alters block acceptance. (#1478)
+	ForensicsProcessor *Forensics
+
 	votePoolCollectionTime time.Time
 
 	// Recursion guard for getEpochSwitchInfo to prevent stack overflow
@@ -206,6 +210,8 @@ func createEngine(chainConfig *params.ChainConfig, db ethdb.Database, minePeriod
 		},
 		highestVotedRound:  types.Round(0),
 		highestCommitBlock: nil,
+
+		ForensicsProcessor: NewForensics(),
 	}
 
 	// Set timeout callback
