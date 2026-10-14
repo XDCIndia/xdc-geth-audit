@@ -299,18 +299,37 @@ func (s *BlockChainAPI) rpcOutputBlockSigners(block *types.Block, ctx context.Co
 		return nil, errors.New("header not found")
 	}
 
-	// Extract signers from header's Validator field
+	// Recover real block signers using ecrecover, matching canonical XDPoSChain
+	// getSigners (internal/ethapi/api.go:1491-1517).
+	//
+	// V1 blocks: Extra[len-65:] = M1 creator seal; Validator = M2 seal (65 bytes).
+	//            Both RecoverSigner (M1) and RecoverValidator (M2) apply.
+	// V2 blocks: Validator = creator seal (65 bytes); Extra is an RLP blob.
+	//            Only RecoverValidator applies (RecoverSigner reads Extra, invalid for V2).
+	// Never split header.Validator into 20-byte chunks: a 65-byte seal yields 3 bogus addresses.
 	signers := make([]common.Address, 0)
-	if len(header.Validator) > 0 {
-		// Decode validator bytes to addresses
-		for i := 0; i+common.AddressLength <= len(header.Validator); i += common.AddressLength {
-			var addr common.Address
-			copy(addr[:], header.Validator[i:i+common.AddressLength])
+	seen := make(map[common.Address]bool)
+	addSigner := func(addr common.Address) {
+		if !seen[addr] {
+			seen[addr] = true
 			signers = append(signers, addr)
 		}
 	}
 
-	// If no signers found in Validator field, return the block miner
+	if engine, ok := s.b.Engine().(*XDPoS.XDPoS); ok {
+		// M2 (or V2 creator): always try RecoverValidator when Validator is 65 bytes.
+		if addr, err := engine.RecoverValidator(header); err == nil {
+			addSigner(addr)
+		}
+		// M1 creator: only valid for V1 blocks (Extra ends with a 65-byte seal).
+		if !engine.IsV2Block(header) {
+			if addr, err := engine.RecoverSigner(header); err == nil {
+				addSigner(addr)
+			}
+		}
+	}
+
+	// Fallback: use the block miner when ecrecover is unavailable.
 	if len(signers) == 0 {
 		signers = append(signers, header.Coinbase)
 	}
