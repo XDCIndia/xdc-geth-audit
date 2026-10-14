@@ -122,6 +122,7 @@ func (f *fakeEngineV2) ProposedBlockHandler(chain consensus.ChainReader, header 
 	return f.returnErr
 }
 func (f *fakeEngineV2) ReinitBFT(_ consensus.ChainReader, _ *types.Header) error { return nil }
+func (f *fakeEngineV2) GetLatestCommittedBlockInfo() *types.BlockInfo            { return nil }
 
 // Stubs for the new EngineV2Iface methods added by issue #1482 fix.
 func (f *fakeEngineV2) GetCurrentEpochSwitchBlock(_ consensus.ChainReader, _ *big.Int) (uint64, uint64, error) {
