@@ -55,6 +55,13 @@ func supportsParallelExecution(block *types.Block, config *params.ChainConfig, w
 	if disableParallel {
 		return false
 	}
+	// XDC: the parallel processor has none of the XDPoS seams of the
+	// sequential one (0x89/0x92/0x93 special-tx dispatch, TRC21 fee owner,
+	// parentState for rewards). XDC never schedules Amsterdam, but refuse
+	// here as well so a misconfigured chain cannot silently diverge.
+	if config.IsXDC() {
+		return false
+	}
 	// No tracer is attached (tracing requires the strict sequential
 	// ordering of state operations that parallel execution does not
 	// preserve).

@@ -101,7 +101,7 @@ func runTraced(alloc types.GenesisAlloc, tx *types.Transaction) {
 		panic(err)
 	}
 	evm.SetTxContext(NewEVMTxContext(msg))
-	res, err := newStateTransition(evm, msg, NewGasPool(evm.Context.GasLimit)).execute()
+	res, err := newStateTransition(evm, msg, NewGasPool(evm.Context.GasLimit), common.Address{}).execute()
 	if err != nil {
 		panic(err)
 	}
