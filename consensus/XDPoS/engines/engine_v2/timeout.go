@@ -130,9 +130,23 @@ func (x *XDPoS_v2) timeoutHandler(chain consensus.ChainReader, timeout *types.Ti
 
 // onTimeoutPoolThresholdReached generates a TC when enough timeouts are collected
 func (x *XDPoS_v2) onTimeoutPoolThresholdReached(chain consensus.ChainReader, pooledTimeouts map[common.Hash]utils.PoolObj, currentTimeoutMsg utils.PoolObj, gapNumber uint64) error {
-	// Collect signatures
+	// Collect signatures, deduped by recovered signer address.
+	// The pool keys entries by message hash (which includes signature bytes), so
+	// one signer can produce multiple pool entries with distinct nonces. Only one
+	// signature per unique signer may count toward the threshold (F-2026-19525).
+	emptySigner := common.Address{}
+	seenSigners := make(map[common.Address]struct{})
 	signatures := make([]types.Signature, 0, len(pooledTimeouts))
 	for _, v := range pooledTimeouts {
+		signer := v.GetSigner()
+		if signer == emptySigner {
+			continue
+		}
+		if _, seen := seenSigners[signer]; seen {
+			log.Warn("[onTimeoutPoolThresholdReached] Duplicate signer in pool, skipping", "signer", signer)
+			continue
+		}
+		seenSigners[signer] = struct{}{}
 		signatures = append(signatures, v.(*types.Timeout).Signature)
 	}
 
