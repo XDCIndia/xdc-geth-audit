@@ -178,7 +178,12 @@ func (c *XDPoS) IsEpochSwitch(header *types.Header) (bool, uint64, error) {
 }
 
 // GetCurrentEpochSwitchBlock returns the epoch switch block for the epoch containing blockNum.
-func (c *XDPoS) GetCurrentEpochSwitchBlock(chain consensus.ChainHeaderReader, blockNum *big.Int) (uint64, uint64, error) {
+// For V2 blocks, delegates to the V2 engine for round-based epoch calculation (issue #1482).
+func (c *XDPoS) GetCurrentEpochSwitchBlock(chain consensus.ChainReader, blockNum *big.Int) (uint64, uint64, error) {
+	if c.IsV2Block(&types.Header{Number: blockNum}) && c.EngineV2 != nil {
+		return c.EngineV2.GetCurrentEpochSwitchBlock(chain, blockNum)
+	}
+	// V1: block-number arithmetic is correct (epoch switch is always at a multiple of Epoch).
 	num := blockNum.Uint64()
 	epochNum := num / c.config.Epoch
 	switchBlock := epochNum * c.config.Epoch

@@ -13,6 +13,7 @@ import (
 	"strings"
 
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/consensus"
 	"github.com/ethereum/go-ethereum/consensus/XDPoS/utils"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/log"
@@ -21,12 +22,12 @@ import (
 
 // V2BlockInfo contains V2-specific block information for RPC responses
 type V2BlockInfo struct {
-	Hash           common.Hash      `json:"hash"`
-	Number         *big.Int         `json:"number"`
-	Round          types.Round      `json:"round"`
-	Masternodes    []common.Address `json:"masternodes"`
-	EncodedQC      string           `json:"encodedQC"`
-	Error          string           `json:"error,omitempty"`
+	Hash        common.Hash      `json:"hash"`
+	Number      *big.Int         `json:"number"`
+	Round       types.Round      `json:"round"`
+	Masternodes []common.Address `json:"masternodes"`
+	EncodedQC   string           `json:"encodedQC"`
+	Error       string           `json:"error,omitempty"`
 }
 
 // MasternodesStatus contains masternode status for RPC
@@ -41,11 +42,11 @@ type MessageStatus struct {
 	TimeoutPool int `json:"timeoutPool"`
 }
 
-// NetworkInfo contains network summary information  
+// NetworkInfo contains network summary information
 type NetworkInfo struct {
-	NetworkId   *big.Int `json:"networkId"`
+	NetworkId     *big.Int `json:"networkId"`
 	XDCValidators int      `json:"xdcValidators"`
-	Epoch       uint64   `json:"epoch"`
+	Epoch         uint64   `json:"epoch"`
 	V2SwitchBlock *big.Int `json:"v2SwitchBlock,omitempty"`
 }
 
@@ -97,19 +98,22 @@ func (api *API) GetV2BlockByHash(blockHash common.Hash) *V2BlockInfo {
 	return api.GetV2BlockByHeader(header, false)
 }
 
-// GetV2BlockByHeader extracts V2-specific info from a header
+// GetV2BlockByHeader extracts V2-specific info from a header.
+// For V2 blocks, recovers the round from the header seal via the V2 engine (issue #1482).
 func (api *API) GetV2BlockByHeader(header *types.Header, uncle bool) *V2BlockInfo {
 	info := &V2BlockInfo{
 		Hash:   header.Hash(),
 		Number: header.Number,
 	}
 
-	// Extract round and masternodes from extra data if V2 block
 	if api.xdpos.config.V2 != nil && api.xdpos.config.V2.SwitchBlock != nil &&
-		header.Number.Uint64() > api.xdpos.config.V2.SwitchBlock.Uint64() {
-		// Parse V2 extra fields
-		masternodes := api.xdpos.GetMasternodes(api.chain, header)
-		info.Masternodes = masternodes
+		header.Number.Uint64() > api.xdpos.config.V2.SwitchBlock.Uint64() &&
+		api.xdpos.EngineV2 != nil {
+		round, err := api.xdpos.EngineV2.GetRoundNumber(header)
+		if err == nil {
+			info.Round = round
+		}
+		info.Masternodes = api.xdpos.GetMasternodes(api.chain, header)
 	}
 
 	return info
@@ -128,14 +132,44 @@ func (api *API) GetMasternodesByNumber(number *rpc.BlockNumber) MasternodesStatu
 	}
 }
 
-// GetBlockInfoByEpochNum returns block info for a specific epoch number
+// GetBlockInfoByEpochNum returns block info for a specific epoch number.
+// For V2 epochs, uses the V2 engine's round-based lookup (issue #1482).
+// For V1 epochs (before SwitchEpoch), falls back to block-number arithmetic.
 func (api *API) GetBlockInfoByEpochNum(epochNumber uint64) (*utils.EpochNumInfo, error) {
+	if api.xdpos.config.V2 != nil && epochNumber >= api.xdpos.config.V2.SwitchEpoch &&
+		api.xdpos.EngineV2 != nil {
+		chainReader, ok := api.chain.(consensus.ChainReader)
+		if !ok {
+			return nil, fmt.Errorf("chain does not implement ChainReader")
+		}
+		blockInfo, err := api.xdpos.EngineV2.GetBlockByEpochNumber(chainReader, epochNumber)
+		if err != nil {
+			return nil, err
+		}
+		info := &utils.EpochNumInfo{
+			EpochBlockHash:        blockInfo.Hash,
+			EpochRound:            types.Round(blockInfo.Round),
+			EpochFirstBlockNumber: blockInfo.Number,
+		}
+		// Best-effort: look up the last block of this epoch (first block of next epoch - 1).
+		nextInfo, err := api.xdpos.EngineV2.GetBlockByEpochNumber(chainReader, epochNumber+1)
+		if err == nil {
+			info.EpochLastBlockNumber = new(big.Int).Sub(nextInfo.Number, big.NewInt(1))
+		}
+		return info, nil
+	}
+	// V1: epoch switch block is always at epochNumber * Epoch.
+	epoch := api.xdpos.config.Epoch
+	epochBlockNum := epochNumber * epoch
 	return &utils.EpochNumInfo{
-		EpochRound: types.Round(epochNumber * api.xdpos.config.Epoch),
+		EpochRound:            types.Round(epochBlockNum),
+		EpochFirstBlockNumber: new(big.Int).SetUint64(epochBlockNum),
+		EpochLastBlockNumber:  new(big.Int).SetUint64(epochBlockNum + epoch - 1),
 	}, nil
 }
 
-// GetEpochNumbersBetween returns epoch numbers between two block numbers
+// GetEpochNumbersBetween returns the epoch-switch block numbers between two block numbers.
+// For V2 ranges, uses the V2 engine's round-based epoch switch lookup (issue #1482).
 func (api *API) GetEpochNumbersBetween(begin, end *rpc.BlockNumber) ([]uint64, error) {
 	beginHeader := api.getHeaderFromApiBlockNum(begin)
 	endHeader := api.getHeaderFromApiBlockNum(end)
@@ -143,10 +177,27 @@ func (api *API) GetEpochNumbersBetween(begin, end *rpc.BlockNumber) ([]uint64, e
 		return nil, nil
 	}
 
+	// Use V2 engine for ranges fully in V2 (both headers past the switch block).
+	if api.xdpos.IsV2Block(beginHeader) && api.xdpos.EngineV2 != nil {
+		chainReader, ok := api.chain.(consensus.ChainReader)
+		if !ok {
+			return nil, fmt.Errorf("chain does not implement ChainReader")
+		}
+		epochSwitchInfos, err := api.xdpos.EngineV2.GetEpochSwitchInfoBetween(chainReader, beginHeader, endHeader)
+		if err != nil {
+			return nil, err
+		}
+		result := make([]uint64, len(epochSwitchInfos))
+		for i, info := range epochSwitchInfos {
+			result[i] = info.EpochSwitchBlockInfo.Number.Uint64()
+		}
+		return result, nil
+	}
+
+	// V1: block-number arithmetic.
 	beginNum := beginHeader.Number.Uint64()
 	endNum := endHeader.Number.Uint64()
 	epoch := api.xdpos.config.Epoch
-
 	epochs := make([]uint64, 0)
 	for i := beginNum / epoch; i <= endNum/epoch; i++ {
 		epochs = append(epochs, i)
@@ -154,13 +205,23 @@ func (api *API) GetEpochNumbersBetween(begin, end *rpc.BlockNumber) ([]uint64, e
 	return epochs, nil
 }
 
-// GetMissedRoundsInEpochByBlockNum returns missed rounds info for the epoch
+// GetMissedRoundsInEpochByBlockNum returns missed rounds info for the epoch containing the given block.
+// For V2 blocks, delegates to the V2 engine's round-based calculation (issue #1482).
 func (api *API) GetMissedRoundsInEpochByBlockNum(number *rpc.BlockNumber) (*utils.PublicApiMissedRoundsMetadata, error) {
 	header := api.getHeaderFromApiBlockNum(number)
 	if header == nil {
 		return nil, nil
 	}
 
+	if api.xdpos.IsV2Block(header) && api.xdpos.EngineV2 != nil {
+		chainReader, ok := api.chain.(consensus.ChainReader)
+		if !ok {
+			return nil, fmt.Errorf("chain does not implement ChainReader")
+		}
+		return api.xdpos.EngineV2.CalculateMissingRounds(chainReader, header)
+	}
+
+	// V1: block-number arithmetic.
 	num := header.Number.Uint64()
 	epochStart := num - num%api.xdpos.config.Epoch
 	return &utils.PublicApiMissedRoundsMetadata{
