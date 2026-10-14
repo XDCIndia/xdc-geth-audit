@@ -24,6 +24,7 @@ import (
 	"github.com/ethereum/go-ethereum/consensus"
 	"github.com/ethereum/go-ethereum/consensus/XDPoS/utils"
 	"github.com/ethereum/go-ethereum/contracts"
+	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/core/state"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
@@ -430,6 +431,8 @@ func (x *XDPoS_v2) initial(chain consensus.ChainReader, header *types.Header) er
 				"currentHead", currentHead)
 			// Mark as initialized so sync can proceed
 			// Snapshot will be created when gap block is processed
+			// F-2026-19774: restore persisted local safety state.
+			x.loadBFTSafetyState()
 			x.isInitialized = true
 			// A.99.3: preserve currentRound if processQC already set it from the
 			// header's embedded QC (e.g. restarting with head=5220, QC sets round=2700).
@@ -483,6 +486,8 @@ func (x *XDPoS_v2) initial(chain consensus.ChainReader, header *types.Header) er
 				log.Warn("[initial] checkpoint header not found during sync past V2 switch — deferring snapshot init",
 					"checkpoint", x.config.V2.SwitchBlock.Uint64(),
 					"currentHead", currentHead)
+				// F-2026-19774: restore persisted local safety state.
+				x.loadBFTSafetyState()
 				x.isInitialized = true
 				// A.99.3: preserve currentRound if processQC already set it.
 				if x.currentRound == 0 {
@@ -539,10 +544,35 @@ func (x *XDPoS_v2) initial(chain consensus.ChainReader, header *types.Header) er
 
 	// Start countdown timer
 	x.timeoutWorker.Reset(chain, 0, 0)
+	// F-2026-19774: restore persisted local safety state before marking ready.
+	x.loadBFTSafetyState()
 	x.isInitialized = true
 
 	log.Warn("[initial] finish initialisation")
 	return nil
+}
+
+// loadBFTSafetyState reads the persisted equivocation-guard values from the DB
+// and applies max(stored, in-memory) so a restart inside a round cannot lower
+// the guard.  This is a local-safety improvement; it does not affect which
+// blocks other nodes accept.  Called from initial() at every path that sets
+// isInitialized = true (except the "already initialized" early-return, where
+// the values were loaded on first init).
+func (x *XDPoS_v2) loadBFTSafetyState() {
+	if stored := rawdb.ReadBFTHighestVotedRound(x.db); stored > x.highestVotedRound {
+		log.Info("[loadBFTSafetyState] restoring highestVotedRound", "stored", stored, "memory", x.highestVotedRound)
+		x.highestVotedRound = stored
+	}
+	if stored := rawdb.ReadBFTHighestSelfMinedRound(x.db); stored > x.highestSelfMinedRound {
+		log.Info("[loadBFTSafetyState] restoring highestSelfMinedRound", "stored", stored, "memory", x.highestSelfMinedRound)
+		x.highestSelfMinedRound = stored
+	}
+	if stored := rawdb.ReadBFTLockQC(x.db); stored != nil {
+		if x.lockQuorumCert == nil || stored.ProposedBlockInfo.Round > x.lockQuorumCert.ProposedBlockInfo.Round {
+			log.Info("[loadBFTSafetyState] restoring lockQuorumCert", "storedRound", stored.ProposedBlockInfo.Round)
+			x.lockQuorumCert = stored
+		}
+	}
 }
 
 // Author returns the signer of a block
@@ -787,6 +817,8 @@ func (x *XDPoS_v2) Seal(chain consensus.ChainReader, block *types.Block, stop <-
 		return nil, err
 	}
 	x.highestSelfMinedRound = decodedExtra.Round
+	// F-2026-19774: persist so a restart inside a round cannot produce a second seal.
+	rawdb.WriteBFTHighestSelfMinedRound(x.db, x.highestSelfMinedRound)
 
 	return block.WithSeal(header), nil
 }

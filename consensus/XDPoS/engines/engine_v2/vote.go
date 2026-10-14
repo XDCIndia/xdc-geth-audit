@@ -14,6 +14,7 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/consensus"
 	"github.com/ethereum/go-ethereum/consensus/XDPoS/utils"
+	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/log"
 )
@@ -235,6 +236,8 @@ func (x *XDPoS_v2) sendVote(chain consensus.ChainReader, blockInfo *types.BlockI
 	// Canonical XDPoSChain (v2.9.3-testnet vote.go:47) avoids this by latching
 	// before voteHandler; we latch the explicit voted round instead.
 	x.highestVotedRound = blockInfo.Round
+	// F-2026-19774: persist so a restart inside a round cannot produce a second vote.
+	rawdb.WriteBFTHighestVotedRound(x.db, x.highestVotedRound)
 
 	// Broadcast
 	x.broadcastToBftChannel(voteMsg)

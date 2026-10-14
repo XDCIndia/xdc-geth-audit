@@ -13,6 +13,7 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/consensus"
 	"github.com/ethereum/go-ethereum/consensus/XDPoS/utils"
+	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/log"
@@ -408,6 +409,9 @@ func (x *XDPoS_v2) processQC(chain consensus.ChainReader, incomingQuorumCert *ty
 		}
 		if x.lockQuorumCert == nil || (proposedBlockQuorumCert != nil && proposedBlockQuorumCert.ProposedBlockInfo.Round > x.lockQuorumCert.ProposedBlockInfo.Round) {
 			x.lockQuorumCert = proposedBlockQuorumCert
+			// F-2026-19774: persist so a restart cannot lower the lock below what
+			// was committed before shutdown.
+			rawdb.WriteBFTLockQC(x.db, x.lockQuorumCert)
 		}
 
 		// Commit blocks (3-chain rule)
