@@ -822,6 +822,16 @@ func (c *XDPoS) verifyHeader(chain consensus.ChainHeaderReader, header *types.He
 		return errInvalidUncleHash
 	}
 
+	// V1 does not check GasLimit or GasUsed.
+	//
+	// F-2026-19615 (Info): this matches canonical XDPoSChain v2.9.3-testnet
+	// (consensus/XDPoS/engines/engine_v1/engine.go:173 and :238 have no gas
+	// checks; only V2 calls misc.VerifyGaslimit). All V1 blocks are historical
+	// (mainnet V2 from 80,370,000; Apothem from 56,828,700). Adding a bound
+	// here would reject old blocks that canonical accepts — do not add without
+	// a full V1 history scan gated on replay-parity returning 0 rejections.
+	// Execution still enforces GasUsed ≤ GasLimit via ValidateState.
+
 	// All basic checks passed, verify cascading fields
 	return c.verifyCascadingFields(chain, header, parents)
 }
