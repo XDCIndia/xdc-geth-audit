@@ -111,6 +111,12 @@ type XdcWorker struct {
 	// Ported from XDPoSChain/miner/worker.go:497 + contracts/utils.go:64.
 	accountManager *accounts.Manager
 	txPool         contracts.TxPoolAdder
+
+	// lastSealedHash is the hash of the most recently self-minted block.
+	// Set by commitMinedBlock before InsertChain so maybeBroadcastImportedSignTx
+	// can skip the chainHeadCh event for our own block and avoid a second sign tx.
+	// Only accessed from the single update() goroutine; no locking needed.
+	lastSealedHash common.Hash
 }
 
 // NewXdcWorker constructs (but does not start) the XDPoS V2 production worker.
@@ -817,6 +823,11 @@ func (w *XdcWorker) commitMinedBlock(block *types.Block) {
 		}
 	}
 
+	// Record the sealed block hash before InsertChain so the chainHeadCh
+	// handler (maybeBroadcastImportedSignTx) can skip it and avoid a second
+	// sign tx at the same nonce+1.  Fixes F-2026-19640 / #1472.
+	w.lastSealedHash = block.Hash()
+
 	n, err := w.miner.chain.InsertChain(types.Blocks{block})
 	if err != nil || n != 1 {
 		log.Error("XDPoS2: InsertChain failed for minted block",
@@ -957,6 +968,13 @@ func (c chainStateNonces) ConfirmedNonce(addr common.Address) (uint64, bool) {
 // whole point of the comeback path.
 func (w *XdcWorker) maybeBroadcastImportedSignTx(block *types.Block) {
 	if w.coinbase == (common.Address{}) {
+		return
+	}
+	// Skip blocks we sealed ourselves: commitMinedBlock already called
+	// broadcastSigningTx for this block; the chainHeadCh event arriving here
+	// is for the same block.  Sending a second sign tx wastes a nonce slot
+	// and can jam the pool.  Fixes F-2026-19640 / #1472.
+	if block.Hash() == w.lastSealedHash {
 		return
 	}
 	// Cheap gate first — block number must be a merge block.
