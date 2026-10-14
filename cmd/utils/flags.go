@@ -318,13 +318,20 @@ var (
 		Usage:    "(Fast Sync only) operator-pinned trust anchor: pivot state root (0x...)",
 		Category: flags.StateCategory,
 	}
-	// NoAutoPivotFlag disables the A.96 automatic pivot selection from
-	// TrustedSyncCheckpoints so chains with checkpoints (Apothem, XDC mainnet)
-	// can exercise the A.97.1 dynamic-pivot path. Primarily for testing.
-	// Refs: A.97 / #894.
+	// NoAutoPivotFlag is deprecated: A.96 auto-pin from TrustedSyncCheckpoints is
+	// disabled by default (F-2026-19471). --no-auto-pivot is a no-op.
+	// Use --auto-checkpoint-pivot to opt in. Refs: A.97 / #894.
 	NoAutoPivotFlag = &cli.BoolFlag{
 		Name:     "no-auto-pivot",
-		Usage:    "(Fast Sync only) disable A.96 auto-pin from TrustedSyncCheckpoints; use dynamic-pivot path with A.97.1 freeze instead",
+		Usage:    "(deprecated, no-op) A.96 auto-pin from TrustedSyncCheckpoints is disabled by default; use --auto-checkpoint-pivot to opt in",
+		Category: flags.StateCategory,
+	}
+	// AutoCheckpointPivotFlag opts in to A.96 automatic pivot selection from
+	// compiled TrustedSyncCheckpoints. Trust root is the binary, not QC-verified
+	// (F-2026-19471). Use explicit --fastsyncpivot flags for a QC-backed anchor.
+	AutoCheckpointPivotFlag = &cli.BoolFlag{
+		Name:     "auto-checkpoint-pivot",
+		Usage:    "(Fast Sync only) opt in to A.96 auto-pin of fast-sync pivot from compiled TrustedSyncCheckpoints (trust root is the binary, not QC-verified; refs F-2026-19471)",
 		Category: flags.StateCategory,
 	}
 	GCModeFlag = &cli.StringFlag{
@@ -2010,13 +2017,17 @@ func SetEthConfig(ctx *cli.Context, stack *node.Node, cfg *ethconfig.Config) {
 			cfg.FastSyncPivotRoot = pivotRoot
 		}
 	}
-	// A.97 (refs #894): --no-auto-pivot disables the A.96 TrustedSyncCheckpoints
-	// auto-pin so the A.97.1 dynamic-pivot-freeze path is exercised.
+	// --no-auto-pivot is deprecated (no-op): A.96 auto-pin is off by default
+	// (F-2026-19471). Log a deprecation warning so operators know to switch.
 	if ctx.IsSet(NoAutoPivotFlag.Name) {
+		log.Warn("--no-auto-pivot is deprecated and has no effect: A.96 auto-pin from TrustedSyncCheckpoints is disabled by default (F-2026-19471); use --auto-checkpoint-pivot to opt in")
+	}
+	// F-2026-19471: --auto-checkpoint-pivot opts in to A.96 auto-pin.
+	if ctx.IsSet(AutoCheckpointPivotFlag.Name) {
 		if cfg.SyncMode != ethconfig.FastSync {
-			Fatalf("--no-auto-pivot requires --syncmode fast")
+			Fatalf("--auto-checkpoint-pivot requires --syncmode fast")
 		}
-		cfg.NoAutoPivot = ctx.Bool(NoAutoPivotFlag.Name)
+		cfg.AutoCheckpointPivot = ctx.Bool(AutoCheckpointPivotFlag.Name)
 	}
 
 	if ctx.IsSet(ChainHistoryFlag.Name) {

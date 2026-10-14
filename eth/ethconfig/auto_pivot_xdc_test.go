@@ -232,3 +232,42 @@ func TestNoAutoPivot_DefaultPathUnchanged(t *testing.T) {
 		t.Errorf("default path: FastSyncPivotNumber = %d, want 10000", cfg.FastSyncPivotNumber)
 	}
 }
+
+// TestAutoCheckpointPivotDefaultOptOut verifies that AutoCheckpointPivot is
+// false by default — auto-pin from compiled TrustedSyncCheckpoints is opt-in
+// after F-2026-19471. The backend.go condition is:
+//
+//	if config.AutoCheckpointPivot { AutoPinPivotFromCheckpoints(...) }
+//
+// A default-constructed Config must not trigger auto-pin.
+//
+// Fails on origin/main: Config has no AutoCheckpointPivot field (compile error).
+// Passes after fix: field exists and zero value is false.
+func TestAutoCheckpointPivotDefaultOptOut(t *testing.T) {
+	cfg := &Config{SyncMode: FastSync}
+	if cfg.AutoCheckpointPivot {
+		t.Fatal("AutoCheckpointPivot must default to false (auto-pin is opt-in, refs F-2026-19471)")
+	}
+}
+
+// TestAutoCheckpointPivotEnablesAutoPin verifies that setting AutoCheckpointPivot
+// enables the A.96 auto-pin path. Simulates the opt-in gate in backend.go:
+//
+//	if config.AutoCheckpointPivot { AutoPinPivotFromCheckpoints(...) }
+func TestAutoCheckpointPivotEnablesAutoPin(t *testing.T) {
+	mns := []common.Address{{0x3}}
+	chain := xdcChainConfig(
+		&params.TrustedSyncCheckpoint{Number: 9999, Hash: nonZeroHash(11), Root: nonZeroHash(12), Masternodes: mns},
+	)
+	cfg := &Config{SyncMode: FastSync, AutoCheckpointPivot: true}
+
+	// Simulate backend.go opt-in: only call when AutoCheckpointPivot is true.
+	if cfg.AutoCheckpointPivot {
+		if !AutoPinPivotFromCheckpoints(chain, cfg) {
+			t.Fatal("expected auto-pin to succeed when AutoCheckpointPivot=true")
+		}
+	}
+	if cfg.FastSyncPivotNumber != 9999 {
+		t.Errorf("FastSyncPivotNumber = %d, want 9999", cfg.FastSyncPivotNumber)
+	}
+}
