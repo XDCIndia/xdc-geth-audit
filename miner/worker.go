@@ -456,8 +456,8 @@ func (miner *Miner) commitBlobTransaction(ctx context.Context, env *environment,
 // "invalid merkle root" (#952 / apothem 83,088,792). Specifically:
 //   - signing txs to BlockSignersBinary (0x89) after TIPSigning run through
 //     ApplySigningTransaction (zero-gas, no EVM), NOT the normal EVM path;
-//   - XDCx notifier txs to 0x92/0x93 in the TIPXDCXReceiver window run through
-//     ApplyEmptyTransaction;
+//   - XDCx txs to 0x91-0x94 in the TIPXDCXReceiver window run through
+//     ApplyEmptyTransaction (both via core.RouteTransaction);
 //   - all other txs route the TRC21 gas fee to env.coinbaseOwner.
 func (miner *Miner) applyTransaction(ctx context.Context, env *environment, tx *types.Transaction) (*types.Receipt, *bal.ConstructionBlockAccessList, error) {
 	var (
@@ -472,18 +472,18 @@ func (miner *Miner) applyTransaction(ctx context.Context, env *environment, tx *
 		receipt   *types.Receipt
 		txBAL     *bal.ConstructionBlockAccessList
 		err       error
-		to        = tx.To()
 	)
-	switch {
-	case to != nil && *to == common.BlockSignersBinary && config.IsTIPSigning(blockNumber):
-		receipt, err = core.ApplySigningTransaction(config, env.state, blockNumber, blockHash, tx, env.gasPool.Used())
-	case config.IsTIPXDCXReceiver(blockNumber) && to != nil &&
-		(*to == common.TradingStateAddrBinary || *to == common.XDCXLendingAddressBinary):
-		receipt, err = core.ApplyEmptyTransaction(config, env.state, blockNumber, blockHash, tx, env.gasPool.Used())
-	default:
-		var msg *core.Message
-		msg, err = core.TransactionToMessage(tx, types.MakeSigner(config, blockNumber, env.header.Time), env.header.BaseFee)
-		if err == nil {
+	// Recover the sender first and route through core.RouteTransaction, the
+	// same order and helper core.StateProcessor.Process uses.
+	var msg *core.Message
+	msg, err = core.TransactionToMessage(tx, types.MakeSigner(config, blockNumber, env.header.Time), env.header.BaseFee)
+	if err == nil {
+		switch core.RouteTransaction(config, blockNumber, tx) {
+		case core.TxRouteSign:
+			receipt, err = core.ApplySigningTransaction(config, env.state, blockNumber, blockHash, tx, env.gasPool.Used())
+		case core.TxRouteEmpty:
+			receipt, err = core.ApplyEmptyTransaction(config, env.state, blockNumber, blockHash, tx, env.gasPool.Used())
+		default:
 			tokenFee := env.trc21Fee != nil && core.ApplyTRC21TokenFee(config, msg, env.trc21Fee, tx, blockNumber)
 			receipt, txBAL, err = core.ApplyTransactionWithEVM(ctx, msg, env.gasPool, env.state, blockNumber, blockHash, env.header.Time, tx, env.evm, env.coinbaseOwner)
 			if err == nil && tokenFee {
