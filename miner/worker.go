@@ -220,7 +220,10 @@ func (miner *Miner) generateWork(ctx context.Context, genParam *generateParams, 
 		Transactions: work.txs,
 		Withdrawals:  genParam.withdrawals,
 	}
-	if !miner.chainConfig.IsShanghai(work.header.Number, work.header.Time) {
+	if miner.chainConfig.IsXDC() {
+		// XDPoS rejects headers with a WithdrawalsHash (#1417).
+		body.Withdrawals = nil
+	} else if !miner.chainConfig.IsShanghai(work.header.Number, work.header.Time) {
 		if body.Withdrawals != nil {
 			return &newPayloadResult{err: errors.New("unexpected withdrawals before shanghai")}
 		}
@@ -240,7 +243,7 @@ func (miner *Miner) generateWork(ctx context.Context, genParam *generateParams, 
 	if err != nil {
 		return &newPayloadResult{err: err}
 	}
-	if requests != nil {
+	if requests != nil && !miner.chainConfig.IsXDC() {
 		reqHash := types.CalcRequestsHash(requests)
 		work.header.RequestsHash = &reqHash
 	}
@@ -338,8 +341,8 @@ func (miner *Miner) prepareWork(ctx context.Context, genParams *generateParams, 
 		log.Error("Failed to prepare header for sealing", "err", err)
 		return nil, err
 	}
-	// Apply EIP-4844, EIP-4788.
-	if miner.chainConfig.IsCancun(header.Number, header.Time) {
+	// Apply EIP-4844, EIP-4788. XDPoS headers never carry these fields (#1417).
+	if miner.chainConfig.IsCancun(header.Number, header.Time) && !miner.chainConfig.IsXDC() {
 		var excessBlobGas uint64
 		if miner.chainConfig.IsCancun(parent.Number, parent.Time) {
 			excessBlobGas = eip4844.CalcExcessBlobGas(miner.chainConfig, parent, timestamp)
@@ -349,7 +352,7 @@ func (miner *Miner) prepareWork(ctx context.Context, genParams *generateParams, 
 		header.ParentBeaconRoot = genParams.beaconRoot
 	}
 	// Apply EIP-7843.
-	if miner.chainConfig.IsAmsterdam(header.Number, header.Time) {
+	if miner.chainConfig.IsAmsterdam(header.Number, header.Time) && !miner.chainConfig.IsXDC() {
 		if genParams.slotNum == nil {
 			return nil, errors.New("no slot number set post-amsterdam")
 		}
