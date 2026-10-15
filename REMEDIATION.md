@@ -4,17 +4,16 @@ Report: Hacken final report, 2026-10-13. Audited commit: `45e2b6ee`.
 
 ## Final commit
 
-**`c5e7c37de28ed1b4b1da01918b7fdee03a58f151`**: the head of `main` in this repository. Remediation branch: `hacken/remediation-2026-10` (`main` plus this file).
+**`d4590cfa086b65f7691f086c2c5d8175107ef4b4`**: the head code commit of the remediation branch `hacken/remediation-2026-10`. It is the first hand-over plus the follow-up fixes below. Use this commit.
 
-Contents of `main` after `45e2b6ee`:
-- the v1.17.8 audit view (upstream go-ethereum v1.17.8 base): merge `42f2db823550308bf34992bcfdd1bc77cc456340`;
-- one commit per finding, applied on top.
+- First hand-over: `main` = `c5e7c37de28ed1b4b1da01918b7fdee03a58f151`.
+- On top of `45e2b6ee`: the v1.17.8 audit view (upstream go-ethereum v1.17.8 base), merge `42f2db823550308bf34992bcfdd1bc77cc456340`, then one commit per finding.
 
 ## How to verify
 
 - **One commit per finding.** The finding ID is in the commit subject and in a `Hacken:` trailer. Find the fix for one finding with:
   ```sh
-  git log --grep 'Hacken: F-2026-19525' c5e7c37de28ed1b4b1da01918b7fdee03a58f151
+  git log --grep 'Hacken: F-2026-19525' d4590cfa086b65f7691f086c2c5d8175107ef4b4
   ```
 - **Shared root cause.** Two commits each fix two findings, and list both IDs:
   - F-2026-19596 + F-2026-19612;
@@ -24,6 +23,14 @@ Contents of `main` after `45e2b6ee`:
   - **F-2026-19615:** documentation only. Canonical XDPoSChain's V1 engine has no gas-limit bound either, and adding one would reject historical blocks, so the commit records that in a code comment.
   - **F-2026-19815:** diagnostic only. Canonical compares the epoch-switch validator list without regard to order, so the commit logs a warning when the order differs and does not reject the block.
 - **Tests that fail with and without the fixes:** 5 `internal/ethapi` tests (`TestEIP7910Config`, `TestRPC*`) fail on the code before the fixes too.
+
+## Follow-up fixes after the first hand-over
+
+Each follow-up fix is one commit on its own branch, with the finding ID in the subject and in a `Hacken:` trailer. The same commit is merged into `hacken/remediation-2026-10`.
+
+| Finding | Branch | Commit | What changed |
+|---|---|---|---|
+| F-2026-19614 | `hacken/f-2026-19614-v1-double-validation-mainnet` | `0f1b4363dd0d709d163ab1673c9f71e56547f179` | The V1 double-validation check (empty-Validator and M2-assignment rejection) now runs on mainnet (chain 50) only, where another check already enforces it. The first fix applied it to every chain except Apothem. On private and mixed legacy + geth networks that rejected V1 blocks that canonical XDPoSChain accepts: blocks without an M2 co-signature, when the assigned M2 does not co-sign. Mainnet behaviour does not change. |
 
 ## Summary
 
@@ -66,7 +73,7 @@ Contents of `main` after `45e2b6ee`:
 | F-2026-19596 | Low | Timeout Certificates Count Penalized Signers Toward The Active Set Quorum | `eb4caa2b12abda7a724c4786abb767ad30092521`<br>consensus/XDPoS: verify tc signers against the tc round epoch masternodes (F-2026-19596, F-2026-19612) |
 | F-2026-19602 | Low | V1 Checkpoint Extra Replaces The Signer Set And Authorizes That Sealer | `5fbbf8d385c400ad35f0bce3f86a57995011c45c`<br>consensus/XDPoS, eth/hooks: reject v1 checkpoints with a mismatched signer list (F-2026-19602) |
 | F-2026-19612 | Low | Timeout Gap Number Selects The Signer Set Independently Of The Round Epoch | `eb4caa2b12abda7a724c4786abb767ad30092521`<br>consensus/XDPoS: verify tc signers against the tc round epoch masternodes (F-2026-19596, F-2026-19612) |
-| F-2026-19614 | Low | V1 Full Seal Logs The M2 Co-Sign And Does Not Reject It | `ab1b7b90c178328df219242885d4e913e445f8ec`<br>consensus/XDPoS: enforce v1 double validation under full verification (F-2026-19614) |
+| F-2026-19614 | Low | V1 Full Seal Logs The M2 Co-Sign And Does Not Reject It | `ab1b7b90c178328df219242885d4e913e445f8ec`<br>consensus/XDPoS: enforce v1 double validation under full verification (F-2026-19614)<br>Follow-up: `0f1b4363dd0d709d163ab1673c9f71e56547f179`<br>consensus/XDPoS: restrict v1 double-validation to mainnet (F-2026-19614) |
 | F-2026-19621 | Low | V1 Checkpoint Penalties Are Outside The Seal And Never Checked | `08d4ec587dbae5b497e87e964b655f3435a9d19a`<br>consensus/XDPoS, eth/hooks: check v1 checkpoint penalties against the computed list (F-2026-19621) |
 | F-2026-19640 | Low | A Sealed Sign-Slot Block Submits A Second Signing Transaction | `fbed2764957600cecf9d03bedbcddc0512bd8561`<br>miner: skip sign tx for self-sealed blocks (F-2026-19640) |
 | F-2026-19641 | Low | NewBlock Imports A V1 Extension Without Recovering The Seal | `c2541e1ccda34028d4614c51b9a71a171171cae6`<br>consensus/XDPoS: verify the v1 seal on the bulk-sync path (F-2026-19641) |
