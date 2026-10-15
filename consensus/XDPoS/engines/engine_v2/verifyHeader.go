@@ -43,10 +43,12 @@ func (x *XDPoS_v2) verifyHeader(chain consensus.ChainReader, header *types.Heade
 		return fmt.Errorf("invalid validator signature length %d, want 65", len(header.Validator))
 	}
 
-	if fullVerify {
-		if header.Time > uint64(time.Now().Unix()) {
-			return consensus.ErrFutureBlock
-		}
+	// Checked regardless of fullVerify: canonical XDPoSChain gates this on
+	// fullVerify too, but its InsertChain always verifies seals, so every
+	// imported block gets the check. Our fullVerify is a global bulk-sync
+	// switch, so gating here would let a future-dated block through.
+	if header.Time > uint64(time.Now().Unix()) {
+		return consensus.ErrFutureBlock
 	}
 
 	var parent *types.Header
