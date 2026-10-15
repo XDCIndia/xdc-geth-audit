@@ -597,6 +597,9 @@ func (pool *LegacyPool) ValidateTxBasics(tx *types.Transaction) error {
 			1<<types.SetCodeTxType,
 		MaxSize: txMaxSize,
 		MinTip:  minTip,
+		NotSigner: func(from common.Address) bool {
+			return pool.IsSigner != nil && !pool.IsSigner(from)
+		},
 	}
 	return txpool.ValidateTransaction(tx, pool.currentHead.Load(), pool.signer, opts)
 }
@@ -918,11 +921,10 @@ func (pool *LegacyPool) add(tx *types.Transaction) (replaced bool, err error) {
 		}()
 	}
 	// If the transaction pool is full, discard underpriced transactions.
-	// XDC: special-txs are never price-evicted — they bypass pool-full discard
-	// entirely. Mirrors XDPoSChain/core/txpool/txpool.go:779 fast-path which
-	// returns before the pool-full check.
-	if uint64(pool.all.Slots()+numSlots(tx)) > pool.config.GlobalSlots+pool.config.GlobalQueue &&
-		!tx.IsSpecialTransaction() {
+	// XDC: this applies to special-txs too; only signers' special-txs at the
+	// pending nonce skip it via the fast path above (XDPoSChain
+	// core/txpool/legacypool/legacypool.go:765-770).
+	if uint64(pool.all.Slots()+numSlots(tx)) > pool.config.GlobalSlots+pool.config.GlobalQueue {
 		// If the new transaction is underpriced, don't accept it
 		if pool.priced.Underpriced(tx) {
 			log.Trace("Discarding underpriced transaction", "hash", hash, "gasTipCap", tx.GasTipCap(), "gasFeeCap", tx.GasFeeCap())

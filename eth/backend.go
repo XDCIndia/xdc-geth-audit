@@ -431,6 +431,18 @@ func New(stack *node.Node, config *ethconfig.Config) (*Ethereum, error) {
 		config.TxPool.Journal = stack.ResolvePath(config.TxPool.Journal)
 	}
 	legacyPool := legacypool.New(config.TxPool, eth.blockchain)
+	// XDC: only current masternodes may send special txs (BlockSigners /
+	// RandomizeSMC). Mirrors XDPoSChain eth/backend.go:430-440, including
+	// treating every sender as a non-signer while the downloader is syncing.
+	// Set before txpool.New starts the pool loops; the handler is read lazily.
+	if xdposEngine, ok := eth.engine.(*XDPoS.XDPoS); ok {
+		legacyPool.SetIsSigner(func(address common.Address) bool {
+			if eth.handler == nil || eth.handler.downloader.Synchronising() {
+				return false
+			}
+			return xdposEngine.IsAuthorisedAddress(eth.blockchain, eth.blockchain.CurrentHeader(), address)
+		})
+	}
 
 	if config.BlobPool.Datadir != "" {
 		config.BlobPool.Datadir = stack.ResolvePath(config.BlobPool.Datadir)
