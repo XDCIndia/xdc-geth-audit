@@ -203,6 +203,22 @@ func (p *StateProcessor) Process(ctx context.Context, block *types.Block, stated
 		if err != nil {
 			return nil, fmt.Errorf("could not apply tx %d [%v]: %w", i, tx.Hash().Hex(), err)
 		}
+		// XDC: reject transactions from or to blacklisted addresses once the
+		// chain has passed BlackListHFNumber.  Canonical XDPoSChain enforces
+		// this check in Process (core/state_processor.go:170-180 in v2.9.2-testnet
+		// and core/state_processor.go:96-105 in v2.7.1).  Without this check a
+		// malicious block producer can transfer funds to/from a listed address;
+		// other honest nodes on this client would accept the block while canonical
+		// nodes reject it, causing a consensus split.  We keep the fork's naming
+		// (blacklist, not denylist).
+		if blockNumber.Uint64() >= common.BlackListHFNumber {
+			if common.IsInBlacklist(&msg.From) {
+				return nil, fmt.Errorf("tx %d [%v]: sender %v is blacklisted", i, tx.Hash().Hex(), msg.From.Hex())
+			}
+			if common.IsInBlacklist(tx.To()) {
+				return nil, fmt.Errorf("tx %d [%v]: recipient %v is blacklisted", i, tx.Hash().Hex(), tx.To().Hex())
+			}
+		}
 		// XDC: signing txs (0x89, from TIPSigning) and XDCx empty txs
 		// (0x91-0x94, in the TIPXDCXReceiver window) bypass the EVM; see
 		// RouteTransaction. Canonical XDPoSChain produces byte-identical
