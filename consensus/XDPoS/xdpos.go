@@ -55,6 +55,7 @@ import (
 	"github.com/ethereum/go-ethereum/common/lru"
 	"github.com/ethereum/go-ethereum/consensus"
 	"github.com/ethereum/go-ethereum/consensus/XDPoS/engines/engine_v2"
+	"github.com/ethereum/go-ethereum/consensus/XDPoS/utils"
 	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/core/state"
 	"github.com/ethereum/go-ethereum/core/types"
@@ -397,6 +398,13 @@ type EngineV2Iface interface {
 	// currentRound is re-seeded from the head's embedded QC rather than being
 	// left at whatever stale round the engine observed during bulk import. A.99.4b.
 	ReinitBFT(chain consensus.ChainReader, header *types.Header) error
+
+	// Epoch and round query methods for RPC handlers (issue #1482).
+	// These dispatch to the round-based V2 logic instead of block-number arithmetic.
+	GetCurrentEpochSwitchBlock(chain consensus.ChainReader, blockNumber *big.Int) (uint64, uint64, error)
+	GetEpochSwitchInfoBetween(chain consensus.ChainReader, begin, end *types.Header) ([]*types.EpochSwitchInfo, error)
+	GetBlockByEpochNumber(chain consensus.ChainReader, epochNumber uint64) (*types.BlockInfo, error)
+	CalculateMissingRounds(chain consensus.ChainReader, header *types.Header) (*utils.PublicApiMissedRoundsMetadata, error)
 }
 
 // SetEngineV2 wires the V2 consensus engine for full V2 header verification. (#94)
