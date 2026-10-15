@@ -602,6 +602,22 @@ func (miner *Miner) commitTransactions(ctx context.Context, env *environment, pl
 			txs.Pop()
 			continue
 		}
+		// XDC: canonical miner filter for 0x89 signing txs (XDPoSChain
+		// miner/worker.go:1141-1150). Skip short data and txs that sign a
+		// block at or above the one being built. Import is not affected.
+		if to := tx.To(); to != nil && *to == common.BlockSignersBinary {
+			data := tx.Data()
+			if len(data) < 68 {
+				log.Trace("Ignoring signing transaction with short data", "hash", ltx.Hash, "len", len(data))
+				txs.Pop()
+				continue
+			}
+			if signed := new(big.Int).SetBytes(data[4:36]).Uint64(); signed >= env.header.Number.Uint64() {
+				log.Trace("Ignoring signing transaction for a future block", "hash", ltx.Hash, "signed", signed, "number", env.header.Number)
+				txs.Pop()
+				continue
+			}
+		}
 		// Start executing the transaction
 		env.state.SetTxContext(tx.Hash(), env.tcount, uint32(env.tcount+1))
 
