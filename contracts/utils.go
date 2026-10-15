@@ -370,36 +370,69 @@ func GetRandomizeFromContract(client bind.ContractBackend, addr common.Address) 
 	return result, nil
 }
 
-// GenM2FromRandomize generates M2 validator list from random numbers
-func GenM2FromRandomize(candidates []int64, lenSigners int64) ([]int64, error) {
-	if len(candidates) == 0 {
-		return nil, errors.New("empty candidates")
+// GenM2FromRandomize generates the M2 index list from the randomize values.
+// Byte-exact port of canonical XDPoSChain contracts/utils.go GenM2FromRandomize:
+// a math/rand stream seeded with the sum of the values picks the indices.
+func GenM2FromRandomize(randomizes []int64, lenSigners int64) ([]int64, error) {
+	blockValidator := NewSlice(int64(0), lenSigners, 1)
+	randIndexs := make([]int64, lenSigners)
+	total := int64(0)
+	for _, j := range randomizes {
+		total += j
 	}
-
-	// Create a copy of candidates for shuffling
-	m2 := make([]int64, len(candidates))
-	copy(m2, candidates)
-
-	// Fisher-Yates shuffle using candidates as seeds
-	for i := len(m2) - 1; i > 0; i-- {
-		seed := candidates[i%len(candidates)]
-		j := int(seed) % (i + 1)
-		if j < 0 {
-			j = -j
+	rng := rand.New(rand.NewSource(total))
+	for i := len(blockValidator) - 1; i >= 0; i-- {
+		blockLength := len(blockValidator) - 1
+		if blockLength <= 1 {
+			blockLength = 1
 		}
-		m2[i], m2[j] = m2[j], m2[i]
+		randomIndex := int64(rng.Intn(blockLength))
+		temp := blockValidator[randomIndex]
+		blockValidator[randomIndex] = blockValidator[i]
+		blockValidator[i] = temp
+		blockValidator = append(blockValidator[:i], blockValidator[i+1:]...)
+		randIndexs[i] = temp
 	}
 
-	return m2, nil
+	return randIndexs, nil
 }
 
-// BuildValidatorFromM2 builds validator bytes from M2 list
-func BuildValidatorFromM2(m2 []int64) []byte {
-	var validators []byte
-	for _, v := range m2 {
-		validators = append(validators, byte(v))
+// BuildValidatorFromM2 encodes the M2 indices as header.Validators bytes: each
+// index in decimal ASCII, left-padded with zeros to 4 bytes. Port of canonical
+// XDPoSChain contracts/utils.go BuildValidatorFromM2.
+func BuildValidatorFromM2(listM2 []int64) []byte {
+	const m2ByteLength = 4 // utils.M2ByteLength
+	validatorBytes := make([]byte, 0, len(listM2)*m2ByteLength)
+	for _, numberM2 := range listM2 {
+		m2Byte := common.LeftPadBytes([]byte(strconv.FormatInt(numberM2, 10)), m2ByteLength)
+		validatorBytes = append(validatorBytes, m2Byte...)
 	}
-	return validators
+	return validatorBytes
+}
+
+// DecryptRandomizeFromSecretsAndOpening decrypts a masternode's randomize value
+// from its 0x90 secrets and opening. Port of canonical XDPoSChain
+// contracts/utils.go DecryptRandomizeFromSecretsAndOpening.
+func DecryptRandomizeFromSecretsAndOpening(secrets [][32]byte, opening [32]byte) (int64, error) {
+	var random int64
+	for _, secret := range secrets {
+		trimSecret := bytes.TrimLeft(secret[:], "\x00")
+		decryptSecret := Decrypt(opening[:], string(trimSecret))
+		if intNumber, err := strconv.Atoi(decryptSecret); err == nil {
+			random = int64(intNumber)
+		}
+	}
+	return random, nil
+}
+
+// NewSlice returns [start, start+step, ...) with end-start elements.
+func NewSlice(start int64, end int64, step int64) []int64 {
+	s := make([]int64, end-start)
+	for i := range s {
+		s[i] = start
+		start += step
+	}
+	return s
 }
 
 // GetBlockSigners returns signers who signed a specific block
