@@ -107,6 +107,17 @@ func TestV1FullVerifyEnforcesDoubleValidation(t *testing.T) {
 	if err := verify(51, keyA); err != nil {
 		t.Errorf("chain 51 (fullVerify off in canonical): got %v, want nil", err)
 	}
+	// Devnet (chain 2002): a block with empty Validator must be accepted. Legacy
+	// v2.7.x nodes accept such blocks via the fetcher prepareBlock path (fullVerify=false
+	// call caches the header, letting the later fullVerify=true insertChain hit the cache).
+	// Modern geth has no equivalent fetcher hook, so rejecting here wedges import on
+	// any mixed network where the assigned M2 is a non-co-signing client. Refs #1530.
+	if err := verify(2002, nil); err != nil {
+		t.Errorf("devnet chain 2002, empty Validator (accepted by legacy): got %v, want nil", err)
+	}
+	if err := verify(2002, keyA); err != nil {
+		t.Errorf("devnet chain 2002, any Validator (no M2 check on devnet): got %v, want nil", err)
+	}
 }
 
 // batchChain is m2Chain before the checkpoint is written: the checkpoint is only

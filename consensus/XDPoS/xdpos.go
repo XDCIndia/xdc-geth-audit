@@ -1247,9 +1247,20 @@ func (c *XDPoS) verifySeal(chain consensus.ChainHeaderReader, header *types.Head
 	// co-signer other than the creator's assigned M2 (ErrFailedDoubleValidation).
 	// fullVerify mirrors verifyHeaderV2 (not during bulk sync); canonical turns it
 	// off on chain 51 (engine.go:162-167).
+	//
+	// Enforcement is restricted to mainnet (chain 50). On testnet/devnet, the
+	// canonical V1 chain legitimately contains empty-Validator blocks past epoch 1
+	// when the assigned M2 is a mixed-client node that does not co-sign legacy
+	// blocks (e.g. modern geth in a hybrid network). verifyCascadingFields already
+	// applies the mainnet-only empty-Validator guard; this check adds the M2
+	// assignment check for mainnet. Applying either guard on devnets wedges import
+	// on blocks that legacy v2.7.x nodes accept via the fetcher's prepareBlock path
+	// (engine_v1 verifyHeaderWithCache caches a fullVerify=false result, letting
+	// the subsequent fullVerify=true insertChain call hit the cache and skip the
+	// check). Refs #1530 (regression on net2002 from PR #1503).
 	cfg := chain.Config()
-	testnet := cfg != nil && cfg.ChainID != nil && cfg.ChainID.Cmp(params.XDCApothemChainConfig.ChainID) == 0
-	if xdcFullVerify() && !testnet && number > c.config.Epoch {
+	mainnet := cfg != nil && cfg.ChainID != nil && cfg.ChainID.Uint64() == params.XDCMainnetChainConfig.ChainID.Uint64()
+	if xdcFullVerify() && mainnet && number > c.config.Epoch {
 		if len(header.Validator) == 0 {
 			return errNoValidatorSignature
 		}
