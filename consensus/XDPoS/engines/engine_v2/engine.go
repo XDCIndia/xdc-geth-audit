@@ -724,7 +724,7 @@ func (x *XDPoS_v2) Finalize(chain consensus.ChainReader, header *types.Header, s
 		return nil, consensus.ErrUnknownAncestor
 	}
 
-	header.Root = state.IntermediateRoot(chain.Config().IsEIP158(header.Number))
+	header.Root = state.IntermediateRoot(params.Rules{IsEIP158: chain.Config().IsEIP158(header.Number)})
 	header.UncleHash = types.CalcUncleHash(nil)
 
 	return types.NewBlock(header, &types.Body{Transactions: txs}, receipts, trie.NewStackTrie(nil)), nil
@@ -1213,12 +1213,12 @@ func (x *XDPoS_v2) getSnapshot(chain consensus.ChainReader, number uint64, forSi
 // unavailable; callers then fall back to header-derived seeding.
 func (x *XDPoS_v2) rebuildGapSnapshotFromState(chain consensus.ChainReader, gapNumber uint64, gapHeader *types.Header) *SnapshotV2 {
 	stateReader, ok := chain.(interface {
-		StateAt(*types.Header) (*state.StateDB, error)
+		StateAt(common.Hash, *big.Int, uint64) (*state.StateDB, error)
 	})
 	if !ok {
 		return nil
 	}
-	statedb, err := stateReader.StateAt(gapHeader)
+	statedb, err := stateReader.StateAt(gapHeader.Root, gapHeader.Number, gapHeader.Time)
 	if err != nil || statedb == nil {
 		return nil
 	}
@@ -1301,12 +1301,13 @@ func (x *XDPoS_v2) repairSnapshot(chain consensus.ChainReader, checkpointNumber 
 		return nil, fmt.Errorf("gap header not found for V2 checkpoint: %d", gapNumber)
 	}
 	// Attempt to read candidates from smart contract state at gap block.
-	// v1.17.3 signature: StateAt takes *types.Header (not common.Hash root).
+	// v1.17.7 signature: StateAt takes (root, number, time); a mismatched
+	// signature here makes the assertion silently fail (no compile error).
 	// Refs #740/#742: blockchain_reader.go conflict resolution adopts upstream API.
 	if stateReader, ok := chain.(interface {
-		StateAt(*types.Header) (*state.StateDB, error)
+		StateAt(common.Hash, *big.Int, uint64) (*state.StateDB, error)
 	}); ok {
-		if statedb, err := stateReader.StateAt(gapHeader); err == nil {
+		if statedb, err := stateReader.StateAt(gapHeader.Root, gapHeader.Number, gapHeader.Time); err == nil {
 			candidates := state.GetCandidates(statedb)
 			if len(candidates) > 0 {
 				// Sort by stake descending to match v2.6.8 / UpdateMasternodesFromHeader behavior
@@ -2865,6 +2866,38 @@ func removeItemFromArray(array []common.Address, toRemove []common.Address) []co
 		}
 	}
 	return result
+}
+
+// GetStandbynodes returns the standby pool of the epoch whose epoch-switch
+// header is given: that epoch's snapshot candidates (stake-sorted at the gap
+// block), minus its masternodes and penalties. Empty when the snapshot is
+// missing or every candidate is a masternode. Mirrors the standbynodes
+// derivation of XinFinOrg/XDPoSChain getEpochSwitchInfo (v2.9.1-testnet), used
+// by the Reward 2.0 protector/observer tiers (#2612).
+//
+// The gap block is computed here, not left to getSnapshot: getSnapshot treats a
+// number that is itself a gap-block number as the gap block, and a V2 epoch
+// switch (round-driven) can land on such a number.
+func (x *XDPoS_v2) GetStandbynodes(chain consensus.ChainReader, header *types.Header) []common.Address {
+	number := header.Number.Uint64()
+	gapNumber := number - number%x.config.Epoch
+	if gapNumber > x.config.Gap {
+		gapNumber -= x.config.Gap
+	} else {
+		gapNumber = 0
+	}
+	snap, err := x.getSnapshot(chain, gapNumber, true, nil)
+	if err != nil {
+		log.Warn("[GetStandbynodes] getSnapshot has error, cannot get standbynodes", "number", number, "gap", gapNumber, "err", err)
+		return []common.Address{}
+	}
+	masternodes := x.GetMasternodesFromEpochSwitchHeader(chain, header)
+	candidates := snap.NextEpochCandidates
+	if len(masternodes) == len(candidates) {
+		return []common.Address{}
+	}
+	standby := removeItemFromArray(candidates, masternodes)
+	return removeItemFromArray(standby, common.ExtractAddressFromBytes(header.Penalties))
 }
 
 // GetMasternodesByHash retrieves the masternode list for a given block hash.

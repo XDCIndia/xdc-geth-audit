@@ -362,13 +362,19 @@ func (d *Downloader) fetchHeaders(from uint64) error {
 
 	for {
 		// Some beacon headers might have appeared since the last cycle, make
-		// sure we're always syncing to all available ones
+		// sure we're always syncing to all available ones.
 		head, _, _, err = d.skeleton.Bounds()
 		if err != nil {
 			return err
 		}
 		// If the pivot became stale (older than 2*64-8 (bit of wiggle room)),
 		// move it ahead to HEAD-64.
+		//
+		// XDC: upstream v1.17.7 (#35749) moved this mover into the snap content
+		// loop (downloader.go movePivotIfStale). XDC's NodeData fast sync runs in
+		// processFastSyncContent, which never moves the pivot, so the mover stays
+		// here for fast sync only; snap sync uses movePivotIfStale, which applies
+		// the same beaconPivotMoverDecision. One mover per mode.
 		//
 		// RESOLVED (issue #1371 item B): two independently-implemented
 		// pivot-freeze mechanisms are combined here, deliberately. XDC's A.97.1b
@@ -401,7 +407,7 @@ func (d *Downloader) fetchHeaders(from uint64) error {
 		// frozen pivot, the chain has a stateful head and the pivot must not
 		// advance by either mechanism.
 		d.pivotLock.Lock()
-		if d.pivotHeader != nil {
+		if d.pivotHeader != nil && d.getMode() == ethconfig.FastSync {
 			advance, refused, newNumber := beaconPivotMoverDecision(
 				head.Number.Uint64(),
 				d.pivotHeader.Number.Uint64(),

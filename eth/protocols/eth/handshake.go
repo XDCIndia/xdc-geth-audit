@@ -193,7 +193,15 @@ func (p *Peer) readStatus62(networkID uint64, status *StatusPacket62, genesis co
 	// Validate would reject that as zero-latest-hash. The downloader
 	// tolerates a zero hash and just doesn't request from this peer
 	// until the next BlockRangeUpdate.
-	if status.Head != (common.Hash{}) && tdAsRank > 0 {
+	if status.Head != (common.Hash{}) {
+		// Fresh-genesis chains legitimately have TD==0 at block 0 (XDPoS
+		// difficulty is small, not cumulative-PoW-sized). Dropping the range
+		// leaves maxPeerHead==0 forever, deadlocking every miner sync gate
+		// at genesis (both peers at block 0, nobody can mint, no nonzero
+		// head ever appears). Store unconditionally when head hash exists so
+		// the syncer's genesis-bootstrap watchdog can see that the peer's
+		// head is genesis. peerAtTip still needs maxPeerHead > 0, so a
+		// zero-TD range never marks us at tip by itself.
 		p.lastRange.Store(initRange)
 	}
 	// A.37 fix: no Caps field on the wire (see StatusPacket62 doc). The

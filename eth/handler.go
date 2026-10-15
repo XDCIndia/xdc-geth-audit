@@ -216,7 +216,7 @@ func newHandler(config *handlerConfig) (*handler, error) {
 				}
 				// Open trie state at the gap block's root using StateAt so the
 				// correct DB backend (UBT vs MPT) is chosen per chain config.
-				statedb, err := chain.StateAt(gapHeader)
+				statedb, err := chain.StateAt(gapHeader.Root, gapHeader.Number, gapHeader.Time)
 				if err != nil {
 					return fmt.Errorf("open statedb at gap %d: %w", gapNumber, err)
 				}

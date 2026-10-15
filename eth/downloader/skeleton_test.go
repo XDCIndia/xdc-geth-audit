@@ -223,6 +223,14 @@ func (p *skeletonTestPeer) RequestNodeData([]common.Hash) error {
 	panic("skeleton sync must not request node data")
 }
 
+func (p *skeletonTestPeer) RequestBALs([]common.Hash, chan *eth.Response) (*eth.Request, error) {
+	panic("skeleton sync must not request block access lists")
+}
+
+func (p *skeletonTestPeer) BlockRange() *eth.BlockRangeUpdatePacket {
+	return nil // Headers are served regardless of any announced range
+}
+
 // Tests various sync initializations based on previous leftovers in the database
 // and announced heads.
 func TestSkeletonSyncInit(t *testing.T) {

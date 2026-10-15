@@ -255,8 +255,8 @@ func CalculateRewardForSigner(
 // CalculateRewardForSignerFixed: deep-copy chainReward into each signer's
 // reward (new(big.Int).Set) and write rLog.Reward.
 //
-// DEAD CODE until TIPUpgradeReward is enabled (apothem TIPUpgradeRewardBlock is
-// nil = disabled), so it cannot affect live behaviour.
+// Live from TIPUpgradeReward (apothem TIPUpgradeRewardBlock = 83,600,000;
+// mainnet unscheduled).
 func CalculateRewardForSignerFixed(
 	chainReward *big.Int,
 	signers map[common.Address]*RewardLog,
@@ -294,8 +294,8 @@ func CalculateRewardForSignerFixed(
 // fidelity. RewardVoterPercent is 0, so the loop is a no-op in practice, but the
 // structure is preserved bit-for-bit.
 //
-// DEAD CODE until TIPUpgradeReward is enabled (apothem TIPUpgradeRewardBlock is
-// nil = disabled).
+// Live from TIPUpgradeReward (apothem TIPUpgradeRewardBlock = 83,600,000;
+// mainnet unscheduled).
 func GetRewardBalancesRateUpgrade(chainConfig *params.ChainConfig, foundationWalletAddr common.Address, statedb *state.StateDB, masterAddr common.Address, totalReward *big.Int, blockNumber *big.Int) (map[common.Address]*big.Int, error) {
 	owner := state.GetCandidateOwner(statedb, masterAddr)
 	balances := make(map[common.Address]*big.Int)

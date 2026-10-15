@@ -45,6 +45,7 @@ var (
 	errBlockInterruptedByNewHead  = errors.New("new head arrived while building block")
 	errBlockInterruptedByRecommit = errors.New("recommit interrupt while building block")
 	errBlockInterruptedByTimeout  = errors.New("timeout while building block")
+	errStateReadFailure           = errors.New("state read failed while building block")
 )
 
 // maxBlobsPerBlock returns the maximum number of blobs per block.
@@ -71,7 +72,14 @@ type environment struct {
 	// core/state_processor.go Process. Zero address ⇒ fees route to the coinbase
 	// (pre-TIPTRC21Fee behaviour). Set by the XDPoS worker after makeEnv.
 	coinbaseOwner common.Address
-	evm           *vm.EVM
+
+	// XDC TRC21 token fees, mirroring core/state_processor.go Process: the
+	// capacities read from the pre-tx state, drawn down as txs are committed and
+	// written back (UpdateTRC21Fee) before the block is finalized.
+	trc21Fee     map[common.Address]*big.Int
+	trc21Updated map[common.Address]*big.Int
+	trc21FeeUsed *big.Int
+	evm          *vm.EVM
 
 	header   *types.Header
 	txs      []*types.Transaction
@@ -79,6 +87,12 @@ type environment struct {
 	sidecars []*types.BlobTxSidecar
 	blobs    int
 	bal      *bal.ConstructionBlockAccessList
+
+	// revertedTxs and revertedIdx record transactions that were executed during
+	// block building but then reverted (excluded from the block), together with
+	// the index each was tried at.
+	revertedTxs []*types.Transaction
+	revertedIdx []uint32
 
 	witness *stateless.Witness
 }
@@ -118,6 +132,11 @@ type newPayloadResult struct {
 	receipts []*types.Receipt       // Receipts collected during construction
 	requests [][]byte               // Consensus layer requests collected during block construction
 	witness  *stateless.Witness     // Witness is an optional stateless proof
+
+	// revertedTxs and revertedIdx record the transactions tried-and-reverted
+	// during construction and the index each was assigned.
+	revertedTxs []*types.Transaction
+	revertedIdx []uint32
 }
 
 // generateParams wraps various settings for generating sealing task.
@@ -217,7 +236,7 @@ func (miner *Miner) generateWork(ctx context.Context, genParam *generateParams, 
 	}
 
 	// Collect consensus-layer requests if Prague is enabled.
-	requests, bal, err := core.PostExecution(ctx, miner.chainConfig, work.header.Number, work.header.Time, allLogs, work.evm, uint32(work.tcount+1))
+	requests, bal, err := core.PostExecution(ctx, miner.chainConfig, work.header.Number, work.header.Time, allLogs, genParam.withdrawals, work.evm, uint32(work.tcount+1))
 	if err != nil {
 		return &newPayloadResult{err: err}
 	}
@@ -228,21 +247,28 @@ func (miner *Miner) generateWork(ctx context.Context, genParam *generateParams, 
 	work.bal.Merge(bal)
 
 	// Apply the consensus-specific post-transaction changes
-	miner.engine.Finalize(miner.chain, work.header, work.state, &body, uint32(work.tcount+1), work.bal)
+	miner.engine.Finalize(miner.chain, work.header, work.state, &body)
 
 	// Assemble the block for delivery.
 	_, _, assembleSpanEnd := telemetry.StartSpan(ctx, "miner.AssembleBlock")
 	block := core.AssembleBlock(miner.chain, work.header, work.state, &body, work.receipts, work.bal)
 	assembleSpanEnd(nil)
 
+	// Check for db errors. If anything happened during the mining or IntermediateRoot, such as a
+	// weird flush or a trie node missing, we need to bail out and not create a block.
+	if dbErr := work.state.Error(); dbErr != nil {
+		return &newPayloadResult{err: fmt.Errorf("%w: %v", errStateReadFailure, dbErr)}
+	}
 	return &newPayloadResult{
-		block:    block,
-		fees:     totalFees(block, work.receipts),
-		sidecars: work.sidecars,
-		stateDB:  work.state,
-		receipts: work.receipts,
-		requests: requests,
-		witness:  work.witness,
+		block:       block,
+		fees:        totalFees(block, work.receipts),
+		sidecars:    work.sidecars,
+		stateDB:     work.state,
+		receipts:    work.receipts,
+		requests:    requests,
+		witness:     work.witness,
+		revertedTxs: work.revertedTxs,
+		revertedIdx: work.revertedIdx,
 	}
 }
 
@@ -359,6 +385,7 @@ func (miner *Miner) makeEnv(parent *types.Header, header *types.Header, coinbase
 	state.StartPrefetcher("miner", bundle)
 	evm := vm.NewEVM(core.NewEVMBlockContext(header, miner.chain, &coinbase), state, miner.chainConfig, vm.Config{})
 	evm.SetJumpDestCache(miner.chain.JumpDestCache())
+	evm.SetPrecompileCache(miner.chain.PrecompileCache())
 
 	// Note the passed coinbase may be different with header.Coinbase.
 	return &environment{
@@ -375,12 +402,12 @@ func (miner *Miner) makeEnv(parent *types.Header, header *types.Header, coinbase
 }
 
 func (miner *Miner) commitTransaction(ctx context.Context, env *environment, tx *types.Transaction) (err error) {
-	_, _, spanEnd := telemetry.StartSpan(ctx, "miner.commitTransaction")
+	ctx, _, spanEnd := telemetry.StartSpan(ctx, "miner.commitTransaction")
 	defer spanEnd(&err)
 	if tx.Type() == types.BlobTxType {
-		return miner.commitBlobTransaction(env, tx)
+		return miner.commitBlobTransaction(ctx, env, tx)
 	}
-	receipt, bal, err := miner.applyTransaction(env, tx)
+	receipt, bal, err := miner.applyTransaction(ctx, env, tx)
 	if err != nil {
 		return err
 	}
@@ -392,7 +419,7 @@ func (miner *Miner) commitTransaction(ctx context.Context, env *environment, tx 
 	return nil
 }
 
-func (miner *Miner) commitBlobTransaction(env *environment, tx *types.Transaction) error {
+func (miner *Miner) commitBlobTransaction(ctx context.Context, env *environment, tx *types.Transaction) error {
 	sc := tx.BlobTxSidecar()
 	if sc == nil {
 		panic("blob transaction without blobs in miner")
@@ -405,7 +432,7 @@ func (miner *Miner) commitBlobTransaction(env *environment, tx *types.Transactio
 	if env.blobs+len(sc.Blobs) > maxBlobs {
 		return errors.New("max data blobs reached")
 	}
-	receipt, bal, err := miner.applyTransaction(env, tx)
+	receipt, bal, err := miner.applyTransaction(ctx, env, tx)
 	if err != nil {
 		return err
 	}
@@ -432,7 +459,7 @@ func (miner *Miner) commitBlobTransaction(env *environment, tx *types.Transactio
 //   - XDCx notifier txs to 0x92/0x93 in the TIPXDCXReceiver window run through
 //     ApplyEmptyTransaction;
 //   - all other txs route the TRC21 gas fee to env.coinbaseOwner.
-func (miner *Miner) applyTransaction(env *environment, tx *types.Transaction) (*types.Receipt, *bal.ConstructionBlockAccessList, error) {
+func (miner *Miner) applyTransaction(ctx context.Context, env *environment, tx *types.Transaction) (*types.Receipt, *bal.ConstructionBlockAccessList, error) {
 	var (
 		snap        = env.state.Snapshot()
 		gp          = env.gasPool.Snapshot()
@@ -457,12 +484,19 @@ func (miner *Miner) applyTransaction(env *environment, tx *types.Transaction) (*
 		var msg *core.Message
 		msg, err = core.TransactionToMessage(tx, types.MakeSigner(config, blockNumber, env.header.Time), env.header.BaseFee)
 		if err == nil {
-			receipt, txBAL, err = core.ApplyTransactionWithEVM(msg, env.gasPool, env.state, blockNumber, blockHash, env.header.Time, tx, env.evm, env.coinbaseOwner)
+			tokenFee := env.trc21Fee != nil && core.ApplyTRC21TokenFee(config, msg, env.trc21Fee, tx, blockNumber)
+			receipt, txBAL, err = core.ApplyTransactionWithEVM(ctx, msg, env.gasPool, env.state, blockNumber, blockHash, env.header.Time, tx, env.evm, env.coinbaseOwner)
+			if err == nil && tokenFee {
+				core.SettleTRC21TokenFee(config, env.state, msg, tx, receipt, blockNumber, env.trc21Fee, env.trc21Updated, env.trc21FeeUsed)
+			}
 		}
 	}
 	if err != nil {
 		env.state.RevertToSnapshot(snap)
 		env.gasPool.Set(gp)
+
+		env.revertedTxs = append(env.revertedTxs, tx.WithoutBlobTxSidecar())
+		env.revertedIdx = append(env.revertedIdx, uint32(env.tcount))
 		return nil, nil, err
 	}
 	env.header.GasUsed = env.gasPool.Used()
@@ -473,7 +507,16 @@ func (miner *Miner) commitTransactions(ctx context.Context, env *environment, pl
 	ctx, _, spanEnd := telemetry.StartSpan(ctx, "miner.commitTransactions")
 	defer spanEnd(nil)
 
-	isCancun := miner.chainConfig.IsCancun(env.header.Number, env.header.Time)
+	var (
+		isCancun    = miner.chainConfig.IsCancun(env.header.Number, env.header.Time)
+		isAmsterdam = miner.chainConfig.IsAmsterdam(env.header.Number, env.header.Time)
+	)
+	// The smallest gas limit a transaction may carry, EIP-2780 lowers
+	// the intrinsic floor after Amsterdam.
+	minTxGas := params.TxGas
+	if isAmsterdam {
+		minTxGas = params.TxBaseCost2780
+	}
 	for {
 		// Check interruption signal and abort building if it's fired.
 		if interrupt != nil {
@@ -482,8 +525,8 @@ func (miner *Miner) commitTransactions(ctx context.Context, env *environment, pl
 			}
 		}
 		// If we don't have enough gas for any further transactions then we're done.
-		if env.gasPool.Gas() < params.TxGas {
-			log.Trace("Not enough gas for further transactions", "have", env.gasPool, "want", params.TxGas)
+		if env.gasPool.Available(isAmsterdam) < minTxGas {
+			log.Trace("Not enough gas for further transactions", "have", env.gasPool, "want", minTxGas)
 			break
 		}
 		// If we don't have enough blob space for any further blob transactions,
@@ -517,8 +560,8 @@ func (miner *Miner) commitTransactions(ctx context.Context, env *environment, pl
 			break
 		}
 		// If we don't have enough space for the next transaction, skip the account.
-		if env.gasPool.Gas() < ltx.Gas {
-			log.Trace("Not enough gas left for transaction", "hash", ltx.Hash, "left", env.gasPool.Gas(), "needed", ltx.Gas)
+		if env.gasPool.Available(isAmsterdam) < ltx.Gas {
+			log.Trace("Not enough gas left for transaction", "hash", ltx.Hash, "have", env.gasPool, "needed", ltx.Gas)
 			txs.Pop()
 			continue
 		}
@@ -683,5 +726,21 @@ func signalToErr(signal int32) error {
 		return errBlockInterruptedByTimeout
 	default:
 		panic(fmt.Errorf("undefined signal %d", signal))
+	}
+}
+
+// initTRC21Fee reads the TRC21 token fee capacities from the pre-tx state of
+// env, as core/state_processor.go Process does before executing a block.
+func (env *environment) initTRC21Fee() {
+	env.trc21Fee = state.GetTRC21FeeCapacityFromState(env.state)
+	env.trc21Updated = map[common.Address]*big.Int{}
+	env.trc21FeeUsed = new(big.Int)
+}
+
+// finalizeTRC21Fee writes the drawn-down TRC21 capacities back before the
+// block is finalized (core/state_processor.go Process: UpdateTRC21Fee).
+func (env *environment) finalizeTRC21Fee() {
+	if env.trc21Fee != nil {
+		state.UpdateTRC21Fee(env.state, env.trc21Updated, env.trc21FeeUsed)
 	}
 }

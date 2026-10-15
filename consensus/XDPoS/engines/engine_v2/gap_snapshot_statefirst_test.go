@@ -63,7 +63,7 @@ func (m *mockChain1330) GetHeaderByNumber(n uint64) *types.Header { return m.byN
 // state-first rebuild (full/archive node).
 type mockChain1330WithState struct{ mockChain1330 }
 
-func (m *mockChain1330WithState) StateAt(h *types.Header) (*state.StateDB, error) {
+func (m *mockChain1330WithState) StateAt(common.Hash, *big.Int, uint64) (*state.StateDB, error) {
 	if m.statedb == nil {
 		return nil, errMissingState1330
 	}

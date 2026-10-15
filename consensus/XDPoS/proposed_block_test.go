@@ -94,6 +94,9 @@ func (f *fakeEngineV2) GetPreviousPenaltyByHash(_ consensus.ChainReader, _ commo
 func (f *fakeEngineV2) GetMasternodesFromEpochSwitchHeader(_ consensus.ChainReader, _ *types.Header) []common.Address {
 	return nil
 }
+func (f *fakeEngineV2) GetStandbynodes(_ consensus.ChainReader, _ *types.Header) []common.Address {
+	return nil
+}
 func (f *fakeEngineV2) GetMasternodesV2(_ consensus.ChainReader, _ *types.Header) []common.Address {
 	return nil
 }
