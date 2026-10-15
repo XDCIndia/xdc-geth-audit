@@ -504,7 +504,8 @@ func (c *XDPoS) VerifyHeader(chain consensus.ChainHeaderReader, header *types.He
 //
 // Optimisation (XDC): during bulk sync we use two fast-paths:
 //   - V2 blocks (after SwitchBlock): parallel worker pool (header-independent checks)
-//   - V1 blocks in bulk-sync mode: light verification that skips verifySeal (ecrecover)
+//   - V1 blocks in bulk-sync mode: light verification that skips the checkpoint
+//     signer-list checks (the seal is still verified)
 func (c *XDPoS) VerifyHeaders(chain consensus.ChainHeaderReader, headers []*types.Header) (chan<- struct{}, <-chan error) {
 	abort := make(chan struct{})
 	results := make(chan error, len(headers))
@@ -579,9 +580,9 @@ func (c *XDPoS) VerifyHeaders(chain consensus.ChainHeaderReader, headers []*type
 	return abort, results
 }
 
-// verifyHeaderLightV1 performs V1 header verification without the expensive
-// verifySeal (ecrecover + snapshot). Safe during bulk sync because the blocks
-// were already accepted by the network.
+// verifyHeaderLightV1 performs V1 header verification for bulk sync. It skips
+// the checkpoint signer-list checks (penalty hooks need state) but always
+// verifies the seal, matching canonical engine_v1 with fullVerify=false.
 func (c *XDPoS) verifyHeaderLightV1(chain consensus.ChainHeaderReader, header *types.Header, parents []*types.Header) error {
 	if _, check := c.verifiedHeaders.Get(header.Hash()); check {
 		return nil
@@ -674,6 +675,13 @@ func (c *XDPoS) verifyHeaderLightV1(chain consensus.ChainHeaderReader, header *t
 		return errNoValidatorSignature
 	}
 
+	// Always verify the V1 seal (ecrecover + signer/difficulty), even in bulk
+	// mode. Canonical XDPoSChain engine_v1 verifyCascadingFields ends every
+	// path in verifySeal; fullVerify only gates the checkpoint signer-list and
+	// double-validation checks, which stay skipped here (#1405).
+	if err := c.verifySeal(chain, header, parents); err != nil {
+		return err
+	}
 	c.verifiedHeaders.Add(header.Hash(), true)
 	return nil
 }
@@ -1009,7 +1017,7 @@ func (c *XDPoS) verifySeal(chain consensus.ChainHeaderReader, header *types.Head
 	}
 
 	difficulty := c.calcDifficulty(chain, parent, creator)
-	log.Info("verify seal block", "number", header.Number, "hash", header.Hash(), "block difficulty", header.Difficulty, "calc difficulty", difficulty, "creator", creator, "snap signers", len(snap.Signers))
+	log.Debug("verify seal block", "number", header.Number, "hash", header.Hash(), "block difficulty", header.Difficulty, "calc difficulty", difficulty, "creator", creator, "snap signers", len(snap.Signers))
 
 	// Ensure that the block's difficulty is meaningful (may not be correct at this point)
 	// Note: During sync, we may not have checkpoint headers yet, so difficulty calculation
@@ -1700,7 +1708,7 @@ func (c *XDPoS) YourTurn(chain consensus.ChainHeaderReader, parent *types.Header
 	for i, mn := range masternodes {
 		mnStrs[i] = mn.Hex()[:16]
 	}
-	log.Info("YourTurn debug", "parent", parent.Number, "signer", signer, "pre", pre, "preIndex", preIndex, "curIndex", curIndex, "masternodes", len(masternodes), "mnList", mnStrs)
+	log.Debug("YourTurn debug", "parent", parent.Number, "signer", signer, "pre", pre, "preIndex", preIndex, "curIndex", curIndex, "masternodes", len(masternodes), "mnList", mnStrs)
 
 	// Pre-switch (V1) turn assignment routes to the canonical engine_v1 position
 	// rule  masternodes[number % len] == signer  (number = parent.Number+1).
