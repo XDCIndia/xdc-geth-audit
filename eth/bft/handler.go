@@ -18,6 +18,8 @@
 package bft
 
 import (
+	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/common/lru"
 	"github.com/ethereum/go-ethereum/consensus"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/log"
@@ -26,6 +28,14 @@ import (
 // maxBlockDist is the maximum allowed backward distance from the chain head.
 // Matches XDPoSChain/eth/bft/bft_handler.go:12.
 const maxBlockDist = 7
+
+// Known-message cache sizes mirror XDPoSChain/eth/peer.go:maxKnown*.
+// 128 K slots each; one common.Hash = 32 bytes → ~4 MB per cache at capacity.
+const (
+	maxKnownVotes     = 131072
+	maxKnownTimeouts  = 131072
+	maxKnownSyncInfos = 131072
+)
 
 // EngineV2 is the narrow surface of the V2 engine that the BFT dispatcher
 // requires. Defined here (rather than imported from consensus/XDPoS) to
@@ -75,17 +85,29 @@ type Bfter struct {
 	broadcast   BroadcastFns
 	broadcastCh chan interface{}
 	quit        chan struct{}
+
+	// Known-message caches deduplicate inbound BFT messages before verification.
+	// Mirrors XDPoSChain/eth/handler.go knownVotes/knownTimeouts/knownSyncInfos
+	// (F-2026-19460). The cache is keyed by message hash (which includes all
+	// fields, including the signature bytes), so identical messages are dropped
+	// and distinct messages from the same round are forwarded once each.
+	knownVotes     *lru.Cache[common.Hash, struct{}]
+	knownTimeouts  *lru.Cache[common.Hash, struct{}]
+	knownSyncInfos *lru.Cache[common.Hash, struct{}]
 }
 
 // New creates a Bfter. Call SetConsensusFns afterwards to wire the engine
 // reference (matches the two-step initialization in v2.6.8).
 func New(broadcasts BroadcastFns, chain consensus.ChainReader, chainHeight ChainHeightFn) *Bfter {
 	return &Bfter{
-		broadcast:   broadcasts,
-		chain:       chain,
-		chainHeight: chainHeight,
-		quit:        make(chan struct{}),
-		broadcastCh: make(chan interface{}),
+		broadcast:      broadcasts,
+		chain:          chain,
+		chainHeight:    chainHeight,
+		quit:           make(chan struct{}),
+		broadcastCh:    make(chan interface{}),
+		knownVotes:     lru.NewCache[common.Hash, struct{}](maxKnownVotes),
+		knownTimeouts:  lru.NewCache[common.Hash, struct{}](maxKnownTimeouts),
+		knownSyncInfos: lru.NewCache[common.Hash, struct{}](maxKnownSyncInfos),
 	}
 }
 
@@ -116,6 +138,23 @@ func (b *Bfter) Engine() EngineV2 {
 	return b.engine
 }
 
+// enqueueForBroadcast sends msg to the broadcast channel, selecting on quit
+// so that sends do not block after Stop(). Returns true if the message was
+// enqueued, false if the Bfter has stopped. Mirrors canonical
+// XDPoSChain/eth/bft/bft_handler.go:enqueueForBroadcast.
+//
+// Called from a per-message goroutine (Vote/Timeout/SyncInfo spawn one) to
+// keep the eth handler goroutine non-blocking while ensuring the goroutine
+// itself exits cleanly after Stop instead of leaking (F-2026-19460).
+func (b *Bfter) enqueueForBroadcast(msg interface{}) bool {
+	select {
+	case <-b.quit:
+		return false
+	case b.broadcastCh <- msg:
+		return true
+	}
+}
+
 // Vote handles an inbound vote message from the given peer. Mirrors
 // XDPoSChain/eth/bft/bft_handler.go:Vote.
 func (b *Bfter) Vote(peer string, vote *types.Vote) error {
@@ -135,6 +174,15 @@ func (b *Bfter) Vote(peer string, vote *types.Vote) error {
 		return nil
 	}
 
+	// Dedup by message hash before verification. Mirrors canonical
+	// XDPoSChain/eth/handler.go:handleVote (F-2026-19460).
+	h := vote.Hash()
+	if b.knownVotes.Contains(h) {
+		log.Trace("Discarded vote, already known", "hash", h, "peer", peer)
+		return nil
+	}
+	b.knownVotes.Add(h, struct{}{})
+
 	verified, err := b.engine.VerifyVoteMessage(b.chain, vote)
 	if err != nil {
 		log.Error("Verify BFT Vote", "error", err)
@@ -144,12 +192,10 @@ func (b *Bfter) Vote(peer string, vote *types.Vote) error {
 		return nil
 	}
 
-	// FIX B (A.97-M.D): forward verified vote to the broadcast channel.
-	// Use a goroutine-wrapped blocking send (mirrors engine_v2.broadcastToBftChannel
-	// and XDPoSChain/eth/bft/bft_handler.go:97). The non-blocking select+default
-	// silently dropped inbound votes when the loop consumer was momentarily busy,
-	// causing "collected vote count=1" to never advance past 1/3 — QC never formed.
-	go func() { b.broadcastCh <- vote }()
+	// Enqueue for broadcast via a quit-aware goroutine. This keeps the eth
+	// handler goroutine non-blocking while ensuring the goroutine exits after
+	// Stop (F-2026-19460). Mirrors canonical enqueueForBroadcast pattern.
+	go b.enqueueForBroadcast(vote)
 	if err := b.engine.VoteHandler(b.chain, vote); err != nil {
 		log.Debug("handle BFT Vote", "error", err)
 		return err
@@ -174,6 +220,14 @@ func (b *Bfter) Timeout(peer string, timeout *types.Timeout) error {
 		}
 	}
 
+	// Dedup by message hash before verification (F-2026-19460).
+	h := timeout.Hash()
+	if b.knownTimeouts.Contains(h) {
+		log.Trace("Discarded timeout, already known", "hash", h, "peer", peer)
+		return nil
+	}
+	b.knownTimeouts.Add(h, struct{}{})
+
 	verified, err := b.engine.VerifyTimeoutMessage(b.chain, timeout)
 	if err != nil {
 		log.Error("Verify BFT Timeout", "timeoutRound", timeout.Round, "timeoutGapNum", gapNum, "error", err)
@@ -183,8 +237,8 @@ func (b *Bfter) Timeout(peer string, timeout *types.Timeout) error {
 		return nil
 	}
 
-	// FIX B: goroutine-wrapped blocking send; see Vote() for reasoning.
-	go func() { b.broadcastCh <- timeout }()
+	// Quit-aware enqueue; see Vote() (F-2026-19460).
+	go b.enqueueForBroadcast(timeout)
 	if err := b.engine.TimeoutHandler(b.chain, timeout); err != nil {
 		log.Debug("handle BFT Timeout", "error", err)
 		return err
@@ -208,6 +262,14 @@ func (b *Bfter) SyncInfo(peer string, syncInfo *types.SyncInfo) error {
 		return nil
 	}
 
+	// Dedup by message hash before verification (F-2026-19460).
+	h := syncInfo.Hash()
+	if b.knownSyncInfos.Contains(h) {
+		log.Trace("Discarded syncInfo, already known", "hash", h, "peer", peer)
+		return nil
+	}
+	b.knownSyncInfos.Add(h, struct{}{})
+
 	verified, err := b.engine.VerifySyncInfoMessage(b.chain, syncInfo)
 	if err != nil {
 		log.Error("Verify BFT SyncInfo", "error", err)
@@ -217,8 +279,8 @@ func (b *Bfter) SyncInfo(peer string, syncInfo *types.SyncInfo) error {
 		return nil
 	}
 
-	// FIX B: goroutine-wrapped blocking send; see Vote() for reasoning.
-	go func() { b.broadcastCh <- syncInfo }()
+	// Quit-aware enqueue; see Vote() (F-2026-19460).
+	go b.enqueueForBroadcast(syncInfo)
 	if err := b.engine.SyncInfoHandler(b.chain, syncInfo); err != nil {
 		log.Debug("handle BFT SyncInfo", "error", err)
 		return err
