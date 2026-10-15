@@ -291,6 +291,22 @@ func (x *XDPoS_v2) verifyHeader(chain consensus.ChainReader, header *types.Heade
 			}
 		}
 
+		// F-2026-19815: Under fullVerify, warn when the stored order of
+		// header.Validators differs from the locally-computed calcMasternodes
+		// order. The set equality above already passed; an order mismatch
+		// means leaderIndex = round % epoch % len will differ for the rest of
+		// this epoch. Diagnostic only — no blocks are rejected.
+		// Gate before promoting to a hard rejection: replay-parity over
+		// mainnet V2 epoch switches (80,370,000 → tip) must produce 0 WARNs.
+		// Canonical XDPoSChain v2.9.3-testnet also uses sorted comparison (no
+		// order check), so this is an improvement over canonical.
+		if fullVerify && !utils.ValidatorsOrderMatches(masterNodes, validatorsAddress) {
+			log.Warn("[verifyHeader F-2026-19815] epoch-switch header.Validators order differs from calcMasternodes; "+
+				"leaderIndex rotation for remaining epoch blocks may shift",
+				"block", header.Number,
+				"hash", header.Hash().Hex()[:16])
+		}
+
 		penaltiesAddress := contracts.ExtractAddressFromBytes(header.Penalties)
 		if !utils.CompareSignersLists(localPenalties, penaltiesAddress) {
 			// Same bulk-sync tolerance reasoning as the validators check

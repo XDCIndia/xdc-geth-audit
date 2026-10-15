@@ -80,6 +80,32 @@ func CompareSignersLists(list1 []common.Address, list2 []common.Address) bool {
 	return reflect.DeepEqual(l1, l2)
 }
 
+// ValidatorsOrderMatches returns true when expected and actual contain the same
+// addresses in the same order. Unlike CompareSignersLists (which sorts both
+// sides), this is a strict positional check.
+//
+// Use it under fullVerify at V2 epoch-switch blocks to detect a proposer that
+// stored header.Validators in a non-canonical order. A reordered list shifts
+// leaderIndex = round % epoch % len for all subsequent blocks in the epoch
+// (F-2026-19815). The sorted set-equality check (CompareSignersLists) must
+// pass first; call this only when the sets are known equal.
+//
+// Canonical XDPoSChain v2.9.3-testnet uses the same sorted CompareSignersLists
+// at epoch switch (no ordered check). This function is diagnostic: callers log
+// a WARN but do not reject blocks. Gate before promoting to rejection: replay-
+// parity over mainnet V2 epoch switches (80,370,000 → tip) must fire 0 WARNs.
+func ValidatorsOrderMatches(expected, actual []common.Address) bool {
+	if len(expected) != len(actual) {
+		return false
+	}
+	for i := range expected {
+		if expected[i] != actual[i] {
+			return false
+		}
+	}
+	return true
+}
+
 // Decode extra fields for consensus version >= 2 (XDPoS 2.0 and future versions)
 func DecodeBytesExtraFields(b []byte, val interface{}) error {
 	if len(b) == 0 {
