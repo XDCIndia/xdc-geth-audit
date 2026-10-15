@@ -276,14 +276,25 @@ func (x *XDPoS_v2) verifyVotes(chain consensus.ChainReader, votes map[common.Has
 
 // onVotePoolThresholdReached generates a QC when enough votes are collected
 func (x *XDPoS_v2) onVotePoolThresholdReached(chain consensus.ChainReader, pooledVotes map[common.Hash]utils.PoolObj, currentVoteMsg utils.PoolObj, header *types.Header) error {
-	// Collect valid signatures
-	var validSignatures []types.Signature
+	// Collect valid signatures, deduped by recovered signer address.
+	// The pool keys entries by message hash (which includes signature bytes), so
+	// one signer can produce multiple pool entries with distinct nonces. Only one
+	// signature per unique signer may count toward the threshold (F-2026-19525).
 	emptySigner := common.Address{}
+	seenSigners := make(map[common.Address]struct{})
+	var validSignatures []types.Signature
 
 	for _, vote := range pooledVotes {
-		if vote.GetSigner() != emptySigner {
-			validSignatures = append(validSignatures, vote.(*types.Vote).Signature)
+		signer := vote.GetSigner()
+		if signer == emptySigner {
+			continue
 		}
+		if _, seen := seenSigners[signer]; seen {
+			log.Warn("[onVotePoolThresholdReached] Duplicate signer in pool, skipping", "signer", signer)
+			continue
+		}
+		seenSigners[signer] = struct{}{}
+		validSignatures = append(validSignatures, vote.(*types.Vote).Signature)
 	}
 
 	// Get epoch info
