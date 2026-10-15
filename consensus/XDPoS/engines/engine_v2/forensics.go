@@ -246,11 +246,19 @@ func (f *Forensics) checkQCsOnTheSameChain(chain consensus.ChainReader, highestC
 	proposedBlockInfo := higherBlockNumQCs[0].ProposedBlockInfo
 	for i := 0; i < int((big.NewInt(0).Sub(higherBlockNumQCs[0].ProposedBlockInfo.Number, lowerBlockNumQCs[0].ProposedBlockInfo.Number)).Int64()); i++ {
 		parentHeader := chain.GetHeaderByHash(proposedBlockInfo.Hash)
+		if parentHeader == nil {
+			log.Error("[checkQCsOnTheSameChain] Header not found", "hash", proposedBlockInfo.Hash)
+			return false, fmt.Errorf("header not found: %s", proposedBlockInfo.Hash.Hex())
+		}
 		var decodedExtraField types.ExtraFields_v2
 		err := utils.DecodeBytesExtraFields(parentHeader.Extra, &decodedExtraField)
 		if err != nil {
 			log.Error("[checkQCsOnTheSameChain] Fail to decode extra when checking the two QCs set on the same chain", "err", err)
 			return false, err
+		}
+		if decodedExtraField.QuorumCert == nil {
+			log.Error("[checkQCsOnTheSameChain] nil QuorumCert in decoded extra", "blockNum", parentHeader.Number)
+			return false, errors.New("nil QuorumCert in decoded extra")
 		}
 		proposedBlockInfo = decodedExtraField.QuorumCert.ProposedBlockInfo
 	}
@@ -312,11 +320,19 @@ func (f *Forensics) findAncestorQcThroughRound(chain consensus.ChainReader, high
 	ancestorQC := higherRoundQCs[0]
 	for ancestorQC.ProposedBlockInfo.Round >= lowerRoundQCs[NUM_OF_FORENSICS_QC-1].ProposedBlockInfo.Round {
 		proposedBlock := chain.GetHeaderByHash(ancestorQC.ProposedBlockInfo.Hash)
+		if proposedBlock == nil {
+			log.Error("[findAncestorQcThroughRound] Header not found", "hash", ancestorQC.ProposedBlockInfo.Hash)
+			return ancestorQC, lowerRoundQCs, higherRoundQCs, fmt.Errorf("header not found: %s", ancestorQC.ProposedBlockInfo.Hash.Hex())
+		}
 		var decodedExtraField types.ExtraFields_v2
 		err := utils.DecodeBytesExtraFields(proposedBlock.Extra, &decodedExtraField)
 		if err != nil {
 			log.Error("[findAncestorQcThroughRound] Error while trying to decode extra field", "ProposedBlockInfo.Hash", ancestorQC.ProposedBlockInfo.Hash)
 			return ancestorQC, lowerRoundQCs, higherRoundQCs, err
+		}
+		if decodedExtraField.QuorumCert == nil {
+			log.Error("[findAncestorQcThroughRound] nil QuorumCert in decoded extra", "hash", ancestorQC.ProposedBlockInfo.Hash)
+			return ancestorQC, lowerRoundQCs, higherRoundQCs, errors.New("nil QuorumCert in decoded extra")
 		}
 		// Found the ancestor QC
 		if decodedExtraField.QuorumCert.ProposedBlockInfo.Round < lowerRoundQCs[NUM_OF_FORENSICS_QC-1].ProposedBlockInfo.Round {
@@ -358,8 +374,16 @@ func (f *Forensics) FindAncestorBlockHash(chain consensus.ChainReader, firstBloc
 
 	// Now, they are on the same starting line, we try find the common ancestor
 	for lowerBlockNumHash != higherBlockNumberHash {
-		lowerBlockNumHash = chain.GetHeaderByHash(lowerBlockNumHash).ParentHash
-		higherBlockNumberHash = chain.GetHeaderByHash(higherBlockNumberHash).ParentHash
+		lh := chain.GetHeaderByHash(lowerBlockNumHash)
+		if lh == nil {
+			return common.Hash{}, lowerBlockNumToAncestorHashPath, higherBlockToAncestorNumHashPath, fmt.Errorf("unable to find parent block of hash %v", lowerBlockNumHash)
+		}
+		hh := chain.GetHeaderByHash(higherBlockNumberHash)
+		if hh == nil {
+			return common.Hash{}, lowerBlockNumToAncestorHashPath, higherBlockToAncestorNumHashPath, fmt.Errorf("unable to find parent block of hash %v", higherBlockNumberHash)
+		}
+		lowerBlockNumHash = lh.ParentHash
+		higherBlockNumberHash = hh.ParentHash
 		// Append the path
 		lowerBlockNumToAncestorHashPath = append(lowerBlockNumToAncestorHashPath, lowerBlockNumHash.Hex())
 		higherBlockToAncestorNumHashPath = append(higherBlockToAncestorNumHashPath, higherBlockNumberHash.Hex())
@@ -475,6 +499,10 @@ func (f *Forensics) isExtendingFromAncestor(blockChainReader consensus.ChainRead
 
 func (f *Forensics) isVoteBlamed(chain consensus.ChainReader, highestCommittedQCs []types.QuorumCert, incomingVote *types.Vote) (bool, *types.QuorumCert, error) {
 	proposedBlock := chain.GetHeaderByHash(incomingVote.ProposedBlockInfo.Hash)
+	if proposedBlock == nil {
+		log.Error("[isVoteBlamed] Header not found", "hash", incomingVote.ProposedBlockInfo.Hash)
+		return false, nil, fmt.Errorf("header not found: %s", incomingVote.ProposedBlockInfo.Hash.Hex())
+	}
 	var decodedExtraField types.ExtraFields_v2
 	err := utils.DecodeBytesExtraFields(proposedBlock.Extra, &decodedExtraField)
 	if err != nil {

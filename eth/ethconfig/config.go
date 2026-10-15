@@ -103,13 +103,22 @@ type Config struct {
 	FastSyncPivotHash   common.Hash `toml:",omitempty"`
 	FastSyncPivotRoot   common.Hash `toml:",omitempty"`
 
-	// NoAutoPivot disables the A.96 automatic pivot selection from
-	// TrustedSyncCheckpoints (refs #892). When set, the fast-sync path falls
-	// through to the dynamic-pivot path even on chains that carry checkpoints
-	// (Apothem, XDC mainnet). Primarily useful for testing the dynamic-pivot
-	// path on public chains and for chains with no TrustedSyncCheckpoints.
-	// CLI: --no-auto-pivot. A.97 (refs #894).
+	// NoAutoPivot is retained for backward compatibility but is now a no-op:
+	// auto-pin from TrustedSyncCheckpoints is disabled by default (F-2026-19471).
+	// Use AutoCheckpointPivot to opt in.
+	// Deprecated: superseded by AutoCheckpointPivot. CLI: --no-auto-pivot.
 	NoAutoPivot bool `toml:",omitempty"`
+
+	// AutoCheckpointPivot enables A.96 automatic pivot selection from the
+	// compiled TrustedSyncCheckpoints when running --syncmode fast without
+	// explicit --fastsyncpivot{number,hash,root} flags (F-2026-19471).
+	//
+	// The trust root for auto-pin is the binary, not a QC-verified chain
+	// epoch-switch header (canonical XDPoSChain has no compiled checkpoints).
+	// Disabled by default; use explicit --fastsyncpivot flags for a QC-backed
+	// anchor, or supply --auto-checkpoint-pivot to opt in to A.96.
+	// CLI: --auto-checkpoint-pivot.
+	AutoCheckpointPivot bool `toml:",omitempty"`
 
 	// HistoryMode configures chain history retention.
 	HistoryMode history.HistoryPolicy

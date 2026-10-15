@@ -17,6 +17,7 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/consensus"
 	engine_v2 "github.com/ethereum/go-ethereum/consensus/XDPoS/engines/engine_v2"
+	"github.com/ethereum/go-ethereum/consensus/XDPoS/utils"
 	"github.com/ethereum/go-ethereum/core/state"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/params"
@@ -121,6 +122,21 @@ func (f *fakeEngineV2) ProposedBlockHandler(chain consensus.ChainReader, header 
 	return f.returnErr
 }
 func (f *fakeEngineV2) ReinitBFT(_ consensus.ChainReader, _ *types.Header) error { return nil }
+func (f *fakeEngineV2) GetLatestCommittedBlockInfo() *types.BlockInfo            { return nil }
+
+// Stubs for the new EngineV2Iface methods added by issue #1482 fix.
+func (f *fakeEngineV2) GetCurrentEpochSwitchBlock(_ consensus.ChainReader, _ *big.Int) (uint64, uint64, error) {
+	return 0, 0, nil
+}
+func (f *fakeEngineV2) GetEpochSwitchInfoBetween(_ consensus.ChainReader, _, _ *types.Header) ([]*types.EpochSwitchInfo, error) {
+	return nil, nil
+}
+func (f *fakeEngineV2) GetBlockByEpochNumber(_ consensus.ChainReader, _ uint64) (*types.BlockInfo, error) {
+	return nil, nil
+}
+func (f *fakeEngineV2) CalculateMissingRounds(_ consensus.ChainReader, _ *types.Header) (*utils.PublicApiMissedRoundsMetadata, error) {
+	return nil, nil
+}
 
 // buildMinimalXDPoS creates an XDPoS wrapper with a fakeEngineV2 wired and a
 // V2 switch block of 0, so any header with Number > 0 is treated as a V2 block

@@ -144,6 +144,9 @@ func (x *XDPoS_v2) verifyHeader(chain consensus.ChainReader, header *types.Heade
 	}
 
 	var masterNodes []common.Address
+	// localList: masterNodes was computed locally by calcMasternodes and matched
+	// header.Validators, i.e. it does not come from a header (#1413).
+	localList := false
 	isEpochSwitch, _, err := x.IsEpochSwitch(header)
 	if err != nil {
 		log.Error("[verifyHeader] error when checking if header is epoch switch header", "Hash", header.Hash(), "Number", header.Number, "Error", err)
@@ -162,23 +165,15 @@ func (x *XDPoS_v2) verifyHeader(chain consensus.ChainReader, header *types.Heade
 
 		localMasterNodes, localPenalties, _, err := x.calcMasternodes(chain, header.Number, header.ParentHash, round, parents)
 		masterNodes = localMasterNodes
+		localList = err == nil
 		if err != nil {
-			// A.94-aftermath relaxation: when getSnapshot returns ErrV2SnapshotMissing the
-			// local node literally cannot recompute the canonical masternode set — the gap
-			// block was imported under checkpoint-sync-no-state so UpdateMasternodesFromHeader
-			// never ran. Engage the header-anchored fallback regardless of fullVerify; security
-			// is preserved by the QC-recovery earlier in this same verifyHeader call (2/3+ of
-			// the previous epoch's signers proved chain extension) plus the CompareSignersLists
-			// gate against header.Validators below.
-			snapshotMissing := errors.Is(err, utils.ErrV2SnapshotMissing)
-			// Match v2.6.8 strict semantics during normal operation: any calcMasternodes failure
-			// outside of bulk sync (fullVerify=true) is a real consensus bug — fail closed.
-			if fullVerify && !snapshotMissing {
-				log.Error("[verifyHeader] calcMasternodes failed during normal operation", "Number", header.Number, "Hash", header.Hash(), "err", err)
+			// Canonical XDPoSChain (verifyHeader.go:137-143): under fullVerify any
+			// calcMasternodes failure is fatal, including a missing gap snapshot
+			// (#1415). The fallback below derives the list from the header being
+			// verified, so it is only safe when the caller trusts the header (!fullVerify).
+			if fullVerify {
+				log.Error("[verifyHeader] calcMasternodes failed under fullVerify", "Number", header.Number, "Hash", header.Hash(), "err", err)
 				return err
-			}
-			if fullVerify && snapshotMissing {
-				log.Warn("[verifyHeader] V2 snapshot missing under fullVerify — using header-anchored fallback (A.94 checkpoint-sync-no-state aftermath)", "Number", header.Number, "Hash", header.Hash(), "err", err)
 			}
 			// Bulk-sync fallback: snapshots may not yet be in the DB on a fresh node, so fall
 			// back to GetMasternodesWithParents. The CompareSignersLists checks below still run
@@ -242,43 +237,20 @@ func (x *XDPoS_v2) verifyHeader(chain consensus.ChainReader, header *types.Heade
 			// HookPenalty has full state and should produce the exact
 			// match. The relaxation is bulk-sync-only.
 			//
-			// A.80 exception: when HookPenalty is unwired (nil), the local
-			// calcMasternodes cannot apply penalty removal and takes a
-			// naive first-N truncation of the full candidate pool. This
-			// produces a different set than canonical at epoch-switch blocks
-			// where some top-N candidates are penalised. Treat nil-HookPenalty
-			// the same as bulk-sync: accept header.Validators as authoritative.
-			// Security hold: block's QuorumCert (2/3+ majority) already
-			// validates the proposer came from the correct active set.
-			// A.81 wires HookPenalty in eth/hooks/engine_v2_hooks.go. This
-			// exemption remains for bulk-sync safety (parents not yet in DB).
-			// A.94-aftermath (snapshot missing) + A.99.2 (synthetic-epoch superset):
-			// Two distinct fullVerify=true relaxations sharing the same security model:
-			//   (a) snapshotMissing — A.94 checkpoint-sync-no-state skipped Process() at
-			//       the gap block, so UpdateMasternodesFromHeader never ran. Local masternode
-			//       computation is impossible; trust header.Validators (QC-recovery above
-			//       proves the signing set).
-			//   (b) isSupersetCase — header.Validators is a strict superset of our locally
-			//       computed set due to the synthetic-epoch active-masternodes-len bug
-			//       (refs #894). Block's QC certifies it.
-			// Both fall through to the bulk-sync fallback that trusts header.Validators.
-			snapshotMissing := err != nil && errors.Is(err, utils.ErrV2SnapshotMissing)
-			isSupersetCase := len(masterNodes) < len(validatorsAddress) && isMasternodeSubset(masterNodes, validatorsAddress)
-			if !fullVerify || x.HookPenalty == nil || snapshotMissing || isSupersetCase {
-				if isSupersetCase && fullVerify {
-					log.Warn("[verifyHeader] fullVerify: synthetic-epoch superset tolerated (trusting header.Validators)",
-						"block", header.Number.Uint64(),
-						"localMnCount", len(masterNodes),
-						"headerValCount", len(validatorsAddress))
-				} else {
-					log.Warn("[verifyHeader] masternode set mismatch tolerated (trusting header.Validators)",
-						"block", header.Number.Uint64(),
-						"mnCount", len(masterNodes),
-						"valCount", len(validatorsAddress),
-						"hookPenaltyNil", x.HookPenalty == nil,
-						"snapshotMissing", snapshotMissing)
-				}
+			// #1404/#1415: under fullVerify the compare is exact, as in canonical
+			// XDPoSChain (verifyHeader.go:145-155). The former fullVerify tolerances
+			// (nil HookPenalty, missing snapshot, header list a superset of ours) let
+			// the header under verification choose the list its own signer and leader
+			// are then checked against.
+			if !fullVerify {
+				log.Warn("[verifyHeader] masternode set mismatch tolerated (trusting header.Validators)",
+					"block", header.Number.Uint64(),
+					"mnCount", len(masterNodes),
+					"valCount", len(validatorsAddress),
+					"hookPenaltyNil", x.HookPenalty == nil,
+					"snapshotMissing", err != nil && errors.Is(err, utils.ErrV2SnapshotMissing))
 				masterNodes = validatorsAddress
+				localList = false
 				localPenalties = contracts.ExtractAddressFromBytes(header.Penalties)
 			} else {
 				log.Warn("[verifyHeader DIAG]",
@@ -319,20 +291,34 @@ func (x *XDPoS_v2) verifyHeader(chain consensus.ChainReader, header *types.Heade
 			}
 		}
 
+		// F-2026-19815: Under fullVerify, warn when the stored order of
+		// header.Validators differs from the locally-computed calcMasternodes
+		// order. The set equality above already passed; an order mismatch
+		// means leaderIndex = round % epoch % len will differ for the rest of
+		// this epoch. Diagnostic only — no blocks are rejected.
+		// Gate before promoting to a hard rejection: replay-parity over
+		// mainnet V2 epoch switches (80,370,000 → tip) must produce 0 WARNs.
+		// Canonical XDPoSChain v2.9.3-testnet also uses sorted comparison (no
+		// order check), so this is an improvement over canonical.
+		if fullVerify && !utils.ValidatorsOrderMatches(masterNodes, validatorsAddress) {
+			log.Warn("[verifyHeader F-2026-19815] epoch-switch header.Validators order differs from calcMasternodes; "+
+				"leaderIndex rotation for remaining epoch blocks may shift",
+				"block", header.Number,
+				"hash", header.Hash().Hex()[:16])
+		}
+
 		penaltiesAddress := contracts.ExtractAddressFromBytes(header.Penalties)
 		if !utils.CompareSignersLists(localPenalties, penaltiesAddress) {
 			// Same bulk-sync tolerance reasoning as the validators check
 			// above: penalties also rotate as candidates come back from
 			// penalty into the active set. Accept header.Penalties in bulk
-			// sync; hard-fail in fullVerify mode.
-			// A.94-aftermath: snapshot missing also tolerates — same security model.
-			snapshotMissingPen := err != nil && errors.Is(err, utils.ErrV2SnapshotMissing)
-			if !fullVerify || snapshotMissingPen {
+			// sync; hard-fail in fullVerify mode (canonical verifyHeader.go:157-165).
+			if !fullVerify {
 				log.Warn("[verifyHeader] bulk-sync penalty rotation tolerated (trusting header.Penalties)",
 					"block", header.Number.Uint64(),
 					"localCount", len(localPenalties),
 					"headerCount", len(penaltiesAddress),
-					"snapshotMissing", snapshotMissingPen)
+					"snapshotMissing", err != nil && errors.Is(err, utils.ErrV2SnapshotMissing))
 				localPenalties = penaltiesAddress
 			} else {
 				for i, addr := range localPenalties {
@@ -385,7 +371,9 @@ func (x *XDPoS_v2) verifyHeader(chain consensus.ChainReader, header *types.Heade
 		// gap-N and the next epoch switch. The pivot hash chain already establishes
 		// canonicality; the proposer's signature was verified above. Hard-fail only in
 		// fullVerify (steady-state tip processing) where HookPenalty has full state.
-		if !fullVerify {
+		// #1413: the tolerance only covers lists taken from headers; a list computed
+		// locally (localList) is checked as in canonical (verifyHeader.go:199-204).
+		if !fullVerify && !localList {
 			log.Warn("[verifyHeader] A.87 leader mismatch tolerated during bulk sync",
 				"block", header.Number, "curIndex", curIndex, "leaderIndex", leaderIndex,
 				"expected", masterNodes[leaderIndex], "actual", validatorAddress)
@@ -395,26 +383,11 @@ func (x *XDPoS_v2) verifyHeader(chain consensus.ChainReader, header *types.Heade
 		}
 	}
 
-	x.verifiedHeaders.Add(header.Hash(), struct{}{})
+	// #1413: only a full verification is worth remembering. The cache short-circuits
+	// every later call, so caching a header whose leader check was skipped would let a
+	// later fullVerify pass accept it unchecked (canonical verifyHeader.go:206-212).
+	if fullVerify {
+		x.verifiedHeaders.Add(header.Hash(), struct{}{})
+	}
 	return nil
-}
-
-// isMasternodeSubset returns true if every address in subset appears in the superset slice.
-// Used by the A.99.2 synthetic-epoch tolerance: a block minted with header.Validators being
-// a strict superset of our locally-computed masterNodes (due to the synthetic-epoch
-// active-masternodes-len bug) can be accepted when all our local masternodes are present.
-func isMasternodeSubset(subset []common.Address, superset []common.Address) bool {
-	if len(subset) == 0 {
-		return false
-	}
-	supersetMap := make(map[common.Address]struct{}, len(superset))
-	for _, addr := range superset {
-		supersetMap[addr] = struct{}{}
-	}
-	for _, addr := range subset {
-		if _, ok := supersetMap[addr]; !ok {
-			return false
-		}
-	}
-	return true
 }

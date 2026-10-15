@@ -77,8 +77,8 @@ func CalculatePenalties(
 
 // CreateDefaultHookPenalty creates a default penalty hook function
 // This calculates penalties based on block signing activity
-func (c *XDPoS) CreateDefaultHookPenalty() func(chain consensus.ChainHeaderReader, blockNumberEpoch uint64) ([]common.Address, error) {
-	return func(chain consensus.ChainHeaderReader, blockNumberEpoch uint64) ([]common.Address, error) {
+func (c *XDPoS) CreateDefaultHookPenalty() func(chain consensus.ChainHeaderReader, blockNumberEpoch uint64, parents []*types.Header) ([]common.Address, error) {
+	return func(chain consensus.ChainHeaderReader, blockNumberEpoch uint64, _ []*types.Header) ([]common.Address, error) {
 		epoch := c.config.Epoch
 		if blockNumberEpoch == 0 || epoch == 0 {
 			return []common.Address{}, nil
@@ -133,8 +133,8 @@ func (c *XDPoS) CreateDefaultHookPenalty() func(chain consensus.ChainHeaderReade
 
 // CreateDefaultHookPenaltyTIPSigning creates a penalty hook for TIP signing
 // This is an enhanced penalty calculation that includes signature validation
-func (c *XDPoS) CreateDefaultHookPenaltyTIPSigning() func(chain consensus.ChainHeaderReader, header *types.Header, candidates []common.Address) ([]common.Address, error) {
-	return func(chain consensus.ChainHeaderReader, header *types.Header, candidates []common.Address) ([]common.Address, error) {
+func (c *XDPoS) CreateDefaultHookPenaltyTIPSigning() func(chain consensus.ChainHeaderReader, header *types.Header, candidates []common.Address, parents []*types.Header) ([]common.Address, error) {
+	return func(chain consensus.ChainHeaderReader, header *types.Header, candidates []common.Address, _ []*types.Header) ([]common.Address, error) {
 		number := header.Number.Uint64()
 		epoch := c.config.Epoch
 

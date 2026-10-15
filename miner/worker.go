@@ -220,7 +220,10 @@ func (miner *Miner) generateWork(ctx context.Context, genParam *generateParams, 
 		Transactions: work.txs,
 		Withdrawals:  genParam.withdrawals,
 	}
-	if !miner.chainConfig.IsShanghai(work.header.Number, work.header.Time) {
+	if miner.chainConfig.IsXDC() {
+		// XDPoS rejects headers with a WithdrawalsHash (#1417).
+		body.Withdrawals = nil
+	} else if !miner.chainConfig.IsShanghai(work.header.Number, work.header.Time) {
 		if body.Withdrawals != nil {
 			return &newPayloadResult{err: errors.New("unexpected withdrawals before shanghai")}
 		}
@@ -240,7 +243,7 @@ func (miner *Miner) generateWork(ctx context.Context, genParam *generateParams, 
 	if err != nil {
 		return &newPayloadResult{err: err}
 	}
-	if requests != nil {
+	if requests != nil && !miner.chainConfig.IsXDC() {
 		reqHash := types.CalcRequestsHash(requests)
 		work.header.RequestsHash = &reqHash
 	}
@@ -338,8 +341,8 @@ func (miner *Miner) prepareWork(ctx context.Context, genParams *generateParams, 
 		log.Error("Failed to prepare header for sealing", "err", err)
 		return nil, err
 	}
-	// Apply EIP-4844, EIP-4788.
-	if miner.chainConfig.IsCancun(header.Number, header.Time) {
+	// Apply EIP-4844, EIP-4788. XDPoS headers never carry these fields (#1417).
+	if miner.chainConfig.IsCancun(header.Number, header.Time) && !miner.chainConfig.IsXDC() {
 		var excessBlobGas uint64
 		if miner.chainConfig.IsCancun(parent.Number, parent.Time) {
 			excessBlobGas = eip4844.CalcExcessBlobGas(miner.chainConfig, parent, timestamp)
@@ -349,7 +352,7 @@ func (miner *Miner) prepareWork(ctx context.Context, genParams *generateParams, 
 		header.ParentBeaconRoot = genParams.beaconRoot
 	}
 	// Apply EIP-7843.
-	if miner.chainConfig.IsAmsterdam(header.Number, header.Time) {
+	if miner.chainConfig.IsAmsterdam(header.Number, header.Time) && !miner.chainConfig.IsXDC() {
 		if genParams.slotNum == nil {
 			return nil, errors.New("no slot number set post-amsterdam")
 		}
@@ -456,8 +459,8 @@ func (miner *Miner) commitBlobTransaction(ctx context.Context, env *environment,
 // "invalid merkle root" (#952 / apothem 83,088,792). Specifically:
 //   - signing txs to BlockSignersBinary (0x89) after TIPSigning run through
 //     ApplySigningTransaction (zero-gas, no EVM), NOT the normal EVM path;
-//   - XDCx notifier txs to 0x92/0x93 in the TIPXDCXReceiver window run through
-//     ApplyEmptyTransaction;
+//   - XDCx txs to 0x91-0x94 in the TIPXDCXReceiver window run through
+//     ApplyEmptyTransaction (both via core.RouteTransaction);
 //   - all other txs route the TRC21 gas fee to env.coinbaseOwner.
 func (miner *Miner) applyTransaction(ctx context.Context, env *environment, tx *types.Transaction) (*types.Receipt, *bal.ConstructionBlockAccessList, error) {
 	var (
@@ -472,18 +475,18 @@ func (miner *Miner) applyTransaction(ctx context.Context, env *environment, tx *
 		receipt   *types.Receipt
 		txBAL     *bal.ConstructionBlockAccessList
 		err       error
-		to        = tx.To()
 	)
-	switch {
-	case to != nil && *to == common.BlockSignersBinary && config.IsTIPSigning(blockNumber):
-		receipt, err = core.ApplySigningTransaction(config, env.state, blockNumber, blockHash, tx, env.gasPool.Used())
-	case config.IsTIPXDCXReceiver(blockNumber) && to != nil &&
-		(*to == common.TradingStateAddrBinary || *to == common.XDCXLendingAddressBinary):
-		receipt, err = core.ApplyEmptyTransaction(config, env.state, blockNumber, blockHash, tx, env.gasPool.Used())
-	default:
-		var msg *core.Message
-		msg, err = core.TransactionToMessage(tx, types.MakeSigner(config, blockNumber, env.header.Time), env.header.BaseFee)
-		if err == nil {
+	// Recover the sender first and route through core.RouteTransaction, the
+	// same order and helper core.StateProcessor.Process uses.
+	var msg *core.Message
+	msg, err = core.TransactionToMessage(tx, types.MakeSigner(config, blockNumber, env.header.Time), env.header.BaseFee)
+	if err == nil {
+		switch core.RouteTransaction(config, blockNumber, tx) {
+		case core.TxRouteSign:
+			receipt, err = core.ApplySigningTransaction(config, env.state, blockNumber, blockHash, tx, env.gasPool.Used())
+		case core.TxRouteEmpty:
+			receipt, err = core.ApplyEmptyTransaction(config, env.state, blockNumber, blockHash, tx, env.gasPool.Used())
+		default:
 			tokenFee := env.trc21Fee != nil && core.ApplyTRC21TokenFee(config, msg, env.trc21Fee, tx, blockNumber)
 			receipt, txBAL, err = core.ApplyTransactionWithEVM(ctx, msg, env.gasPool, env.state, blockNumber, blockHash, env.header.Time, tx, env.evm, env.coinbaseOwner)
 			if err == nil && tokenFee {

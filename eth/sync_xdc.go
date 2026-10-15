@@ -2322,6 +2322,10 @@ func (s *xdcSyncer) fullSyncOnce() {
 			ch := make(chan *lookaheadResult, 1)
 			go func(outCh chan *lookaheadResult, lhPeer *eth.Peer, from uint64) {
 				hdrs := s.fetchHeaderBatchTimeout(lhPeer, from, xdcBatchSize, xdcBulkReqTimeout)
+				if len(hdrs) > 0 && hdrs[0].Number.Uint64() != from { // #1423: not the range we asked for
+					s.taintPeer(lhPeer)
+					hdrs = nil
+				}
 				outCh <- &lookaheadResult{peer: lhPeer, headers: hdrs}
 			}(ch, c, lhFrom)
 			lookaheadChs = append(lookaheadChs, ch)
@@ -2350,8 +2354,14 @@ func (s *xdcSyncer) fullSyncOnce() {
 		return
 	}
 
-	// Insert + execute range 0.
-	n, err := s.handler.chain.InsertChain(blocks)
+	// Insert + execute range 0. #1423: only if the batch extends our head;
+	// InsertChain would otherwise reorg onto any known parent. A batch that
+	// doesn't is handled like an unknown ancestor, so the fork-heal below
+	// (co-signed sibling adoption, then rollback) decides what to do.
+	n, err := 0, consensus.ErrUnknownAncestor
+	if blocks[0].ParentHash() == s.handler.chain.CurrentBlock().Hash() {
+		n, err = s.handler.chain.InsertChain(blocks)
+	}
 	if err != nil {
 		log.Warn("xdcSyncer: InsertChain failed",
 			"from", fromBlock, "attempted", len(blocks), "inserted", n, "err", err)
@@ -2364,12 +2374,14 @@ func (s *xdcSyncer) fullSyncOnce() {
 		// gated forever. Clear XdcBulkSyncMode here so the producer can seal the valid
 		// successor and unwedge the chain (e.g. apothem halted at 83,088,791 by an
 		// out-of-bound 420M gas limit above our 419,589,845 head — #952). NON-MAINNET
-		// only: mainnet must never relax on a validation error. Guard on fromBlock being
-		// at/just above head so a deep-history invalid block cannot trip it.
+		// only: mainnet must never relax on a validation error. Guard on the peer being
+		// at the tip: fromBlock is always head+1, so it cannot tell "at tip" from "far
+		// behind" (#1427). A short header batch can: the peer has nothing past it, so
+		// the invalid block really sits at the network tip.
 		if !errors.Is(err, consensus.ErrUnknownAncestor) &&
 			s.handler.chain.Config().ChainID != nil &&
 			s.handler.chain.Config().ChainID.Uint64() != 50 {
-			if cur := s.handler.chain.CurrentBlock(); cur != nil && fromBlock <= cur.Number.Uint64()+1 {
+			if cur := s.handler.chain.CurrentBlock(); cur != nil && len(res.headers) < xdpos2MaxHeaderFetch {
 				if core.XdcBulkSyncMode.Load() {
 					log.Warn("xdcSyncer: #952 next block invalid at tip — clearing XdcBulkSyncMode so miner can seal the valid successor",
 						"from", fromBlock, "head", cur.Number.Uint64(), "err", err)
@@ -2441,7 +2453,11 @@ func (s *xdcSyncer) fullSyncOnce() {
 			return
 		}
 		lhFrom := lhRes.headers[0].Number.Uint64()
-		lhN, lhErr := s.handler.chain.InsertChain(lhBlocks)
+		// #1423: same head-extension check as range 0.
+		lhN, lhErr := 0, consensus.ErrUnknownAncestor
+		if lhBlocks[0].ParentHash() == s.handler.chain.CurrentBlock().Hash() {
+			lhN, lhErr = s.handler.chain.InsertChain(lhBlocks)
+		}
 		if lhErr != nil {
 			log.Warn("xdcSyncer: A.77 lookahead InsertChain failed",
 				"from", lhFrom, "attempted", len(lhBlocks), "inserted", lhN, "err", lhErr)
@@ -3665,6 +3681,15 @@ func (s *xdcSyncer) fetchHeadersParallel(candidates []*eth.Peer, fromBlock uint6
 			defer wg.Done()
 			hdrs := s.fetchHeaderBatchTimeout(p, fromBlock, xdcBatchSize, xdcBulkReqTimeout)
 			if len(hdrs) == 0 {
+				return
+			}
+			// #1423: XDPOS2 replies carry no request id. A batch that does not
+			// start at fromBlock is not an answer to this request: drop it so
+			// another peer can win, and taint the sender.
+			if hdrs[0].Number.Uint64() != fromBlock {
+				log.Debug("xdcSyncer: header batch does not start at requested block",
+					"peer", p.ID(), "want", fromBlock, "got", hdrs[0].Number)
+				s.taintPeer(p)
 				return
 			}
 			select {

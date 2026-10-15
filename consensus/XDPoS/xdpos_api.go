@@ -105,6 +105,47 @@ func (c *XDPoS) GetValidator(creator common.Address, chain consensus.ChainHeader
 	return m[creator], nil
 }
 
+// getValidatorWithParents is GetValidator for header verification. The
+// checkpoint is this block's own ancestor, so it is resolved along the block's
+// ancestry rather than by canonical number: first among the batch's parents (a
+// batch that crosses a checkpoint holds it before it is written), then by
+// walking parent hashes through stored headers (a sidechain re-import after a
+// state rewind holds it stored but not canonical). Only if neither finds it
+// does it fall back to GetValidator. Canonical XDPoSChain gets the same result
+// by verifying batches through a reader that serves the batch's headers
+// (consensus/XDPoS/verify_chain_reader.go, core/blockchain.go:2583-2585).
+func (c *XDPoS) getValidatorWithParents(creator common.Address, chain consensus.ChainHeaderReader, header *types.Header, parents []*types.Header) (common.Address, error) {
+	epoch := c.config.Epoch
+	no := header.Number.Uint64()
+	cpNo := no - no%epoch
+	if cpNo == 0 || no%epoch == 0 {
+		return c.GetValidator(creator, chain, header)
+	}
+	inBatch := make(map[common.Hash]*types.Header, len(parents))
+	for _, p := range parents {
+		if p != nil {
+			inBatch[p.Hash()] = p
+		}
+	}
+	cur := header
+	for cur.Number.Uint64() > cpNo {
+		n := cur.Number.Uint64() - 1
+		next, ok := inBatch[cur.ParentHash]
+		if !ok || next.Number.Uint64() != n {
+			next = chain.GetHeader(cur.ParentHash, n)
+		}
+		if next == nil {
+			return c.GetValidator(creator, chain, header)
+		}
+		cur = next
+	}
+	m, err := getM1M2FromCheckpointHeader(cur, header, chain.Config())
+	if err != nil {
+		return common.Address{}, err
+	}
+	return m[creator], nil
+}
+
 // IsAuthorisedAddress checks if an address is authorised to sign blocks.
 func (c *XDPoS) IsAuthorisedAddress(chain consensus.ChainHeaderReader, header *types.Header, address common.Address) bool {
 	masternodes := c.GetMasternodes(chain, header)
@@ -137,7 +178,12 @@ func (c *XDPoS) IsEpochSwitch(header *types.Header) (bool, uint64, error) {
 }
 
 // GetCurrentEpochSwitchBlock returns the epoch switch block for the epoch containing blockNum.
-func (c *XDPoS) GetCurrentEpochSwitchBlock(chain consensus.ChainHeaderReader, blockNum *big.Int) (uint64, uint64, error) {
+// For V2 blocks, delegates to the V2 engine for round-based epoch calculation (issue #1482).
+func (c *XDPoS) GetCurrentEpochSwitchBlock(chain consensus.ChainReader, blockNum *big.Int) (uint64, uint64, error) {
+	if c.IsV2Block(&types.Header{Number: blockNum}) && c.EngineV2 != nil {
+		return c.EngineV2.GetCurrentEpochSwitchBlock(chain, blockNum)
+	}
+	// V1: block-number arithmetic is correct (epoch switch is always at a multiple of Epoch).
 	num := blockNum.Uint64()
 	epochNum := num / c.config.Epoch
 	switchBlock := epochNum * c.config.Epoch

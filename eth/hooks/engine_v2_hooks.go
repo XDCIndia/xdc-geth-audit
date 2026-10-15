@@ -35,6 +35,17 @@ const (
 	ObserverNodeBeneficiary
 )
 
+// resolvePostUpgradeLimitPenaltyEpoch returns the number of consecutive penalty
+// epochs a signer must accumulate before the post-TIPUpgradePenalty comeback
+// check can clear them.  Falls back to 1 when the V2Config does not override it.
+// Canonical reference: XDPoSChain v2.9.2-testnet eth/hooks/engine_v2_hooks.go:45-53.
+func resolvePostUpgradeLimitPenaltyEpoch(cfg *params.V2Config) int {
+	if cfg != nil && cfg.LimitPenaltyEpoch > 0 {
+		return cfg.LimitPenaltyEpoch
+	}
+	return 1
+}
+
 // AttachConsensusV2Hooks attaches V2 consensus hooks to XDPoS engine.
 //
 // Wires HookPenalty and HookReward on adaptor.EngineV2, matching the shape of
@@ -423,6 +434,75 @@ func AttachConsensusV2Hooks(adaptor *XDPoS.XDPoS, bc *core.BlockChain, chainConf
 						if !already {
 							penalties = append(penalties, comeback)
 						}
+					}
+				}
+			} else {
+				// Post-TIPUpgradePenalty comeback: a signer must appear in the
+				// Penalties list for LimitPenaltyEpoch consecutive epochs AND have
+				// submitted at least MinimumSigningTx signing txs in the current
+				// epoch before it is released.  Without this branch the penalised
+				// signer was cleared after a single epoch, producing a shorter
+				// Penalties list than canonical and causing ErrPenaltiesNotLegit on
+				// the next epoch-switch header.
+				// Canonical: XDPoSChain v2.9.2-testnet eth/hooks/engine_v2_hooks.go:210-272.
+				limitPenaltyEpoch := resolvePostUpgradeLimitPenaltyEpoch(currentConfig)
+				comebackHeight := uint64(limitPenaltyEpoch)*chainConfig.XDPoS.Epoch + chainConfig.XDPoS.V2.SwitchBlock.Uint64()
+				if number.Uint64() > comebackHeight {
+					// penParoleeMap counts consecutive penalty epochs for each signer.
+					penParoleeMap := map[common.Address]int{}
+					// lastPenalty is the most-recent (i==0) epoch's penalty list.
+					lastPenalty := []common.Address{}
+					for i := 0; i < limitPenaltyEpoch; i++ {
+						pens := adaptor.EngineV2.GetPreviousPenaltyByHash(chain, currentHash, i)
+						for _, p := range pens {
+							penParoleeMap[p]++
+						}
+						if i == 0 {
+							lastPenalty = pens
+						}
+					}
+					// Count signing txs per signer over the current epoch's blocks.
+					mapBlockHash := map[common.Hash]bool{}
+					txSignerMap := map[common.Address]int{}
+					startRange := int(chainConfig.XDPoS.Epoch) - 1
+					if startRange >= len(listBlockHash) {
+						startRange = len(listBlockHash) - 1
+					}
+					for i := startRange; i >= 0; i-- {
+						blockNumber := number.Uint64() - uint64(i) - 1
+						bhash := listBlockHash[i]
+						if blockNumber%uint64(common.MergeSignRange) == 0 {
+							mapBlockHash[bhash] = true
+						}
+						signingTxs, ok := adaptor.GetCachedSigningTxs(bhash)
+						if !ok {
+							blk := chain.GetBlock(bhash, blockNumber)
+							if blk != nil {
+								signingTxs = adaptor.CacheSigner(bhash, blk.Transactions())
+							}
+						}
+						signer := types.MakeSigner(chainConfig, big.NewInt(int64(blockNumber)), 0)
+						for _, tx := range signingTxs {
+							if len(tx.Data()) < 36 {
+								continue
+							}
+							blkHash := common.BytesToHash(tx.Data()[len(tx.Data())-32:])
+							from, err := types.Sender(signer, tx)
+							if err != nil {
+								continue
+							}
+							if mapBlockHash[blkHash] {
+								txSignerMap[from]++
+							}
+						}
+					}
+					// A signer in lastPenalty is released only if it has served
+					// limitPenaltyEpoch epochs AND submitted enough signing txs.
+					for _, p := range lastPenalty {
+						if penParoleeMap[p] == limitPenaltyEpoch && txSignerMap[p] >= currentConfig.MinimumSigningTx {
+							continue
+						}
+						penalties = append(penalties, p)
 					}
 				}
 			}

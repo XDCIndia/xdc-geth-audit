@@ -14,6 +14,7 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/consensus"
 	"github.com/ethereum/go-ethereum/consensus/XDPoS/utils"
+	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/log"
 )
@@ -121,6 +122,12 @@ func (x *XDPoS_v2) voteHandler(chain consensus.ChainReader, voteMsg *types.Vote)
 	numberOfVotes, pooledVotes := x.votePool.Add(voteMsg)
 	log.Debug("[voteHandler] collected vote", "count", numberOfVotes)
 
+	// Equivocation detection in goroutines — never blocks or alters acceptance (#1478).
+	if x.ForensicsProcessor != nil {
+		go x.ForensicsProcessor.DetectEquivocationInVotePool(voteMsg, x.votePool)
+		go x.ForensicsProcessor.ProcessVoteEquivocation(chain, x, voteMsg)
+	}
+
 	// Get epoch info
 	epochInfo, err := x.getEpochSwitchInfo(chain, nil, voteMsg.ProposedBlockInfo.Hash)
 	if err != nil {
@@ -220,7 +227,17 @@ func (x *XDPoS_v2) sendVote(chain consensus.ChainReader, blockInfo *types.BlockI
 	// Latch the voted round only once the vote is accepted and about to be
 	// broadcast — the one-vote-per-round equivocation guard applies to votes
 	// that can actually reach the network.
-	x.highestVotedRound = x.currentRound
+	//
+	// F-2026-19622 fix: latch blockInfo.Round (the round we voted for), NOT
+	// x.currentRound. If our vote was the last one needed to complete a QC,
+	// voteHandler already called processQC → setNewRound, advancing
+	// x.currentRound from R to R+1. Reading x.currentRound here would latch
+	// R+1, causing verifyVotingRule to refuse our vote in the very next round.
+	// Canonical XDPoSChain (v2.9.3-testnet vote.go:47) avoids this by latching
+	// before voteHandler; we latch the explicit voted round instead.
+	x.highestVotedRound = blockInfo.Round
+	// F-2026-19774: persist so a restart inside a round cannot produce a second vote.
+	rawdb.WriteBFTHighestVotedRound(x.db, x.highestVotedRound)
 
 	// Broadcast
 	x.broadcastToBftChannel(voteMsg)
@@ -270,14 +287,25 @@ func (x *XDPoS_v2) verifyVotes(chain consensus.ChainReader, votes map[common.Has
 
 // onVotePoolThresholdReached generates a QC when enough votes are collected
 func (x *XDPoS_v2) onVotePoolThresholdReached(chain consensus.ChainReader, pooledVotes map[common.Hash]utils.PoolObj, currentVoteMsg utils.PoolObj, header *types.Header) error {
-	// Collect valid signatures
-	var validSignatures []types.Signature
+	// Collect valid signatures, deduped by recovered signer address.
+	// The pool keys entries by message hash (which includes signature bytes), so
+	// one signer can produce multiple pool entries with distinct nonces. Only one
+	// signature per unique signer may count toward the threshold (F-2026-19525).
 	emptySigner := common.Address{}
+	seenSigners := make(map[common.Address]struct{})
+	var validSignatures []types.Signature
 
 	for _, vote := range pooledVotes {
-		if vote.GetSigner() != emptySigner {
-			validSignatures = append(validSignatures, vote.(*types.Vote).Signature)
+		signer := vote.GetSigner()
+		if signer == emptySigner {
+			continue
 		}
+		if _, seen := seenSigners[signer]; seen {
+			log.Warn("[onVotePoolThresholdReached] Duplicate signer in pool, skipping", "signer", signer)
+			continue
+		}
+		seenSigners[signer] = struct{}{}
+		validSignatures = append(validSignatures, vote.(*types.Vote).Signature)
 	}
 
 	// Get epoch info

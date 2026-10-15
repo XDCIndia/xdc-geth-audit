@@ -55,6 +55,7 @@ import (
 	"github.com/ethereum/go-ethereum/common/lru"
 	"github.com/ethereum/go-ethereum/consensus"
 	"github.com/ethereum/go-ethereum/consensus/XDPoS/engines/engine_v2"
+	"github.com/ethereum/go-ethereum/consensus/XDPoS/utils"
 	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/core/state"
 	"github.com/ethereum/go-ethereum/core/types"
@@ -144,11 +145,22 @@ var (
 	// errInvalidCheckpointPenalties is returned if penalties list is invalid
 	errInvalidCheckpointPenalties = errors.New("invalid penalty list on checkpoint block")
 
+	// ErrPenaltyDataUnavailable is wrapped by the V1 penalty hooks when this node
+	// lacks the data to compute a checkpoint's penalties (state pruned after a
+	// rewind, block bodies of a batch not written yet). Verification then skips
+	// the penalties compare instead of failing.
+	ErrPenaltyDataUnavailable = errors.New("v1 penalty data unavailable")
+
 	// errInvalidMixDigest is returned if a block's mix digest is non-zero.
 	errInvalidMixDigest = errors.New("non-zero mix digest")
 
 	// errInvalidUncleHash is returned if a block contains an non-empty uncle list.
 	errInvalidUncleHash = errors.New("non empty uncle hash")
+
+	// errUnsealedHeaderFields is returned if a header sets a post-London
+	// optional field (WithdrawalsHash .. SlotNumber). They change the block
+	// hash without being sealed, and canonical XDPoSChain headers lack them.
+	errUnsealedHeaderFields = errors.New("header sets post-London fields not allowed in XDPoS")
 
 	// errInvalidDifficulty is returned if the difficulty of a block is not either
 	// of 1 or 2, or if the value does not match the turn of the signer.
@@ -293,11 +305,19 @@ type XDPoS struct {
 
 	// Hook functions for XDC-specific logic
 	// These hooks integrate with the XDC smart contracts for rewards, penalties, etc.
-	HookReward            func(chain consensus.ChainHeaderReader, stateBlock *state.StateDB, parentState *state.StateDB, header *types.Header) (map[string]interface{}, error)
-	HookPenalty           func(chain consensus.ChainHeaderReader, blockNumberEpoc uint64) ([]common.Address, error)
-	HookPenaltyTIPSigning func(chain consensus.ChainHeaderReader, header *types.Header, candidate []common.Address) ([]common.Address, error)
+	HookReward func(chain consensus.ChainHeaderReader, stateBlock *state.StateDB, parentState *state.StateDB, header *types.Header) (map[string]interface{}, error)
+	// The V1 penalty hooks take the verify batch's parents (oldest first, ending
+	// at the header's parent; nil outside verification) so headers not written
+	// yet are found, as canonical's batch chain reader serves them.
+	HookPenalty           func(chain consensus.ChainHeaderReader, blockNumberEpoc uint64, parents []*types.Header) ([]common.Address, error)
+	HookPenaltyTIPSigning func(chain consensus.ChainHeaderReader, header *types.Header, candidate []common.Address, parents []*types.Header) ([]common.Address, error)
 	HookValidator         func(header *types.Header, signers []common.Address) ([]byte, error)
 	HookVerifyMNs         func(header *types.Header, signers []common.Address) error
+
+	// HookGetSignersFromContract returns the signers from the state of a V1 gap
+	// block. A checkpoint whose list fails the snapshot check is checked again
+	// against these, as canonical does.
+	HookGetSignersFromContract func(gapHeader *types.Header) ([]common.Address, error)
 
 	// EngineV2 is the XDPoS 2.0 consensus engine instance. (#94)
 	// Set via SetEngineV2 when full chain config is available.
@@ -378,6 +398,19 @@ type EngineV2Iface interface {
 	// currentRound is re-seeded from the head's embedded QC rather than being
 	// left at whatever stale round the engine observed during bulk import. A.99.4b.
 	ReinitBFT(chain consensus.ChainReader, header *types.Header) error
+
+	// Epoch and round query methods for RPC handlers (issue #1482).
+	// These dispatch to the round-based V2 logic instead of block-number arithmetic.
+	GetCurrentEpochSwitchBlock(chain consensus.ChainReader, blockNumber *big.Int) (uint64, uint64, error)
+	GetEpochSwitchInfoBetween(chain consensus.ChainReader, begin, end *types.Header) ([]*types.EpochSwitchInfo, error)
+	GetBlockByEpochNumber(chain consensus.ChainReader, epochNumber uint64) (*types.BlockInfo, error)
+	CalculateMissingRounds(chain consensus.ChainReader, header *types.Header) (*utils.PublicApiMissedRoundsMetadata, error)
+
+	// GetLatestCommittedBlockInfo returns the highest block committed by the
+	// BFT 3-chain rule, or nil before the first commit. Thread-safe; read under
+	// the engine's internal lock. Used by core/blockchain.go reorg() to refuse
+	// a reorg below the latest committed block (F-2026-19773).
+	GetLatestCommittedBlockInfo() *types.BlockInfo
 }
 
 // SetEngineV2 wires the V2 consensus engine for full V2 header verification. (#94)
@@ -386,6 +419,18 @@ type EngineV2Iface interface {
 // engine_v2.XDPoS_v2 directly to New() to avoid the two-step initialization.
 func (c *XDPoS) SetEngineV2(v2 EngineV2Iface) {
 	c.EngineV2 = v2
+}
+
+// LatestCommittedBlock returns the highest XDPoS v2 committed block, or nil
+// before the first BFT commit. Safe to call from core/blockchain.go without
+// importing the consensus/XDPoS package (avoids the import cycle that exists
+// because consensus/XDPoS imports core). Core type-asserts the engine to the
+// committedBlocker local interface rather than *XDPoS.
+func (c *XDPoS) LatestCommittedBlock() *types.BlockInfo {
+	if c.EngineV2 == nil {
+		return nil
+	}
+	return c.EngineV2.GetLatestCommittedBlockInfo()
 }
 
 // UpdateMasternodesV2 forwards a direct masternode-set seed to the V2 engine.
@@ -504,7 +549,8 @@ func (c *XDPoS) VerifyHeader(chain consensus.ChainHeaderReader, header *types.He
 //
 // Optimisation (XDC): during bulk sync we use two fast-paths:
 //   - V2 blocks (after SwitchBlock): parallel worker pool (header-independent checks)
-//   - V1 blocks in bulk-sync mode: light verification that skips verifySeal (ecrecover)
+//   - V1 blocks in bulk-sync mode: light verification that skips the checkpoint
+//     signer-list checks (the seal is still verified)
 func (c *XDPoS) VerifyHeaders(chain consensus.ChainHeaderReader, headers []*types.Header) (chan<- struct{}, <-chan error) {
 	abort := make(chan struct{})
 	results := make(chan error, len(headers))
@@ -579,9 +625,9 @@ func (c *XDPoS) VerifyHeaders(chain consensus.ChainHeaderReader, headers []*type
 	return abort, results
 }
 
-// verifyHeaderLightV1 performs V1 header verification without the expensive
-// verifySeal (ecrecover + snapshot). Safe during bulk sync because the blocks
-// were already accepted by the network.
+// verifyHeaderLightV1 performs V1 header verification for bulk sync. It skips
+// the checkpoint signer-list checks (penalty hooks need state) but always
+// verifies the seal, matching canonical engine_v1 with fullVerify=false.
 func (c *XDPoS) verifyHeaderLightV1(chain consensus.ChainHeaderReader, header *types.Header, parents []*types.Header) error {
 	if _, check := c.verifiedHeaders.Get(header.Hash()); check {
 		return nil
@@ -589,6 +635,9 @@ func (c *XDPoS) verifyHeaderLightV1(chain consensus.ChainHeaderReader, header *t
 
 	if header.Number == nil {
 		return errUnknownBlock
+	}
+	if err := verifyNoUnsealedFields(header); err != nil {
+		return err
 	}
 	number := header.Number.Uint64()
 
@@ -674,6 +723,13 @@ func (c *XDPoS) verifyHeaderLightV1(chain consensus.ChainHeaderReader, header *t
 		return errNoValidatorSignature
 	}
 
+	// Always verify the V1 seal (ecrecover + signer/difficulty), even in bulk
+	// mode. Canonical XDPoSChain engine_v1 verifyCascadingFields ends every
+	// path in verifySeal; fullVerify only gates the checkpoint signer-list and
+	// double-validation checks, which stay skipped here (#1405).
+	if err := c.verifySeal(chain, header, parents); err != nil {
+		return err
+	}
 	c.verifiedHeaders.Add(header.Hash(), true)
 	return nil
 }
@@ -692,10 +748,33 @@ func (c *XDPoS) verifyHeaderWithCache(chain consensus.ChainHeaderReader, header 
 	return err
 }
 
+// verifyNoUnsealedFields rejects headers that set any post-London optional
+// field. Header.Hash() covers them but the V2 seal hash (and, for some, the V1
+// seal hash) does not, so anyone could add e.g. an empty WithdrawalsHash to a
+// sealed block and get a different-hash twin with a valid seal (#1417).
+// Canonical XDPoSChain headers have only BaseFee as an optional field, so no
+// canonical block carries these. Genesis is exempt: it is fixed by the local
+// config (a custom genesis with a Shanghai/Cancun time sets them) and is never
+// verified against peers.
+func verifyNoUnsealedFields(header *types.Header) error {
+	if header.Number.Sign() == 0 {
+		return nil
+	}
+	if header.WithdrawalsHash != nil || header.BlobGasUsed != nil || header.ExcessBlobGas != nil ||
+		header.ParentBeaconRoot != nil || header.RequestsHash != nil ||
+		header.BlockAccessListHash != nil || header.SlotNumber != nil {
+		return errUnsealedHeaderFields
+	}
+	return nil
+}
+
 // verifyHeader checks whether a header conforms to the consensus rules.
 func (c *XDPoS) verifyHeader(chain consensus.ChainHeaderReader, header *types.Header, parents []*types.Header) error {
 	if header.Number == nil {
 		return errUnknownBlock
+	}
+	if err := verifyNoUnsealedFields(header); err != nil {
+		return err
 	}
 	number := header.Number.Uint64()
 
@@ -760,6 +839,16 @@ func (c *XDPoS) verifyHeader(chain consensus.ChainHeaderReader, header *types.He
 	if header.UncleHash != uncleHash {
 		return errInvalidUncleHash
 	}
+
+	// V1 does not check GasLimit or GasUsed.
+	//
+	// F-2026-19615 (Info): this matches canonical XDPoSChain v2.9.3-testnet
+	// (consensus/XDPoS/engines/engine_v1/engine.go:173 and :238 have no gas
+	// checks; only V2 calls misc.VerifyGaslimit). All V1 blocks are historical
+	// (mainnet V2 from 80,370,000; Apothem from 56,828,700). Adding a bound
+	// here would reject old blocks that canonical accepts — do not add without
+	// a full V1 history scan gated on replay-parity returning 0 rejections.
+	// Execution still enforces GasUsed ≤ GasLimit via ValidateState.
 
 	// All basic checks passed, verify cascading fields
 	return c.verifyCascadingFields(chain, header, parents)
@@ -860,124 +949,224 @@ func (c *XDPoS) verifyCascadingFields(chain consensus.ChainHeaderReader, header 
 		return err
 	}
 
-	// If the block is a checkpoint block, verify the signer list
-	if number%c.config.Epoch == 0 {
-		signers := snap.GetSigners()
-		penPenalties := []common.Address{}
-
-		// Get penalties if hook is configured
-		if c.HookPenalty != nil || c.HookPenaltyTIPSigning != nil {
-			var penErr error
-			if c.HookPenaltyTIPSigning != nil {
-				penPenalties, penErr = c.HookPenaltyTIPSigning(chain, header, signers)
-			} else if c.HookPenalty != nil {
-				penPenalties, penErr = c.HookPenalty(chain, number)
-			}
-			if penErr != nil {
-				return penErr
-			}
-			for _, address := range penPenalties {
-				log.Debug("Penalty Info", "address", address, "number", number)
-			}
-		}
-
-		// Remove penalties from signers
-		signers = removeItemFromArray(signers, penPenalties)
-
-		// Remove penalties from previous epochs (up to LimitPenaltyEpoch)
-		for i := 1; i <= LimitPenaltyEpoch; i++ {
-			if number > uint64(i)*c.config.Epoch {
-				signers = c.removePenaltiesFromBlock(chain, signers, number-uint64(i)*c.config.Epoch)
-			}
-		}
-
-		// Verify checkpoint signers match
-		// CRITICAL FIX: For V2 blocks, prefer header.Validators (xdc2.6.8 format).
-		// For V1 blocks, header.Validators holds 4-byte ASCII M2 indices, NOT addresses.
-		// We must use header.Extra for V1 and header.Validators for V2.
-		var masternodesFromCheckpointHeader []common.Address
-		// #951: must be strict `>` — the switch block itself (number == SwitchBlock) is the
-		// LAST V1 block and carries header.Validators in V1 4-byte-M2-index format. Using `>=`
-		// here misparses those M2 bytes as 20-byte addresses whenever validator count N%5==0,
-		// then the bootstrap-from-header branch below persists a corrupted snapshot. Legacy V1
-		// verification (engine_v1/engine.go:304-305) always reads the switch-block masternodes
-		// from header.Extra. Matches the already-correct sibling at xdpos.go:1868 and IsV2Block.
-		isV2Checkpoint := c.config.V2 != nil && c.config.V2.SwitchBlock != nil && number > c.config.V2.SwitchBlock.Uint64()
-		if isV2Checkpoint && len(header.Validators) > 0 && len(header.Validators)%common.AddressLength == 0 {
-			masternodesFromCheckpointHeader = make([]common.Address, len(header.Validators)/common.AddressLength)
-			for i := 0; i < len(masternodesFromCheckpointHeader); i++ {
-				copy(masternodesFromCheckpointHeader[i][:], header.Validators[i*common.AddressLength:])
-			}
-			// Sanity check: reject all-zero addresses
-			allZero := true
-			for _, mn := range masternodesFromCheckpointHeader {
-				if mn != (common.Address{}) {
-					allZero = false
-					break
-				}
-			}
-			if allZero {
-				log.Warn("verifyCascadingFields: header.Validators all-zero, falling back to Extra", "number", number)
-				masternodesFromCheckpointHeader = nil
-			}
-		}
-		if len(masternodesFromCheckpointHeader) == 0 {
-			extraSuffix := len(header.Extra) - extraSeal
-			if extraSuffix > extraVanity {
-				masternodesFromCheckpointHeader = extractAddressFromBytes(header.Extra[extraVanity:extraSuffix])
-			}
-		}
-		if !compareSignersLists(masternodesFromCheckpointHeader, signers) {
-			// Mismatch between our computed signer set and what the checkpoint header says.
-			// This can happen during initial sync when we don't yet have full penalty history
-			// for previous epochs (removePenaltiesFromBlock returns the header from the chain,
-			// but if those headers aren't downloaded yet, penalties are skipped).
-			//
-			// Resolution strategy (compatible with v2.6.8):
-			//   1. If the header has a non-empty masternode list, trust it — the block signature
-			//      will still prove it was accepted by the actual network.
-			//   2. Bootstrap the snapshot's signer set from the header so that the next epoch
-			//      starts from the correct state, eliminating cascading mismatches.
-			//   3. Reject if the header has an empty masternode list (that would be invalid).
-			if len(masternodesFromCheckpointHeader) > 0 {
-				log.Warn("Checkpoint signer mismatch — bootstrapping snapshot from header (sync mode)",
-					"number", number,
-					"header_masternodes", len(masternodesFromCheckpointHeader),
-					"snapshot_signers", len(signers),
-					"note", "transient during initial sync; resolves as penalty history is downloaded")
-				// Update the snapshot to match the header so downstream epochs are correct.
-				// This mirrors what v2.6.8 does when it builds the snapshot from scratch.
-				newSigners := make(map[common.Address]struct{}, len(masternodesFromCheckpointHeader))
-				for _, mn := range masternodesFromCheckpointHeader {
-					newSigners[mn] = struct{}{}
-				}
-				snap.Signers = newSigners
-				// Persist the corrected snapshot so the next call uses the right set.
-				if err := snap.store(c.db); err != nil {
-					log.Warn("Failed to persist corrected checkpoint snapshot", "number", number, "err", err)
-				}
-				c.recents.Add(snap.Hash, snap)
-				signers = masternodesFromCheckpointHeader
-			} else {
-				log.Error("Masternodes lists are different in checkpoint header and snapshot",
-					"number", number,
-					"masternodes_from_checkpoint_header", masternodesFromCheckpointHeader,
-					"masternodes_in_snapshot", signers,
-					"penList", penPenalties)
-				return errInvalidCheckpointSigners
-			}
-		}
-
-		// Verify MNs if hook is configured
-		if c.HookVerifyMNs != nil {
-			if err := c.HookVerifyMNs(header, signers); err != nil {
+	// If the block is a checkpoint block, verify the signer list. Like canonical
+	// (engine_v1/engine.go:266-297), a mismatch is retried once with the signers
+	// read from the contract and otherwise rejected. Nothing from the header is
+	// written into the snapshot here: verifySeal must authorize the sealer against
+	// the parent's signer set, not against the list the checkpoint names (#1418).
+	if number%c.config.Epoch == 0 && v1FullVerifyChain(chain) {
+		err := c.checkSignersOnCheckpoint(chain, header, c.checkpointSigners(chain, header, parents, snap), parents)
+		if err != nil && c.HookGetSignersFromContract != nil {
+			log.Debug("checkSignersOnCheckpoint failed, fallback to smart contract check", "number", number, "err", err)
+			var signers []common.Address
+			if signers, err = c.getSignersFromContract(chain, header, parents); err != nil {
 				return err
 			}
+			err = c.checkSignersOnCheckpoint(chain, header, signers, parents)
+		}
+		if err != nil {
+			return err
 		}
 	}
 
 	// All basic checks passed, verify the seal and return
 	return c.verifySeal(chain, header, parents)
+}
+
+// checkSignersOnCheckpoint mirrors canonical engine_v1 checkSignersOnCheckpoint
+// (engine.go:300-345): the checkpoint's signer list must equal signers minus the
+// penalties of this epoch and of the previous LimitPenaltyEpoch epochs.
+func (c *XDPoS) checkSignersOnCheckpoint(chain consensus.ChainHeaderReader, header *types.Header, signers []common.Address, parents []*types.Header) error {
+	number := header.Number.Uint64()
+	var chainID uint64
+	if cfg := chain.Config(); cfg != nil && cfg.ChainID != nil {
+		chainID = cfg.ChainID.Uint64()
+	}
+	// Canonical skips the whole check on these blocks.
+	if IsIgnoreSignerCheckBlock(chainID, number) {
+		return nil
+	}
+	// Get penalties with the hook canonical selects by IsTIPSigning
+	// (engine_v1/engine.go:306-326) and reject a checkpoint whose Penalties differ
+	// from the computed list. Penalties are not in the V1 seal hash (canonical
+	// too), so this compare is what binds them (#1422).
+	penPenalties, ok, penErr := c.v1CheckpointPenalties(chain, header, signers, parents)
+	if errors.Is(penErr, ErrPenaltyDataUnavailable) {
+		// Same policy as a missing parent state: a node without the data
+		// (e.g. non-archive after a rewind) must not wedge. Use the header's
+		// list for the signer check below and skip the compare.
+		log.Warn("Skipping v1 checkpoint penalties check", "number", number, "err", penErr)
+		penPenalties, ok, penErr = extractAddressFromBytes(header.Penalties), false, nil
+	}
+	if penErr != nil {
+		return penErr
+	}
+	if ok {
+		for _, address := range penPenalties {
+			log.Debug("Penalty Info", "address", address, "number", number)
+		}
+		var penBytes []byte
+		for _, addr := range penPenalties {
+			penBytes = append(penBytes, addr[:]...)
+		}
+		if !bytes.Equal(header.Penalties, penBytes) {
+			log.Error("Penalties in checkpoint header differ from the computed list", "number", number, "header", len(header.Penalties)/common.AddressLength, "computed", len(penPenalties))
+			return errInvalidCheckpointPenalties
+		}
+	}
+
+	// Remove penalties from signers
+	signers = removeItemFromArray(signers, penPenalties)
+
+	// Remove penalties from previous epochs (up to LimitPenaltyEpoch)
+	for i := 1; i <= LimitPenaltyEpoch; i++ {
+		if number > uint64(i)*c.config.Epoch {
+			signers = c.removePenaltiesFromBlock(chain, signers, number-uint64(i)*c.config.Epoch)
+		}
+	}
+
+	// Verify checkpoint signers match
+	// CRITICAL FIX: For V2 blocks, prefer header.Validators (xdc2.6.8 format).
+	// For V1 blocks, header.Validators holds 4-byte ASCII M2 indices, NOT addresses.
+	// We must use header.Extra for V1 and header.Validators for V2.
+	var masternodesFromCheckpointHeader []common.Address
+	// #951: must be strict `>` — the switch block itself (number == SwitchBlock) is the
+	// LAST V1 block and carries header.Validators in V1 4-byte-M2-index format. Using `>=`
+	// here misparses those M2 bytes as 20-byte addresses whenever validator count N%5==0,
+	// and the list compare below would then check the wrong addresses. Legacy V1
+	// verification (engine_v1/engine.go:304-305) always reads the switch-block masternodes
+	// from header.Extra. Matches the already-correct sibling at xdpos.go:1868 and IsV2Block.
+	isV2Checkpoint := c.config.V2 != nil && c.config.V2.SwitchBlock != nil && number > c.config.V2.SwitchBlock.Uint64()
+	if isV2Checkpoint && len(header.Validators) > 0 && len(header.Validators)%common.AddressLength == 0 {
+		masternodesFromCheckpointHeader = make([]common.Address, len(header.Validators)/common.AddressLength)
+		for i := 0; i < len(masternodesFromCheckpointHeader); i++ {
+			copy(masternodesFromCheckpointHeader[i][:], header.Validators[i*common.AddressLength:])
+		}
+		// Sanity check: reject all-zero addresses
+		allZero := true
+		for _, mn := range masternodesFromCheckpointHeader {
+			if mn != (common.Address{}) {
+				allZero = false
+				break
+			}
+		}
+		if allZero {
+			log.Warn("verifyCascadingFields: header.Validators all-zero, falling back to Extra", "number", number)
+			masternodesFromCheckpointHeader = nil
+		}
+	}
+	if len(masternodesFromCheckpointHeader) == 0 {
+		extraSuffix := len(header.Extra) - extraSeal
+		if extraSuffix > extraVanity {
+			masternodesFromCheckpointHeader = extractAddressFromBytes(header.Extra[extraVanity:extraSuffix])
+		}
+	}
+	if !compareSignersLists(masternodesFromCheckpointHeader, signers) {
+		log.Error("Masternodes lists are different in checkpoint header and snapshot",
+			"number", number,
+			"masternodes_from_checkpoint_header", masternodesFromCheckpointHeader,
+			"masternodes_in_snapshot", signers,
+			"penList", penPenalties)
+		return errInvalidCheckpointSigners
+	}
+
+	// Verify MNs if hook is configured
+	if c.HookVerifyMNs != nil {
+		return c.HookVerifyMNs(header, signers)
+	}
+	return nil
+}
+
+// checkpointSigners returns the masternode set a checkpoint is checked against:
+// the snapshot of this epoch's gap block, Gap blocks back along the
+// checkpoint's own ancestry. That snapshot holds the set refreshed from the
+// 0x88 candidates when the gap block was written (UpdateM1At), the set
+// canonical's snapshot carries at the checkpoint. Reading it directly avoids a
+// snapshot cached between the gap block and the checkpoint before that refresh
+// (mainnet replay: checkpoint 616,500 saw a pre-refresh set). If the gap block
+// cannot be resolved, the parent snapshot is used as before.
+func (c *XDPoS) checkpointSigners(chain consensus.ChainHeaderReader, header *types.Header, parents []*types.Header, parentSnap *Snapshot) []common.Address {
+	inBatch := make(map[common.Hash]*types.Header, len(parents))
+	for _, p := range parents {
+		if p != nil {
+			inBatch[p.Hash()] = p
+		}
+	}
+	number := header.Number.Uint64()
+	gap := header
+	for step := uint64(1); step <= c.config.Gap; step++ {
+		next, ok := inBatch[gap.ParentHash]
+		if !ok || next.Number.Uint64() != number-step {
+			next = chain.GetHeader(gap.ParentHash, number-step)
+		}
+		if next == nil {
+			return parentSnap.GetSigners()
+		}
+		gap = next
+	}
+	gapSnap, err := c.snapshot(chain, gap.Number.Uint64(), gap.Hash(), parents)
+	if err != nil || gapSnap == nil {
+		return parentSnap.GetSigners()
+	}
+	return gapSnap.GetSigners()
+}
+
+// getSignersFromContract mirrors canonical engine_v1 getSignersFromContract
+// (engine.go:1048-1062): the signers are read from the state of the gap block,
+// Gap blocks before the checkpoint. A batch that crosses the checkpoint holds the
+// blocks on that walk in parents before they are written, so they are looked up
+// there first, as canonical's batch chain reader serves them
+// (consensus/XDPoS/verify_chain_reader.go, core/blockchain.go:2583-2585).
+func (c *XDPoS) getSignersFromContract(chain consensus.ChainHeaderReader, checkpointHeader *types.Header, parents []*types.Header) ([]common.Address, error) {
+	inBatch := make(map[common.Hash]*types.Header, len(parents))
+	for _, p := range parents {
+		if p != nil {
+			inBatch[p.Hash()] = p
+		}
+	}
+	gapHeader := checkpointHeader
+	number := checkpointHeader.Number.Uint64()
+	for step := uint64(1); step <= c.config.Gap; step++ {
+		if p, ok := inBatch[gapHeader.ParentHash]; ok && p.Number.Uint64() == number-step {
+			gapHeader = p
+			continue
+		}
+		gapHeader = chain.GetHeader(gapHeader.ParentHash, number-step)
+		if gapHeader == nil {
+			return nil, fmt.Errorf("no block at %d to get the signers from", number-step)
+		}
+	}
+	signers, err := c.HookGetSignersFromContract(gapHeader)
+	if err != nil {
+		return nil, fmt.Errorf("can't get signers from smart contract: %w", err)
+	}
+	return signers, nil
+}
+
+// v1FullVerifyChain reports whether the V1 checks canonical runs only under
+// fullVerify apply on this chain. Canonical turns fullVerify off on the
+// testnet, chain 51 (engine_v1/engine.go:162-167).
+func v1FullVerifyChain(chain consensus.ChainHeaderReader) bool {
+	cfg := chain.Config()
+	return cfg == nil || cfg.ChainID == nil || cfg.ChainID.Cmp(params.XDCApothemChainConfig.ChainID) != 0
+}
+
+// v1CheckpointPenalties computes the penalties of a V1 checkpoint with the hook
+// canonical selects by IsTIPSigning (engine_v1/engine.go:309-313, 764-768).
+// ok is false when that hook is not configured.
+func (c *XDPoS) v1CheckpointPenalties(chain consensus.ChainHeaderReader, header *types.Header, signers []common.Address, parents []*types.Header) (penalties []common.Address, ok bool, err error) {
+	if cfg := chain.Config(); cfg != nil && cfg.IsTIPSigning(header.Number) {
+		if c.HookPenaltyTIPSigning == nil {
+			return nil, false, nil
+		}
+		penalties, err = c.HookPenaltyTIPSigning(chain, header, signers, parents)
+		return penalties, true, err
+	}
+	if c.HookPenalty == nil {
+		return nil, false, nil
+	}
+	penalties, err = c.HookPenalty(chain, header.Number.Uint64(), parents)
+	return penalties, true, err
 }
 
 // verifySeal checks whether the signature contained in the header satisfies the
@@ -1009,7 +1198,7 @@ func (c *XDPoS) verifySeal(chain consensus.ChainHeaderReader, header *types.Head
 	}
 
 	difficulty := c.calcDifficulty(chain, parent, creator)
-	log.Info("verify seal block", "number", header.Number, "hash", header.Hash(), "block difficulty", header.Difficulty, "calc difficulty", difficulty, "creator", creator, "snap signers", len(snap.Signers))
+	log.Debug("verify seal block", "number", header.Number, "hash", header.Hash(), "block difficulty", header.Difficulty, "calc difficulty", difficulty, "creator", creator, "snap signers", len(snap.Signers))
 
 	// Ensure that the block's difficulty is meaningful (may not be correct at this point)
 	// Note: During sync, we may not have checkpoint headers yet, so difficulty calculation
@@ -1052,33 +1241,29 @@ func (c *XDPoS) verifySeal(chain consensus.ChainHeaderReader, header *types.Head
 		}
 	}
 
-	// #951 Defect 1c: V1 double-validation (M1/M2) — DIAGNOSTIC (non-enforcing) phase.
-	// Legacy (engine_v1/engine.go:164-167,638-655) rejects, for Number>Epoch under
-	// fullVerify: an empty header.Validator (ErrNoValidatorSignature) and a
-	// RecoverValidator(header.Validator) != GetValidator(creator) mismatch
-	// (ErrFailedDoubleValidation). Modern did neither. Before enforcing — a wrong M2
-	// computation would reject the entire chain past the first epoch and wedge the node
-	// — we LOG agreement/disagreement against canonical blocks to validate the M2 map.
-	// fullVerify mirrors verifyHeaderV2: only at-tip (not bulk sync). Flip [DIAG-1c] to a
-	// hard reject once the live chain shows zero mismatches.
-	fullVerify := xdcFullVerify()
-	if fullVerify && number > c.config.Epoch {
-		switch {
-		case len(header.Validator) == 0:
-			log.Warn("[DIAG-1c] empty header.Validator past epoch (legacy→ErrNoValidatorSignature)", "number", number, "creator", creator)
-		default:
-			validator, vErr := c.RecoverValidator(header)
-			assigned, aErr := c.GetValidator(creator, chain, header)
-			switch {
-			case vErr != nil:
-				log.Warn("[DIAG-1c] RecoverValidator failed", "number", number, "err", vErr)
-			case aErr != nil:
-				log.Warn("[DIAG-1c] GetValidator(M2) failed", "number", number, "creator", creator, "err", aErr)
-			case validator != assigned:
-				log.Warn("[DIAG-1c] M2 MISMATCH (legacy→ErrFailedDoubleValidation)", "number", number, "creator", creator, "recovered", validator, "assignedM2", assigned)
-			default:
-				log.Debug("[DIAG-1c] M2 double-validation OK", "number", number, "creator", creator, "m2", assigned)
-			}
+	// V1 double validation (M1/M2), #951 Defect 1c / #1421. Canonical
+	// (engine_v1/engine.go:185-188, 667-680) rejects, for Number > Epoch under
+	// fullVerify, an empty header.Validator (ErrNoValidatorSignature) and a
+	// co-signer other than the creator's assigned M2 (ErrFailedDoubleValidation).
+	// fullVerify mirrors verifyHeaderV2 (not during bulk sync); canonical turns it
+	// off on chain 51 (engine.go:162-167).
+	cfg := chain.Config()
+	testnet := cfg != nil && cfg.ChainID != nil && cfg.ChainID.Cmp(params.XDCApothemChainConfig.ChainID) == 0
+	if xdcFullVerify() && !testnet && number > c.config.Epoch {
+		if len(header.Validator) == 0 {
+			return errNoValidatorSignature
+		}
+		validator, err := c.RecoverValidator(header)
+		if err != nil {
+			return err
+		}
+		assigned, err := c.getValidatorWithParents(creator, chain, header, parents)
+		if err != nil {
+			return err
+		}
+		if validator != assigned {
+			log.Debug("Bad block detected. Header contains wrong pair of creator-validator", "number", number, "creator", creator, "assigned validator", assigned, "wrong validator", validator)
+			return errFailedDoubleValidation
 		}
 	}
 
@@ -1152,11 +1337,7 @@ func (c *XDPoS) Prepare(chain consensus.ChainHeaderReader, header *types.Header)
 			var penMasternodes []common.Address
 			var penErr error
 
-			if c.HookPenaltyTIPSigning != nil {
-				penMasternodes, penErr = c.HookPenaltyTIPSigning(chain, header, masternodes)
-			} else if c.HookPenalty != nil {
-				penMasternodes, penErr = c.HookPenalty(chain, number)
-			}
+			penMasternodes, _, penErr = c.v1CheckpointPenalties(chain, header, masternodes, nil)
 			if penErr != nil {
 				return penErr
 			}
@@ -1700,7 +1881,7 @@ func (c *XDPoS) YourTurn(chain consensus.ChainHeaderReader, parent *types.Header
 	for i, mn := range masternodes {
 		mnStrs[i] = mn.Hex()[:16]
 	}
-	log.Info("YourTurn debug", "parent", parent.Number, "signer", signer, "pre", pre, "preIndex", preIndex, "curIndex", curIndex, "masternodes", len(masternodes), "mnList", mnStrs)
+	log.Debug("YourTurn debug", "parent", parent.Number, "signer", signer, "pre", pre, "preIndex", preIndex, "curIndex", curIndex, "masternodes", len(masternodes), "mnList", mnStrs)
 
 	// Pre-switch (V1) turn assignment routes to the canonical engine_v1 position
 	// rule  masternodes[number % len] == signer  (number = parent.Number+1).

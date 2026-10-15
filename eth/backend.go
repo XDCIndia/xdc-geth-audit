@@ -276,11 +276,11 @@ func New(stack *node.Node, config *ethconfig.Config) (*Ethereum, error) {
 	}
 	var (
 		options = &core.BlockChainConfig{
-			TrieCleanLimit:          config.TrieCleanCache,
-			NoPrefetch:              config.NoPrefetch,
-			NoPrecompileCache:       config.NoPrecompileCache,
-			TrieDirtyLimit:          config.TrieDirtyCache,
-			ArchiveMode:             config.NoPruning,
+			TrieCleanLimit:    config.TrieCleanCache,
+			NoPrefetch:        config.NoPrefetch,
+			NoPrecompileCache: config.NoPrecompileCache,
+			TrieDirtyLimit:    config.TrieDirtyCache,
+			ArchiveMode:       config.NoPruning,
 			// #62 / netv12: a node configured to produce blocks must never silently
 			// enter no-state mode. Masking a missing parent state would import every
 			// later block with EmptyRootHash, which permanently poisons the DB and
@@ -485,26 +485,14 @@ func New(stack *node.Node, config *ethconfig.Config) (*Ethereum, error) {
 		return nil, err
 	}
 
-	// XDC A.96 (refs #892): when the operator runs --syncmode fast WITHOUT the
-	// --fastsyncpivot{number,hash,root} triplet, auto-pin the pivot from the
-	// highest usable TrustedSyncCheckpoint baked into the chain config. This
-	// turns the default fast-sync path deterministic and matches what every
-	// legacy v2.7.0-devnet deployment did by hand, eliminating the moving-pivot
-	// race (#886) that forced the A.92/A.93/A.94/A.95 recovery series. Operator
-	// override still wins (FastSyncPivotNumber != 0 short-circuits), and chains
-	// without a usable checkpoint fall through to the dynamic-pivot path with a
-	// WARN. Must run BEFORE the A.6 wiring below so the pinned values flow
-	// through the normal config fields unchanged.
-	//
-	// A.97 (refs #894): the --no-auto-pivot flag bypasses this so operators on
-	// Apothem/mainnet (which have TrustedSyncCheckpoints) can exercise the
-	// dynamic-pivot path with the A.97.1 pivot freeze applied.
-	if config.SyncMode == ethconfig.FastSync && config.FastSyncPivotNumber == 0 {
-		if config.NoAutoPivot {
-			log.Info("XDC fast-sync: --no-auto-pivot set, skipping TrustedSyncCheckpoints auto-pin (A.96); using dynamic-pivot path with A.97.1 freeze (refs #894)")
-		} else {
-			ethconfig.AutoPinPivotFromCheckpoints(chainConfig, config)
-		}
+	// A.96 auto-pin from TrustedSyncCheckpoints is opt-in only (F-2026-19471):
+	// the trust root is the binary, not a QC-verified chain epoch-switch header.
+	// Canonical XDPoSChain has no compiled checkpoints (operator --fastsyncpivot
+	// flags only). The default is dynamic pivot; supply --auto-checkpoint-pivot to
+	// restore A.96. Operator-explicit --fastsyncpivot flags always take precedence
+	// (FastSyncPivotNumber != 0 gate below). Must run BEFORE the A.6 wiring.
+	if config.SyncMode == ethconfig.FastSync && config.FastSyncPivotNumber == 0 && config.AutoCheckpointPivot {
+		ethconfig.AutoPinPivotFromCheckpoints(chainConfig, config)
 	}
 
 	// Operator-pinned Fast Sync trust anchor (refs #844 Phase A.6).

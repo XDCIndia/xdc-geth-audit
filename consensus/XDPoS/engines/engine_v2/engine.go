@@ -5,9 +5,14 @@
 package engine_v2
 
 import (
+	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math/big"
+	"os"
+	"path/filepath"
+	"strconv"
 	"sync"
 	"time"
 
@@ -19,6 +24,7 @@ import (
 	"github.com/ethereum/go-ethereum/consensus"
 	"github.com/ethereum/go-ethereum/consensus/XDPoS/utils"
 	"github.com/ethereum/go-ethereum/contracts"
+	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/core/state"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
@@ -91,12 +97,20 @@ type XDPoS_v2 struct {
 	highestTimeoutCert    *types.TimeoutCert
 	highestCommitBlock    *types.BlockInfo
 
+	// Latest epoch-switch reward, kept so saveRewardToFile can write it after Finalize.
+	latestReward         map[string]interface{}
+	latestRewardBlocknum uint64
+
 	// Hooks
 	HookReward  func(chain consensus.ChainReader, state *state.StateDB, parentState *state.StateDB, header *types.Header) (map[string]interface{}, error)
 	HookPenalty func(chain consensus.ChainReader, number *big.Int, parentHash common.Hash, candidates []common.Address) ([]common.Address, error)
 	// HookCommitBlock is called whenever a block is committed (finalized) via the 3-chain rule.
 	// Wire this to blockchain.SetFinalized() so eth_getFinalizedBlock reflects real BFT finality. (#95)
 	HookCommitBlock func(header *types.Header)
+
+	// ForensicsProcessor detects double-signing and vote equivocation.
+	// Runs exclusively in goroutines — never blocks or alters block acceptance. (#1478)
+	ForensicsProcessor *Forensics
 
 	votePoolCollectionTime time.Time
 
@@ -197,6 +211,8 @@ func createEngine(chainConfig *params.ChainConfig, db ethdb.Database, minePeriod
 		},
 		highestVotedRound:  types.Round(0),
 		highestCommitBlock: nil,
+
+		ForensicsProcessor: NewForensics(),
 	}
 
 	// Set timeout callback
@@ -415,6 +431,8 @@ func (x *XDPoS_v2) initial(chain consensus.ChainReader, header *types.Header) er
 				"currentHead", currentHead)
 			// Mark as initialized so sync can proceed
 			// Snapshot will be created when gap block is processed
+			// F-2026-19774: restore persisted local safety state.
+			x.loadBFTSafetyState()
 			x.isInitialized = true
 			// A.99.3: preserve currentRound if processQC already set it from the
 			// header's embedded QC (e.g. restarting with head=5220, QC sets round=2700).
@@ -468,6 +486,8 @@ func (x *XDPoS_v2) initial(chain consensus.ChainReader, header *types.Header) er
 				log.Warn("[initial] checkpoint header not found during sync past V2 switch — deferring snapshot init",
 					"checkpoint", x.config.V2.SwitchBlock.Uint64(),
 					"currentHead", currentHead)
+				// F-2026-19774: restore persisted local safety state.
+				x.loadBFTSafetyState()
 				x.isInitialized = true
 				// A.99.3: preserve currentRound if processQC already set it.
 				if x.currentRound == 0 {
@@ -524,10 +544,35 @@ func (x *XDPoS_v2) initial(chain consensus.ChainReader, header *types.Header) er
 
 	// Start countdown timer
 	x.timeoutWorker.Reset(chain, 0, 0)
+	// F-2026-19774: restore persisted local safety state before marking ready.
+	x.loadBFTSafetyState()
 	x.isInitialized = true
 
 	log.Warn("[initial] finish initialisation")
 	return nil
+}
+
+// loadBFTSafetyState reads the persisted equivocation-guard values from the DB
+// and applies max(stored, in-memory) so a restart inside a round cannot lower
+// the guard.  This is a local-safety improvement; it does not affect which
+// blocks other nodes accept.  Called from initial() at every path that sets
+// isInitialized = true (except the "already initialized" early-return, where
+// the values were loaded on first init).
+func (x *XDPoS_v2) loadBFTSafetyState() {
+	if stored := rawdb.ReadBFTHighestVotedRound(x.db); stored > x.highestVotedRound {
+		log.Info("[loadBFTSafetyState] restoring highestVotedRound", "stored", stored, "memory", x.highestVotedRound)
+		x.highestVotedRound = stored
+	}
+	if stored := rawdb.ReadBFTHighestSelfMinedRound(x.db); stored > x.highestSelfMinedRound {
+		log.Info("[loadBFTSafetyState] restoring highestSelfMinedRound", "stored", stored, "memory", x.highestSelfMinedRound)
+		x.highestSelfMinedRound = stored
+	}
+	if stored := rawdb.ReadBFTLockQC(x.db); stored != nil {
+		if x.lockQuorumCert == nil || stored.ProposedBlockInfo.Round > x.lockQuorumCert.ProposedBlockInfo.Round {
+			log.Info("[loadBFTSafetyState] restoring lockQuorumCert", "storedRound", stored.ProposedBlockInfo.Round)
+			x.lockQuorumCert = stored
+		}
+	}
 }
 
 // Author returns the signer of a block
@@ -710,10 +755,19 @@ func (x *XDPoS_v2) Finalize(chain consensus.ChainReader, header *types.Header, s
 
 	if x.HookReward != nil && isEpochSwitch {
 		log.Info("[Finalize] V2 HookReward firing", "block", header.Number.Uint64(), "hash", header.Hash().Hex())
-		_, err := x.HookReward(chain, state, parentState, header)
+		rewards, err := x.HookReward(chain, state, parentState, header)
 		if err != nil {
 			return nil, err
 		}
+		x.lock.Lock()
+		x.latestRewardBlocknum = header.Number.Uint64()
+		x.latestReward, err = deepCloneJSON(rewards)
+		x.lock.Unlock()
+		if err != nil {
+			log.Error("[Finalize] Error deep cloning latest reward", "err", err, "rewards", rewards)
+			return nil, err
+		}
+		x.saveRewardToFile(header.Hash(), header.Number.Uint64())
 	} else if isEpochSwitch {
 		log.Warn("[Finalize] V2 HookReward is nil at epoch switch!", "block", header.Number.Uint64())
 	}
@@ -763,6 +817,8 @@ func (x *XDPoS_v2) Seal(chain consensus.ChainReader, block *types.Block, stop <-
 		return nil, err
 	}
 	x.highestSelfMinedRound = decodedExtra.Round
+	// F-2026-19774: persist so a restart inside a round cannot produce a second seal.
+	rawdb.WriteBFTHighestSelfMinedRound(x.db, x.highestSelfMinedRound)
 
 	return block.WithSeal(header), nil
 }
@@ -2770,6 +2826,25 @@ func (x *XDPoS_v2) setNewRound(chain consensus.ChainReader, round types.Round) {
 	log.Info("[setNewRound] new round", "round", round)
 	x.currentRound = round
 	x.timeoutCount = 0
+
+	// Update per-round config so the timeout timer uses the correct period for this
+	// round, not the round-0 initial value. Canonical XDPoSChain does this via
+	// UpdateParams on each core.CheckpointCh signal; our fork wires it here instead
+	// because we have no CheckpointCh. Fixes #1477 (F-2026-19726).
+	x.config.V2.UpdateConfig(uint64(round))
+	cfg := x.config.V2.CurrentConfig
+	if err := x.timeoutWorker.SetParams(
+		time.Duration(cfg.TimeoutPeriod)*time.Second,
+		cfg.ExpTimeoutConfig.Base,
+		int(cfg.ExpTimeoutConfig.MaxExponent),
+	); err != nil {
+		log.Error("[setNewRound] timeoutWorker.SetParams failed", "round", round, "err", err)
+	}
+	// Notify the miner of the updated mine period for this config row.
+	if x.minePeriodCh != nil {
+		go func() { x.minePeriodCh <- cfg.MinePeriod }()
+	}
+
 	x.timeoutWorker.Reset(chain, uint64(x.currentRound), uint64(x.highestQuorumCert.ProposedBlockInfo.Round))
 	x.timeoutPool.Clear()
 
@@ -2987,4 +3062,53 @@ func (x *XDPoS_v2) InvalidateCaches(newHead uint64) {
 	x.round2epochBlockInfo.Purge()
 	log.Warn("[XDPoS_v2] caches invalidated after chain rewind (refs #802 task 3)",
 		"newHead", newHead)
+}
+
+// saveRewardToFile writes the latestReward map to a JSON file in common.StoreRewardFolder.
+// It is a no-op when StoreRewardFolder is not set (--store-reward flag not given).
+func (x *XDPoS_v2) saveRewardToFile(blockHash common.Hash, blockNumber uint64) {
+	if len(common.StoreRewardFolder) == 0 {
+		return
+	}
+
+	x.lock.RLock()
+	rewardsBlocknum := x.latestRewardBlocknum
+	rewards, err := deepCloneJSON(x.latestReward)
+	x.lock.RUnlock()
+	if err != nil {
+		log.Error("[saveRewardToFile] Error deep cloning latest reward", "err", err)
+		return
+	}
+	if rewardsBlocknum != blockNumber {
+		log.Error("[saveRewardToFile] block number mismatch", "stored", rewardsBlocknum, "arg", blockNumber)
+		return
+	}
+
+	data, err := json.MarshalIndent(rewards, "", "  ")
+	if err != nil {
+		log.Error("[saveRewardToFile] Error marshalling rewards", "err", err)
+		return
+	}
+	filename := strconv.FormatUint(blockNumber, 10) + "." + blockHash.Hex()
+	if err = os.WriteFile(filepath.Join(common.StoreRewardFolder, filename), data, 0644); err != nil {
+		log.Error("[saveRewardToFile] Error writing reward file", "filename", filename, "err", err)
+	}
+}
+
+// deepCloneJSON deep-clones a map[string]interface{} via JSON round-trip.
+func deepCloneJSON(original map[string]interface{}) (map[string]interface{}, error) {
+	if original == nil {
+		return nil, nil
+	}
+	data, err := json.Marshal(original)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal: %w", err)
+	}
+	var cloned map[string]interface{}
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.UseNumber()
+	if err = dec.Decode(&cloned); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal: %w", err)
+	}
+	return cloned, nil
 }
