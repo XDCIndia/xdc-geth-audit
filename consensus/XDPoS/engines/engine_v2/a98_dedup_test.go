@@ -1,10 +1,21 @@
 // Copyright (c) 2024 XDC Network
 // A.98 unit tests: byte-level signature deduplication in UniqueSignatures.
 //
+// IMPORTANT (#1074): UniqueSignatures (byte-dedup) is NO LONGER on the
+// verifyQC/verifyTC hot path. It was removed from there because byte-dedup
+// is unsafe for threshold counting — see a99_qctc_malleability_test.go for
+// the corrected regression tests (RecoverUniqueSigners: address-dedup +
+// low-S rejection) that now guard the QC/TC signature-counting hot path.
+// The tests below describe ONLY the standalone UniqueSignatures() helper's
+// own (unchanged, byte-level) mechanics; they do NOT describe consensus
+// signature-counting behaviour and must not be read as such.
+//
 // Covers:
 //   1. Byte-identical duplicates are counted once.
-//   2. ECDSA-malleated pairs (same signer, different byte string) are counted
-//      as two distinct signatures — matching canonical XDPoSChain behaviour.
+//   2. ECDSA-malleated pairs (same signer, different byte string) are still
+//      counted as two distinct byte strings by this low-level helper — this
+//      is exactly why the helper is unsafe for threshold counting and is no
+//      longer used there.
 //   3. Genuinely distinct signatures from different signers are all kept.
 
 package engine_v2
@@ -65,15 +76,17 @@ func TestUniqueSignatures_ByteIdenticalDuplicate(t *testing.T) {
 	}
 }
 
-// TestUniqueSignatures_MalleatedPairCountsAsTwo verifies that a malleated
-// sig (same signer, different bytes) is counted as a second distinct signature.
-// This matches canonical XDPoSChain behaviour (byte-dedup).
-//
-// This is intentional: the canonical chain accepts malleated pairs toward
-// the threshold, and we must match that behaviour for consensus parity.
-// A validator that emits both forms is malicious or broken; honest nodes
-// sign once and the extra vote never appears in practice.
-func TestUniqueSignatures_MalleatedPairCountsAsTwo(t *testing.T) {
+// TestUniqueSignatures_MalleatedPair_ByteDedupStillCountsTwo documents that
+// the raw byte-level UniqueSignatures() helper (in isolation) still treats a
+// malleated pair as two distinct byte strings — that is simply what
+// byte-comparison does. This is NOT the consensus-relevant behaviour: since
+// #1074, verifyQC/verifyTC no longer call UniqueSignatures() for threshold
+// counting, precisely because byte-dedup collapsing to "two" here would let
+// a single signer inflate a QC/TC toward the 2/3 quorum threshold. The
+// corrected, consensus-relevant expectation — a malleated pair must count
+// as ONE (or be rejected outright) — is asserted against
+// RecoverUniqueSigners/verifyQC/verifyTC in a99_qctc_malleability_test.go.
+func TestUniqueSignatures_MalleatedPair_ByteDedupStillCountsTwo(t *testing.T) {
 	k := genKey(t)
 	hash := common.HexToHash("0xcafebabe")
 	sig, err := crypto.Sign(hash[:], k)
@@ -142,11 +155,16 @@ func TestUniqueSignatures_Empty(t *testing.T) {
 	}
 }
 
-// TestUniqueSignatures_ThresholdImplication is a commentary test that
-// documents the consensus-split scenario from issue #926 explicitly.
-// It verifies that a QC carrying 13 legitimate sigs + 1 malleated copy
-// counts as 14 distinct sigs after byte-dedup (matching canonical), not
-// 13 (which address-dedup would produce).
+// TestUniqueSignatures_ThresholdImplication is a commentary test documenting
+// the #1074/#926 vulnerability at the level of the raw byte-dedup helper: a
+// QC carrying 13 legitimate sigs + 1 malleated copy of one of them counts as
+// 14 distinct sigs under byte-dedup, inflating the threshold count by one
+// signer that never actually cast a second vote. This is exactly why
+// UniqueSignatures() is no longer used for QC/TC threshold counting — see
+// TestVerifyQC_MalleatedCopy_RejectedNotCountedTwice and
+// TestVerifyTC_MalleatedCopy_RejectedNotCountedTwice in
+// a99_qctc_malleability_test.go for the corrected hot-path behaviour
+// (RecoverUniqueSigners), which does NOT count this pair as two.
 func TestUniqueSignatures_ThresholdImplication(t *testing.T) {
 	hash := common.HexToHash("0x888")
 	const legitimateSigCount = 13

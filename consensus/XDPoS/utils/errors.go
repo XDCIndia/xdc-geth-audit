@@ -40,6 +40,10 @@ var (
 	ErrNotItsTurn         = errors.New("not its turn")
 	ErrInvalidMixDigest   = errors.New("invalid mix digest")
 	ErrNoValidatorSignatureV2 = errors.New("no validator signature v2")
+	// ErrInvalidSignature is returned by RecoverUniqueSigners when a
+	// signature is not in canonical low-S form (an ECDSA-malleated
+	// high-S counterpart), or is otherwise malformed. See #1074.
+	ErrInvalidSignature = errors.New("invalid signature")
 )
 
 // ErrIncomingMessageRoundTooFarFromCurrentRound is returned when a message's round

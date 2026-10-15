@@ -18,6 +18,13 @@ import (
 	"github.com/ethereum/go-ethereum/log"
 )
 
+// secp256k1halfN is half of the secp256k1 curve order N. A signature's S
+// value must be <= secp256k1halfN to be in canonical low-S form; ECDSA
+// malleability means (r, s) and (r, N-s) both recover the same public key,
+// so without this check a single signer can produce two byte-distinct
+// signatures over the same message. See #1074 / legacy XDPoSChain utils.go:21.
+var secp256k1halfN = new(big.Int).Rsh(crypto.S256().Params().N, 1)
+
 // signSignature signs a hash with the node's private key
 func (x *XDPoS_v2) signSignature(signingHash common.Hash) (types.Signature, error) {
 	x.signLock.RLock()
@@ -64,7 +71,35 @@ func (x *XDPoS_v2) verifyMsgSignature(signedHashToBeVerified common.Hash, signat
 	return false, signerAddress, nil
 }
 
-// RecoverUniqueSigners recovers unique signers from a list of signatures
+// hasLowS reports whether the signature's S value is in the lower half of the
+// secp256k1 curve order, the canonical low-S form that prevents
+// (r, s) -> (r, N-s) malleability. Matches legacy XDPoSChain utils.go:479.
+func hasLowS(signature types.Signature) bool {
+	if len(signature) != 65 {
+		log.Warn("[hasLowS] invalid signature length", "length", len(signature), "signature", common.Bytes2Hex(signature))
+		return false
+	}
+	s := new(big.Int).SetBytes(signature[32:64])
+	isLowS := s.Cmp(secp256k1halfN) <= 0
+	if !isLowS {
+		log.Warn("[hasLowS] found a flipped signature",
+			"r", common.Bytes2Hex(signature[0:32]),
+			"s", common.Bytes2Hex(signature[32:64]),
+			"v", signature[64],
+			"signature", common.Bytes2Hex(signature))
+	}
+	return isLowS
+}
+
+// RecoverUniqueSigners recovers unique signers (deduped by recovered
+// ADDRESS, not signature bytes) from a list of signatures, and rejects the
+// whole batch if any signature is not in canonical low-S form. This is the
+// address-dedup + low-S enforcement required for BFT-safe QC/TC threshold
+// counting: ECDSA malleability lets one signer produce multiple byte-distinct
+// signatures over the same message (the high-S complement of a valid low-S
+// signature recovers the same address), which would otherwise let a single
+// masternode key inflate the counted total toward the 2/3 quorum threshold.
+// Matches legacy XDPoSChain engines/engine_v2/utils.go:83 (#1074 / go-ethereum#1074).
 func RecoverUniqueSigners(signedHash common.Hash, signatureList []types.Signature) ([]types.Signature, []types.Signature, error) {
 	if signedHash == (common.Hash{}) {
 		return nil, nil, errors.New("signedHash cannot be empty")
@@ -96,6 +131,20 @@ func RecoverUniqueSigners(signedHash common.Hash, signatureList []types.Signatur
 			}
 			var signerAddress common.Address
 			copy(signerAddress[:], crypto.Keccak256(pubkey[1:])[12:])
+
+			// Reject the entire batch if this signature is an ECDSA-malleated
+			// (high-S) counterpart. An honest signer (crypto.Sign) always
+			// produces low-S; a high-S signature over an already-recoverable
+			// hash is evidence of a malleability attack, not a genuine second
+			// vote/timeout from a distinct signer.
+			if !hasLowS(sig) {
+				log.Warn("[RecoverUniqueSigners] found evidence of malleability attack",
+					"signer", signerAddress,
+					"message", signedHash.Hex())
+				errCh <- utils.ErrInvalidSignature
+				return
+			}
+
 			result <- Message{pubkey: signerAddress, sig: sig}
 		}(signature)
 	}
@@ -188,15 +237,27 @@ func (x *XDPoS_v2) verifyQC(chain consensus.ChainReader, quorumCert *types.Quoru
 		GapNumber:         quorumCert.GapNumber,
 	})
 
-	// A.98: Dedupe by signature bytes (matches canonical XDPoSChain).
-	// RecoverUniqueSigners ran Ecrecover purely to dedupe by address, then
-	// verifyMsgSignature re-Ecrecovered every sig — 2× Ecrecover per sig on
-	// the hot verify path. UniqueSignatures avoids the dedup-time Ecrecover.
-	// Parity note: canonical XDPoSChain (utils.go:78) dedupes by bytes;
-	// address-dedup (RecoverUniqueSigners) collapsed ECDSA-malleated pairs
-	// that share an address, whereas byte-dedup counts them as distinct — the
-	// canonical behaviour. See issue #926 for full analysis.
-	signatures, duplicates := UniqueSignatures(quorumCert.Signatures)
+	// #1074 fix: dedupe by recovered ADDRESS and reject high-S (ECDSA
+	// malleability) signatures, matching canonical XDPoSChain
+	// (engines/engine_v2/engine.go:915) and native eth2030 #136. Byte-level
+	// dedup (the old UniqueSignatures call previously here) is unsafe: a
+	// malleated (high-S) counterpart of a valid low-S signature is a
+	// byte-distinct encoding of the SAME signer's vote, so byte-dedup lets
+	// one masternode key inflate the counted total toward the 2/3 threshold
+	// — a BFT safety violation. RecoverUniqueSigners runs unconditionally
+	// (not gated on qcRound>0) so a high-S signature is rejected even on the
+	// round-0 QC marker path; only the threshold-count comparison below stays
+	// gated on qcRound>0.
+	signatures, duplicates, err := RecoverUniqueSigners(signedVoteObj, quorumCert.Signatures)
+	if err != nil {
+		log.Error("[verifyQC] Error while recovering unique signers from QC",
+			"qcBlockNum", quorumCert.ProposedBlockInfo.Number,
+			"qcRound", quorumCert.ProposedBlockInfo.Round,
+			"qcBlockHash", quorumCert.ProposedBlockInfo.Hash,
+			"qcSignLen", len(quorumCert.Signatures),
+			"error", err)
+		return utils.ErrInvalidQCSignatures
+	}
 
 	if len(duplicates) > 0 {
 		for _, d := range duplicates {
