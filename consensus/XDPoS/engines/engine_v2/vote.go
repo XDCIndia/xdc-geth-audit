@@ -226,7 +226,15 @@ func (x *XDPoS_v2) sendVote(chain consensus.ChainReader, blockInfo *types.BlockI
 	// Latch the voted round only once the vote is accepted and about to be
 	// broadcast — the one-vote-per-round equivocation guard applies to votes
 	// that can actually reach the network.
-	x.highestVotedRound = x.currentRound
+	//
+	// F-2026-19622 fix: latch blockInfo.Round (the round we voted for), NOT
+	// x.currentRound. If our vote was the last one needed to complete a QC,
+	// voteHandler already called processQC → setNewRound, advancing
+	// x.currentRound from R to R+1. Reading x.currentRound here would latch
+	// R+1, causing verifyVotingRule to refuse our vote in the very next round.
+	// Canonical XDPoSChain (v2.9.3-testnet vote.go:47) avoids this by latching
+	// before voteHandler; we latch the explicit voted round instead.
+	x.highestVotedRound = blockInfo.Round
 
 	// Broadcast
 	x.broadcastToBftChannel(voteMsg)

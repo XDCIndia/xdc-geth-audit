@@ -8,6 +8,7 @@ import (
 	"math/big"
 	"testing"
 
+	"github.com/ethereum/go-ethereum/accounts"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/consensus/XDPoS/utils"
 	"github.com/ethereum/go-ethereum/core/types"
@@ -301,4 +302,166 @@ func TestTimeoutSigHash_Deterministic(t *testing.T) {
 	if h1 != h2 {
 		t.Errorf("TimeoutSigHash not deterministic: %v vs %v", h1, h2)
 	}
+}
+
+// TestVerifyVotingRule_F2026_19622 reproduces the F-2026-19622 scenario:
+// a node whose vote completes a QC must still be allowed to vote in the next round.
+//
+// Before the fix, sendVote latched highestVotedRound = x.currentRound AFTER
+// voteHandler; if our vote triggered processQC, currentRound advanced from R to
+// R+1, so the latch stored R+1.  verifyVotingRule then refused to vote in round
+// R+1 because currentRound(R+1) <= highestVotedRound(R+1).
+//
+// After the fix, sendVote latches blockInfo.Round (=R), so round R+1 is open.
+//
+// This test fails on origin/main (the check with highestVotedRound=6 returns
+// true from verifyVotingRule when it should return false, showing the bug exists
+// in the old code path).  It passes after the fix is applied.
+// TestSendVote_HighestVotedRound_F2026_19622 is the integration test for fix
+// F-2026-19622. It drives the real sendVote → voteHandler →
+// onVotePoolThresholdReached → processQC → setNewRound path and proves that
+// highestVotedRound is latched to R (the voted round), not R+1 (the round
+// processQC just advanced to).
+//
+// Setup: 1 masternode, CertThreshold=2/3 → our single vote completes the QC.
+// processQC fires, setNewRound advances currentRound from 5 to 6.
+//
+// On origin/main (x.highestVotedRound = x.currentRound):
+//
+//	highestVotedRound is set to 6 (R+1), so verifyVotingRule refuses round-6.
+//
+// On this branch (x.highestVotedRound = blockInfo.Round):
+//
+//	highestVotedRound is set to 5 (R), so verifyVotingRule allows round-6.
+//
+// Run: go test ./consensus/XDPoS/engines/engine_v2/... -run TestSendVote_HighestVotedRound_F2026_19622 -v
+func TestSendVote_HighestVotedRound_F2026_19622(t *testing.T) {
+	// Engine: SwitchBlock=0, Epoch=900, CertThreshold=2/3.
+	// newA894Engine gives us all of this; 1 masternode ensures our single vote
+	// crosses the 2/3 threshold and triggers processQC.
+	eng, _ := newA894Engine(t)
+	// Buffered so broadcastToBftChannel's goroutine never blocks.
+	eng.BroadcastCh = make(chan interface{}, 1)
+
+	// Generate a signing key and authorize the engine.
+	key, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	ourAddr := crypto.PubkeyToAddress(key.PublicKey)
+	eng.Authorize(ourAddr, func(_ accounts.Account, hash []byte) ([]byte, error) {
+		return crypto.Sign(hash, key)
+	})
+
+	// Build proposed block at height=2, round=5 with valid V2 extra.
+	// The QC embedded in the block's extra covers a fictitious parent at round=4.
+	// commitBlocks returns early (2-2=0 <= SwitchBlock=0) so no parent lookup occurs.
+	parentHash := common.HexToHash("0xbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeef")
+	qcInBlock := &types.QuorumCert{
+		ProposedBlockInfo: &types.BlockInfo{Hash: parentHash, Round: 4, Number: big.NewInt(1)},
+		Signatures:        []types.Signature{},
+		GapNumber:         0,
+	}
+	blockExtra := &types.ExtraFields_v2{Round: 5, QuorumCert: qcInBlock}
+	extraBytes, err := blockExtra.EncodeToBytes()
+	if err != nil {
+		t.Fatalf("EncodeToBytes: %v", err)
+	}
+	proposedHeader := &types.Header{
+		Number:     big.NewInt(2),
+		ParentHash: parentHash,
+		Extra:      extraBytes,
+		Difficulty: big.NewInt(1),
+	}
+	blockHash := proposedHeader.Hash()
+
+	// blockInfo is what sendVote is called with.
+	blockInfo := &types.BlockInfo{Round: 5, Number: big.NewInt(2), Hash: blockHash}
+
+	// Pre-seed epochSwitches LRU so getEpochSwitchInfo never reaches the chain.
+	// 1 masternode, MasternodesLen=1 → threshold = 1*2/3 ≈ 0.667 → 1 vote suffices.
+	eng.epochSwitches.Add(blockHash, &types.EpochSwitchInfo{
+		Masternodes:    []common.Address{ourAddr},
+		MasternodesLen: 1,
+		EpochSwitchBlockInfo: &types.BlockInfo{
+			Round:  0,
+			Number: big.NewInt(0),
+			Hash:   common.Hash{},
+		},
+	})
+
+	// Engine state: we are in round 5, fully initialised.
+	eng.currentRound = 5
+	eng.isInitialized = true
+
+	// Mock chain: only GetHeaderByHash(blockHash) needs to return a header.
+	// All other lookups (parent, grandparent) are never reached because
+	// commitBlocks exits early for block 2 (2-2=0 <= SwitchBlock=0).
+	// The vote handler checks our own vote against the gap snapshot, so the
+	// chain must serve the gap header (block 0) by number and its snapshot
+	// must list our address.
+	gapHeader := &types.Header{Number: big.NewInt(0), Difficulty: big.NewInt(1)}
+	eng.snapshots.Add(gapHeader.Hash(), newSnapshot(0, gapHeader.Hash(), []common.Address{ourAddr}))
+	chain := &gapChain19622{
+		mockChainForA894: mockChainForA894{
+			headers: map[common.Hash]*types.Header{blockHash: proposedHeader, gapHeader.Hash(): gapHeader},
+		},
+		gap: gapHeader,
+	}
+
+	// sendVote is the function under test. It will:
+	//   1. sign a vote for blockInfo (round=5)
+	//   2. call voteHandler → 1 vote >= 1 * 2/3 → threshold reached
+	//   3. onVotePoolThresholdReached → processQC → setNewRound(6)
+	//   4. latch highestVotedRound
+	if err := eng.sendVote(chain, blockInfo); err != nil {
+		t.Fatalf("sendVote error: %v", err)
+	}
+
+	// Drain the broadcast channel (broadcastToBftChannel spawned a goroutine).
+	<-eng.BroadcastCh
+
+	// processQC must have fired and advanced currentRound to 6.
+	if eng.currentRound != 6 {
+		t.Fatalf("expected currentRound=6 after processQC, got %d", eng.currentRound)
+	}
+
+	// KEY ASSERTION: highestVotedRound must equal the voted round (R=5), not
+	// the round processQC advanced to (R+1=6). On origin/main the latch reads
+	// x.currentRound after processQC already mutated it, so it stores 6.
+	if eng.highestVotedRound != 5 {
+		t.Fatalf("F-2026-19622: highestVotedRound=%d want 5 (voted round); "+
+			"if it is 6, the latch reads x.currentRound after processQC advanced it (the bug)",
+			eng.highestVotedRound)
+	}
+
+	// Consequence: the node must be able to vote in round 6 (the very next round).
+	// qcR5 is the QC we just formed (round=5 > lockQC.round=4), so the voting
+	// rule's safety branch is satisfied.
+	blockInfoR6 := &types.BlockInfo{Round: 6, Number: big.NewInt(3), Hash: common.Hash{0x06}}
+	qcR5 := &types.QuorumCert{
+		ProposedBlockInfo: &types.BlockInfo{Round: 5, Number: big.NewInt(2), Hash: blockHash},
+	}
+	ok, err := eng.verifyVotingRule(chain, blockInfoR6, qcR5)
+	if err != nil {
+		t.Fatalf("verifyVotingRule error: %v", err)
+	}
+	if !ok {
+		t.Fatalf("F-2026-19622: verifyVotingRule refused round-6 vote; "+
+			"highestVotedRound=%d currentRound=%d (blocked because highestVotedRound >= currentRound)",
+			eng.highestVotedRound, eng.currentRound)
+	}
+}
+
+// gapChain19622 serves the gap header by number for TestSendVote_HighestVotedRound_F2026_19622.
+type gapChain19622 struct {
+	mockChainForA894
+	gap *types.Header
+}
+
+func (c *gapChain19622) GetHeaderByNumber(n uint64) *types.Header {
+	if n == 0 {
+		return c.gap
+	}
+	return nil
 }
