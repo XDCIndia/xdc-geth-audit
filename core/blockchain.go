@@ -131,6 +131,14 @@ var (
 	forkReadyInterval = 3 * time.Minute
 )
 
+// committedBlocker is satisfied by the XDPoS wrapper's LatestCommittedBlock
+// method. Defined as a local interface to avoid the consensus/XDPoS→core
+// import cycle: consensus/XDPoS imports core, so core cannot import it back.
+// reorg() type-asserts bc.Engine() to this interface at runtime.
+type committedBlocker interface {
+	LatestCommittedBlock() *types.BlockInfo
+}
+
 const (
 	bodyCacheLimit     = 256
 	blockCacheLimit    = 256
@@ -3030,6 +3038,46 @@ func (bc *BlockChain) reorg(oldHead *types.Header, newHead *types.Header) error 
 		newHead = bc.GetHeader(newHead.ParentHash, newHead.Number.Uint64()-1)
 		if newHead == nil {
 			return errInvalidNewChain
+		}
+	}
+	// XDC F-2026-19773: refuse a reorg that would drop an XDPoS v2 committed
+	// block from the canonical chain. Matches canonical XDPoSChain v2.9.3-testnet
+	// blockchain.go:3986-4004. The guard checks only the old chain (the chain
+	// being replaced): if the committed block appears there with the committed
+	// hash, the reorg is refused; a differing hash at the committed number is an
+	// impossible state and is logged as an error. The new chain is not checked
+	// here; verifying that the new chain also carries the committed block is a
+	// protocol-level gap present in canonical as well.
+	if cb, ok := bc.Engine().(committedBlocker); ok {
+		if lcb := cb.LatestCommittedBlock(); lcb != nil {
+			if commonBlock.Number.Cmp(lcb.Number) < 0 {
+				// Common ancestor is below the committed block — the old chain
+				// contains the committed block and the reorg would drop it.
+				for _, h := range oldChain {
+					if h.Number.Cmp(lcb.Number) == 0 {
+						if h.Hash() == lcb.Hash {
+							log.Warn("Stop reorg, blockchain is under forking attack",
+								"committedNum", lcb.Number, "committedHash", lcb.Hash,
+								"commonNum", commonBlock.Number, "commonHash", commonBlock.Hash())
+							return fmt.Errorf("stop reorg: new chain would drop XDPoS v2 committed block %d %s",
+								lcb.Number, lcb.Hash)
+						}
+						// The old chain at the committed number has a different
+						// hash — that is impossible (we committed it). Log and
+						// continue without refusing the reorg.
+						log.Error("Impossible reorg, please file an issue",
+							"committedNum", lcb.Number, "committedHash", lcb.Hash,
+							"oldChainHash", h.Hash())
+						break
+					}
+				}
+			} else if commonBlock.Number.Cmp(lcb.Number) == 0 && commonBlock.Hash() != lcb.Hash {
+				// Common ancestor is at the committed number but with a different
+				// hash — should never happen.
+				log.Error("Impossible reorg, please file an issue",
+					"committedNum", lcb.Number, "committedHash", lcb.Hash,
+					"commonHash", commonBlock.Hash())
+			}
 		}
 	}
 	// Ensure the user sees large reorgs

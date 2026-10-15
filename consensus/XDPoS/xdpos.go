@@ -405,6 +405,12 @@ type EngineV2Iface interface {
 	GetEpochSwitchInfoBetween(chain consensus.ChainReader, begin, end *types.Header) ([]*types.EpochSwitchInfo, error)
 	GetBlockByEpochNumber(chain consensus.ChainReader, epochNumber uint64) (*types.BlockInfo, error)
 	CalculateMissingRounds(chain consensus.ChainReader, header *types.Header) (*utils.PublicApiMissedRoundsMetadata, error)
+
+	// GetLatestCommittedBlockInfo returns the highest block committed by the
+	// BFT 3-chain rule, or nil before the first commit. Thread-safe; read under
+	// the engine's internal lock. Used by core/blockchain.go reorg() to refuse
+	// a reorg below the latest committed block (F-2026-19773).
+	GetLatestCommittedBlockInfo() *types.BlockInfo
 }
 
 // SetEngineV2 wires the V2 consensus engine for full V2 header verification. (#94)
@@ -413,6 +419,18 @@ type EngineV2Iface interface {
 // engine_v2.XDPoS_v2 directly to New() to avoid the two-step initialization.
 func (c *XDPoS) SetEngineV2(v2 EngineV2Iface) {
 	c.EngineV2 = v2
+}
+
+// LatestCommittedBlock returns the highest XDPoS v2 committed block, or nil
+// before the first BFT commit. Safe to call from core/blockchain.go without
+// importing the consensus/XDPoS package (avoids the import cycle that exists
+// because consensus/XDPoS imports core). Core type-asserts the engine to the
+// committedBlocker local interface rather than *XDPoS.
+func (c *XDPoS) LatestCommittedBlock() *types.BlockInfo {
+	if c.EngineV2 == nil {
+		return nil
+	}
+	return c.EngineV2.GetLatestCommittedBlockInfo()
 }
 
 // UpdateMasternodesV2 forwards a direct masternode-set seed to the V2 engine.

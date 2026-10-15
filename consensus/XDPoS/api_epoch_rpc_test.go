@@ -331,3 +331,5 @@ func TestGetV2BlockByHeaderPopulatesRound(t *testing.T) {
 		t.Fatalf("expected Round=1823 from V2 engine, got %d (issue #1482: GetV2BlockByHeader always returned Round=0)", info.Round)
 	}
 }
+
+func (s *stubV2Engine) GetLatestCommittedBlockInfo() *types.BlockInfo { return nil }
