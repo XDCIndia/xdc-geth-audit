@@ -89,6 +89,7 @@ var (
 		utils.FastSyncPivotHashFlag,
 		utils.FastSyncPivotRootFlag,
 		utils.NoAutoPivotFlag,
+		utils.AutoCheckpointPivotFlag,
 		utils.SyncTargetFlag,
 		utils.ExitWhenSyncedFlag,
 		utils.GCModeFlag,
