@@ -121,6 +121,12 @@ func (x *XDPoS_v2) voteHandler(chain consensus.ChainReader, voteMsg *types.Vote)
 	numberOfVotes, pooledVotes := x.votePool.Add(voteMsg)
 	log.Debug("[voteHandler] collected vote", "count", numberOfVotes)
 
+	// Equivocation detection in goroutines — never blocks or alters acceptance (#1478).
+	if x.ForensicsProcessor != nil {
+		go x.ForensicsProcessor.DetectEquivocationInVotePool(voteMsg, x.votePool)
+		go x.ForensicsProcessor.ProcessVoteEquivocation(chain, x, voteMsg)
+	}
+
 	// Get epoch info
 	epochInfo, err := x.getEpochSwitchInfo(chain, nil, voteMsg.ProposedBlockInfo.Hash)
 	if err != nil {

@@ -505,6 +505,14 @@ func (x *XDPoS_v2) commitBlocks(chain consensus.ChainReader, proposedBlockHeader
 		x.HookCommitBlock(grandParentBlock)
 	}
 
+	// Forensics monitoring: detect diverging QCs after each commit (#1478).
+	// Matches canonical engine_v2/engine.go processQC call at the same point.
+	// Runs in a goroutine — never blocks or alters block acceptance.
+	if x.ForensicsProcessor != nil {
+		headerQcToBeCommitted := []types.Header{*parentBlock, *proposedBlockHeader}
+		go x.ForensicsProcessor.ForensicsMonitoring(chain, x, headerQcToBeCommitted, *incomingQc)
+	}
+
 	return true, nil
 }
 
