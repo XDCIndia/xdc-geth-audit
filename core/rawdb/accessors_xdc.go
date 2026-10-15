@@ -12,6 +12,7 @@ import (
 	"encoding/binary"
 
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/ethdb"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/rlp"
@@ -19,39 +20,47 @@ import (
 
 // XDPoS-specific database key prefixes
 var (
+	// BFT local safety state — singleton keys (F-2026-19774).
+	// These persist highestVotedRound, highestSelfMinedRound, and lockQuorumCert
+	// across restarts so the equivocation guards survive a crash/restart inside a round.
+	// The values are local safety state only; they do not affect block acceptance.
+	bftHighestVotedRoundKey     = []byte("bftsafety-hvr")
+	bftHighestSelfMinedRoundKey = []byte("bftsafety-hsmr")
+	bftLockQCKey                = []byte("bftsafety-lqc")
+
 	// Masternode data
-	masternodePrefix      = []byte("masternode-")
-	masternodeListPrefix  = []byte("masternodelist-")
-	
+	masternodePrefix     = []byte("masternode-")
+	masternodeListPrefix = []byte("masternodelist-")
+
 	// Epoch data
-	epochPrefix           = []byte("epoch-")
-	epochSnapshotPrefix   = []byte("epochsnapshot-")
-	
+	epochPrefix         = []byte("epoch-")
+	epochSnapshotPrefix = []byte("epochsnapshot-")
+
 	// Penalty data
-	penaltyPrefix         = []byte("penalty-")
-	penalizedListPrefix   = []byte("penalizedlist-")
-	
+	penaltyPrefix       = []byte("penalty-")
+	penalizedListPrefix = []byte("penalizedlist-")
+
 	// Reward data
-	rewardPrefix          = []byte("reward-")
-	rewardEpochPrefix     = []byte("rewardepoch-")
-	
+	rewardPrefix      = []byte("reward-")
+	rewardEpochPrefix = []byte("rewardepoch-")
+
 	// Block signer data
-	blockSignerPrefix     = []byte("blocksigner-")
-	
+	blockSignerPrefix = []byte("blocksigner-")
+
 	// Vote data
-	votePrefix            = []byte("vote-")
-	
+	votePrefix = []byte("vote-")
+
 	// Trading state root prefix
-	tradingStatePrefix    = []byte("tradingstate-")
-	
+	tradingStatePrefix = []byte("tradingstate-")
+
 	// Lending state root prefix
-	lendingStatePrefix    = []byte("lendingstate-")
-	
+	lendingStatePrefix = []byte("lendingstate-")
+
 	// QC (Quorum Certificate) data
-	qcPrefix              = []byte("qc-")
-	
+	qcPrefix = []byte("qc-")
+
 	// Timeout pool data
-	timeoutPoolPrefix     = []byte("timeoutpool-")
+	timeoutPoolPrefix = []byte("timeoutpool-")
 )
 
 // encodeBlockNumber encodes a block number as big endian uint64
@@ -148,7 +157,7 @@ func ReadMasternodeList(db ethdb.Reader, epoch uint64) []common.Address {
 	if err != nil || len(data) == 0 {
 		return nil
 	}
-	
+
 	var masternodes []common.Address
 	if err := rlp.DecodeBytes(data, &masternodes); err != nil {
 		log.Error("Invalid masternode list RLP", "epoch", epoch, "err", err)
@@ -174,7 +183,7 @@ func ReadPenalizedList(db ethdb.Reader, epoch uint64) []common.Address {
 	if err != nil || len(data) == 0 {
 		return nil
 	}
-	
+
 	var penalized []common.Address
 	if err := rlp.DecodeBytes(data, &penalized); err != nil {
 		log.Error("Invalid penalized list RLP", "epoch", epoch, "err", err)
@@ -257,7 +266,7 @@ func ReadEpochData(db ethdb.Reader, epoch uint64) *EpochData {
 	if err != nil || len(data) == 0 {
 		return nil
 	}
-	
+
 	var epochData EpochData
 	if err := rlp.DecodeBytes(data, &epochData); err != nil {
 		log.Error("Invalid epoch data RLP", "epoch", epoch, "err", err)
@@ -287,5 +296,82 @@ func HasEpochData(db ethdb.Reader, epoch uint64) bool {
 func DeleteEpochData(db ethdb.KeyValueWriter, epoch uint64) {
 	if err := db.Delete(EpochKey(epoch)); err != nil {
 		log.Crit("Failed to delete epoch data", "err", err)
+	}
+}
+
+// --- BFT local safety state (F-2026-19774) ---------------------------------
+//
+// highestVotedRound, highestSelfMinedRound, and lockQuorumCert are in-memory
+// equivocation guards.  Persisting them prevents a restart inside a round from
+// lowering the guard and allowing a double vote or double seal.
+//
+// These keys hold local-validator state only; they do not affect which blocks
+// other nodes accept.  Canonical XDPoSChain keeps these in memory only; this
+// is an intentional local-safety improvement beyond canonical.
+
+// ReadBFTHighestVotedRound reads the persisted highest voted round.
+// Returns 0 (safe default) if the key does not exist.
+func ReadBFTHighestVotedRound(db ethdb.Reader) types.Round {
+	data, err := db.Get(bftHighestVotedRoundKey)
+	if err != nil || len(data) != 8 {
+		return 0
+	}
+	return types.Round(binary.BigEndian.Uint64(data))
+}
+
+// WriteBFTHighestVotedRound persists the highest voted round.
+func WriteBFTHighestVotedRound(db ethdb.KeyValueWriter, round types.Round) {
+	var enc [8]byte
+	binary.BigEndian.PutUint64(enc[:], uint64(round))
+	if err := db.Put(bftHighestVotedRoundKey, enc[:]); err != nil {
+		log.Crit("Failed to persist BFT highest voted round", "err", err)
+	}
+}
+
+// ReadBFTHighestSelfMinedRound reads the persisted highest self-mined round.
+// Returns 0 (safe default) if the key does not exist.
+func ReadBFTHighestSelfMinedRound(db ethdb.Reader) types.Round {
+	data, err := db.Get(bftHighestSelfMinedRoundKey)
+	if err != nil || len(data) != 8 {
+		return 0
+	}
+	return types.Round(binary.BigEndian.Uint64(data))
+}
+
+// WriteBFTHighestSelfMinedRound persists the highest self-mined round.
+func WriteBFTHighestSelfMinedRound(db ethdb.KeyValueWriter, round types.Round) {
+	var enc [8]byte
+	binary.BigEndian.PutUint64(enc[:], uint64(round))
+	if err := db.Put(bftHighestSelfMinedRoundKey, enc[:]); err != nil {
+		log.Crit("Failed to persist BFT highest self-mined round", "err", err)
+	}
+}
+
+// ReadBFTLockQC reads the persisted lock quorum certificate.
+// Returns nil if the key does not exist or decoding fails.
+func ReadBFTLockQC(db ethdb.Reader) *types.QuorumCert {
+	data, err := db.Get(bftLockQCKey)
+	if err != nil || len(data) == 0 {
+		return nil
+	}
+	var qc types.QuorumCert
+	if err := rlp.DecodeBytes(data, &qc); err != nil {
+		log.Error("Invalid BFT lock QC RLP in DB", "err", err)
+		return nil
+	}
+	return &qc
+}
+
+// WriteBFTLockQC persists the lock quorum certificate.
+func WriteBFTLockQC(db ethdb.KeyValueWriter, qc *types.QuorumCert) {
+	if qc == nil {
+		return
+	}
+	data, err := rlp.EncodeToBytes(qc)
+	if err != nil {
+		log.Crit("Failed to RLP encode BFT lock QC", "err", err)
+	}
+	if err := db.Put(bftLockQCKey, data); err != nil {
+		log.Crit("Failed to persist BFT lock QC", "err", err)
 	}
 }
