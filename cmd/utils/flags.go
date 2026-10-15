@@ -786,6 +786,13 @@ var (
 		Category: flags.LoggingCategory,
 	}
 
+	// StoreRewardFlag enables writing per-epoch reward maps to disk (RPC #1475).
+	StoreRewardFlag = &cli.BoolFlag{
+		Name:     "store-reward",
+		Usage:    "Store epoch reward maps to <datadir>/XDC/rewards/ for use by reward RPCs",
+		Category: flags.MiscCategory,
+	}
+
 	// MISC settings
 	SyncTargetFlag = &cli.StringFlag{
 		Name:      "synctarget",
@@ -2153,6 +2160,13 @@ func SetEthConfig(ctx *cli.Context, stack *node.Node, cfg *ethconfig.Config) {
 	}
 	if ctx.IsSet(RPCGlobalEVMTimeoutFlag.Name) {
 		cfg.RPCEVMTimeout = ctx.Duration(RPCGlobalEVMTimeoutFlag.Name)
+	}
+	if ctx.Bool(StoreRewardFlag.Name) {
+		dir := filepath.Join(stack.DataDir(), "XDC", "rewards")
+		if err := os.MkdirAll(dir, os.ModePerm); err != nil {
+			Fatalf("Failed to create reward storage dir: %v", err)
+		}
+		common.StoreRewardFolder = dir
 	}
 	if ctx.IsSet(RPCGlobalTxFeeCapFlag.Name) {
 		cfg.RPCTxFeeCap = ctx.Float64(RPCGlobalTxFeeCapFlag.Name)

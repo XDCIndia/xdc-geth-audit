@@ -54,7 +54,7 @@ var (
 	// flags that configure the node
 	nodeFlags = slices.Concat([]cli.Flag{
 		utils.IdentityFlag,
-		utils.UnlockedAccountFlag, // deprecated; XDPoS minter uses it to select the sealer keystore account
+		utils.UnlockedAccountFlag,       // deprecated; XDPoS minter uses it to select the sealer keystore account
 		utils.InsecureUnlockAllowedFlag, // deprecated; no-op, accepted for XDPoS minter CLI back-compat
 		utils.PasswordFileFlag,
 		utils.BootnodesFlag,
@@ -162,6 +162,7 @@ var (
 		utils.BeaconCheckpointFlag,
 		utils.BeaconCheckpointFileFlag,
 		utils.LogSlowBlockFlag,
+		utils.StoreRewardFlag,
 	}, utils.NetworkFlags, utils.DatabaseFlags)
 
 	rpcFlags = []cli.Flag{

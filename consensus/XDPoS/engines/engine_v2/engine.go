@@ -5,9 +5,14 @@
 package engine_v2
 
 import (
+	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math/big"
+	"os"
+	"path/filepath"
+	"strconv"
 	"sync"
 	"time"
 
@@ -90,6 +95,10 @@ type XDPoS_v2 struct {
 	lockQuorumCert        *types.QuorumCert
 	highestTimeoutCert    *types.TimeoutCert
 	highestCommitBlock    *types.BlockInfo
+
+	// Latest epoch-switch reward, kept so saveRewardToFile can write it after Finalize.
+	latestReward         map[string]interface{}
+	latestRewardBlocknum uint64
 
 	// Hooks
 	HookReward  func(chain consensus.ChainReader, state *state.StateDB, parentState *state.StateDB, header *types.Header) (map[string]interface{}, error)
@@ -710,10 +719,19 @@ func (x *XDPoS_v2) Finalize(chain consensus.ChainReader, header *types.Header, s
 
 	if x.HookReward != nil && isEpochSwitch {
 		log.Info("[Finalize] V2 HookReward firing", "block", header.Number.Uint64(), "hash", header.Hash().Hex())
-		_, err := x.HookReward(chain, state, parentState, header)
+		rewards, err := x.HookReward(chain, state, parentState, header)
 		if err != nil {
 			return nil, err
 		}
+		x.lock.Lock()
+		x.latestRewardBlocknum = header.Number.Uint64()
+		x.latestReward, err = deepCloneJSON(rewards)
+		x.lock.Unlock()
+		if err != nil {
+			log.Error("[Finalize] Error deep cloning latest reward", "err", err, "rewards", rewards)
+			return nil, err
+		}
+		x.saveRewardToFile(header.Hash(), header.Number.Uint64())
 	} else if isEpochSwitch {
 		log.Warn("[Finalize] V2 HookReward is nil at epoch switch!", "block", header.Number.Uint64())
 	}
@@ -2987,4 +3005,53 @@ func (x *XDPoS_v2) InvalidateCaches(newHead uint64) {
 	x.round2epochBlockInfo.Purge()
 	log.Warn("[XDPoS_v2] caches invalidated after chain rewind (refs #802 task 3)",
 		"newHead", newHead)
+}
+
+// saveRewardToFile writes the latestReward map to a JSON file in common.StoreRewardFolder.
+// It is a no-op when StoreRewardFolder is not set (--store-reward flag not given).
+func (x *XDPoS_v2) saveRewardToFile(blockHash common.Hash, blockNumber uint64) {
+	if len(common.StoreRewardFolder) == 0 {
+		return
+	}
+
+	x.lock.RLock()
+	rewardsBlocknum := x.latestRewardBlocknum
+	rewards, err := deepCloneJSON(x.latestReward)
+	x.lock.RUnlock()
+	if err != nil {
+		log.Error("[saveRewardToFile] Error deep cloning latest reward", "err", err)
+		return
+	}
+	if rewardsBlocknum != blockNumber {
+		log.Error("[saveRewardToFile] block number mismatch", "stored", rewardsBlocknum, "arg", blockNumber)
+		return
+	}
+
+	data, err := json.MarshalIndent(rewards, "", "  ")
+	if err != nil {
+		log.Error("[saveRewardToFile] Error marshalling rewards", "err", err)
+		return
+	}
+	filename := strconv.FormatUint(blockNumber, 10) + "." + blockHash.Hex()
+	if err = os.WriteFile(filepath.Join(common.StoreRewardFolder, filename), data, 0644); err != nil {
+		log.Error("[saveRewardToFile] Error writing reward file", "filename", filename, "err", err)
+	}
+}
+
+// deepCloneJSON deep-clones a map[string]interface{} via JSON round-trip.
+func deepCloneJSON(original map[string]interface{}) (map[string]interface{}, error) {
+	if original == nil {
+		return nil, nil
+	}
+	data, err := json.Marshal(original)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal: %w", err)
+	}
+	var cloned map[string]interface{}
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.UseNumber()
+	if err = dec.Decode(&cloned); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal: %w", err)
+	}
+	return cloned, nil
 }
