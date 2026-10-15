@@ -288,28 +288,8 @@ func makeFullNode(ctx *cli.Context) *node.Node {
 	if ctx.Bool(utils.GraphQLEnabledFlag.Name) {
 		utils.RegisterGraphQLService(stack, backend, filterSystem, &cfg.Node)
 	}
-	// Add the Ethereum Stats daemon. XDC: on XDPoS chains the node reports to the
-	// shared XDC stats board by DEFAULT — even without --ethstats — and the host
-	// IP is baked into the reported name (see utils.XDCEthstatsURL). A passed
-	// --ethstats still wins for name/secret/host; the IP is appended to its name.
-	// Non-XDC chains keep upstream behaviour (register only when the flag is set).
-	if eth != nil && eth.BlockChain().Config().XDPoS != nil {
-		chainID := eth.BlockChain().Config().ChainID.Uint64()
-		nodetype := "full" // xdcnode.sh node-name component
-		switch cfg.Eth.SyncMode {
-		case ethconfig.FastSync:
-			nodetype = "fast"
-		case ethconfig.SnapSync:
-			nodetype = "snap"
-		default:
-			if cfg.Eth.NoPruning {
-				nodetype = "archive"
-			}
-		}
-		utils.RegisterEthStatsService(stack, backend, utils.XDCEthstatsURL(cfg.Ethstats.URL, chainID, nodetype))
-	} else if cfg.Ethstats.URL != "" {
-		utils.RegisterEthStatsService(stack, backend, cfg.Ethstats.URL)
-	}
+	// Add the Ethereum Stats daemon if requested.
+	registerEthStats(stack, backend, cfg.Ethstats.URL)
 
 	// Configure synchronization override service
 	syncConfig := syncer.Config{
@@ -523,4 +503,16 @@ func (l *xdcMiningLifecycle) Start() error {
 func (l *xdcMiningLifecycle) Stop() error {
 	l.eth.StopMining()
 	return nil
+}
+
+// registerEthStatsService is a test hook for registerEthStats.
+var registerEthStatsService = utils.RegisterEthStatsService
+
+// registerEthStats adds the ethstats service only when --ethstats is set, on
+// every chain. There is no default stats endpoint (XDPoSChain
+// cmd/XDC/config.go:236).
+func registerEthStats(stack *node.Node, backend *ethpkg.EthAPIBackend, url string) {
+	if url != "" {
+		registerEthStatsService(stack, backend, url)
+	}
 }
