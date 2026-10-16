@@ -177,6 +177,27 @@ func RecoverUniqueSigners(signedHash common.Hash, signatureList []types.Signatur
 	return uniqueSigners, duplicates, nil
 }
 
+// countPoolSigners returns the number of distinct signers among the pooled
+// messages that are in masternodes. The pool keys entries by message hash,
+// which includes the signature bytes, so one signer can hold several entries;
+// the vote and timeout threshold gates must count signers, not entries (#1552).
+// Signers were recovered when each message was admitted, so no ecrecover here.
+func countPoolSigners(pooled map[common.Hash]utils.PoolObj, masternodes []common.Address) int {
+	member := make(map[common.Address]struct{}, len(masternodes))
+	for _, mn := range masternodes {
+		member[mn] = struct{}{}
+	}
+	seen := make(map[common.Address]struct{}, len(pooled))
+	for _, obj := range pooled {
+		if signer := obj.GetSigner(); signer != (common.Address{}) {
+			if _, ok := member[signer]; ok {
+				seen[signer] = struct{}{}
+			}
+		}
+	}
+	return len(seen)
+}
+
 // verifyQC verifies a quorum certificate
 // inCheckpointCatchup reports whether the given block number falls within the
 // "catchup window" after a trusted-checkpoint anchor — i.e. the chain was started
@@ -696,26 +717,6 @@ func (x *XDPoS_v2) GetSignersFromSnapshot(chain consensus.ChainReader, header *t
 		return nil, err
 	}
 	return snap.NextEpochCandidates, nil
-}
-
-// UniqueSignatures deduplicates signatures by their byte content.
-// Returns unique signatures and any duplicates found.
-// Matches v2.6.8 engines/engine_v2/utils.go conceptually.
-func UniqueSignatures(signatureSlice []types.Signature) ([]types.Signature, []types.Signature) {
-	seen := make(map[common.Hash]bool)
-	unique := make([]types.Signature, 0, len(signatureSlice))
-	duplicates := make([]types.Signature, 0)
-
-	for _, sig := range signatureSlice {
-		sigHash := common.BytesToHash(sig)
-		if seen[sigHash] {
-			duplicates = append(duplicates, sig)
-		} else {
-			seen[sigHash] = true
-			unique = append(unique, sig)
-		}
-	}
-	return unique, duplicates
 }
 
 // CalculateMissingRounds computes which consensus rounds were missed in the current epoch.

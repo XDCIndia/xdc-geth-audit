@@ -33,6 +33,31 @@ import (
 	"github.com/ethereum/go-ethereum/params"
 )
 
+// malleateSig returns the secp256k1 "complementary" signature for sig.
+// For a signature (r || s || v), the malleated form is (r || (n-s) || (v^1)).
+// Both recover the same public key via Ecrecover.
+func malleateSig(t *testing.T, sig types.Signature) types.Signature {
+	t.Helper()
+	if len(sig) != 65 {
+		t.Fatalf("expected 65-byte signature, got %d", len(sig))
+	}
+
+	// secp256k1 curve order n.
+	n := crypto.S256().Params().N
+
+	s := new(big.Int).SetBytes(sig[32:64])
+	sNeg := new(big.Int).Sub(n, s)
+
+	malleated := make([]byte, 65)
+	copy(malleated[0:32], sig[0:32]) // r unchanged
+	sNegBytes := sNeg.Bytes()
+	// left-pad to 32 bytes
+	copy(malleated[32+(32-len(sNegBytes)):64], sNegBytes)
+	malleated[64] = sig[64] ^ 0x01 // flip v
+
+	return types.Signature(malleated)
+}
+
 // --- hasLowS -----------------------------------------------------------------
 
 // TestHasLowS_BoundaryAtHalfN mirrors legacy XDPoSChain's boundary test:
@@ -158,6 +183,17 @@ func TestRecoverUniqueSigners_DistinctLowSSigners_AllKept(t *testing.T) {
 	}
 	if len(dups) != 0 {
 		t.Errorf("want 0 duplicates, got %d", len(dups))
+	}
+}
+
+// TestRecoverUniqueSigners_Empty checks the empty-slice edge case.
+func TestRecoverUniqueSigners_Empty(t *testing.T) {
+	unique, dups, err := RecoverUniqueSigners(common.HexToHash("0x1"), nil)
+	if err != nil {
+		t.Fatalf("RecoverUniqueSigners: %v", err)
+	}
+	if len(unique) != 0 || len(dups) != 0 {
+		t.Errorf("empty input: want (0,0), got (%d,%d)", len(unique), len(dups))
 	}
 }
 
