@@ -141,11 +141,14 @@ func (x *XDPoS_v2) voteHandler(chain consensus.ChainReader, voteMsg *types.Vote)
 
 	// Check threshold using per-round config (fix #63)
 	certThreshold := x.config.V2.Config(uint64(voteMsg.ProposedBlockInfo.Round)).CertThreshold
-	thresholdReached := float64(numberOfVotes) >= float64(epochInfo.MasternodesLen)*certThreshold
+	// Count distinct masternode signers, not pool entries (#1552).
+	signers := countPoolSigners(pooledVotes, epochInfo.Masternodes)
+	thresholdReached := float64(signers) >= float64(epochInfo.MasternodesLen)*certThreshold
 
 	if thresholdReached {
 		log.Info("[voteHandler] Vote threshold reached",
 			"votes", numberOfVotes,
+			"signers", signers,
 			"threshold", float64(epochInfo.MasternodesLen)*certThreshold)
 
 		// Check if block exists

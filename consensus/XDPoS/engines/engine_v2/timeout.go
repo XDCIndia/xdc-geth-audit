@@ -113,11 +113,14 @@ func (x *XDPoS_v2) timeoutHandler(chain consensus.ChainReader, timeout *types.Ti
 
 	// Check threshold using per-round config (fix #63)
 	certThreshold := x.config.V2.Config(uint64(timeout.Round)).CertThreshold
-	isThresholdReached := float64(numberOfTimeouts) >= float64(epochInfo.MasternodesLen)*certThreshold
+	// Count distinct masternode signers, not pool entries (#1552).
+	signers := countPoolSigners(pooledTimeouts, epochInfo.Masternodes)
+	isThresholdReached := float64(signers) >= float64(epochInfo.MasternodesLen)*certThreshold
 
 	if isThresholdReached {
 		log.Info("[timeoutHandler] Timeout threshold reached",
 			"count", numberOfTimeouts,
+			"signers", signers,
 			"threshold", float64(epochInfo.MasternodesLen)*certThreshold)
 
 		if err := x.onTimeoutPoolThresholdReached(chain, pooledTimeouts, timeout, timeout.GapNumber); err != nil {
