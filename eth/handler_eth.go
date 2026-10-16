@@ -259,6 +259,17 @@ func (h *ethHandler) Handle(peer *eth.Peer, packet eth.Packet) error {
 					"block", block.NumberU64(), "hash", block.Hash())
 			}
 		}
+		// A V1 block still waiting for its assigned M2's co-signature is not
+		// imported: the M2 gossips the co-signed block, which is. Importing it would
+		// only fail verification and report a BAD BLOCK. Mirrors XDPoSChain
+		// eth/fetcher/block_fetcher.go:734-756 (ErrNoValidatorSignature, not M2:
+		// relay and prepare, no insert).
+		if !didCoSign && len(block.Header().Validator) == 0 &&
+			errors.Is(h.chain.Engine().VerifyHeader(h.chain, block.Header()), XDPoS.ErrNoValidatorSignature) {
+			peer.Log().Debug("XDC NewBlock: waiting for the M2 co-signed block",
+				"block", block.NumberU64(), "hash", block.Hash())
+			return nil
+		}
 		if _, err := h.chain.InsertChain(types.Blocks{block}); err != nil {
 			peer.Log().Debug("XDC NewBlock: InsertChain failed",
 				"block", block.NumberU64(), "hash", block.Hash(), "err", err)
