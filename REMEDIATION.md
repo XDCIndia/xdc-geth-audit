@@ -4,7 +4,7 @@ Report: Hacken final report, 2026-10-13. Audited commit: `45e2b6ee`.
 
 ## Final commit
 
-**`d4590cfa086b65f7691f086c2c5d8175107ef4b4`**: the head code commit of the remediation branch `hacken/remediation-2026-10`. It is the first hand-over plus the follow-up fixes below. Use this commit.
+**`c1ee2319783814104823ee88b5764a1e45211978`**: the head code commit of the remediation branch `hacken/remediation-2026-10`. It is the first hand-over plus the follow-up fixes below. Use this commit.
 
 - First hand-over: `main` = `c5e7c37de28ed1b4b1da01918b7fdee03a58f151`.
 - On top of `45e2b6ee`: the v1.17.8 audit view (upstream go-ethereum v1.17.8 base), merge `42f2db823550308bf34992bcfdd1bc77cc456340`, then one commit per finding.
@@ -13,12 +13,12 @@ Report: Hacken final report, 2026-10-13. Audited commit: `45e2b6ee`.
 
 - **One commit per finding.** The finding ID is in the commit subject and in a `Hacken:` trailer. Find the fix for one finding with:
   ```sh
-  git log --grep 'Hacken: F-2026-19525' d4590cfa086b65f7691f086c2c5d8175107ef4b4
+  git log --grep 'Hacken: F-2026-19525' c1ee2319783814104823ee88b5764a1e45211978
   ```
 - **Shared root cause.** Two commits each fix two findings, and list both IDs:
   - F-2026-19596 + F-2026-19612;
   - F-2026-19466 + F-2026-19468.
-- **Two commits for F-2026-19525.** One fixes `verifyQC` / `verifyTC`; the other fixes the vote / timeout pools.
+- **Three commits for F-2026-19525.** One fixes `verifyQC` / `verifyTC`; one dedupes the vote / timeout pools in the threshold callbacks; the follow-up below makes the pool threshold gates count distinct signers.
 - **Tests.** Each fix commit adds a test that fails without the fix and passes with it. There are two exceptions:
   - **F-2026-19615:** documentation only. Canonical XDPoSChain's V1 engine has no gas-limit bound either, and adding one would reject historical blocks, so the commit records that in a code comment.
   - **F-2026-19815:** diagnostic only. Canonical compares the epoch-switch validator list without regard to order, so the commit logs a warning when the order differs and does not reject the block.
@@ -31,6 +31,7 @@ Each follow-up fix is one commit on its own branch, with the finding ID in the s
 | Finding | Branch | Commit | What changed |
 |---|---|---|---|
 | F-2026-19614 | `hacken/f-2026-19614-v1-double-validation-mainnet` | `0f1b4363dd0d709d163ab1673c9f71e56547f179` | The V1 double-validation check (empty-Validator and M2-assignment rejection) now runs on mainnet (chain 50) only, where another check already enforces it. The first fix applied it to every chain except Apothem. On private and mixed legacy + geth networks that rejected V1 blocks that canonical XDPoSChain accepts: blocks without an M2 co-signature, when the assigned M2 does not co-sign. Mainnet behaviour does not change. |
+| F-2026-19525 | `hacken/f-2026-19525-distinct-signer-gates` | `512744a9973d00eed2619d53a041830633acf9c1` | The vote and timeout pool threshold gates now count distinct, in-set signers instead of raw pool entries. The pool keys entries by message hash, which includes the signature bytes, so before this one masternode key could open the gate with several validly signed entries. On the timeout path that built a single-signer timeout certificate, advanced the local round, and broadcast a certificate that peers reject. The unused `UniqueSignatures` byte-dedupe helper is removed. The test `threshold_distinct_signers_test.go` fails on the first hand-over code and passes with this fix. |
 
 ## Summary
 
@@ -46,7 +47,7 @@ Each follow-up fix is one commit on its own branch, with the finding ID in the s
 
 | Finding | Severity | Title | Commit on `main` (full SHA, subject) or reason |
 |---|---|---|---|
-| F-2026-19525 | High | One Masternode Key Can Satisfy A Quorum Or Timeout Certificate | `3127524992766aff9bf78ea28edf7c20b25dbc8d`<br>consensus/XDPoS: dedup qc/tc signatures by address and reject high-s (F-2026-19525)<br>`9a1c11225688819019e3f722ee61c7036cab88d9`<br>consensus/XDPoS/engines/engine_v2: dedupe pool entries by signer in threshold callbacks (F-2026-19525) |
+| F-2026-19525 | High | One Masternode Key Can Satisfy A Quorum Or Timeout Certificate | `3127524992766aff9bf78ea28edf7c20b25dbc8d`<br>consensus/XDPoS: dedup qc/tc signatures by address and reject high-s (F-2026-19525)<br>`9a1c11225688819019e3f722ee61c7036cab88d9`<br>consensus/XDPoS/engines/engine_v2: dedupe pool entries by signer in threshold callbacks (F-2026-19525)<br>Follow-up: `512744a9973d00eed2619d53a041830633acf9c1`<br>consensus/XDPoS/engines/engine_v2: count distinct signers at the vote and timeout threshold gates (F-2026-19525) |
 | F-2026-19601 | High | V2 Proposer Seal Omits Header Fields That Change The Block Hash | `322af2f93960d988c812c685c8c67e9a91904486`<br>consensus/XDPoS, miner: reject post-london header fields xdpos does not seal (F-2026-19601) |
 | F-2026-19636 | High | Full Sync Canonizes A Header Batch That Does Not Extend The Local Head | `b7d201b2656b63dc4e3f6fcaf61dde9385844a57`<br>eth: only import full-sync header batches that extend the local head (F-2026-19636) |
 | F-2026-19727 | High | A Zero Price Signing Transaction Keeps That Account Out Of The Block | `bdd0fdc0aaa2f8e6175b0e5f3325ecd4bb319729`<br>miner: commit special transactions before the price heap (F-2026-19727) |
