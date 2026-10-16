@@ -704,29 +704,20 @@ func (c *XDPoS) verifyHeaderLightV1(chain consensus.ChainHeaderReader, header *t
 	}
 
 	// #951 Defect 1c: reject empty header.Validator past the first epoch (V1 double
-	// validation requires the assigned-M2 co-signature) — MAINNET (chainId 50) ONLY.
-	//
-	// On mainnet the canonical V1 chain always co-signs (legacy fullVerify), so an
-	// empty Validator is a pre-co-sign anomaly that must be rejected, forcing the
-	// xdcSyncer to re-fetch the co-signed canonical (modern lacks TD fork choice).
-	//
-	// On testnet/devnet the canonical chain legitimately CONTAINS empty-Validator
-	// >epoch blocks and there is no co-signed sibling to re-fetch: e.g. devnet-5151
-	// block 1962 has validator_len=0 and is canonical on legacy node1 AND accepted by
-	// older modern (c52d2957), while its neighbours (1960/1961/1963) carry the 65-byte
-	// co-signature. Rejecting it wedges import there (modern-val2 stuck at 1962). Mirror
-	// legacy's relaxed testnet/devnet verification (common.IsTestnet → fullVerify=false):
-	// accept empty there. Production still co-signs (miner Part C); this only gates IMPORT.
-	if number > c.config.Epoch && len(header.Validator) == 0 &&
-		chain.Config() != nil && chain.Config().ChainID != nil &&
-		chain.Config().ChainID.Uint64() == params.XDCMainnetChainConfig.ChainID.Uint64() {
+	// validation requires the assigned-M2 co-signature). Canonical v2.9.3 rejects it
+	// on every chain but Apothem (engine_v1/engine.go:162-167, 185-188; block import
+	// always runs full verification). An empty Validator is a pre-co-sign block that
+	// must be rejected, forcing the xdcSyncer to re-fetch the co-signed canonical.
+	// (v2.7.x accepted it on custom chains through a verify-cache quirk that v2.9.3
+	// removed, so v2.7-era devnets such as 5151 can hold such blocks.)
+	if number > c.config.Epoch && len(header.Validator) == 0 && v1DoubleValidation(chain.Config()) {
 		return errNoValidatorSignature
 	}
 
 	// Always verify the V1 seal (ecrecover + signer/difficulty), even in bulk
 	// mode. Canonical XDPoSChain engine_v1 verifyCascadingFields ends every
 	// path in verifySeal; fullVerify only gates the checkpoint signer-list and
-	// double-validation checks, which stay skipped here (#1405).
+	// double-validation checks, which stay skipped here.
 	if err := c.verifySeal(chain, header, parents); err != nil {
 		return err
 	}
@@ -751,7 +742,7 @@ func (c *XDPoS) verifyHeaderWithCache(chain consensus.ChainHeaderReader, header 
 // verifyNoUnsealedFields rejects headers that set any post-London optional
 // field. Header.Hash() covers them but the V2 seal hash (and, for some, the V1
 // seal hash) does not, so anyone could add e.g. an empty WithdrawalsHash to a
-// sealed block and get a different-hash twin with a valid seal (#1417).
+// sealed block and get a different-hash twin with a valid seal.
 // Canonical XDPoSChain headers have only BaseFee as an optional field, so no
 // canonical block carries these. Genesis is exempt: it is fixed by the local
 // config (a custom genesis with a Shanghai/Cancun time sets them) and is never
@@ -953,7 +944,7 @@ func (c *XDPoS) verifyCascadingFields(chain consensus.ChainHeaderReader, header 
 	// (engine_v1/engine.go:266-297), a mismatch is retried once with the signers
 	// read from the contract and otherwise rejected. Nothing from the header is
 	// written into the snapshot here: verifySeal must authorize the sealer against
-	// the parent's signer set, not against the list the checkpoint names (#1418).
+	// the parent's signer set, not against the list the checkpoint names.
 	if number%c.config.Epoch == 0 && v1FullVerifyChain(chain) {
 		err := c.checkSignersOnCheckpoint(chain, header, c.checkpointSigners(chain, header, parents, snap), parents)
 		if err != nil && c.HookGetSignersFromContract != nil {
@@ -989,7 +980,7 @@ func (c *XDPoS) checkSignersOnCheckpoint(chain consensus.ChainHeaderReader, head
 	// Get penalties with the hook canonical selects by IsTIPSigning
 	// (engine_v1/engine.go:306-326) and reject a checkpoint whose Penalties differ
 	// from the computed list. Penalties are not in the V1 seal hash (canonical
-	// too), so this compare is what binds them (#1422).
+	// too), so this compare is what binds them.
 	penPenalties, ok, penErr := c.v1CheckpointPenalties(chain, header, signers, parents)
 	if errors.Is(penErr, ErrPenaltyDataUnavailable) {
 		// Same policy as a missing parent state: a node without the data
@@ -1248,19 +1239,10 @@ func (c *XDPoS) verifySeal(chain consensus.ChainHeaderReader, header *types.Head
 	// fullVerify mirrors verifyHeaderV2 (not during bulk sync); canonical turns it
 	// off on chain 51 (engine.go:162-167).
 	//
-	// Enforcement is restricted to mainnet (chain 50). On testnet/devnet, the
-	// canonical V1 chain legitimately contains empty-Validator blocks past epoch 1
-	// when the assigned M2 is a mixed-client node that does not co-sign legacy
-	// blocks (e.g. modern geth in a hybrid network). verifyCascadingFields already
-	// applies the mainnet-only empty-Validator guard; this check adds the M2
-	// assignment check for mainnet. Applying either guard on devnets wedges import
-	// on blocks that legacy v2.7.x nodes accept via the fetcher's prepareBlock path
-	// (engine_v1 verifyHeaderWithCache caches a fullVerify=false result, letting
-	// the subsequent fullVerify=true insertChain call hit the cache and skip the
-	// check). Refs #1530 (regression on net2002 from PR #1503).
-	cfg := chain.Config()
-	mainnet := cfg != nil && cfg.ChainID != nil && cfg.ChainID.Uint64() == params.XDCMainnetChainConfig.ChainID.Uint64()
-	if xdcFullVerify() && mainnet && number > c.config.Epoch {
+	// Like canonical v2.9.3, this applies on every chain but Apothem. (v2.7.x
+	// skipped it on custom chains through a verify-cache quirk that v2.9.3 removed:
+	// engine_v1 verifyHeaderWithCache now caches full verifications only.)
+	if xdcFullVerify() && v1DoubleValidation(chain.Config()) && number > c.config.Epoch {
 		if len(header.Validator) == 0 {
 			return errNoValidatorSignature
 		}
@@ -1279,6 +1261,13 @@ func (c *XDPoS) verifySeal(chain consensus.ChainHeaderReader, header *types.Head
 	}
 
 	return nil
+}
+
+// v1DoubleValidation reports whether V1 blocks past the first epoch must carry
+// the assigned M2 co-signature. Canonical turns full verification off on Apothem
+// (chain 51) only (engine_v1/engine.go shouldDisableFullVerify).
+func v1DoubleValidation(cfg *params.ChainConfig) bool {
+	return cfg != nil && cfg.ChainID != nil && cfg.ChainID.Cmp(params.XDCApothemChainConfig.ChainID) != 0
 }
 
 // VerifyUncles implements consensus.Engine, always returning an error for any

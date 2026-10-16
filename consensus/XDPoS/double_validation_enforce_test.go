@@ -45,7 +45,7 @@ func (c m2Chain) GetHeaderByHash(h common.Hash) *types.Header {
 
 // TestV1FullVerifyEnforcesDoubleValidation: under full verification a V1 block
 // past the first epoch must carry the M2 co-signature of the creator's assigned
-// validator (#1421). Canonical skips this on chain 51.
+// validator. Canonical skips this on chain 51.
 func TestV1FullVerifyEnforcesDoubleValidation(t *testing.T) {
 	saved := core.XdcBulkSyncMode.Load()
 	core.XdcBulkSyncMode.Store(false)
@@ -107,16 +107,19 @@ func TestV1FullVerifyEnforcesDoubleValidation(t *testing.T) {
 	if err := verify(51, keyA); err != nil {
 		t.Errorf("chain 51 (fullVerify off in canonical): got %v, want nil", err)
 	}
-	// Devnet (chain 2002): a block with empty Validator must be accepted. Legacy
-	// v2.7.x nodes accept such blocks via the fetcher prepareBlock path (fullVerify=false
-	// call caches the header, letting the later fullVerify=true insertChain hit the cache).
-	// Modern geth has no equivalent fetcher hook, so rejecting here wedges import on
-	// any mixed network where the assigned M2 is a non-co-signing client. Refs #1530.
-	if err := verify(2002, nil); err != nil {
-		t.Errorf("devnet chain 2002, empty Validator (accepted by legacy): got %v, want nil", err)
+	// Custom chain (2003): canonical v2.9.3 enforces double validation on every
+	// chain but 51, so an empty or wrong co-signature is rejected there too.
+	if err := verify(2003, nil); !errors.Is(err, errNoValidatorSignature) {
+		t.Errorf("chain 2003, empty Validator: got %v, want %v", err, errNoValidatorSignature)
 	}
-	if err := verify(2002, keyA); err != nil {
-		t.Errorf("devnet chain 2002, any Validator (no M2 check on devnet): got %v, want nil", err)
+	if err := verify(2003, keyA); !errors.Is(err, errFailedDoubleValidation) {
+		t.Errorf("chain 2003, wrong M2 co-signer: got %v, want %v", err, errFailedDoubleValidation)
+	}
+	if err := verify(2003, keyB); err != nil {
+		t.Errorf("chain 2003, assigned M2 co-signer rejected: %v", err)
+	}
+	if err := verify(51, nil); err != nil {
+		t.Errorf("chain 51, empty Validator: got %v, want nil", err)
 	}
 }
 
