@@ -10,6 +10,7 @@ package rawdb
 
 import (
 	"encoding/binary"
+	"math/big"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
@@ -17,6 +18,75 @@ import (
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/rlp"
 )
+
+// headerTDKey returns the DB key for a block's cumulative total difficulty.
+// Format matches the canonical XDPoSChain legacy key:
+//
+//	headerPrefix + num (uint64 big-endian) + hash + headerTDSuffix
+//
+// ("h" + 8-byte number + 32-byte hash + "t").
+func headerTDKey(number uint64, hash common.Hash) []byte {
+	enc := make([]byte, 8)
+	binary.BigEndian.PutUint64(enc, number)
+	key := make([]byte, 0, len(headerPrefix)+8+common.HashLength+len(headerTDSuffix))
+	key = append(key, headerPrefix...)
+	key = append(key, enc...)
+	key = append(key, hash.Bytes()...)
+	key = append(key, headerTDSuffix...)
+	return key
+}
+
+// ReadTd retrieves a block's total difficulty from the DB, nil if absent.
+func ReadTd(db ethdb.Reader, hash common.Hash, number uint64) *big.Int {
+	data, err := db.Get(headerTDKey(number, hash))
+	if err != nil || len(data) == 0 {
+		return nil
+	}
+	td := new(big.Int)
+	if err := rlp.DecodeBytes(data, td); err != nil {
+		log.Error("XDC ReadTd: invalid RLP", "hash", hash, "number", number, "err", err)
+		return nil
+	}
+	return td
+}
+
+// WriteTd persists a block's cumulative total difficulty.
+func WriteTd(db ethdb.KeyValueWriter, hash common.Hash, number uint64, td *big.Int) {
+	data, err := rlp.EncodeToBytes(td)
+	if err != nil {
+		log.Crit("XDC WriteTd: RLP encode failed", "err", err)
+	}
+	if err := db.Put(headerTDKey(number, hash), data); err != nil {
+		log.Crit("XDC WriteTd: DB write failed", "err", err)
+	}
+}
+
+// xdcTDBackfillProgressKey is a singleton key recording the highest block
+// number for which cumulative TD has been persisted by the background backfill
+// goroutine. It lets the goroutine resume after a restart without re-scanning
+// from genesis.
+var xdcTDBackfillProgressKey = []byte("xdc-td-backfill-progress")
+
+// ReadTdBackfillProgress returns the highest canonical block number whose TD
+// was persisted by the background backfill, or 0 if the key is absent.
+func ReadTdBackfillProgress(db ethdb.Reader) uint64 {
+	data, err := db.Get(xdcTDBackfillProgressKey)
+	if err != nil || len(data) != 8 {
+		return 0
+	}
+	return binary.BigEndian.Uint64(data)
+}
+
+// WriteTdBackfillProgress persists the highest block number covered by the
+// background TD backfill. Called inside the same batch as the TD writes so
+// progress is always consistent with what is on disk.
+func WriteTdBackfillProgress(db ethdb.KeyValueWriter, number uint64) {
+	var enc [8]byte
+	binary.BigEndian.PutUint64(enc[:], number)
+	if err := db.Put(xdcTDBackfillProgressKey, enc[:]); err != nil {
+		log.Crit("XDC WriteTdBackfillProgress: DB write failed", "err", err)
+	}
+}
 
 // XDPoS-specific database key prefixes
 var (

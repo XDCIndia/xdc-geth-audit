@@ -19,7 +19,6 @@ package main
 import (
 	"bytes"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"io"
 	"math/big"
@@ -138,8 +137,8 @@ func readGenesis(genesisPath string) *core.Genesis {
 	}
 	defer file.Close()
 
-	genesis := new(core.Genesis)
-	if err := json.NewDecoder(file).Decode(genesis); err != nil {
+	genesis, err := core.DecodeGenesisJSON(file)
+	if err != nil {
 		utils.Fatalf("invalid genesis file: %v", err)
 	}
 	return genesis

@@ -302,8 +302,13 @@ func Test1330_SendVote_NoLatchOnLocalDrop(t *testing.T) {
 	}
 	t.Log("PASS: locally-dropped vote did not latch highestVotedRound")
 
-	// Clear the cause: snapshot now includes the signer → same-round retry must succeed.
-	eng.snapshots.Add(gapHeader.Hash(), newSnapshot(5850, gapHeader.Hash(), append(otherAddrs, signer)))
+	// Clear the cause: the voted block's epoch now seats the signer → same-round
+	// retry must succeed (#1457: own votes are checked against the epoch list).
+	eng.epochSwitches.Add(blockHash, &types.EpochSwitchInfo{
+		Masternodes:          append(append([]common.Address{}, otherAddrs...), signer),
+		MasternodesLen:       6,
+		EpochSwitchBlockInfo: &types.BlockInfo{Hash: blockHash, Round: votedRound, Number: big.NewInt(7199)},
+	})
 	if err := eng.sendVote(chain, blockInfo); err != nil {
 		t.Fatalf("sendVote retry should succeed once the snapshot includes the signer: %v", err)
 	}

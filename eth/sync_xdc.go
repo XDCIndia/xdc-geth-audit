@@ -447,7 +447,7 @@ func (s *xdcSyncer) loop() {
 			phase := xdcSnapPhase(s.snapPhase.Load())
 			if phase == phaseTipCatch || phase == phaseFullSync {
 				maxPeerHead := uint64(0)
-				for _, p := range s.handler.peers.peers {
+				for _, p := range s.handler.peers.all() {
 					rng := p.BlockRange()
 					if rng != nil && rng.LatestBlock > maxPeerHead {
 						maxPeerHead = rng.LatestBlock
@@ -540,7 +540,7 @@ func (s *xdcSyncer) loop() {
 				if cur == 0 {
 					genesis := s.handler.chain.Genesis().Hash()
 					stallable = true
-					for _, p := range s.handler.peers.peers {
+					for _, p := range s.handler.peers.all() {
 						if rng := p.BlockRange(); rng == nil || rng.LatestBlockHash != genesis {
 							stallable = false
 							break
@@ -734,7 +734,7 @@ func (s *xdcSyncer) maybeEngageSnap() {
 	// If the fetch fails (peer not ready / XDPOS2 wire doesn't carry block
 	// number), fall back to checking whether any peer is connected at all.
 	var bestPeer *eth.Peer
-	for _, p := range s.handler.peers.peers {
+	for _, p := range s.handler.peers.all() {
 		rng := p.BlockRange()
 		if rng != nil && rng.LatestBlockHash != (common.Hash{}) {
 			bestPeer = p.Peer
@@ -750,7 +750,7 @@ func (s *xdcSyncer) maybeEngageSnap() {
 	// disconnected), proceed without the guard — snap will fall back to
 	// FULL_SYNC via SelectSnapPivot returning nil anyway.
 	var actualPeerHead uint64
-	for _, p := range s.handler.peers.peers {
+	for _, p := range s.handler.peers.all() {
 		rng := p.BlockRange()
 		if rng == nil || rng.LatestBlockHash == (common.Hash{}) {
 			continue
@@ -1473,7 +1473,7 @@ func (s *xdcSyncer) maybeTransitionToAtTip() {
 		return
 	}
 	localHash := cur.Hash()
-	for _, p := range s.handler.peers.peers {
+	for _, p := range s.handler.peers.all() {
 		rng := p.BlockRange()
 		if rng == nil {
 			continue
@@ -2025,7 +2025,7 @@ func (s *xdcSyncer) snapKeepAlive() {
 	// Request 1 header starting at pivot from each peer. Returns
 	// quickly; goroutine isolates each peer so a slow peer doesn't
 	// stall the tick.
-	for _, p := range s.handler.peers.peers {
+	for _, p := range s.handler.peers.all() {
 		ethP := p.Peer
 		go func() {
 			defer func() { _ = recover() }()
@@ -2298,6 +2298,12 @@ func (s *xdcSyncer) fullSyncOnce() {
 	peer := res.peer
 	r := res.rng
 	headers := res.headers
+	// #1429: XDPOS2 peers serve up to 192 headers but only 128 bodies per request,
+	// so range 0 can import at most xdcLookaheadRangeSize blocks. Cap it here so
+	// the lookahead ranges below start exactly where range 0's import ends.
+	if len(headers) > xdcLookaheadRangeSize {
+		headers = headers[:xdcLookaheadRangeSize]
+	}
 
 	// A.77+A.78: kick off lookahead header fetches for ranges 1..xdcLookaheadStreams
 	// from FRESH candidates — peers not queried in the fan-out round — concurrently
@@ -2311,17 +2317,20 @@ func (s *xdcSyncer) fullSyncOnce() {
 	{
 		lhIdx := 0
 		for _, c := range candidates {
-			if lhIdx >= xdcLookaheadStreams {
+			// #1429: a short range 0 means the peer has nothing further to serve.
+			if lhIdx >= xdcLookaheadStreams || len(headers) < xdcLookaheadRangeSize {
 				break
 			}
 			// Skip the range-0 winner and any peer already raced this round.
 			if c.ID() == peer.ID() || racedIDs[c.ID()] {
 				continue
 			}
-			lhFrom := fromBlock + uint64(len(headers)) + uint64(lhIdx)*xdcLookaheadRangeSize
+			// #1429: every range is xdcLookaheadRangeSize blocks, so range lhIdx+1
+			// starts right after range lhIdx ends.
+			lhFrom := fromBlock + uint64(lhIdx+1)*xdcLookaheadRangeSize
 			ch := make(chan *lookaheadResult, 1)
 			go func(outCh chan *lookaheadResult, lhPeer *eth.Peer, from uint64) {
-				hdrs := s.fetchHeaderBatchTimeout(lhPeer, from, xdcBatchSize, xdcBulkReqTimeout)
+				hdrs := s.fetchHeaderBatchTimeout(lhPeer, from, xdcLookaheadRangeSize, xdcBulkReqTimeout)
 				if len(hdrs) > 0 && hdrs[0].Number.Uint64() != from { // #1423: not the range we asked for
 					s.taintPeer(lhPeer)
 					hdrs = nil
@@ -2353,13 +2362,24 @@ func (s *xdcSyncer) fullSyncOnce() {
 		log.Debug("xdcSyncer: no valid blocks to import")
 		return
 	}
+	if blocks = s.dropAwaitingM2(blocks); len(blocks) == 0 {
+		log.Debug("xdcSyncer: next block waits for its M2 co-signature", "from", fromBlock)
+		return
+	}
 
 	// Insert + execute range 0. #1423: only if the batch extends our head;
 	// InsertChain would otherwise reorg onto any known parent. A batch that
 	// doesn't is handled like an unknown ancestor, so the fork-heal below
-	// (co-signed sibling adoption, then rollback) decides what to do.
+	// (co-signed sibling adoption, then rollback) decides what to do. A V2
+	// batch whose parent is a stored side sibling of our head (a timeout
+	// re-proposal that won its QC) is imported too: it is higher than the head,
+	// so fork choice moves the head onto it as canonical XDPoSChain does.
 	n, err := 0, consensus.ErrUnknownAncestor
-	if blocks[0].ParentHash() == s.handler.chain.CurrentBlock().Hash() {
+	head, xdpos := s.handler.chain.CurrentBlock(), s.handler.chain.Config().XDPoS
+	sideParentV2 := xdpos != nil && xdpos.V2 != nil && xdpos.V2.SwitchBlock != nil &&
+		head.Number.Cmp(xdpos.V2.SwitchBlock) > 0 &&
+		s.handler.chain.HasBlockAndState(blocks[0].ParentHash(), head.Number.Uint64())
+	if blocks[0].ParentHash() == head.Hash() || sideParentV2 {
 		n, err = s.handler.chain.InsertChain(blocks)
 	}
 	if err != nil {
@@ -2379,6 +2399,7 @@ func (s *xdcSyncer) fullSyncOnce() {
 		// behind" (#1427). A short header batch can: the peer has nothing past it, so
 		// the invalid block really sits at the network tip.
 		if !errors.Is(err, consensus.ErrUnknownAncestor) &&
+			!errors.Is(err, consensus.ErrFutureBlock) && // early, not invalid: retried next tick
 			s.handler.chain.Config().ChainID != nil &&
 			s.handler.chain.Config().ChainID.Uint64() != 50 {
 			if cur := s.handler.chain.CurrentBlock(); cur != nil && len(res.headers) < xdpos2MaxHeaderFetch {
@@ -2440,6 +2461,15 @@ func (s *xdcSyncer) fullSyncOnce() {
 			log.Info("xdcSyncer: A.77 lookahead empty", "peer", lhRes.peer.ID()[:8])
 			return
 		}
+		// #1429: an earlier range imported fewer blocks than its size, so this one
+		// does not extend our head. That gap is local, not a fork: stop here and
+		// keep it away from the rollback trigger.
+		lhFrom := lhRes.headers[0].Number.Uint64()
+		if head := s.handler.chain.CurrentBlock().Number.Uint64(); lhFrom != head+1 {
+			log.Debug("xdcSyncer: A.77 lookahead range not contiguous with head",
+				"from", lhFrom, "head", head)
+			return
+		}
 		lhHashes := make([]common.Hash, len(lhRes.headers))
 		for i, h := range lhRes.headers {
 			lhHashes[i] = h.Hash()
@@ -2452,7 +2482,6 @@ func (s *xdcSyncer) fullSyncOnce() {
 		if len(lhBlocks) == 0 {
 			return
 		}
-		lhFrom := lhRes.headers[0].Number.Uint64()
 		// #1423: same head-extension check as range 0.
 		lhN, lhErr := 0, consensus.ErrUnknownAncestor
 		if lhBlocks[0].ParentHash() == s.handler.chain.CurrentBlock().Hash() {
@@ -2486,6 +2515,33 @@ func (s *xdcSyncer) fullSyncOnce() {
 
 // buildBlocks pairs headers with bodies into types.Blocks. Stops at the first
 // malformed body. Used by fullSyncOnce for both range-0 and A.77 lookahead ranges.
+// dropAwaitingM2 cuts the batch before the first V1 block that still waits for
+// its assigned M2's co-signature. A legacy V1 creator serves its own block from
+// its head until the co-signed block replaces it, so a peer at the tip can answer
+// a header request with it. Importing it only fails verification with
+// ErrNoValidatorSignature and reports a BAD BLOCK. Canonical XDPoSChain does not
+// insert such a block (eth/fetcher/block_fetcher.go:734-756); the co-signed block
+// is fetched on a later tick. Acceptance is unchanged: the block is refused either way.
+func (s *xdcSyncer) dropAwaitingM2(blocks types.Blocks) types.Blocks {
+	// Only the tip block can wait for its co-signature; a co-signed V1 block and
+	// every V2 block carry a non-empty Validator.
+	if len(blocks[len(blocks)-1].Header().Validator) != 0 {
+		return blocks
+	}
+	headers := make([]*types.Header, len(blocks))
+	for i, b := range blocks {
+		headers[i] = b.Header()
+	}
+	abort, results := s.handler.chain.Engine().VerifyHeaders(s.handler.chain, headers)
+	defer close(abort)
+	for i, h := range headers {
+		if err := <-results; len(h.Validator) == 0 && errors.Is(err, XDPoS.ErrNoValidatorSignature) {
+			return blocks[:i]
+		}
+	}
+	return blocks
+}
+
 func (s *xdcSyncer) buildBlocks(headers []*types.Header, bodies []eth.BlockBody) types.Blocks {
 	pairCount := len(bodies)
 	if pairCount > len(headers) {
@@ -2537,12 +2593,23 @@ func (s *xdcSyncer) buildBlocks(headers []*types.Header, bodies []eth.BlockBody)
 // window that re-stamps the miner cooldown and churns the head), so the head stays
 // fresh, XdcBulkSyncMode flips false at-tip, and the miner ungates.
 //
+// The co-signed sibling may already be stored locally as a non-canonical side-chain
+// block (e.g. it was once inserted as a same-height sibling via NewBlock gossip but
+// never won the fork choice because equal-TD blocks keep the existing canonical head).
+// In that case HasBlock returns true but GetCanonicalHash returns the unsigned twin's
+// hash. This function detects that sub-case and adopts the stored sibling directly
+// (no network fetch needed) by calling InsertChain — the ErrKnownBlock path triggers
+// writeKnownBlock → bc.reorg, swapping canonical from the unsigned to the co-signed
+// twin in one step. This was the live failure mode on net2002: co-signed-2488 was in
+// the sealer's DB as a side chain, so the old HasBlock guard returned false prematurely
+// and the node looped in maybeRollbackOnUnknownAncestor forever.
+//
 // V1-only and gated strictly above Epoch (V2 uses QC-chain fork choice, not the
 // single-signature header.Validator). Uses only existing primitives — no wire, rawdb,
 // core, or consensus change, and zero change to block bytes (we adopt the legacy
-// canonical co-signed block verbatim). Returns true iff the sibling was fetched,
-// inserted, and the batch re-imported successfully; any miss returns false so the
-// caller falls back to maybeRollbackOnUnknownAncestor. Refs #951.
+// canonical co-signed block verbatim). Returns true iff the sibling was adopted and
+// the batch re-imported successfully; any miss returns false so the caller falls back
+// to maybeRollbackOnUnknownAncestor. Refs #951.
 func (s *xdcSyncer) adoptCoSignedSibling(blocks types.Blocks, peer *eth.Peer) bool {
 	if len(blocks) == 0 || peer == nil {
 		return false
@@ -2563,11 +2630,46 @@ func (s *xdcSyncer) adoptCoSignedSibling(blocks types.Blocks, peer *eth.Peer) bo
 		return false
 	}
 	parentHash := first.ParentHash()
-	// If we already have the batch's parent, the failure is not the empty/co-signed
-	// sibling case — let the normal rollback path handle it.
+
+	// Check if the co-signed sibling is already in our local block database.
 	if s.handler.chain.HasBlock(parentHash, parentNum) {
-		return false
+		// Two cases:
+		//   (a) Already CANONICAL: blocks[0].ParentHash() == CurrentBlock().Hash() should
+		//       be true, so the #1496 guard would have let InsertChain run. If it ran and
+		//       failed with ErrUnknownAncestor, the cause is a deeper missing ancestor —
+		//       not an unsigned/co-signed split. Let rollback handle it.
+		//   (b) NON-CANONICAL (side chain): the co-signed twin was stored as a side-chain
+		//       block (e.g. equal-TD NewBlock sibling insertion) but never became the
+		//       canonical head. Adopt it directly: InsertChain on a known block triggers
+		//       the ErrKnownBlock → writeKnownBlock → bc.reorg path, swapping canonical
+		//       from the unsigned twin to the co-signed twin in one step.
+		if s.handler.chain.GetCanonicalHash(parentNum) == parentHash {
+			// Case (a): already canonical; the failure has a different cause.
+			return false
+		}
+		// Case (b): known but non-canonical — reorg to it directly from local DB.
+		sib := s.handler.chain.GetBlock(parentHash, parentNum)
+		if sib == nil {
+			return false
+		}
+		if _, err := s.handler.chain.InsertChain(types.Blocks{sib}); err != nil {
+			log.Debug("xdcSyncer: adopt co-signed sibling — known-sibling reorg failed",
+				"number", parentNum, "hash", parentHash, "err", err)
+			return false
+		}
+		if _, err := s.handler.chain.InsertChain(blocks); err != nil {
+			log.Warn("xdcSyncer: adopt co-signed sibling — batch re-insert after known-sibling reorg failed",
+				"from", first.NumberU64(), "err", err)
+			return false
+		}
+		log.Info("xdcSyncer: adopted co-signed sibling (known non-canonical, Defect 1c Part B-ext)",
+			"siblingNum", parentNum, "siblingHash", parentHash,
+			"newHead", s.handler.chain.CurrentBlock().Number.Uint64())
+		core.XdcForkRecovering.Store(false)
+		return true
 	}
+
+	// Sibling not in DB — fetch from the peer that served the batch.
 	// Fetch the co-signed sibling (the batch's missing parent) by hash from the same
 	// peer that served the batch — a by-hash request returns exactly that block.
 	hdr := s.fetchHeaderByHash(peer, parentHash)
@@ -2910,7 +3012,7 @@ func (s *xdcSyncer) fetchPeerHeadHeader() *types.Header {
 		hdr  *types.Header
 	}
 	var heads []peerHead
-	for _, ep := range s.handler.peers.peers {
+	for _, ep := range s.handler.peers.all() {
 		p := ep.Peer
 		rng := p.BlockRange()
 		if rng == nil || rng.LatestBlockHash == (common.Hash{}) {
@@ -3656,8 +3758,19 @@ func (s *xdcSyncer) fetchHeadersParallel(candidates []*eth.Peer, fromBlock uint6
 		if rng == nil {
 			continue
 		}
-		// XDC: LatestBlock is TD, not block number. Use hash equality.
-		if rng.LatestBlockHash != (common.Hash{}) && rng.LatestBlockHash == curHash {
+		// XDC: LatestBlock is TD, not block number. Use hash equality to detect
+		// at-tip, but only for non-XDPOS2 peers. XDPOS2 peers (p.Version()==
+		// eth.XDPOS2) do not receive BlockRangeUpdate messages — their
+		// LatestBlockHash is frozen at handshake time and never updated. If a
+		// peer connects while it is at our current head (common after a
+		// coordinated restart), rng.LatestBlockHash == curHash becomes a
+		// permanent false-positive: every fetchHeadersParallel call counts
+		// the peer as at-tip and skips the header request, stalling sync
+		// indefinitely even though the peer has since advanced. For XDPOS2
+		// peers, rely solely on an empty header response as the at-tip signal.
+		// Refs #1654.
+		if p.Version() != eth.XDPOS2 &&
+			rng.LatestBlockHash != (common.Hash{}) && rng.LatestBlockHash == curHash {
 			atTipCount++
 			continue
 		}

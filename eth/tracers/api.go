@@ -531,7 +531,7 @@ func (api *API) IntermediateRoots(ctx context.Context, hash common.Hash, config 
 		}
 		msg, _ := core.TransactionToMessage(tx, signer, block.BaseFee())
 		statedb.SetTxContext(tx.Hash(), i, uint32(i+1))
-		if _, err := core.ApplyMessage(evm, msg, nil); err != nil {
+		if _, err := core.ApplyTransactionForTrace(ctx, msg, statedb, block.Number(), block.Hash(), block.Time(), tx, evm); err != nil {
 			log.Warn("Tracing intermediate roots did not complete", "txindex", i, "txhash", tx.Hash(), "err", err)
 			// We intentionally don't return the error here: if we do, then the RPC server will not
 			// return the roots. Most likely, the caller already knows that a certain transaction fails to
@@ -682,7 +682,7 @@ txloop:
 		// Generate the next state snapshot fast without tracing
 		msg, _ := core.TransactionToMessage(tx, signer, block.BaseFee())
 		statedb.SetTxContext(tx.Hash(), i, uint32(i+1))
-		if _, err := core.ApplyMessage(evm, msg, nil); err != nil {
+		if _, err := core.ApplyTransactionForTrace(ctx, msg, statedb, block.Number(), block.Hash(), block.Time(), tx, evm); err != nil {
 			failed = err
 			break txloop
 		}
@@ -760,7 +760,7 @@ func (api *API) standardTraceBlockToFile(ctx context.Context, block *types.Block
 		msg, _ := core.TransactionToMessage(tx, signer, block.BaseFee())
 		if txHash != (common.Hash{}) && tx.Hash() != txHash {
 			// Process the tx to update state, but don't trace it.
-			_, err := core.ApplyMessage(evm, msg, nil)
+			_, err := core.ApplyTransactionForTrace(ctx, msg, statedb, block.Number(), block.Hash(), block.Time(), tx, evm)
 			if err != nil {
 				return dumps, err
 			}
@@ -792,10 +792,7 @@ func (api *API) standardTraceBlockToFile(ctx context.Context, block *types.Block
 		)
 		// Execute the transaction and flush any traces to disk
 		statedb.SetTxContext(tx.Hash(), i, uint32(i+1))
-		if tracer.OnTxStart != nil {
-			tracer.OnTxStart(evm.GetVMContext(), tx, msg.From)
-		}
-		_, err = core.ApplyMessage(evm, msg, nil)
+		_, err = core.ApplyTransactionForTrace(ctx, msg, statedb, block.Number(), block.Hash(), block.Time(), tx, evm)
 		evm.Release()
 		if writer != nil {
 			writer.Flush()
@@ -1020,7 +1017,12 @@ func (api *API) traceTx(ctx context.Context, tx *types.Transaction, message *cor
 	// Call Prepare to clear out the statedb access list
 	statedb.SetTxContext(txctx.TxHash, txctx.TxIndex, uint32(txctx.TxIndex+1))
 
-	_, _, err = core.ApplyTransactionWithEVM(ctx, message, core.NewGasPool(message.GasLimit), statedb, vmctx.BlockNumber, txctx.BlockHash, vmctx.Time, tx, evm)
+	if txctx.BlockHash != (common.Hash{}) {
+		// A transaction of a block: apply it the way block processing does.
+		_, err = core.ApplyTransactionForTrace(ctx, message, statedb, vmctx.BlockNumber, txctx.BlockHash, vmctx.Time, tx, evm)
+	} else {
+		_, _, err = core.ApplyTransactionWithEVM(ctx, message, core.NewGasPool(message.GasLimit), statedb, vmctx.BlockNumber, txctx.BlockHash, vmctx.Time, tx, evm)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("tracing failed: %w", err)
 	}

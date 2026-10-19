@@ -52,7 +52,7 @@ func TestXDPoSMintEnvUsesSignerCoinbase(t *testing.T) {
 		}
 		return true
 	})
-	if calls != 2 {
-		t.Fatalf("expected 2 makeEnv calls (V1 + V2 mint paths), found %d", calls)
+	if calls != 1 {
+		t.Fatalf("expected 1 makeEnv call (makeMintEnv, shared by the V1 and V2 mint paths), found %d", calls)
 	}
 }

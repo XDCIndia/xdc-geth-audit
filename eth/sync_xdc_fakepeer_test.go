@@ -22,12 +22,14 @@ import (
 	"testing"
 
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/consensus"
 	"github.com/ethereum/go-ethereum/consensus/ethash"
 	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/eth/ethconfig"
 	"github.com/ethereum/go-ethereum/eth/protocols/eth"
+	"github.com/ethereum/go-ethereum/ethdb"
 	"github.com/ethereum/go-ethereum/p2p"
 	"github.com/ethereum/go-ethereum/p2p/enode"
 	"github.com/ethereum/go-ethereum/params"
@@ -96,6 +98,7 @@ func (f *fakeXDCPeer) serve(rw p2p.MsgReadWriter) {
 // xdcFakeNet is a local chain plus a canonical remote chain sharing its genesis.
 type xdcFakeNet struct {
 	gspec   *core.Genesis
+	db      ethdb.Database // the local chain's database
 	chain   *core.BlockChain
 	handler *handler
 	remote  []*types.Block // remote[i] is block i+1
@@ -106,13 +109,20 @@ type xdcFakeNet struct {
 // `remote`-block canonical chain, and a handler (not started) around it.
 func newXDCFakeNet(t *testing.T, local, remote int) *xdcFakeNet {
 	t.Helper()
+	return newXDCFakeNetEngine(t, local, remote, ethash.NewFaker())
+}
+
+// newXDCFakeNetEngine is newXDCFakeNet with the local chain verifying blocks with engine.
+func newXDCFakeNetEngine(t *testing.T, local, remote int, engine consensus.Engine) *xdcFakeNet {
+	t.Helper()
 	gspec := &core.Genesis{
 		Config:     params.AllEthashProtocolChanges,
 		Difficulty: common.Big1,
 		GasLimit:   8_000_000,
 	}
 	_, blocks, _ := core.GenerateChainWithGenesis(gspec, ethash.NewFaker(), remote, nil)
-	chain, err := core.NewBlockChain(rawdb.NewMemoryDatabase(), gspec, ethash.NewFaker(), nil)
+	db := rawdb.NewMemoryDatabase()
+	chain, err := core.NewBlockChain(db, gspec, engine, nil)
 	if err != nil {
 		t.Fatalf("NewBlockChain: %v", err)
 	}
@@ -132,7 +142,7 @@ func newXDCFakeNet(t *testing.T, local, remote int) *xdcFakeNet {
 		t.Fatalf("newHandler: %v", err)
 	}
 	t.Cleanup(chain.Stop)
-	return &xdcFakeNet{gspec: gspec, chain: chain, handler: h, remote: blocks, bodyCap: 128}
+	return &xdcFakeNet{gspec: gspec, db: db, chain: chain, handler: h, remote: blocks, bodyCap: 128}
 }
 
 // canonicalHeaders serves the remote chain by number.

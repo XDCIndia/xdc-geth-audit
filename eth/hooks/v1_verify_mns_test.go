@@ -21,7 +21,8 @@ import (
 
 // TestV1HookVerifyMNsRecomputesValidators: the checkpoint Validators field is
 // checked against the M2 list derived from the parent's 0x90 randomize values;
-// wrong bytes are rejected and the header is never rewritten (#1412).
+// wrong bytes are rejected and the header is never rewritten (#1412). A minted
+// checkpoint gets the same list.
 func TestV1HookVerifyMNsRecomputesValidators(t *testing.T) {
 	var masternodes []common.Address
 	for i := byte(1); i <= 5; i++ {
@@ -78,5 +79,15 @@ func TestV1HookVerifyMNsRecomputesValidators(t *testing.T) {
 	}
 	if err := adaptor.HookVerifyMNs(checkpoint(correct), masternodes); err != nil {
 		t.Fatalf("canonical Validators rejected: %v", err)
+	}
+	// Mint side: a checkpoint this node seals carries the same list (canonical
+	// HookValidator), so the other nodes accept it.
+	h = checkpoint(nil)
+	got, err := adaptor.HookValidator(h, masternodes)
+	if err != nil {
+		t.Fatalf("HookValidator: %v", err)
+	}
+	if !bytes.Equal(got, correct) || !bytes.Equal(h.Validators, correct) {
+		t.Fatalf("minted Validators %x (header %x), want %x", got, h.Validators, correct)
 	}
 }

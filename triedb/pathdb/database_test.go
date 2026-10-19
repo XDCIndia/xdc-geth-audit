@@ -657,6 +657,44 @@ func TestDatabaseRecoverable(t *testing.T) {
 	}
 }
 
+// TestRecoverableDepth verifies that RecoverableDepth returns the number of
+// state-history entries a Recover(root) call would truncate. This value is
+// surfaced by core/blockchain.go as a Warn log before state truncation so
+// operators can observe the silent pathdb truncation described in #1458.
+func TestRecoverableDepth(t *testing.T) {
+	maxDiffLayers = 4
+	defer func() { maxDiffLayers = 128 }()
+
+	// 12 layers, maxDiffLayers=4 → disk layer advances on every 4th commit.
+	tester := newTester(t, &testerConfig{layers: 12})
+	defer tester.release()
+
+	idx := tester.bottomIndex() // index of root currently at disk layer
+
+	// Roots below the disk layer are in history and recoverable.
+	// RecoverableDepth(roots[0]) should equal idx (disk is idx commits ahead).
+	if idx < 2 {
+		t.Skipf("bottomIndex=%d too low to test (need ≥2)", idx)
+	}
+	root := tester.roots[0] // oldest root, deep in history
+	got := tester.db.RecoverableDepth(root)
+	want := uint64(idx) // disk stateID minus root's stateID
+	if got != want {
+		t.Fatalf("RecoverableDepth(%v): got %d, want %d (bottomIndex=%d)", root, got, want, idx)
+	}
+
+	// Disk layer root itself is not recoverable → depth must be 0.
+	diskRoot := tester.roots[idx]
+	if d := tester.db.RecoverableDepth(diskRoot); d != 0 {
+		t.Fatalf("RecoverableDepth(disk root) = %d, want 0", d)
+	}
+
+	// Unknown root → depth must be 0.
+	if d := tester.db.RecoverableDepth(common.Hash{0xde, 0xad}); d != 0 {
+		t.Fatalf("RecoverableDepth(unknown) = %d, want 0", d)
+	}
+}
+
 // TestRecoverableDisabled checks that a database disabled for state sync
 // reports nothing as recoverable, matching Recover which refuses to roll
 // back mid-sync. Regression test for a snap-sync restart crash loop: during

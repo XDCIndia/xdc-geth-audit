@@ -604,6 +604,33 @@ func (pool *LegacyPool) ValidateTxBasics(tx *types.Transaction) error {
 	return txpool.ValidateTransaction(tx, pool.currentHead.Load(), pool.signer, opts)
 }
 
+// trc21Data returns the current TRC21 fee capacity map and a cost function for
+// the pending block, used by list.Filter and promoteExecutables to retain TRC21
+// txs that the token's issuer capacity can afford.
+func (pool *LegacyPool) trc21Data() (map[common.Address]*big.Int, func(*types.Transaction) *big.Int) {
+	if pool.currentState == nil || !pool.chainconfig.IsXDC() {
+		return nil, nil
+	}
+	issuers := state.GetTRC21FeeCapacityFromState(pool.currentState)
+	if len(issuers) == 0 {
+		return nil, nil
+	}
+	var num *big.Int
+	if head := pool.currentHead.Load(); head != nil {
+		// Pending block is one past current head.
+		num = new(big.Int).Add(head.Number, big.NewInt(1))
+	} else {
+		num = new(big.Int)
+	}
+	cfg := pool.chainconfig
+	costFn := func(tx *types.Transaction) *big.Int {
+		price := params.TRC21GasPriceForBlock(cfg, num)
+		c := new(big.Int).Mul(price, new(big.Int).SetUint64(tx.Gas()))
+		return c.Add(c, tx.Value())
+	}
+	return issuers, costFn
+}
+
 // validateTx checks whether a transaction is valid according to the consensus
 // rules and adheres to some heuristic limits of the local node (price and size).
 func (pool *LegacyPool) validateTx(tx *types.Transaction) error {
@@ -641,6 +668,19 @@ func (pool *LegacyPool) validateTx(tx *types.Transaction) error {
 				}
 			}
 			return nil
+		},
+		// XDC TRC21 pool admission: supplement balance with the token's fee
+		// capacity for txs sent to a registered TRC21 token (XDPoSChain
+		// core/txpool/legacypool/legacypool.go:622 trc21FeeCapacity). Config
+		// and the head number also drive the gas-price tier floor (Gas50x /
+		// Gas2500x).
+		Trc21FeeCapacity: state.GetTRC21FeeCapacityFromState(pool.currentState),
+		Config:           pool.chainconfig,
+		CurrentNumber: func() *big.Int {
+			if head := pool.currentHead.Load(); head != nil {
+				return head.Number
+			}
+			return new(big.Int)
 		},
 	}
 	if err := txpool.ValidateTransactionWithState(tx, pool.signer, opts); err != nil {
@@ -1632,7 +1672,8 @@ func (pool *LegacyPool) reset(oldHead, newHead *types.Header) {
 // invalidated transactions (low nonce, low balance) are deleted.
 func (pool *LegacyPool) promoteExecutables(accounts []common.Address) []*types.Transaction {
 	gasLimit := pool.currentHead.Load().GasLimit
-	promotable, dropped, removedAddresses := pool.queue.promoteExecutables(accounts, gasLimit, pool.currentState, pool.pendingNonces)
+	trc21Issuers, trc21CostFn := pool.trc21Data()
+	promotable, dropped, removedAddresses := pool.queue.promoteExecutables(accounts, gasLimit, pool.currentState, pool.pendingNonces, trc21Issuers, trc21CostFn)
 
 	// promote all promotable transactions
 	promoted := make([]*types.Transaction, 0, len(promotable))
@@ -1769,6 +1810,7 @@ func (pool *LegacyPool) truncateQueue() {
 func (pool *LegacyPool) demoteUnexecutables() {
 	// Iterate over all accounts and demote any non-executable transactions
 	gasLimit := pool.currentHead.Load().GasLimit
+	trc21Issuers, trc21CostFn := pool.trc21Data()
 	for addr, list := range pool.pending {
 		nonce := pool.currentState.GetNonce(addr)
 
@@ -1779,8 +1821,9 @@ func (pool *LegacyPool) demoteUnexecutables() {
 			pool.all.Remove(hash)
 			log.Trace("Removed old pending transaction", "hash", hash)
 		}
-		// Drop all transactions that are too costly (low balance or out of gas), and queue any invalids back for later
-		drops, invalids := list.Filter(pool.currentState.GetBalance(addr), gasLimit)
+		// Drop all transactions that are too costly (low balance or out of gas), and queue any invalids back for later.
+		// XDC TRC21: pass issuer capacities so TRC21 txs affordable from fee capacity survive the reset.
+		drops, invalids := list.Filter(pool.currentState.GetBalance(addr), gasLimit, trc21Issuers, trc21CostFn)
 		for _, tx := range drops {
 			hash := tx.Hash()
 			pool.all.Remove(hash)

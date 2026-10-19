@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"math"
 	"math/big"
+	"strings"
 	"sync"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -39,6 +40,8 @@ var (
 	XDCMainnetGenesisHash = common.HexToHash("0x4a9d748bd78a8d0385b67788c2435dcdb914f98a96250b68863a1f8b7642d6b1") // verified genesis (#75)
 	XDCApothemGenesisHash = common.HexToHash("0xbdea512b4f12ff1135ec92c00dc047ffb93890c2ea1aa0eefe9b013d80640075")
 	XDCDevnetGenesisHash  = common.HexToHash("0xb8be003946a9c2688e9f1e255a5567c3d144293ccde2ffb38452a5840081b402") // XDPoSChain dev-upgrade DefaultDevnetGenesisBlock (chain ID 5551)
+
+	XDCDevnet551GenesisHash = common.HexToHash("0x50e63112ebf55bba9115ea875eedc3f6c62b42440d23786323e2678a9848b7ac") // XDPoSChain v2.9.3-testnet params/config_networks.go:55 DevnetGenesisHash (chain ID 551)
 )
 
 func newUint64(val uint64) *uint64 { return &val }
@@ -1041,6 +1044,8 @@ var (
 		TIPUpgradeRewardBlock:  big.NewInt(83_600_000), // XinFinOrg/XDPoSChain#2383 (v2.8.0); activation verified on canonical (round>27,360,000; header@83,577,112 carries 25 validators)
 		TIPUpgradePenaltyBlock: big.NewInt(83_600_000), // XinFinOrg/XDPoSChain#2383 (v2.8.0)
 		Gas2500xBlock:          big.NewInt(83_600_000), // XinFinOrg/XDPoSChain#2516 #2695 (v2.9.0-testnet): base fee 625 gwei
+		DynamicGasLimitBlock:   big.NewInt(83_600_000), // XDPoSChain v2.9.3-testnet genesis/testnet.json dynamicGasLimitBlock
+		PragueBlock:            big.NewInt(87_633_000), // XDPoSChain v3.0.0-testnet genesis/testnet.json pragueBlock
 		XDPoS: &XDPoSConfig{
 			Period:              2,                                                                 // 2 second block time
 			Epoch:               900,                                                               // 900 blocks per epoch (~30 minutes)
@@ -1617,6 +1622,63 @@ var (
 		},
 	}
 
+	// XDCDevnet551ChainConfig is the XDC devnet (chain ID 551). Every value is
+	// taken from XinFinOrg/XDPoSChain v2.9.3-testnet params/config_networks.go:471
+	// DevnetChainConfig. Canonical leaves Constantinople/Petersburg/Istanbul nil
+	// and activates Petersburg/Istanbul through TIPXDCXCancellationFeeBlock = 0;
+	// they are pinned to 0 here only to satisfy CheckConfigForkOrder (the same
+	// effective rules). Canonical nil forks (Osaka, TIPEpochHalving) stay nil.
+	XDCDevnet551ChainConfig = &ChainConfig{
+		ChainID:                     big.NewInt(551),
+		HomesteadBlock:              big.NewInt(0),
+		EIP150Block:                 big.NewInt(0),
+		EIP155Block:                 big.NewInt(0),
+		EIP158Block:                 big.NewInt(0),
+		ByzantiumBlock:              big.NewInt(0),
+		ConstantinopleBlock:         big.NewInt(0),
+		PetersburgBlock:             big.NewInt(0),
+		IstanbulBlock:               big.NewInt(0),
+		BerlinBlock:                 big.NewInt(0),
+		LondonBlock:                 big.NewInt(0),
+		MergeBlock:                  big.NewInt(0),
+		ShanghaiBlock:               big.NewInt(0),
+		TIP2019Block:                big.NewInt(0),
+		TIPSigningBlock:             big.NewInt(0),
+		TIPRandomizeBlock:           big.NewInt(0),
+		TIPIncreaseMasternodesBlock: big.NewInt(0),
+		DenylistBlock:               big.NewInt(0),
+		TIPNoHalvingMNRewardBlock:   big.NewInt(0),
+		TIPXDCXBlock:                big.NewInt(0),
+		TIPXDCXLendingBlock:         big.NewInt(0),
+		TIPXDCXCancellationFeeBlock: big.NewInt(0),
+		TIPTRC21FeeBlock:            big.NewInt(0),
+		Gas50xBlock:                 big.NewInt(0),
+		Gas2500xBlock:               big.NewInt(1385100),
+		TIPXDCXMinerDisableBlock:    big.NewInt(0),
+		TIPXDCXReceiverDisableBlock: big.NewInt(0),
+		Eip1559Block:                big.NewInt(25000),
+		CancunBlock:                 big.NewInt(25000),
+		PragueBlock:                 big.NewInt(50000),
+		DynamicGasLimitBlock:        big.NewInt(50000),
+		TIPUpgradeRewardBlock:       big.NewInt(50000),
+		TIPUpgradePenaltyBlock:      big.NewInt(50000),
+		XDPoS: &XDPoSConfig{
+			Period:              2,
+			Epoch:               900,
+			Reward:              1026,
+			RewardCheckpoint:    900,
+			Gap:                 450,
+			FoudationWalletAddr: common.HexToAddress("0xf8b10955abe83acfdae2dbd4b5d351fc5e1c3672"),
+			MaxMasternodesV2:    18,
+			V2: &V2{
+				SwitchBlock:   big.NewInt(2700), // canonical devnetV2SwitchBlock
+				SwitchEpoch:   3,                // 2700 / 900
+				AllConfigs:    Devnet551V2Configs,
+				CurrentConfig: Devnet551V2Configs[0],
+			},
+		},
+	}
+
 	// XDCDefaultPrivateChainConfig is the fork-block and XDPoS-parameter template
 	// inherited by any unregistered XDPoS chain ID (i.e. any chain that is not
 	// mainnet/50, Apothem/51, or devnet/551). It is LEGACY-COMPATIBLE: it mirrors
@@ -1954,6 +2016,8 @@ type ChainConfig struct {
 	Eip1559Block        *big.Int `json:"eip1559Block,omitempty"`        // EIP-1559 fee market switch block (nil = same as LondonBlock); XDC mainnet: 98,800,200
 	CancunBlock         *big.Int `json:"cancunBlock,omitempty"`         // Cancun features switch block (nil = no fork, 0 = already on cancun); XDC mainnet: 98,802,000
 	PragueBlock         *big.Int `json:"pragueBlock,omitempty"`         // Prague features switch block (nil = no fork, block-number based for XDC); XDPoSChain v2.8.0 apothem: 83,600,000 (held disabled until #963 parity)
+	OsakaBlock          *big.Int `json:"osakaBlock,omitempty"`          // Osaka features switch block (nil = no fork, block-number based for XDC); not yet scheduled on any XDC chain
+	AmsterdamBlock      *big.Int `json:"amsterdamBlock,omitempty"`      // Amsterdam (Glamsterdam, EIP-7773) features switch block (nil = no fork, block-number based for XDC); net2030: 31500
 	// XDC v2.8.0 (#963) per-network fork-block fields. nil = disabled. These
 	// supersede the disabled global sentinels (common.TIPUpgradeReward etc.).
 	TIPUpgradeRewardBlock  *big.Int `json:"tipUpgradeRewardBlock,omitempty"`  // Tiered (masternode/protector/observer) reward fork; XDPoSChain v2.8.0 apothem: 83,600,000 (held disabled)
@@ -1973,7 +2037,35 @@ type ChainConfig struct {
 	// the hardcoded table (see eth/backend.go); nil (the default for every
 	// existing genesis) preserves the hardcoded per-chainID value exactly as
 	// before. Refs devnet-5151 A.94 sticky-checkpointSyncNoState investigation.
-	TIPSigningBlock    *big.Int `json:"tipSigningBlock,omitempty"`
+	TIPSigningBlock *big.Int `json:"tipSigningBlock,omitempty"`
+
+	// XDC canonical fork keys (v2.9.3 addition, #1528). nil = use common.TIP*
+	// constant for registered chains; unregistered chains use the genesis value.
+	TIP2019Block                *big.Int `json:"tip2019Block,omitempty"`                // XDPoSChain TIP-2019 fork
+	TIPRandomizeBlock           *big.Int `json:"tipRandomizeBlock,omitempty"`           // Randomize masternode selection
+	TIPIncreaseMasternodesBlock *big.Int `json:"tipIncreaseMasternodesBlock,omitempty"` // Increase masternode cap 18→40
+	DenylistBlock               *big.Int `json:"denylistBlock,omitempty"`               // Denylist contract activation
+	TIPNoHalvingMNRewardBlock   *big.Int `json:"tipNoHalvingMNRewardBlock,omitempty"`   // Disable reward halving
+	TIPXDCXBlock                *big.Int `json:"tipXDCXBlock,omitempty"`                // XDCX trading/lending activation
+	TIPXDCXLendingBlock         *big.Int `json:"tipXDCXLendingBlock,omitempty"`         // XDCX lending activation
+	TIPXDCXCancellationFeeBlock *big.Int `json:"tipXDCXCancellationFeeBlock,omitempty"` // XDCX cancellation fee; also Istanbul/Petersburg gate
+	TIPTRC21FeeBlock            *big.Int `json:"tipTRC21FeeBlock,omitempty"`            // TRC21 fee activation (required for custom XDPoS)
+	Gas50xBlock                 *big.Int `json:"gas50xBlock,omitempty"`                 // Gas 50x tier (required for custom XDPoS)
+	TIPXDCXMinerDisableBlock    *big.Int `json:"tipXDCXMinerDisableBlock,omitempty"`    // Miner stops processing XDCX empty-tx
+	TIPXDCXReceiverDisableBlock *big.Int `json:"tipXDCXReceiverDisableBlock,omitempty"` // Receiver stops processing XDCX empty-tx
+	DynamicGasLimitBlock        *big.Int `json:"dynamicGasLimitBlock,omitempty"`        // Sealer switches to CalcGasLimit (dynamic) from this block
+	TIPEpochHalvingBlock        *big.Int `json:"tipEpochHalvingBlock,omitempty"`        // Epoch reward halving activation (nil = never; large sentinel = far future)
+	MergeBlock                  *big.Int `json:"mergeBlock,omitempty"`                  // XDC merge marker block (same as London in practice)
+	ShanghaiBlock               *big.Int `json:"shanghaiBlock,omitempty"`               // XDC Shanghai block (block-based, not timestamp)
+
+	// XDC system-contract addresses (#1528). Nil = use hardcoded constant for
+	// registered chains; non-nil from genesis overrides for unregistered chains.
+	// Pointer type so encoding/json omitempty works correctly for zero-address values.
+	TRC21IssuerSMC         *common.Address `json:"trc21IssuerSMC,omitempty"`
+	XDCXListingSMC         *common.Address `json:"xdcxListingSMC,omitempty"`
+	RelayerRegistrationSMC *common.Address `json:"relayerRegistrationSMC,omitempty"`
+	LendingRegistrationSMC *common.Address `json:"lendingRegistrationSMC,omitempty"`
+
 	ArrowGlacierBlock  *big.Int `json:"arrowGlacierBlock,omitempty"`  // Eip-4345 (bomb delay) switch block (nil = no fork, 0 = already activated)
 	GrayGlacierBlock   *big.Int `json:"grayGlacierBlock,omitempty"`   // Eip-5133 (bomb delay) switch block (nil = no fork, 0 = already activated)
 	MergeNetsplitBlock *big.Int `json:"mergeNetsplitBlock,omitempty"` // Virtual fork after The Merge to use as a network splitter
@@ -2045,6 +2137,86 @@ type ChainConfig struct {
 	EnableUBTAtGenesis bool    `json:"enableUBTAtGenesis,omitempty"`
 }
 
+// knownChainConfigKeys is the set of valid JSON keys for ChainConfig, used by
+// CheckGenesisConfigUnknownKeys to reject unknown keys at genesis-file load time.
+// Keys are lowercased; comparison is case-insensitive (matching Go's encoding/json).
+// Lazy-initialised via sync.Once to avoid package-init ordering issues
+// (chainspecs.go sorts before config.go so BloatnetChainConfig is initialised
+// before this var would be if it were a plain package-level var). Refs #1528.
+var (
+	knownChainConfigKeysOnce sync.Once
+	knownChainConfigKeys     map[string]struct{}
+)
+
+func getKnownChainConfigKeys() map[string]struct{} {
+	knownChainConfigKeysOnce.Do(func() {
+		keys := []string{
+			"chainId",
+			"homesteadBlock", "daoForkBlock", "daoForkSupport",
+			"eip150Block", "eip155Block", "eip158Block",
+			"byzantiumBlock", "constantinopleBlock", "petersburgBlock", "istanbulBlock",
+			"muirGlacierBlock", "berlinBlock", "londonBlock",
+			"eip1559Block", "cancunBlock", "pragueBlock",
+			"tipUpgradeRewardBlock", "tipUpgradePenaltyBlock", "gas2500xBlock",
+			"tipSigningBlock",
+			// XDC canonical fork keys (#1528)
+			"tip2019Block", "tipRandomizeBlock", "tipIncreaseMasternodesBlock",
+			"denylistBlock", "tipNoHalvingMNRewardBlock",
+			"tipXDCXBlock", "tipXDCXLendingBlock", "tipXDCXCancellationFeeBlock",
+			"tipTRC21FeeBlock", "gas50xBlock",
+			"tipXDCXMinerDisableBlock", "tipXDCXReceiverDisableBlock",
+			"dynamicGasLimitBlock", "tipEpochHalvingBlock",
+			"mergeBlock", "shanghaiBlock", "osakaBlock", "amsterdamBlock",
+			// XDC system-contract addresses (#1528)
+			"trc21IssuerSMC", "xdcxListingSMC", "relayerRegistrationSMC", "lendingRegistrationSMC",
+			// Ethereum bomb-delay and netsplit markers
+			"arrowGlacierBlock", "grayGlacierBlock", "mergeNetsplitBlock",
+			// Timestamp-based forks
+			"shanghaiTime", "cancunTime", "pragueTime", "osakaTime",
+			"bpo1Time", "bpo2Time", "bpo3Time", "bpo4Time", "bpo5Time",
+			"amsterdamTime", "verkleTime", "bogotaTime",
+			// Terminal difficulty and deposit
+			"terminalTotalDifficulty", "depositContractAddress",
+			// Verkle / UBT
+			"enableVerkleAtGenesis", "ubtTime", "enableUBTAtGenesis",
+			// Consensus engine blocks
+			"ethash", "clique", "xdpos", "blobSchedule",
+			// XDC extensions
+			"xdcFeatures", "trustedSyncCheckpoints",
+			// eip150 legacy hash (some genesis files include it)
+			"eip150Hash",
+			// Chainspec metadata fields (not ChainConfig struct fields; silently
+			// ignored by the JSON decoder but must pass the unknown-key gate)
+			"chainName", "consensus", "terminalTotalDifficultyPassed", "defaultBlockGasLimit",
+		}
+		m := make(map[string]struct{}, len(keys))
+		for _, k := range keys {
+			m[strings.ToLower(k)] = struct{}{}
+		}
+		knownChainConfigKeys = m
+	})
+	return knownChainConfigKeys
+}
+
+// CheckGenesisConfigUnknownKeys validates that every key in the JSON object
+// data (the "config" field of a genesis file) is a recognised ChainConfig key.
+// Called only from genesis-file loading paths (core.DecodeGenesisJSON). Must
+// NOT be called from rawdb, RPC, or ethclient paths — they must tolerate keys
+// from other releases. Refs #1528.
+func CheckGenesisConfigUnknownKeys(data json.RawMessage) error {
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	known := getKnownChainConfigKeys()
+	for key := range raw {
+		if _, ok := known[strings.ToLower(key)]; !ok {
+			return fmt.Errorf("unknown chain config key %q in genesis", key)
+		}
+	}
+	return nil
+}
+
 // EthashConfig is the consensus engine configs for proof-of-work based sealing.
 type EthashConfig struct{}
 
@@ -2090,6 +2262,7 @@ type XDPoSConfig struct {
 	RewardCheckpoint    uint64         `json:"rewardCheckpoint,omitempty"`    // Checkpoint block for calculate rewards
 	Gap                 uint64         `json:"gap"`                           // Gap time preparing for the next epoch
 	FoudationWalletAddr common.Address `json:"foudationWalletAddr,omitempty"` // Foundation Address Wallet
+	MaxMasternodesV2    int            `json:"maxMasternodesV2,omitempty"`    // Max V2 masternodes; canonical: 108 (mainnet/apothem), 15 (devnet)
 	V2                  *V2            `json:"v2,omitempty"`                  // V2 upgrade config
 }
 
@@ -2411,6 +2584,54 @@ var DevnetV2Configs = map[uint64]*V2Config{
 	},
 }
 
+// Devnet551V2Configs holds the per-round V2 configs of the XDC devnet (chain
+// ID 551): XinFinOrg/XDPoSChain v2.9.3-testnet params/config_networks.go:189
+// DevnetV2Configs.
+var Devnet551V2Configs = map[uint64]*V2Config{
+	0: {
+		MaxMasternodes:       18,
+		CertThreshold:        0.667,
+		TimeoutSyncThreshold: 3,
+		TimeoutPeriod:        10,
+		MinePeriod:           2,
+		ExpTimeoutConfig:     ExpTimeoutConfig{Base: 1.0, MaxExponent: 0},
+	},
+	45000: {
+		SwitchRound:               45000,
+		MaxMasternodes:            10,
+		MaxProtectorNodes:         3,
+		MaxObserverNodes:          10,
+		CertThreshold:             0.667,
+		TimeoutSyncThreshold:      3,
+		TimeoutPeriod:             10,
+		MinePeriod:                2,
+		ExpTimeoutConfig:          ExpTimeoutConfig{Base: 1.0, MaxExponent: 0},
+		MasternodeReward:          63.42,
+		ProtectorReward:           50.27,
+		ObserverReward:            25.13,
+		MinimumMinerBlockPerEpoch: 5,
+		LimitPenaltyEpoch:         5,
+		MinimumSigningTx:          30,
+	},
+	1683000: {
+		SwitchRound:               1683000,
+		MaxMasternodes:            10,
+		MaxProtectorNodes:         3,
+		MaxObserverNodes:          10,
+		CertThreshold:             0.667,
+		TimeoutSyncThreshold:      3,
+		TimeoutPeriod:             10,
+		MinePeriod:                2,
+		ExpTimeoutConfig:          ExpTimeoutConfig{Base: 1.0, MaxExponent: 0},
+		MasternodeReward:          63.4196,
+		ProtectorReward:           50.7357,
+		ObserverReward:            25.3678,
+		MinimumMinerBlockPerEpoch: 5,
+		LimitPenaltyEpoch:         5,
+		MinimumSigningTx:          30,
+	},
+}
+
 // String implements the stringer interface, returning the consensus engine details.
 func (c XDPoSConfig) String() string {
 	return fmt.Sprintf("xdpos(period: %d, epoch: %d, gap: %d, reward: %d)", c.Period, c.Epoch, c.Gap, c.Reward)
@@ -2486,8 +2707,14 @@ func (c *ChainConfig) String() string {
 	if c.PragueTime != nil {
 		result += fmt.Sprintf(", PragueTime: %v", *c.PragueTime)
 	}
+	if c.OsakaBlock != nil {
+		result += fmt.Sprintf(", OsakaBlock: %v", c.OsakaBlock)
+	}
 	if c.OsakaTime != nil {
 		result += fmt.Sprintf(", OsakaTime: %v", *c.OsakaTime)
+	}
+	if c.AmsterdamBlock != nil {
+		result += fmt.Sprintf(", AmsterdamBlock: %v", c.AmsterdamBlock)
 	}
 	if c.BPO1Time != nil {
 		result += fmt.Sprintf(", BPO1Time: %v", *c.BPO1Time)
@@ -2584,8 +2811,14 @@ func (c *ChainConfig) Description() string {
 	if c.PragueTime != nil {
 		banner += fmt.Sprintf(" - Prague:                      @%-10v blob: (%s)\n", *c.PragueTime, c.BlobScheduleConfig.Prague)
 	}
+	if c.OsakaBlock != nil {
+		banner += fmt.Sprintf(" - Osaka (XDC block-gated):     #%-8v\n", c.OsakaBlock)
+	}
 	if c.OsakaTime != nil {
 		banner += fmt.Sprintf(" - Osaka:                       @%-10v\n", *c.OsakaTime)
+	}
+	if c.AmsterdamBlock != nil {
+		banner += fmt.Sprintf(" - Amsterdam/Glamsterdam (XDC): #%-8v\n", c.AmsterdamBlock)
 	}
 	if c.BPO1Time != nil {
 		banner += fmt.Sprintf(" - BPO1:                        @%-10v blob: (%s)\n", *c.BPO1Time, c.BlobScheduleConfig.BPO1)
@@ -2605,6 +2838,7 @@ func (c *ChainConfig) Description() string {
 	if c.AmsterdamTime != nil {
 		banner += fmt.Sprintf(" - Amsterdam:                   @%-10v\n", *c.AmsterdamTime)
 	}
+	// AmsterdamBlock shown above in the XDC block-gated section.
 	if c.BogotaTime != nil {
 		banner += fmt.Sprintf(" - Bogota:                      @%-10v\n", *c.BogotaTime)
 	}
@@ -2699,12 +2933,12 @@ func (c *ChainConfig) IsMuirGlacier(num *big.Int) bool {
 // dominate from 38,383,838 on both clients) but corrected here for bit-exact
 // fork-schedule parity across the full mainnet range.
 func (c *ChainConfig) IsPetersburg(num *big.Int) bool {
-	return isBlockForked(common.TIPXDCXCancellationFee, num) || isBlockForked(c.PetersburgBlock, num) || c.PetersburgBlock == nil && isBlockForked(c.ConstantinopleBlock, num)
+	return c.IsTIPXDCXCancellationFee(num) || isBlockForked(c.PetersburgBlock, num) || c.PetersburgBlock == nil && isBlockForked(c.ConstantinopleBlock, num)
 }
 
 // IsIstanbul returns whether num is either equal to the Istanbul fork block or greater.
 func (c *ChainConfig) IsIstanbul(num *big.Int) bool {
-	return isBlockForked(common.TIPXDCXCancellationFee, num) || isBlockForked(c.IstanbulBlock, num)
+	return c.IsTIPXDCXCancellationFee(num) || isBlockForked(c.IstanbulBlock, num)
 }
 
 // IsBerlin returns whether num is either equal to the Berlin fork block or greater.
@@ -2751,6 +2985,30 @@ func (c *ChainConfig) IsPragueBlock(num *big.Int) bool {
 	return false
 }
 
+// IsOsakaBlock returns whether the Osaka fork (block-number based) is active at num.
+// XDC chains gate Osaka by block number (parallel to IsPragueBlock) rather than
+// the upstream timestamp-based OsakaTime; no XDC chain has a scheduled OsakaBlock yet.
+// For non-XDC chains (OsakaBlock == nil) this returns false and the timestamp-based
+// IsOsaka path is used instead.
+func (c *ChainConfig) IsOsakaBlock(num *big.Int) bool {
+	if c.OsakaBlock != nil {
+		return isBlockForked(c.OsakaBlock, num)
+	}
+	return false
+}
+
+// IsAmsterdamBlock returns whether the Amsterdam fork (block-number based) is active at num.
+// XDC chains gate Amsterdam by block number rather than the upstream timestamp-based
+// AmsterdamTime. For non-XDC chains (AmsterdamBlock == nil) this returns false and
+// the timestamp-based IsAmsterdam path is used instead.
+// Amsterdam = Glamsterdam = EIP-7773 meta-EIP; net2030 target: 31,500.
+func (c *ChainConfig) IsAmsterdamBlock(num *big.Int) bool {
+	if c.AmsterdamBlock != nil {
+		return isBlockForked(c.AmsterdamBlock, num)
+	}
+	return false
+}
+
 // IsArrowGlacier returns whether num is either equal to the Arrow Glacier (EIP-4345) fork block or greater.
 func (c *ChainConfig) IsArrowGlacier(num *big.Int) bool {
 	return isBlockForked(c.ArrowGlacierBlock, num)
@@ -2789,13 +3047,25 @@ func (c *ChainConfig) IsCancun(num *big.Int, time uint64) bool {
 	return c.IsLondon(num) && isTimestampForked(c.CancunTime, time)
 }
 
-// IsPrague returns whether time is either equal to the Prague fork time or greater.
+// IsPrague returns whether Prague is active at (num, time).
+// XDC chains gate Prague by block number (IsPragueBlock) rather than timestamp —
+// PragueTime is always nil on XDC, so the upstream timestamp check would never
+// fire. Non-XDC chains use the upstream timestamp-based path unchanged.
 func (c *ChainConfig) IsPrague(num *big.Int, time uint64) bool {
+	if c.IsXDC() {
+		return c.IsPragueBlock(num)
+	}
 	return c.IsLondon(num) && isTimestampForked(c.PragueTime, time)
 }
 
-// IsOsaka returns whether time is either equal to the Osaka fork time or greater.
+// IsOsaka returns whether Osaka is active at (num, time).
+// XDC chains gate Osaka by block number (IsOsakaBlock) rather than timestamp —
+// OsakaTime is always nil on XDC, so the upstream timestamp check would never
+// fire. Non-XDC chains use the upstream timestamp-based path unchanged.
 func (c *ChainConfig) IsOsaka(num *big.Int, time uint64) bool {
+	if c.IsXDC() {
+		return c.IsOsakaBlock(num)
+	}
 	return c.IsLondon(num) && isTimestampForked(c.OsakaTime, time)
 }
 
@@ -2824,8 +3094,14 @@ func (c *ChainConfig) IsBPO5(num *big.Int, time uint64) bool {
 	return c.IsLondon(num) && isTimestampForked(c.BPO5Time, time)
 }
 
-// IsAmsterdam returns whether time is either equal to the Amsterdam fork time or greater.
+// IsAmsterdam returns whether Amsterdam is active at (num, time).
+// XDC chains gate Amsterdam by block number (IsAmsterdamBlock) rather than
+// timestamp — AmsterdamTime is always nil on XDC, so the upstream timestamp
+// check would never fire. Non-XDC chains use the upstream timestamp-based path.
 func (c *ChainConfig) IsAmsterdam(num *big.Int, time uint64) bool {
+	if c.IsXDC() {
+		return c.IsAmsterdamBlock(num)
+	}
 	return c.IsLondon(num) && isTimestampForked(c.AmsterdamTime, time)
 }
 
@@ -2905,25 +3181,114 @@ func (c *ChainConfig) IsEIP4762(num *big.Int, time uint64) bool {
 	return c.IsVerkle(num, time)
 }
 
-// IsTIP2019 checks if block number is past TIP2019 fork
-func (c *ChainConfig) IsTIP2019(num *big.Int) bool {
-	return isBlockForked(common.TIP2019Block, num)
+// xdcTIPBlock returns the per-genesis value if c is non-nil and the field is
+// non-nil; otherwise returns the global constant. Safe to call on a nil
+// *ChainConfig receiver. This lets unregistered chains drive every TIP gate
+// from their genesis JSON while registered chains keep hardcoded constants.
+// Refs #1528.
+func xdcTIPBlock(c *ChainConfig, getter func(*ChainConfig) *big.Int, globalConst *big.Int) *big.Int {
+	if c != nil {
+		if v := getter(c); v != nil {
+			return v
+		}
+	}
+	return globalConst
 }
 
-// IsTIPSigning checks if block number is past TIPSigning fork
+// IsTIP2019 checks if block number is past TIP2019 fork.
+// For unregistered chains reads TIP2019Block from genesis; registered chains
+// fall back to common.TIP2019Block.
+func (c *ChainConfig) IsTIP2019(num *big.Int) bool {
+	return isBlockForked(xdcTIPBlock(c, func(c *ChainConfig) *big.Int { return c.TIP2019Block }, common.TIP2019Block), num)
+}
+
+// IsTIPSigning checks if block number is past TIPSigning fork.
+// Prefers the per-genesis TIPSigningBlock (set for devnet-5151 and custom
+// chains); falls back to the global common.TIPSigning for registered chains.
 func (c *ChainConfig) IsTIPSigning(num *big.Int) bool {
-	return isBlockForked(common.TIPSigning, num)
+	return isBlockForked(xdcTIPBlock(c, func(c *ChainConfig) *big.Int { return c.TIPSigningBlock }, common.TIPSigning), num)
+}
+
+// EffectiveTIPSigningBlock returns the block number at which TIPSigning activates:
+// the per-genesis TIPSigningBlock if set, else the global common.TIPSigning.
+// Use for exact-match comparisons (e.g. state_processor.go fires the 0x89 wipe
+// exactly at this block). Safe on a nil *ChainConfig receiver.
+func (c *ChainConfig) EffectiveTIPSigningBlock() *big.Int {
+	return xdcTIPBlock(c, func(c *ChainConfig) *big.Int { return c.TIPSigningBlock }, common.TIPSigning)
 }
 
 // IsTIPNoHalvingMNReward checks if block number is past TIPNoHalvingMNReward fork
-// (when this fork is active, masternode reward is no longer halved)
+// (when this fork is active, masternode reward is no longer halved).
 func (c *ChainConfig) IsTIPNoHalvingMNReward(num *big.Int) bool {
-	return isBlockForked(common.TIPNoHalvingMNReward, num)
+	return isBlockForked(xdcTIPBlock(c, func(c *ChainConfig) *big.Int { return c.TIPNoHalvingMNRewardBlock }, common.TIPNoHalvingMNReward), num)
 }
 
-// IsTIPRandomize checks if block number is past TIPRandomize fork
+// IsTIPRandomize checks if block number is past TIPRandomize fork.
 func (c *ChainConfig) IsTIPRandomize(num *big.Int) bool {
-	return isBlockForked(common.TIPRandomize, num)
+	return isBlockForked(xdcTIPBlock(c, func(c *ChainConfig) *big.Int { return c.TIPRandomizeBlock }, common.TIPRandomize), num)
+}
+
+// IsTIPIncreaseMasternodes checks if block number is past TIPIncreaseMasternodes fork
+// (masternode cap increases from 18 to 40).
+func (c *ChainConfig) IsTIPIncreaseMasternodes(num *big.Int) bool {
+	// TIPIncreaseMasternodes lives in consensus/XDPoS/constants.go (not common).
+	// For custom geneses the config field is authoritative; registered chains
+	// use the global variable set by SetNetworkConstants.
+	if c != nil && c.TIPIncreaseMasternodesBlock != nil {
+		return isBlockForked(c.TIPIncreaseMasternodesBlock, num)
+	}
+	return false // caller falls back to consensus/XDPoS.TIPIncreaseMasternodes
+}
+
+// IsDenylist checks if block number is past the Denylist fork.
+func (c *ChainConfig) IsDenylist(num *big.Int) bool {
+	if c == nil {
+		return false
+	}
+	return isBlockForked(c.DenylistBlock, num)
+}
+
+// IsTIPXDCXCancellationFee checks if block number is past TIPXDCXCancellationFee fork.
+func (c *ChainConfig) IsTIPXDCXCancellationFee(num *big.Int) bool {
+	return isBlockForked(xdcTIPBlock(c, func(c *ChainConfig) *big.Int { return c.TIPXDCXCancellationFeeBlock }, common.TIPXDCX), num)
+}
+
+// IsTIPTRC21Fee checks if block number is past TIPTRC21Fee fork.
+func (c *ChainConfig) IsTIPTRC21Fee(num *big.Int) bool {
+	return isBlockForked(xdcTIPBlock(c, func(c *ChainConfig) *big.Int { return c.TIPTRC21FeeBlock }, common.TIPTRC21Fee), num)
+}
+
+// EffectiveTIPTRC21FeeBlock returns the block number at which TIPTRC21Fee activates:
+// the per-genesis TIPTRC21FeeBlock if set, else the global common.TIPTRC21Fee.
+// Use this for strict-greater-than comparisons (canonical XDPoSChain state_transition.go:507
+// uses BlockNumber.Cmp(cfg.TIPTRC21FeeBlock) > 0; IsTIPTRC21Fee uses >=).
+// Safe on a nil *ChainConfig receiver (falls back to the global).
+func (c *ChainConfig) EffectiveTIPTRC21FeeBlock() *big.Int {
+	return xdcTIPBlock(c, func(c *ChainConfig) *big.Int { return c.TIPTRC21FeeBlock }, common.TIPTRC21Fee)
+}
+
+// IsGas50x checks if block number is past the Gas50x gas-price tier fork.
+func (c *ChainConfig) IsGas50x(num *big.Int) bool {
+	return isBlockForked(xdcTIPBlock(c, func(c *ChainConfig) *big.Int { return c.Gas50xBlock }, common.BlockNumberGas50x), num)
+}
+
+// IsDynamicGasLimit reports whether DynamicGasLimitBlock is set and active at
+// num. When active the sealer computes header gas limit with CalcGasLimit
+// (canonical behaviour); when nil (mainnet) the sealer uses the static
+// GasCeil ceiling (unchanged current behaviour). Refs #1528.
+func (c *ChainConfig) IsDynamicGasLimit(num *big.Int) bool {
+	if c == nil {
+		return false
+	}
+	return isBlockForked(c.DynamicGasLimitBlock, num)
+}
+
+// IsTIPEpochHalving checks if block number is past TIPEpochHalving fork.
+func (c *ChainConfig) IsTIPEpochHalving(num *big.Int) bool {
+	if c == nil {
+		return false
+	}
+	return isBlockForked(c.TIPEpochHalvingBlock, num)
 }
 
 // IsTIPUpgradeReward checks if block number is past TIPUpgradeReward fork.
@@ -2946,23 +3311,23 @@ func (c *ChainConfig) IsTIPUpgradePenalty(num *big.Int) bool {
 	return isBlockForked(c.TIPUpgradePenaltyBlock, num)
 }
 
-// IsTIPXDCX checks if block number is past TIPXDCX fork (trading/lending enabled)
+// IsTIPXDCX checks if block number is past TIPXDCX fork (trading/lending enabled).
 func (c *ChainConfig) IsTIPXDCX(num *big.Int) bool {
-	return isBlockForked(common.TIPXDCX, num)
+	return isBlockForked(xdcTIPBlock(c, func(c *ChainConfig) *big.Int { return c.TIPXDCXBlock }, common.TIPXDCX), num)
 }
 
-// IsTIPXDCXMiner checks if block number is past TIPXDCXMinerDisable fork
-// When active, miner no longer processes trading/lending as empty transactions
+// IsTIPXDCXMiner checks if block number is past TIPXDCXMinerDisable fork.
+// When active, miner no longer processes trading/lending as empty transactions.
 func (c *ChainConfig) IsTIPXDCXMiner(num *big.Int) bool {
-	return isBlockForked(common.TIPXDCXMinerDisable, num)
+	return isBlockForked(xdcTIPBlock(c, func(c *ChainConfig) *big.Int { return c.TIPXDCXMinerDisableBlock }, common.TIPXDCXMinerDisable), num)
 }
 
-// IsTIPXDCXReceiver checks if block number is past TIPXDCXReceiverDisable fork
-// When active, receiver no longer processes trading/lending as empty transactions
-// For devnet: TIPXDCX=0 and TIPXDCXReceiverDisable=0 => isForked(0,num)=true && !isForked(0,num)=false => returns false
-// This means devnet processes trading/lending as normal EVM transactions (not empty)
+// IsTIPXDCXReceiver checks if block number is past TIPXDCXReceiverDisable fork.
+// When active, receiver no longer processes trading/lending as empty transactions.
+// For devnet: TIPXDCX=0 and TIPXDCXReceiverDisable=0 => isForked(0,num)=true && !isForked(0,num)=false => returns false.
 func (c *ChainConfig) IsTIPXDCXReceiver(num *big.Int) bool {
-	return isBlockForked(common.TIPXDCX, num) && !isBlockForked(common.TIPXDCXReceiverDisable, num)
+	return isBlockForked(xdcTIPBlock(c, func(c *ChainConfig) *big.Int { return c.TIPXDCXBlock }, common.TIPXDCX), num) &&
+		!isBlockForked(xdcTIPBlock(c, func(c *ChainConfig) *big.Int { return c.TIPXDCXReceiverDisableBlock }, common.TIPXDCXReceiverDisable), num)
 }
 
 // CheckCompatible checks whether scheduled fork transitions have been imported
@@ -3061,6 +3426,29 @@ func (c *ChainConfig) CheckConfigForkOrder() error {
 		// If it was optional and not set, then ignore it
 		if !cur.optional || (cur.block != nil || cur.timestamp != nil) {
 			lastFork = cur
+		}
+	}
+
+	// XDC chains gate Cancun/Prague/Osaka/Amsterdam by block number rather than
+	// timestamp. A genesis that sets the timestamp variants alongside an XDPoS
+	// config is a misconfiguration that would silently leave the features inactive
+	// (IsPrague/IsOsaka/IsAmsterdam dispatch to the block-based paths for XDC).
+	if c.IsXDC() {
+		if c.CancunTime != nil {
+			return fmt.Errorf("XDC chain must not set cancunTime (use cancunBlock instead)")
+		}
+		if c.PragueTime != nil {
+			return fmt.Errorf("XDC chain must not set pragueTime (use pragueBlock instead)")
+		}
+		if c.OsakaTime != nil {
+			return fmt.Errorf("XDC chain must not set osakaTime (use osakaBlock instead)")
+		}
+		if c.AmsterdamTime != nil {
+			return fmt.Errorf("XDC chain must not set amsterdamTime (use amsterdamBlock instead)")
+		}
+		// Amsterdam must come after Osaka on XDC.
+		if c.AmsterdamBlock != nil && c.OsakaBlock != nil && c.AmsterdamBlock.Cmp(c.OsakaBlock) < 0 {
+			return fmt.Errorf("unsupported fork ordering: osakaBlock (%v) > amsterdamBlock (%v)", c.OsakaBlock, c.AmsterdamBlock)
 		}
 	}
 
@@ -3165,6 +3553,12 @@ func (c *ChainConfig) checkCompatible(newcfg *ChainConfig, headNumber *big.Int, 
 	}
 	if isForkBlockIncompatible(c.MergeNetsplitBlock, newcfg.MergeNetsplitBlock, headNumber) {
 		return newBlockCompatError("Merge netsplit fork block", c.MergeNetsplitBlock, newcfg.MergeNetsplitBlock)
+	}
+	if isForkBlockIncompatible(c.OsakaBlock, newcfg.OsakaBlock, headNumber) {
+		return newBlockCompatError("Osaka fork block", c.OsakaBlock, newcfg.OsakaBlock)
+	}
+	if isForkBlockIncompatible(c.AmsterdamBlock, newcfg.AmsterdamBlock, headNumber) {
+		return newBlockCompatError("Amsterdam fork block", c.AmsterdamBlock, newcfg.AmsterdamBlock)
 	}
 	if isForkTimestampIncompatible(c.ShanghaiTime, newcfg.ShanghaiTime, headTimestamp) {
 		return newTimestampCompatError("Shanghai fork timestamp", c.ShanghaiTime, newcfg.ShanghaiTime)
@@ -3516,6 +3910,8 @@ func (c *ChainConfig) Rules(num *big.Int, isMerge bool, timestamp uint64) Rules 
 	isShanghai := isMerge && c.IsShanghai(num, timestamp)
 	isCancun := isMerge && c.IsCancun(num, timestamp)
 	isPrague := isMerge && c.IsPrague(num, timestamp)
+	isOsaka := isMerge && c.IsOsaka(num, timestamp)
+	isAmsterdam := isMerge && c.IsAmsterdam(num, timestamp)
 	// EIP-3860 (initcode word cost + size limit) is upstream-coupled to
 	// Shanghai but on XDC defers to Cancun (canonical XDPoSChain enables it
 	// in newCancunInstructionSet, not newShanghaiInstructionSet).
@@ -3538,6 +3934,14 @@ func (c *ChainConfig) Rules(num *big.Int, isMerge bool, timestamp uint64) Rules 
 		// Prague on XDC is block-gated (XDPoSChain v2.8.0 PragueBlock), not
 		// timestamp-gated. nil PragueBlock => false => Prague stays off (#963).
 		isPrague = c.IsPragueBlock(num)
+		// Osaka is block-gated the same way (XDPoSChain v2.9.3 OsakaBlock).
+		// Callers such as the txpool pass isMerge=false on XDC (non-zero
+		// difficulty), so it must not depend on isMerge either.
+		isOsaka = c.IsOsakaBlock(num)
+		// Amsterdam is block-gated (AmsterdamBlock). IsAmsterdam already
+		// dispatches to IsAmsterdamBlock for XDC, but we call it directly
+		// here so it does not depend on isMerge (same reason as Osaka above).
+		isAmsterdam = c.IsAmsterdamBlock(num)
 	}
 	return Rules{
 		IsHomestead:      c.IsHomestead(num),
@@ -3558,8 +3962,8 @@ func (c *ChainConfig) Rules(num *big.Int, isMerge bool, timestamp uint64) Rules 
 		IsShanghai:       isShanghai,
 		IsCancun:         isCancun,
 		IsPrague:         isPrague,
-		IsOsaka:          isMerge && c.IsOsaka(num, timestamp),
-		IsAmsterdam:      isMerge && c.IsAmsterdam(num, timestamp),
+		IsOsaka:          isOsaka,
+		IsAmsterdam:      isAmsterdam,
 		IsVerkle:         isVerkle,
 		IsEIP4762:        isVerkle,
 		IsBogota:         isMerge && c.IsBogota(num, timestamp),

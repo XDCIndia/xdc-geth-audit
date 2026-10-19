@@ -52,10 +52,6 @@ func TestBulkSyncV1VerifiesSeal(t *testing.T) {
 	forgerKey, _ := crypto.GenerateKey()
 	signer := crypto.PubkeyToAddress(signerKey.PublicKey)
 
-	checkpointCacheMu.Lock()
-	delete(checkpointCache, 0) // global cache; don't inherit other tests' lists
-	checkpointCacheMu.Unlock()
-
 	extra := make([]byte, extraVanity+common.AddressLength+extraSeal)
 	copy(extra[extraVanity:], signer[:])
 	genesis := &types.Header{

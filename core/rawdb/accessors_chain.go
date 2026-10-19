@@ -616,7 +616,7 @@ func ReadReceipts(db ethdb.Reader, hash common.Hash, number uint64, time uint64,
 	}
 	// Compute effective blob gas price.
 	var blobGasPrice *big.Int
-	if header != nil && header.ExcessBlobGas != nil {
+	if header != nil && header.ExcessBlobGas != nil && !config.IsXDC() {
 		blobGasPrice = eip4844.CalcBlobFee(config, header)
 	}
 	if err := receipts.DeriveFields(config, hash, number, time, baseFee, blobGasPrice, body.Transactions); err != nil {
@@ -1088,4 +1088,3 @@ func ReadHeadBlock(db ethdb.Reader) *types.Block {
 	}
 	return ReadBlock(db, headBlockHash, headBlockNumber)
 }
-

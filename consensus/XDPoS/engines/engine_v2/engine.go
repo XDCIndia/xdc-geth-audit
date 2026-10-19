@@ -896,6 +896,12 @@ func (x *XDPoS_v2) getSnapshot(chain consensus.ChainReader, number uint64, forSi
 		}
 	}
 	checkpointNumber := number - number%x.config.Epoch
+	if number%x.config.Epoch == x.config.Epoch-x.config.Gap {
+		// A gap number defines the snapshot of the checkpoint after it, not the one it
+		// rounds down to. Rounding gap SwitchBlock+Gap down lands on the V2 switch and
+		// replaces the stored gap snapshot with the switch block's V1 Extra (#1464).
+		checkpointNumber = number + x.config.Gap
+	}
 	if checkpointNumber == 0 {
 		checkpointNumber = x.config.Epoch
 	}
@@ -971,6 +977,22 @@ func (x *XDPoS_v2) getSnapshot(chain consensus.ChainReader, number uint64, forSi
 				epochSwitchHdr.Number.Uint64() > x.config.V2.SwitchBlock.Uint64() {
 				masternodes := x.GetMasternodesFromEpochSwitchHeader(chain, epochSwitchHdr)
 				penalties := contracts.ExtractAddressFromBytes(epochSwitchHdr.Penalties)
+				// The header carries only the seated masternodes, not the gap
+				// block's candidate pool. A stored snapshot that already holds
+				// every one of them is not the stale seed this guards against:
+				// keep it, since overwriting it drops the standby candidates
+				// that vote checks and the Reward 2.0 protector/observer tiers
+				// read from it.
+				stored, ok := x.snapshots.Get(gapHeader.Hash())
+				if !ok || stored == nil {
+					stored, _ = loadSnapshot(x.db, gapHeader.Hash())
+				}
+				if stored != nil && len(masternodes) > 0 && len(removeItemFromArray(masternodes, stored.NextEpochCandidates)) == 0 {
+					kept := *stored
+					kept.Version = 6
+					x.snapshots.Add(kept.Hash, &kept)
+					return &kept, nil
+				}
 				if len(masternodes) > 0 {
 					snap := newSnapshotWithPenalties(gapNumber, gapHeader.Hash(), masternodes, penalties)
 					snap.Version = 6 // forward-seed certified; see rebuildGapSnapshotFromState
@@ -1214,6 +1236,18 @@ func (x *XDPoS_v2) getSnapshot(chain consensus.ChainReader, number uint64, forSi
 	// lives in header.Extra (vanity 32 + N·20 + seal 65). Always read from Extra at
 	// the switch block. Past the switch, header.Validators is the canonical V2 form.
 	checkpointHeader := chain.GetHeaderByNumber(checkpointNumber)
+	if checkpointHeader == nil {
+		// #1634: the V2 switch block may be in the same A.77 lookahead batch as the
+		// first V2 epoch-switch block and not yet committed to the chain DB. Scan the
+		// in-batch parents slice before giving up — the header IS present, just not
+		// in the DB yet.
+		for _, p := range parents {
+			if p.Number.Uint64() == checkpointNumber {
+				checkpointHeader = p
+				break
+			}
+		}
+	}
 	if checkpointHeader == nil {
 		return nil, fmt.Errorf("no checkpoint header at %d", checkpointNumber)
 	}
@@ -1557,15 +1591,39 @@ func (x *XDPoS_v2) GetMasternodesV2(chain consensus.ChainReader, header *types.H
 	return x.GetMasternodes(chain, header)
 }
 
+// epochEndRound returns the first round of the epoch after the one that info
+// opens. The switch block's round can be past its epoch's start when a TC
+// skipped rounds, so the boundary comes from the epoch start, not from the
+// switch round itself (#1652).
+func (x *XDPoS_v2) epochEndRound(info *types.EpochSwitchInfo) types.Round {
+	r := info.EpochSwitchBlockInfo.Round
+	epoch := types.Round(x.config.Epoch)
+	return r - r%epoch + epoch
+}
+
 // GetMasternodesWithParents returns masternodes for a header using the provided parents slice.
 // This is required during bulk sync when parent headers are not yet committed to the DB.
 func (x *XDPoS_v2) GetMasternodesWithParents(chain consensus.ChainReader, header *types.Header, parents []*types.Header) []common.Address {
-	// Try the DB path first (fast path for already-synced blocks)
+	// #1636 O(1) fast path: parent's epoch info is cached (in-batch headers after
+	// the first).  getEpochSwitchInfoWithParents populates x.epochSwitches[hash]
+	// on first resolution; here we propagate it to the current header via
+	// header.ParentHash, avoiding a DB lookup or parents scan.
+	// Guard: do not propagate if this header is itself an epoch switch — it opens
+	// a new epoch with different masternodes/penalties.
+	if info, ok := x.epochSwitches.Get(header.ParentHash); ok && len(info.Masternodes) > 0 {
+		if _, round, err := x.getExtraFieldsNoChain(header); err == nil &&
+			info.EpochSwitchBlockInfo != nil &&
+			round < x.epochEndRound(info) {
+			x.epochSwitches.Add(header.Hash(), info)
+			return info.Masternodes
+		}
+	}
+	// Try the DB path (already-synced blocks).
 	epochSwitchInfo, err := x.getEpochSwitchInfo(chain, header, header.Hash())
 	if err == nil {
 		return epochSwitchInfo.Masternodes
 	}
-	// Fallback: use parents slice to resolve epoch switch during bulk sync
+	// Fallback: parents-scan path for in-batch epoch switch.
 	log.Debug("[GetMasternodesWithParents] DB path failed, trying parents fallback", "number", header.Number.Uint64(), "err", err)
 	epochSwitchInfo, err = x.getEpochSwitchInfoWithParents(chain, header, header.Hash(), parents)
 	if err != nil {
@@ -1814,7 +1872,16 @@ func (x *XDPoS_v2) calcMasternodes(chain consensus.ChainReader, blockNum *big.In
 	// Fix #63: use per-round config for maxMasternodes
 	maxMasternodes := x.config.V2.Config(uint64(round)).MaxMasternodes
 
-	snap, err := x.getSnapshot(chain, blockNum.Uint64(), false, parents)
+	// Canonical calcMasternodes reads the snapshot with isGapNumber=false
+	// (XDPoSChain v2.9.3-testnet engine.go:1193). getSnapshot instead treats
+	// any number%Epoch == Epoch-Gap as a gap number, so an epoch-switch block
+	// at that position (devnet 5551 block 59,850) looked up itself. Its parent
+	// resolves to the same gap block and checkpoint.
+	snapNum := blockNum.Uint64()
+	if snapNum%x.config.Epoch == x.config.Epoch-x.config.Gap {
+		snapNum--
+	}
+	snap, err := x.getSnapshot(chain, snapNum, false, parents)
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -2150,6 +2217,17 @@ func (x *XDPoS_v2) getEpochSwitchInfo(chain consensus.ChainReader, header *types
 		log.Warn("[getEpochSwitchInfo] cache hit returned empty masternodes, evicting and recomputing",
 			"hash", hash.Hex(), "epochSwitchNumber", info.EpochSwitchBlockInfo.Number.Uint64())
 		x.epochSwitches.Remove(hash)
+	}
+
+	// Resolve a missing header before joining the singleflight. Callers that
+	// pass nil (vote/timeout handlers) fail with "header not found" while the
+	// block is not stored yet; inside the flight that error was shared with a
+	// concurrent verifyHeader holding the header, which then rejected a valid
+	// block with "empty masternode list" (#1556, #969).
+	if header == nil {
+		if header = chain.GetHeaderByHash(hash); header == nil {
+			return nil, fmt.Errorf("header not found: %s", hash.Hex())
+		}
 	}
 
 	// Slow path: use singleflight to deduplicate concurrent calls for the same hash.
@@ -2530,21 +2608,61 @@ func (x *XDPoS_v2) getMasternodesFromSnapshot(chain consensus.ChainReader, epoch
 // getEpochSwitchInfoWithParents is like getEpochSwitchInfo but can resolve the
 // epoch switch header from the supplied parents slice when it is not yet in the DB.
 // Required during bulk sync when a batch spans an epoch boundary.
+//
+// #1634 Bugs 3 & 4: verifyQC calls this to get both the masternode list (for QC
+// signature verification) and the epoch switch block number (for gap-number check).
+// Both fail with the wrong epoch when the in-batch epoch switch is not yet in the
+// DB. Scanning parents BEFORE the DB/cache lookup is the shared fix for all four
+// in-batch epoch-switch failure modes (checkpoint header, leader, gap number, QC
+// signers). The same IsEpochSwitch + epoch-range filter used in
+// GetMasternodesWithParents is applied here so TC-skipped rounds are handled
+// correctly (the switch block's round may be > epochStartRound).
 func (x *XDPoS_v2) getEpochSwitchInfoWithParents(chain consensus.ChainReader, header *types.Header, hash common.Hash, parents []*types.Header) (*types.EpochSwitchInfo, error) {
-	// Try cache + DB first (re-use existing logic)
-	info, err := x.getEpochSwitchInfo(chain, header, hash)
-	if err == nil {
+	// #1636 O(N²)→O(N): Two O(1) fast paths before the O(N) parents scan.
+	//
+	// Fast path 1: this exact header's epoch info is already cached.
+	// Covers repeat calls for the same hash (e.g. verifyQC + GetMasternodesWithParents
+	// both resolving the same header in one verifyHeader invocation).
+	if info, ok := x.epochSwitches.Get(hash); ok && len(info.Masternodes) > 0 {
 		return info, nil
 	}
-	// If DB lookup failed, try to find the epoch switch header in parents.
+	// Fast path 2: the immediate parent's epoch info is cached.
+	// In sequential VerifyHeaders, after the first header in an epoch resolves its
+	// epoch switch via the parents scan and caches the result under its own hash,
+	// every subsequent header finds it here in O(1) — no parents scan needed.
+	// Hash-keyed: each block hash uniquely identifies one block on one branch, so
+	// info from branch A cannot propagate into branch B (the rejected round-keyed
+	// approach would cross-contaminate sibling branches at the same round).
+	// Guard: skip propagation if this header is itself an epoch switch (its round
+	// falls in the next epoch relative to the cached info); let the parents scan
+	// or DB resolve its own — different — epoch switch info.
+	if header != nil {
+		if info, ok := x.epochSwitches.Get(header.ParentHash); ok && len(info.Masternodes) > 0 {
+			if _, round, err := x.getExtraFieldsNoChain(header); err == nil &&
+				info.EpochSwitchBlockInfo != nil &&
+				round < x.epochEndRound(info) {
+				x.epochSwitches.Add(hash, info)
+				return info, nil
+			}
+		}
+	}
+	// O(N) parents scan — needed only for the FIRST header after an in-batch epoch
+	// switch (epoch switch is in parents but not yet in DB or cache), and for
+	// checkpoint-sync boundaries.  After the scan caches the epoch switch block's
+	// hash and the target's hash, fast path 2 handles every subsequent header in
+	// this epoch in O(1).
+	var info *types.EpochSwitchInfo
 	if len(parents) == 0 {
-		return nil, err
+		// No parents to scan; fall through to DB path.
+		var err error
+		info, err = x.getEpochSwitchInfo(chain, header, hash)
+		return info, err
 	}
 	h := header
 	if h == nil {
 		h = chain.GetHeaderByHash(hash)
 		if h == nil {
-			return nil, err
+			return x.getEpochSwitchInfo(chain, nil, hash)
 		}
 	}
 
@@ -2738,7 +2856,8 @@ func (x *XDPoS_v2) getEpochSwitchInfoWithParents(chain consensus.ChainReader, he
 				}
 			}
 		}
-		return nil, err
+		// Epoch switch not in parents; fall back to DB/cache path.
+		return x.getEpochSwitchInfo(chain, header, hash)
 	}
 
 	// Try to get masternodes from epoch switch header
@@ -2796,12 +2915,20 @@ func (x *XDPoS_v2) getEpochSwitchInfoWithParents(chain consensus.ChainReader, he
 			Number: epochSwitchHeader.Number,
 		},
 	}
-	// v146 FIX: Only cache if masternodes are non-empty
+	// Cache by epoch switch block hash AND target hash.
+	// The epoch switch hash seeding is what enables fast-path-2 (parent-hash
+	// propagation) for the NEXT header in the batch: its ParentHash equals the
+	// previous target's hash, which we cache here, so it hits in O(1) without
+	// re-scanning parents (#1636).
 	log.Debug("[getEpochSwitchInfoWithParents] caching epoch switch info",
-		"number", epochSwitchHeader.Number.Uint64(),
-		"hash", hash.Hex(),
+		"epochSwitch", epochSwitchHeader.Number.Uint64(),
+		"target", hash.Hex(),
 		"masternodes", len(masternodes),
 		"source", "parents")
+	esHash := epochSwitchHeader.Hash()
+	if _, ok := x.epochSwitches.Get(esHash); !ok {
+		x.epochSwitches.Add(esHash, info)
+	}
 	x.epochSwitches.Add(hash, info)
 	return info, nil
 }

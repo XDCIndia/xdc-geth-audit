@@ -4796,3 +4796,60 @@ func TestCreateAccessListAuthorizationGas(t *testing.T) {
 		})
 	}
 }
+
+// TestSimulateV1RejectsGasPriceWithAuthorizationList checks that eth_simulateV1
+// refuses an authorization list together with gasPrice, or without a base fee,
+// instead of returning a block that holds a legacy transaction while the call
+// applied the authorization list (XDPoSChain v3.0.0 internal/ethapi/simulate.go).
+func TestSimulateV1RejectsGasPriceWithAuthorizationList(t *testing.T) {
+	var (
+		sender    = common.Address{0xaa, 0xaa}
+		recipient = common.Address{0xbb, 0xbb}
+		gas       = hexutil.Uint64(100000)
+		ctx       = context.Background()
+	)
+	// Berlin without London: blocks carry no base fee.
+	noBaseFee := *params.TestChainConfig
+	noBaseFee.LondonBlock, noBaseFee.ArrowGlacierBlock, noBaseFee.GrayGlacierBlock = nil, nil, nil
+	noBaseFee.MergeNetsplitBlock, noBaseFee.TerminalTotalDifficulty = nil, nil
+	noBaseFee.ShanghaiTime, noBaseFee.CancunTime, noBaseFee.PragueTime, noBaseFee.OsakaTime = nil, nil, nil, nil
+	noBaseFee.BlobScheduleConfig = nil
+	for _, tc := range []struct {
+		name     string
+		config   *params.ChainConfig
+		engine   consensus.Engine
+		gasPrice *hexutil.Big
+		want     string
+	}{
+		{"gasPrice", params.MergedTestChainConfig, beacon.New(ethash.NewFaker()), (*hexutil.Big)(big.NewInt(params.GWei)), "both gasPrice and authorizationList specified"},
+		{"no base fee", &noBaseFee, ethash.NewFaker(), nil, "authorizationList requires a base fee"},
+	} {
+		gspec := &core.Genesis{
+			Config: tc.config,
+			Alloc:  types.GenesisAlloc{sender: {Balance: big.NewInt(params.Ether)}},
+		}
+		backend := newTestBackend(t, 0, gspec, tc.engine, func(i int, b *core.BlockGen) {})
+		stateDB, baseHeader, err := backend.StateAndHeaderByNumberOrHash(ctx, rpc.BlockNumberOrHashWithNumber(rpc.LatestBlockNumber))
+		if err != nil {
+			t.Fatalf("%s: failed to get state and header: %v", tc.name, err)
+		}
+		sim := &simulator{
+			b:           backend,
+			state:       stateDB,
+			base:        baseHeader,
+			chainConfig: backend.ChainConfig(),
+			budget:      newGasBudget(0),
+			fullTx:      true,
+		}
+		_, err = sim.execute(ctx, []simBlock{{Calls: []TransactionArgs{{
+			From:              &sender,
+			To:                &recipient,
+			Gas:               &gas,
+			GasPrice:          tc.gasPrice,
+			AuthorizationList: []types.SetCodeAuthorization{{Address: recipient}},
+		}}}})
+		if err == nil || !strings.Contains(err.Error(), tc.want) {
+			t.Errorf("%s: err = %v, want %q", tc.name, err, tc.want)
+		}
+	}
+}

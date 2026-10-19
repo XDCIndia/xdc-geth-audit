@@ -77,10 +77,29 @@ const (
 	handshakeTimeout = 5 * time.Second
 )
 
-// estimateXDTDP returns the best available total-difficulty estimate for
-// XDC. XDC is pre-merge and does not use TD meaningfully; the only proxy
-// is the current block number. Callers must not rely on TD for consensus.
-func estimateXDTDP(latest *types.Header) *big.Int {
+// xdcTDGetter is satisfied by *core.BlockChain (and any test double) to supply
+// the cumulative total difficulty for the XDC status handshake. Using an
+// interface avoids importing core into eth/protocols/eth.
+type xdcTDGetter interface {
+	GetTd(hash common.Hash, number uint64) *big.Int
+}
+
+// xdcHandshakeTD returns the cumulative total difficulty for the local head.
+// It tries a type assertion on chain to obtain the real stored TD (written at
+// block import and at genesis — see core/blockchain.go ensureXDCTd). If the
+// real TD is unavailable it falls back to the head block number, which is
+// wrong for chains with V1 blocks (difficulty > 1) but safe in the sense that
+// it does not break modern↔modern sync (both sides compare by head hash / QC
+// chain, not by TD). Legacy peers gate sync on peerTD > ownTD, so this
+// fallback leaves them unable to sync — hence the ensureXDCTd init on startup.
+func xdcHandshakeTD(latest *types.Header, chain interface{}) *big.Int {
+	if tg, ok := chain.(xdcTDGetter); ok {
+		if td := tg.GetTd(latest.Hash(), latest.Number.Uint64()); td != nil {
+			return new(big.Int).Set(td)
+		}
+	}
+	// ponytail: fallback to block number; wrong for V1 ranges but only reached
+	// when TD was not yet persisted (first handshake on an uninitialized node).
 	return new(big.Int).SetUint64(latest.Number.Uint64())
 }
 
@@ -128,7 +147,7 @@ func (p *Peer) handshake62(networkID uint64, chain forkid.Blockchain) error {
 		genesis = chain.Genesis()
 		latest  = chain.CurrentHeader()
 	)
-	td := estimateXDTDP(latest)
+	td := xdcHandshakeTD(latest, chain)
 	// A.37 fix: localXDCCaps() is intentionally NOT sent on the wire.
 	// See StatusPacket62 doc comment for why (legacy 5-field decoders
 	// reject extra trailing elements). The caps helper is retained for

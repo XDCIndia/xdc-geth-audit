@@ -316,6 +316,17 @@ func (miner *Miner) prepareWork(ctx context.Context, genParams *generateParams, 
 		Time:       timestamp,
 		Coinbase:   genParams.coinbase,
 	}
+	// DynamicGasLimitBlock (#1528): XDC chains that set this field use the
+	// static GasCeil before the fork, and CalcGasLimit after it. When nil
+	// (mainnet, unset), the CalcGasLimit value set above is kept unchanged —
+	// preserving the existing behavior. Canonical: v2.9.3 miner/worker.go.
+	if miner.chainConfig.XDPoS != nil && miner.chainConfig.DynamicGasLimitBlock != nil {
+		if miner.chainConfig.IsDynamicGasLimit(header.Number) {
+			header.GasLimit = core.CalcGasLimit(parent.GasLimit, gasCeil)
+		} else {
+			header.GasLimit = gasCeil
+		}
+	}
 	// Set the extra field.
 	if len(miner.config.ExtraData) != 0 {
 		header.Extra = miner.config.ExtraData
@@ -478,10 +489,13 @@ func (miner *Miner) applyTransaction(ctx context.Context, env *environment, tx *
 	)
 	// Recover the sender first and route through core.RouteTransaction, the
 	// same order and helper core.StateProcessor.Process uses.
-	var msg *core.Message
+	var (
+		msg   *core.Message
+		route = core.RouteTransaction(config, blockNumber, tx)
+	)
 	msg, err = core.TransactionToMessage(tx, types.MakeSigner(config, blockNumber, env.header.Time), env.header.BaseFee)
 	if err == nil {
-		switch core.RouteTransaction(config, blockNumber, tx) {
+		switch route {
 		case core.TxRouteSign:
 			receipt, err = core.ApplySigningTransaction(config, env.state, blockNumber, blockHash, tx, env.gasPool.Used())
 		case core.TxRouteEmpty:
@@ -495,7 +509,12 @@ func (miner *Miner) applyTransaction(ctx context.Context, env *environment, tx *
 		}
 	}
 	if err != nil {
-		env.state.RevertToSnapshot(snap)
+		// A signing tx finalises the state before its nonce check, which drops
+		// every snapshot, and changes nothing when the check fails. Reverting
+		// to snap would panic ("revision id 0 cannot be reverted").
+		if route != core.TxRouteSign {
+			env.state.RevertToSnapshot(snap)
+		}
 		env.gasPool.Set(gp)
 
 		env.revertedTxs = append(env.revertedTxs, tx.WithoutBlobTxSidecar())
@@ -664,7 +683,7 @@ func (miner *Miner) fillTransactions(ctx context.Context, interrupt *atomic.Int3
 	if env.header.BaseFee != nil {
 		filter.BaseFee = uint256.MustFromBig(env.header.BaseFee)
 	}
-	if env.header.ExcessBlobGas != nil {
+	if env.header.ExcessBlobGas != nil && !miner.chainConfig.IsXDC() {
 		filter.BlobFee = uint256.MustFromBig(eip4844.CalcBlobFee(miner.chainConfig, env.header))
 	}
 	if miner.chainConfig.IsOsaka(env.header.Number, env.header.Time) && !miner.chainConfig.IsAmsterdam(env.header.Number, env.header.Time) {

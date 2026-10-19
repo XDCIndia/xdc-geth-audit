@@ -509,7 +509,7 @@ func (b *EthAPIBackend) BaseFee(ctx context.Context) *big.Int {
 }
 
 func (b *EthAPIBackend) BlobBaseFee(ctx context.Context) *big.Int {
-	if excess := b.CurrentHeader().ExcessBlobGas; excess != nil {
+	if excess := b.CurrentHeader().ExcessBlobGas; excess != nil && !b.ChainConfig().IsXDC() {
 		return eip4844.CalcBlobFee(b.ChainConfig(), b.CurrentHeader())
 	}
 	return nil

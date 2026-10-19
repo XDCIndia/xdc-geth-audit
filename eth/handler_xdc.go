@@ -119,11 +119,18 @@ func (h *handler) BroadcastBlock(block *types.Block) {
 		return
 	}
 
-	// TD: use block.Difficulty() as the announced total difficulty.
-	// XDPoS V2 blocks all have the same difficulty value set by engine.Prepare;
-	// peers do not use TD for chain selection in V2 (QC-chain rule wins).
-	// This matches XDPoSChain's approach of parent.TD + block.Difficulty.
-	td := new(big.Int).Set(block.Difficulty())
+	// XDC #1645: TD for NewBlock must be parent.TD + block.Difficulty(), matching
+	// canonical XDPoSChain (eth/handler.go:1074). Legacy peers compute
+	// trueTD = announced TD - block.Difficulty() and start a sync only when
+	// trueTD > ownTD. Sending only block.Difficulty() (= 1 for V2) meant
+	// trueTD = 0, so legacy nodes behind the tip never triggered a sync.
+	var td *big.Int
+	if parentTD := h.chain.GetTd(block.ParentHash(), block.NumberU64()-1); parentTD != nil {
+		td = new(big.Int).Add(parentTD, block.Difficulty())
+	} else {
+		// ponytail: fallback if parent TD not yet stored (rare race on fresh node).
+		td = new(big.Int).Set(block.Difficulty())
+	}
 
 	pkt := &eth.NewBlockPacket{
 		Block: block,

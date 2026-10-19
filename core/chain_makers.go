@@ -391,6 +391,8 @@ func GenerateChain(config *params.ChainConfig, parent *types.Block, engine conse
 			evm := vm.NewEVM(blockContext, statedb, cm.config, vm.Config{})
 			ProcessParentBlockHash(b.header.ParentHash, evm, b.bal)
 		}
+		// XDC: Multicall3 install once Prague is active (see ApplyMulticall3HardFork).
+		ApplyMulticall3HardFork(config, statedb, b.header.Number)
 
 		// Execute any user modifications to the block
 		if gen != nil {
@@ -480,7 +482,7 @@ func GenerateChain(config *params.ChainConfig, parent *types.Block, engine conse
 			txs = txs[:len(receipts)]
 		}
 		var blobGasPrice *big.Int
-		if block.ExcessBlobGas() != nil {
+		if block.ExcessBlobGas() != nil && !cm.config.IsXDC() {
 			blobGasPrice = eip4844.CalcBlobFee(cm.config, block.Header())
 		}
 		if err := receipts.DeriveFields(config, block.Hash(), block.NumberU64(), block.Time(), block.BaseFee(), blobGasPrice, txs); err != nil {
@@ -535,7 +537,10 @@ func (cm *chainMaker) makeHeader(parent *types.Block, engine consensus.Engine) *
 			header.GasLimit = CalcGasLimit(parentGasLimit, parentGasLimit)
 		}
 	}
-	if cm.config.IsCancun(header.Number, header.Time) {
+	// XDC sets CancunBlock for EVM-level Cancun EIPs but has no BlobScheduleConfig
+	// (no blob transactions). Skip blob-gas fields here; FillAmsterdamHeader sets
+	// ExcessBlobGas=ptr(0) as the canonical placeholder for Amsterdam blocks.
+	if cm.config.IsCancun(header.Number, header.Time) && !cm.config.IsXDC() {
 		excessBlobGas := eip4844.CalcExcessBlobGas(cm.config, parentHeader, time)
 		header.ExcessBlobGas = &excessBlobGas
 		header.BlobGasUsed = new(uint64)

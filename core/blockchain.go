@@ -635,7 +635,179 @@ func NewBlockChain(db ethdb.Database, genesis *Genesis, engine consensus.Engine,
 	} else {
 		log.Info("XDC: checkpointSyncNoState=false at startup — full state validation active")
 	}
+	// XDC #1645: Ensure cumulative TD is stored for the canonical chain so that
+	// the handshake and NewBlock broadcasts can advertise the real TD to legacy
+	// peers (which gate sync on peerTD > ownTD). On a fresh node the genesis
+	// Commit() writes TD=genesis.Difficulty; on a node that already imported
+	// blocks with an older binary that did not write TD we backfill TD in the
+	// background. The goroutine runs at lower priority, is resumable across
+	// restarts via a progress key, and uses O(1) memory (#1645).
+	if bc.chainConfig.IsXDC() {
+		go bc.xdcTDBackfill()
+	}
 	return bc, nil
+}
+
+// GetTd returns the cumulative total difficulty for the block identified by
+// hash and number, or nil if it is not stored. XDC only — always nil for
+// post-merge chains that never write TD. See #1645.
+func (bc *BlockChain) GetTd(hash common.Hash, number uint64) *big.Int {
+	return rawdb.ReadTd(bc.db, hash, number)
+}
+
+// xdcTDBackfill is a background goroutine that walks the canonical chain
+// forward and writes cumulative total difficulty for every block that is
+// missing a stored TD value.
+//
+// Design constraints (#1645):
+//   - O(1) memory: one header at a time; carries runTD in a *big.Int.
+//   - Resumable: progress key tracks the highest covered block number so
+//     restarts skip already-covered blocks.
+//   - Clean shutdown: stops as soon as bc.stopping is set.
+//   - Batched writes: flushes every ethdb.IdealBatchSize bytes.
+//   - Catch-up loop: after each forward pass, re-reads CurrentBlock(). If
+//     head moved past the last written block, runs another pass. Loops until
+//     the current head has stored TD.
+//   - Reorg detection: checks header.ParentHash against the previous
+//     canonical block's hash. On mismatch the current pass is flushed and
+//     restarted from the anchor so the new canonical chain is walked cleanly.
+//   - In-pass accumulation: parentTD for block N+1 is the in-memory runTD
+//     that was just written for block N, not a DB read. The DB may not see
+//     unflushed batch writes; reading from it would return nil and stall.
+//
+// Called as `go bc.xdcTDBackfill()` from NewBlockChain for XDC chains.
+func (bc *BlockChain) xdcTDBackfill() {
+	const (
+		logInterval = 500_000
+		retryDelay  = 10 * time.Millisecond
+	)
+
+	// Seed genesis TD once (needed as the root for all forward walks).
+	genHash := rawdb.ReadCanonicalHash(bc.db, 0)
+	if genHash == (common.Hash{}) {
+		log.Warn("XDC TD backfill: genesis canonical hash missing — aborting")
+		return
+	}
+	if rawdb.ReadTd(bc.db, genHash, 0) == nil {
+		genHeader := bc.GetHeaderByHash(genHash)
+		if genHeader == nil {
+			log.Warn("XDC TD backfill: genesis header missing — aborting")
+			return
+		}
+		rawdb.WriteTd(bc.db, genHash, 0, new(big.Int).Set(genHeader.Difficulty))
+	}
+
+	// Outer loop: keep running passes until the current canonical head has TD.
+	for !bc.stopping.Load() {
+		// Fast exit: current head already has a stored TD.
+		head := bc.CurrentBlock()
+		headHash, headNum := head.Hash(), head.Number.Uint64()
+		if rawdb.ReadTd(bc.db, headHash, headNum) != nil {
+			log.Debug("XDC TD backfill: complete", "num", headNum)
+			return
+		}
+
+		// Establish anchor: the highest block that has TD in the DB.
+		// Seed from the persisted progress key; fall back to genesis.
+		anchorNum := uint64(0)
+		anchorHash := genHash
+		if startNum := rawdb.ReadTdBackfillProgress(bc.db); startNum > 0 {
+			if h := rawdb.ReadCanonicalHash(bc.db, startNum); h != (common.Hash{}) {
+				if rawdb.ReadTd(bc.db, h, startNum) != nil {
+					anchorNum = startNum
+					anchorHash = h
+				}
+			}
+		}
+
+		// Seed the in-memory running TD from the anchor (guaranteed in DB).
+		runTD := new(big.Int).Set(rawdb.ReadTd(bc.db, anchorHash, anchorNum))
+		prevHash := anchorHash // canonical hash of the last-processed block
+
+		log.Info("XDC TD backfill: starting pass", "from", anchorNum+1, "to", headNum)
+		batch := bc.db.NewBatch()
+		written := uint64(0)
+		lastWritten := anchorNum
+
+		for num := anchorNum + 1; num <= headNum; num++ {
+			if bc.stopping.Load() {
+				if batch.ValueSize() > 0 {
+					rawdb.WriteTdBackfillProgress(batch, lastWritten)
+					batch.Write() //nolint:errcheck — best-effort on shutdown
+				}
+				log.Info("XDC TD backfill: interrupted", "at", lastWritten)
+				return
+			}
+
+			hash := rawdb.ReadCanonicalHash(bc.db, num)
+			if hash == (common.Hash{}) {
+				log.Debug("XDC TD backfill: canonical gap, stopping pass", "num", num)
+				break
+			}
+
+			header := bc.GetHeader(hash, num)
+			if header == nil {
+				log.Warn("XDC TD backfill: header missing in canonical chain", "num", num)
+				break
+			}
+
+			// Reorg detection: if this block's parent is not the block we
+			// just processed, the canonical chain changed under us. Flush
+			// progress and restart the pass from the current anchor so we
+			// walk the new canonical chain cleanly.
+			if header.ParentHash != prevHash {
+				log.Debug("XDC TD backfill: reorg detected, restarting pass", "num", num)
+				break
+			}
+
+			// If a concurrent writer (writeLive / writeBlockWithState) already
+			// stored TD for this block, sync the in-memory accumulator to it.
+			if existing := rawdb.ReadTd(bc.db, hash, num); existing != nil {
+				runTD = new(big.Int).Set(existing)
+				prevHash = hash
+				lastWritten = num
+				continue
+			}
+
+			// parentTD for num is runTD (the in-memory value we maintain for
+			// the previous block). Do NOT read parentTD from bc.db here:
+			// the batch may not yet be flushed, so the DB would return nil.
+			blockTD := new(big.Int).Add(runTD, header.Difficulty)
+			rawdb.WriteTd(batch, hash, num, blockTD)
+			written++
+			runTD = blockTD
+			prevHash = hash
+			lastWritten = num
+
+			if batch.ValueSize() >= ethdb.IdealBatchSize {
+				rawdb.WriteTdBackfillProgress(batch, num)
+				if err := batch.Write(); err != nil {
+					log.Crit("XDC TD backfill: batch write failed", "err", err)
+				}
+				batch.Reset()
+				// After flush, runTD is in DB; in-memory value is still correct.
+			}
+			if num%logInterval == 0 {
+				log.Info("XDC TD backfill: progress", "num", num, "written", written)
+			}
+		}
+
+		// Final flush for this pass.
+		if batch.ValueSize() > 0 {
+			rawdb.WriteTdBackfillProgress(batch, lastWritten)
+			if err := batch.Write(); err != nil {
+				log.Crit("XDC TD backfill: batch write failed", "err", err)
+			}
+		}
+		log.Info("XDC TD backfill: pass done", "from", anchorNum+1, "to", headNum, "written", written)
+
+		// If this pass did not reach headNum (canonical gap, reorg, or head
+		// moved), wait briefly before the next outer-loop iteration so we do
+		// not spin while waiting for a concurrent writer to fill the gap.
+		if lastWritten < headNum {
+			time.Sleep(retryDelay)
+		}
+	}
 }
 
 func (bc *BlockChain) setupSnapshot() {
@@ -1455,7 +1627,7 @@ func (bc *BlockChain) ClearCheckpointSyncNoState() {
 //
 // Refs #62, #740, #742, #886.
 func (bc *BlockChain) canMaskMissingState() bool {
-	return XdcBulkSyncMode.Load() && bc.chainConfig.IsXDC() &&
+	return XdcBulkSyncMode.Load() && !XdcForceFullVerify.Load() && bc.chainConfig.IsXDC() &&
 		!bc.cfg.ArchiveMode && !bc.cfg.NoStateMaskingForbidden
 }
 
@@ -1795,6 +1967,17 @@ func (bc *BlockChain) InsertReceiptChain(blockChain types.Blocks, receiptChain [
 	// silently rewritten. Therefore, no explicit reorg logic is needed.
 	writeLive := func(blockChain types.Blocks, receiptChain []rlp.RawValue) error {
 		batch := bc.db.NewBatch()
+
+		// XDC: seed running TD from the first block's parent so we can write
+		// cumulative TD for each block in this bulk import (#1645).
+		var xdcRunTD *big.Int
+		if bc.chainConfig.IsXDC() && len(blockChain) > 0 {
+			first := blockChain[0]
+			xdcRunTD = rawdb.ReadTd(bc.db, first.ParentHash(), first.NumberU64()-1)
+			// If parent TD is absent, leave xdcRunTD nil — the background
+			// backfill goroutine will cover it.
+		}
+
 		for i, block := range blockChain {
 			// Short circuit insertion if shutting down or processing failed
 			if bc.insertStopped() {
@@ -1804,6 +1987,12 @@ func (bc *BlockChain) InsertReceiptChain(blockChain types.Blocks, receiptChain [
 			rawdb.WriteCanonicalHash(batch, block.Hash(), block.NumberU64())
 			rawdb.WriteBlock(batch, block)
 			rawdb.WriteRawReceipts(batch, block.Hash(), block.NumberU64(), receiptChain[i])
+
+			// XDC: write cumulative TD so legacy peers' peerTD>ownTD gate passes (#1645).
+			if xdcRunTD != nil {
+				xdcRunTD = new(big.Int).Add(xdcRunTD, block.Difficulty())
+				rawdb.WriteTd(batch, block.Hash(), block.NumberU64(), xdcRunTD)
+			}
 
 			// Write everything belongs to the blocks into the database. So that
 			// we can ensure all components of body is completed(body, receipts)
@@ -1884,6 +2073,9 @@ func (bc *BlockChain) writeBlockWithoutState(block *types.Block) (err error) {
 // and introduces chain reorg if necessary.
 func (bc *BlockChain) writeKnownBlock(block *types.Block) error {
 	current := bc.CurrentBlock()
+	if bc.keepsV2Head(block, current) {
+		return nil
+	}
 	if block.ParentHash() != current.Hash() {
 		if err := bc.reorg(current, block.Header()); err != nil {
 			return err
@@ -1910,11 +2102,25 @@ func (bc *BlockChain) writeBlockWithState(block *types.Block, receipts []*types.
 	)
 	defer batch.Close()
 
+	// XDC #1645: compute cumulative TD before entering the goroutine so it can
+	// be written atomically with the rest of the block data. TD is needed in the
+	// handshake and NewBlock broadcasts so legacy peers (which gate sync on
+	// peerTD > ownTD) can tell we are ahead.
+	var blockTD *big.Int
+	if bc.chainConfig.IsXDC() {
+		if parentTD := rawdb.ReadTd(bc.db, block.ParentHash(), block.NumberU64()-1); parentTD != nil {
+			blockTD = new(big.Int).Add(parentTD, block.Difficulty())
+		}
+	}
+
 	go func() {
 		start := time.Now()
 		rawdb.WriteBlock(batch, block)
 		rawdb.WriteReceipts(batch, block.Hash(), block.NumberU64(), receipts)
 		rawdb.WritePreimages(batch, preimages)
+		if blockTD != nil {
+			rawdb.WriteTd(batch, block.Hash(), block.NumberU64(), blockTD)
+		}
 		if err := batch.Write(); err != nil {
 			log.Crit("Failed to write block into disk", "err", err)
 		}
@@ -1947,6 +2153,9 @@ func (bc *BlockChain) writeBlockWithState(block *types.Block, receipts []*types.
 		if err != nil {
 			return err
 		}
+	}
+	if err := bc.updateM1At(block.Header(), root); err != nil {
+		return err
 	}
 	// If node is running in path mode, skip explicit gc operation
 	// which is unnecessary in this mode.
@@ -2039,6 +2248,19 @@ func (bc *BlockChain) writeBlockWithState(block *types.Block, receipts []*types.
 	return nil
 }
 
+// keepsV2Head reports whether block, on a branch other than the head's, must be
+// stored as a side block instead of becoming the head. Every XDPoS V2 block has
+// difficulty 1, so canonical XDPoSChain fork choice (core/blockchain.go
+// forkChoiceBeatsHead) moves the head to another branch only with a higher block:
+// a same-number sibling (an equivocation or a timeout re-proposal) stays a side
+// block until a child of it arrives.
+func (bc *BlockChain) keepsV2Head(block *types.Block, head *types.Header) bool {
+	cfg := bc.chainConfig.XDPoS
+	return cfg != nil && cfg.V2 != nil && cfg.V2.SwitchBlock != nil &&
+		block.Number().Cmp(cfg.V2.SwitchBlock) > 0 &&
+		block.ParentHash() != head.Hash() && block.NumberU64() <= head.Number.Uint64()
+}
+
 // writeBlockAndSetHead is the internal implementation of WriteBlockAndSetHead.
 // This function expects the chain mutex to be held.
 func (bc *BlockChain) writeBlockAndSetHead(block *types.Block, receipts []*types.Receipt, logs []*types.Log, state *state.StateDB, emitHeadEvent bool) (status WriteStatus, err error) {
@@ -2046,6 +2268,9 @@ func (bc *BlockChain) writeBlockAndSetHead(block *types.Block, receipts []*types
 		return NonStatTy, err
 	}
 	currentBlock := bc.CurrentBlock()
+	if bc.keepsV2Head(block, currentBlock) {
+		return SideStatTy, nil
+	}
 
 	// Reorganise the chain if the parent is not the head block
 	if block.ParentHash() != currentBlock.Hash() {
@@ -2201,7 +2426,7 @@ func (bc *BlockChain) insertChain(ctx context.Context, chain types.Blocks, setHe
 	case errors.Is(err, consensus.ErrPrunedAncestor):
 		if setHead {
 			// First block is pruned, insert as sidechain and reorg only if TD grows enough
-			log.Debug("Pruned ancestor, inserting as sidechain", "number", block.Number(), "hash", block.Hash())
+			log.Warn("Pruned ancestor, inserting as sidechain", "number", block.Number(), "hash", block.Hash())
 			return bc.insertSideChain(ctx, block, it, makeWitness)
 		} else {
 			// We're post-merge and the parent is pruned, try to recover the parent state
@@ -2850,6 +3075,15 @@ func (bc *BlockChain) insertSideChain(ctx context.Context, block *types.Block, i
 				"root", block.Root())
 		}
 	}
+	// If the last block above is our own canonical block, the whole segment was a
+	// re-import of canonical blocks at or below the head: there is no sidechain to
+	// switch to. Regenerating their state would roll the path database back and
+	// drop the head state, and the import would rewind the head (#1458).
+	if last := it.previous(); last != nil && last.Number.Uint64() <= current.Number.Uint64() &&
+		bc.GetCanonicalHash(last.Number.Uint64()) == last.Hash() {
+		log.Info("Ignoring re-import of pruned canonical blocks", "end", last.Number, "head", current.Number)
+		return nil, it.index, nil
+	}
 	// Gather all the sidechain hashes (full blocks may be memory heavy)
 	var (
 		hashes  []common.Hash
@@ -2858,6 +3092,27 @@ func (bc *BlockChain) insertSideChain(ctx context.Context, block *types.Block, i
 	parent := it.previous()
 	for parent != nil && !bc.HasState(parent.Root) {
 		if bc.StateRecoverable(parent.Root) {
+			// On the path-based state scheme, Recover truncates state-history
+			// entries from the freezer. Guard against calling it when the reorg
+			// from this ancestor would be refused by the XDPoS v2 committed-block
+			// check inside reorg(): if the fork ancestor is at or below the latest
+			// committed block the sidechain can never become canonical, so
+			// destroying canonical state history serves no purpose.
+			if bc.triedb.Scheme() == rawdb.PathScheme {
+				if cb, ok := bc.Engine().(committedBlocker); ok {
+					if lcb := cb.LatestCommittedBlock(); lcb != nil {
+						if parent.Number.Cmp(lcb.Number) <= 0 {
+							log.Debug("Sidechain fork ancestor at or below committed block; skipping state recovery",
+								"forkNum", parent.Number, "committedNum", lcb.Number, "root", parent.Root)
+							return nil, it.index, nil
+						}
+					}
+				}
+			}
+			if depth := bc.triedb.RecoverableDepth(parent.Root); depth > 0 {
+				log.Warn("Recovering state history for sidechain; state will be truncated",
+					"targetNum", parent.Number.Uint64(), "targetRoot", parent.Root, "depth", depth)
+			}
 			if err := bc.triedb.Recover(parent.Root); err != nil {
 				return nil, 0, err
 			}
@@ -2969,7 +3224,7 @@ func (bc *BlockChain) collectLogs(b *types.Block, removed bool) []*types.Log {
 // This avoids duplicate database reads when both are needed.
 func (bc *BlockChain) collectReceiptsAndLogs(b *types.Block, removed bool) ([]*types.Receipt, []*types.Log) {
 	var blobGasPrice *big.Int
-	if b.ExcessBlobGas() != nil {
+	if b.ExcessBlobGas() != nil && !bc.chainConfig.IsXDC() {
 		blobGasPrice = eip4844.CalcBlobFee(bc.chainConfig, b.Header())
 	}
 	receipts := rawdb.ReadRawReceipts(bc.db, b.Hash(), b.NumberU64())
@@ -3328,8 +3583,19 @@ func (bc *BlockChain) skipBlock(err error, it *insertIterator) bool {
 	return false
 }
 
+// maxTimeFutureBlocks is how far ahead of the local clock (seconds) a block may
+// be and still count as early rather than bad.
+const maxTimeFutureBlocks = 30
+
 // reportBadBlock logs a bad block error.
 func (bc *BlockChain) reportBadBlock(block *types.Block, res *ProcessResult, err error) {
+	// A block slightly ahead of the local clock is not bad, only early: canonical
+	// XDPoSChain queues it (core/blockchain.go maxTimeFutureBlocks) and the
+	// syncer re-fetches it here, so do not record or log it as a bad block.
+	if errors.Is(err, consensus.ErrFutureBlock) && block.Time() <= uint64(time.Now().Unix())+maxTimeFutureBlocks {
+		log.Debug("Future block, retrying later", "number", block.Number(), "hash", block.Hash(), "time", block.Time())
+		return
+	}
 	var receipts types.Receipts
 	if res != nil {
 		receipts = res.Receipts
@@ -3497,4 +3763,38 @@ func (bc *BlockChain) SetTrieFlushInterval(interval time.Duration) {
 // GetTrieFlushInterval gets the in-memory tries flushAlloc interval
 func (bc *BlockChain) GetTrieFlushInterval() time.Duration {
 	return time.Duration(bc.flushInterval.Load())
+}
+
+// updateM1At refreshes the V1 masternode snapshot at the gap block of a V1
+// epoch from the candidates in that block's committed state, like canonical
+// XDPoSChain's BlockChain.UpdateM1At. V2 gap blocks are refreshed by
+// XDPoS.Finalize instead, so blocks routed to V2 (number > V2 SwitchBlock,
+// canonical's BlockConsensusVersion boundary) are skipped here.
+func (bc *BlockChain) updateM1At(header *types.Header, root common.Hash) error {
+	cfg := bc.chainConfig.XDPoS
+	if cfg == nil {
+		return nil
+	}
+	num := header.Number.Uint64()
+	// Canonical isGapBlockNumber.
+	if cfg.Epoch == 0 || cfg.Gap == 0 || cfg.Gap > cfg.Epoch || num%cfg.Epoch != cfg.Epoch-cfg.Gap {
+		return nil
+	}
+	if cfg.V2 != nil && cfg.V2.SwitchBlock != nil && header.Number.Cmp(cfg.V2.SwitchBlock) > 0 {
+		return nil
+	}
+	engine, ok := bc.engine.(interface {
+		UpdateMasternodesV1(consensus.ChainHeaderReader, *types.Header, *state.StateDB) error
+	})
+	if !ok {
+		return nil
+	}
+	statedb, err := bc.StateAt(root, header.Number, header.Time)
+	if err != nil {
+		return fmt.Errorf("failed to open the state of gap block %d for the masternode update: %w", num, err)
+	}
+	if err := engine.UpdateMasternodesV1(bc, header, statedb); err != nil {
+		return fmt.Errorf("failed to update the masternodes at gap block %d: %w", num, err)
+	}
+	return nil
 }

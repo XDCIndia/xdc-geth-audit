@@ -19,6 +19,7 @@ package eth
 import (
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/consensus/XDPoS"
@@ -31,6 +32,10 @@ import (
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/rlp"
 )
+
+// maxNewBlockDelay is how far ahead of the local clock (canonical XDPoSChain
+// maxTimeFutureBlocks) a gossiped block may be and still be handled when due.
+const maxNewBlockDelay = 30 * time.Second
 
 // ethHandler implements the eth.Backend interface to handle the various network
 // packets that are sent as replies or broadcasts.
@@ -205,6 +210,16 @@ func (h *ethHandler) Handle(peer *eth.Peer, packet eth.Packet) error {
 		if block == nil {
 			return nil
 		}
+		// A block a little ahead of the local clock is early, not invalid. A v2.9.3
+		// V1 sealer gossips its block about 1 s before the block's timestamp. Handle
+		// it when it is due, as canonical XDPoSChain's fetcher does ("Receive future
+		// block": sleep, then verify, M2 co-sign and import). Importing it now fails
+		// with ErrFutureBlock, so the assigned M2 never co-signs it and the
+		// un-co-signed block later arrives through the syncer.
+		if delay := time.Until(time.Unix(int64(block.Time()), 0)); delay > 0 && delay <= maxNewBlockDelay {
+			time.AfterFunc(delay, func() { h.Handle(peer, packet) })
+			return nil
+		}
 		cur := h.chain.CurrentBlock()
 		if cur == nil {
 			return nil
@@ -258,6 +273,17 @@ func (h *ethHandler) Handle(peer *eth.Peer, packet eth.Packet) error {
 				peer.Log().Debug("XDC NewBlock: M2 co-signed",
 					"block", block.NumberU64(), "hash", block.Hash())
 			}
+		}
+		// A V1 block still waiting for its assigned M2's co-signature is not
+		// imported: the M2 gossips the co-signed block, which is. Importing it would
+		// only fail verification and report a BAD BLOCK. Mirrors XDPoSChain
+		// eth/fetcher/block_fetcher.go:734-756 (ErrNoValidatorSignature, not M2:
+		// relay and prepare, no insert).
+		if !didCoSign && len(block.Header().Validator) == 0 &&
+			errors.Is(h.chain.Engine().VerifyHeader(h.chain, block.Header()), XDPoS.ErrNoValidatorSignature) {
+			peer.Log().Debug("XDC NewBlock: waiting for the M2 co-signed block",
+				"block", block.NumberU64(), "hash", block.Hash())
+			return nil
 		}
 		if _, err := h.chain.InsertChain(types.Blocks{block}); err != nil {
 			peer.Log().Debug("XDC NewBlock: InsertChain failed",

@@ -304,6 +304,18 @@ func (db *Database) Recoverable(root common.Hash) (bool, error) {
 	return pdb.Recoverable(root), nil
 }
 
+// RecoverableDepth returns the number of state-history entries that a
+// Recover(root) call would truncate. Returns 0 if root is not recoverable
+// or if the backend is not path-based. The value is informational and may be
+// approximate under concurrent access; it is used for logging before Recover.
+func (db *Database) RecoverableDepth(root common.Hash) uint64 {
+	pdb, ok := db.backend.(*pathdb.Database)
+	if !ok {
+		return 0
+	}
+	return pdb.RecoverableDepth(root)
+}
+
 // Disable deactivates the database and invalidates all available state layers
 // as stale to prevent access to the persistent state, which is in the syncing
 // stage.

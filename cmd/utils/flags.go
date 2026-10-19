@@ -2320,8 +2320,8 @@ func SetEthConfig(ctx *cli.Context, stack *node.Node, cfg *ethconfig.Config) {
 		}
 		defer f.Close()
 
-		genesis := new(core.Genesis)
-		if err := json.NewDecoder(f).Decode(genesis); err != nil {
+		genesis, err := core.DecodeGenesisJSON(f)
+		if err != nil {
 			Fatalf("Invalid genesis file: %v", err)
 		}
 		cfg.Genesis = genesis

@@ -28,17 +28,21 @@ import (
 // tx.AsMessage (v2.7.1) and params.GetGasPriceForTRC21 (v2.9.1-testnet), which
 // share the gas price tier with the EIP-1559 base fee:
 //
-//	Gas2500x             625 gwei (the Gas2500x tier)
-//	>= BlockNumberGas50x 12.5 gwei
-//	>  TIPTRC21Fee       0.25 gwei (common.TRC21GasPrice)
-//	otherwise            2500 wei  (common.TRC21GasPriceBefore)
+//	Gas2500x                   625 gwei (the Gas2500x tier)
+//	>= Gas50xBlock             12.5 gwei
+//	>  TIPTRC21FeeBlock        0.25 gwei (common.TRC21GasPrice)
+//	otherwise                  2500 wei  (common.TRC21GasPriceBefore)
+//
+// The tier boundaries are read from the chain config (genesis gas50xBlock /
+// tipTRC21FeeBlock) with a per-chain global fallback for registered chains.
+// Refs #1549.
 func TRC21GasPriceForBlock(c *ChainConfig, number *big.Int) *big.Int {
 	switch {
 	case c.IsGas2500x(number):
 		return XDCBaseFeeForBlock(c, number)
-	case number.Cmp(common.BlockNumberGas50x) >= 0:
+	case c.IsGas50x(number):
 		return new(big.Int).Set(common.GasPrice50x)
-	case number.Cmp(common.TIPTRC21Fee) > 0:
+	case number.Cmp(c.EffectiveTIPTRC21FeeBlock()) > 0:
 		return new(big.Int).Set(common.TRC21GasPrice)
 	default:
 		return new(big.Int).Set(common.TRC21GasPriceBefore)

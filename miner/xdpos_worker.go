@@ -49,6 +49,7 @@ import (
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/params"
+	"github.com/ethereum/go-ethereum/trie"
 )
 
 // XdcBroadcaster is the subset of the eth handler that the XdcWorker needs.
@@ -311,6 +312,24 @@ func getResetTimeXDC(chain *core.BlockChain, minePeriod int) time.Duration {
 // is somehow already above 420M, hold it there rather than honing DOWN (a down-
 // step is what wedged #952). In steady state parent == 420M and this returns
 // XDCBlockGasLimit, which core.CalcGasLimit holds flat.
+// xdcGasLimit returns the gas limit of the block minted on parent. A chain that
+// sets DynamicGasLimitBlock follows canonical XDPoSChain (v2.9.3
+// miner/worker.go:844-848): the static miner gas ceiling before the fork and
+// core.CalcGasLimit toward it from the fork on. Without the field (mainnet) the
+// 420M plateau rule below applies unchanged.
+func (w *XdcWorker) xdcGasLimit(parent *types.Header) uint64 {
+	if cfg := w.miner.chainConfig; cfg != nil && cfg.DynamicGasLimitBlock != nil {
+		w.miner.confMu.RLock()
+		ceil := w.miner.config.GasCeil
+		w.miner.confMu.RUnlock()
+		if cfg.IsDynamicGasLimit(new(big.Int).Add(parent.Number, common.Big1)) {
+			return core.CalcGasLimit(parent.GasLimit, ceil)
+		}
+		return ceil
+	}
+	return core.CalcGasLimit(parent.GasLimit, w.xdcGasCeil(parent.GasLimit))
+}
+
 func (w *XdcWorker) xdcGasCeil(parentGasLimit uint64) uint64 {
 	if parentGasLimit > params.XDCBlockGasLimit {
 		return parentGasLimit
@@ -524,7 +543,7 @@ func (w *XdcWorker) commitNewWork() {
 		ParentHash: parent.Hash(),
 		Number:     new(big.Int).Add(parent.Number(), common.Big1),
 		Coinbase:   w.coinbase,
-		GasLimit:   core.CalcGasLimit(parent.GasLimit(), w.xdcGasCeil(parent.GasLimit())),
+		GasLimit:   w.xdcGasLimit(parent.Header()),
 	}
 
 	// EIP-1559: set BaseFee on every block for which the fee market is active.
@@ -555,6 +574,18 @@ func (w *XdcWorker) commitNewWork() {
 		return
 	}
 
+	// Wait out the mine period before building (#1594). Prepare stamps
+	// header.Time = parent.Time + MinePeriod, or now once that has passed, so a
+	// block time still in the future means the period has not elapsed. That is
+	// canonical's YourTurn gate (waitedTime < MinePeriod, checked by
+	// checkPreCommit before building). Building now would leave out every tx
+	// that reaches the pool during the period; the timer (getResetTimeXDC)
+	// re-fires at parent.Time + MinePeriod and the block is built then.
+	if header.Time > uint64(time.Now().Unix()) {
+		log.Debug("XDPoS2: waiting out the mine period", "block", header.Number, "blockTime", header.Time)
+		return
+	}
+
 	// Mark this parent as attempted AFTER Prepare succeeds.
 	// (If Prepare returned ErrNotReadyToPropose we do NOT mark it, allowing
 	// a retry once the QC advances and Prepare might succeed.)
@@ -573,7 +604,7 @@ func (w *XdcWorker) commitNewWork() {
 	// same state base that InsertChain's Process() will use on re-execution.
 	// (Design Q7.9: Finalize is called once here; InsertChain re-executes and
 	// must reproduce the same root.  It will, because HookReward is deterministic.)
-	env, err := w.miner.makeEnv(parent.Header(), header, w.coinbase, false)
+	env, err := w.makeMintEnv(parent.Header(), header)
 	if err != nil {
 		log.Error("XDPoS2: makeEnv failed", "err", err, "block", header.Number)
 		return
@@ -608,6 +639,23 @@ func (w *XdcWorker) commitNewWork() {
 		}
 	}
 
+	// Amsterdam: collect PostExecution BAL before Finalize (mirrors the
+	// ordering in core/state_processor.go Process: PostExecution → Finalize →
+	// feedBAL). For XDC all system calls are gated by !rules.IsXDC so the
+	// returned BAL is empty, but the merge keeps sealing and import identical.
+	if w.miner.chainConfig.IsAmsterdamBlock(header.Number) {
+		_, postBAL, postErr := core.PostExecution(
+			context.Background(), w.miner.chainConfig, header.Number, header.Time,
+			nil /* allLogs: unused for XDC */, nil, /* withdrawals: XDC has none */
+			env.evm, uint32(env.tcount+1),
+		)
+		if postErr != nil {
+			log.Error("XDPoS2: PostExecution failed", "err", postErr, "block", header.Number)
+			return
+		}
+		env.bal.Merge(postBAL)
+	}
+
 	// Finalize: compute state root, fire HookReward at epoch switch,
 	// return assembled *types.Block.  Called ONCE (Q7.8).
 	//
@@ -628,6 +676,18 @@ func (w *XdcWorker) commitNewWork() {
 		return
 	}
 
+	// Amsterdam: V2 Finalize calls types.NewBlock with no Withdrawals, so it
+	// sets WithdrawalsHash = nil. Rebuild the block with the filled header
+	// (placeholder hashes + BAL hash) and an empty Withdrawals body.
+	// header.Root was set by Finalize; we use header directly (same object).
+	if w.miner.chainConfig.IsAmsterdamBlock(header.Number) {
+		blal := core.FillAmsterdamHeader(header, env.bal)
+		assembled = types.NewBlock(header, &types.Body{
+			Transactions: env.txs,
+			Withdrawals:  types.Withdrawals{},
+		}, env.receipts, trie.NewStackTrie(nil)).WithAccessListUnsafe(blal)
+	}
+
 	// Seal: synchronous V2 seal writes header.Validator (ECDSA signature).
 	// Q7.2: worker does NOT pre-size or touch header.Validator.
 	// Pass w.quit as stop channel so we abort cleanly on shutdown.
@@ -646,6 +706,25 @@ func (w *XdcWorker) commitNewWork() {
 	}
 
 	w.commitMinedBlock(sealed)
+}
+
+// makeMintEnv builds the execution environment for a block this node mints on
+// parent and applies the pre-execution state changes that InsertChain's
+// Process applies before the first transaction (core.ApplyTIPSigningHardFork:
+// the 0x89 wipe at the TIPSigning block; core.PreExecution: the Multicall3
+// install and the EIP-2935 parent-hash write once Prague is active).
+// Canonical XDPoSChain applies the same changes in its miner
+// (miner/worker.go:889-893). Without them every minted Prague block carries a
+// state root that the importers, this node included, reject. The env is built
+// with w.coinbase, never header.Coinbase (see commitV1Work, #1383/#1385).
+func (w *XdcWorker) makeMintEnv(parent, header *types.Header) (*environment, error) {
+	env, err := w.miner.makeEnv(parent, header, w.coinbase, false)
+	if err != nil {
+		return nil, err
+	}
+	core.ApplyTIPSigningHardFork(w.miner.chainConfig, env.state, header.Number)
+	env.bal.Merge(core.PreExecution(context.Background(), header.ParentBeaconRoot, parent, w.miner.chainConfig, env.evm, header.Number, header.Time))
+	return env, nil
 }
 
 // commitV1Work seals a single V1 (Clique-style PoA round-robin) block on top of
@@ -684,6 +763,25 @@ func (w *XdcWorker) commitV1Work(parent *types.Block) {
 		return
 	}
 
+	// Canonical does not build in the parent's second (#1598): commitNewWork
+	// sleeps until parent.Time + 1 before Prepare (v2.9.3-testnet
+	// miner/worker.go:808-818), so txs that reach the pool meanwhile are
+	// included. V1 YourTurn has no in-turn period wait (engine_v1/engine.go:
+	// 428-460), so this is the only wait. Re-check the head after it, as
+	// canonical re-runs checkPreCommit.
+	if now := time.Now().Unix(); int64(parent.Time()) >= now {
+		wait := time.Duration(int64(parent.Time())+1-now) * time.Second
+		log.Debug("XDPoS V1: mining too far in the future", "wait", wait, "parent", parent.NumberU64())
+		select {
+		case <-time.After(wait):
+		case <-w.quit:
+			return
+		}
+		if chain.CurrentBlock().Hash() != parent.Hash() {
+			return
+		}
+	}
+
 	// Header skeleton. Worker sets ONLY structural fields + GasLimit + BaseFee;
 	// Coinbase/Difficulty/Extra/Time are set exclusively by engine.Prepare
 	// (V1 zeroes Coinbase then optionally sets a vote address — the signer is
@@ -691,7 +789,7 @@ func (w *XdcWorker) commitV1Work(parent *types.Block) {
 	header := &types.Header{
 		ParentHash: parent.Hash(),
 		Number:     new(big.Int).Add(parent.Number(), common.Big1),
-		GasLimit:   core.CalcGasLimit(parent.GasLimit(), w.xdcGasCeil(parent.GasLimit())),
+		GasLimit:   w.xdcGasLimit(parent.Header()),
 	}
 	// Gated on FeeMarketActive, not IsLondon — see the note in commitNewWork:
 	// on XDC, London and the EIP-1559 fee market are separate forks, and a V1
@@ -726,7 +824,7 @@ func (w *XdcWorker) commitV1Work(parent *types.Block) {
 	// Engine().Author = ecrecover(seal) = this signer. Any mismatch credits
 	// fees (even 0 wei) to a different account, and an EIP-158 touch of an
 	// existing empty account then diverges the state root (#1383/#1385).
-	env, err := w.miner.makeEnv(parent.Header(), header, w.coinbase, false)
+	env, err := w.makeMintEnv(parent.Header(), header)
 	if err != nil {
 		log.Error("XDPoS V1: makeEnv failed", "err", err, "block", header.Number)
 		return
@@ -759,10 +857,37 @@ func (w *XdcWorker) commitV1Work(parent *types.Block) {
 	// checkpoints, computes state root, returns the assembled block.
 	body := &types.Body{Transactions: env.txs}
 	env.finalizeTRC21Fee()
+
+	// Amsterdam: collect PostExecution BAL before FinalizeAndAssemble (mirrors
+	// import path ordering: PostExecution → Finalize → feedBAL).
+	if w.miner.chainConfig.IsAmsterdamBlock(header.Number) {
+		_, postBAL, postErr := core.PostExecution(
+			context.Background(), w.miner.chainConfig, header.Number, header.Time,
+			nil /* allLogs: unused for XDC */, nil, /* withdrawals: XDC has none */
+			env.evm, uint32(env.tcount+1),
+		)
+		if postErr != nil {
+			log.Error("XDPoS V1: PostExecution failed", "err", postErr, "block", header.Number)
+			return
+		}
+		env.bal.Merge(postBAL)
+	}
+
 	assembled, finErr := w.engine.FinalizeAndAssemble(chain, header, env.state, body, env.receipts)
 	if finErr != nil {
 		log.Error("XDPoS V1: FinalizeAndAssemble failed", "err", finErr, "block", header.Number)
 		return
+	}
+
+	// Amsterdam: FinalizeAndAssemble calls types.NewBlock with the original body
+	// (nil Withdrawals), so WithdrawalsHash = nil. Rebuild with filled header
+	// and empty Withdrawals. header.Root was set by FinalizeAndAssemble.
+	if w.miner.chainConfig.IsAmsterdamBlock(header.Number) {
+		blal := core.FillAmsterdamHeader(header, env.bal)
+		assembled = types.NewBlock(header, &types.Body{
+			Transactions: env.txs,
+			Withdrawals:  types.Withdrawals{},
+		}, env.receipts, trie.NewStackTrie(nil)).WithAccessListUnsafe(blal)
 	}
 
 	// Seal (wrapper V1 path): async — signs and pushes the sealed block onto
@@ -891,7 +1016,7 @@ func (w *XdcWorker) commitMinedBlock(block *types.Block) {
 // This method is nil-safe: if accountManager or txPool was not wired (observer
 // node), it returns immediately with a warning.
 func (w *XdcWorker) broadcastSigningTx(block *types.Block) {
-	if block.NumberU64()%common.MergeSignRange != 0 {
+	if !isSignBlock(w.miner.chainConfig, block.Number()) {
 		return
 	}
 	if w.accountManager == nil || w.txPool == nil {
@@ -922,7 +1047,7 @@ func (w *XdcWorker) broadcastSigningTx(block *types.Block) {
 		}
 	}
 
-	if err := contracts.CreateTransactionSign(chainCfg, w.txPool, w.accountManager, block, w.coinbase,
+	if err := createTransactionSign(chainCfg, w.txPool, w.accountManager, block, w.coinbase,
 		chainStateNonces{w.miner.chain}); err != nil {
 		log.Error("XDPoS2: failed to broadcast masternode signing tx",
 			"number", block.NumberU64(), "error", err)
@@ -977,11 +1102,25 @@ func (w *XdcWorker) maybeBroadcastImportedSignTx(block *types.Block) {
 	if block.Hash() == w.lastSealedHash {
 		return
 	}
-	// Cheap gate first — block number must be a merge block.
-	if block.NumberU64()%common.MergeSignRange != 0 {
+	// Cheap gate first — block number must be a merge block (or pre-TIP2019).
+	if !isSignBlock(w.miner.chainConfig, block.Number()) {
 		return
 	}
-	if w.engine == nil || w.engine.EngineV2 == nil {
+	if w.engine == nil {
+		return
+	}
+	// V1 blocks have no V2 snapshot: use canonical's signHook gate instead
+	// (XDPoSChain eth/backend.go:364-377): sign when the coinbase is in the V1
+	// masternode set. Canonical's txPool.IsSigner checks the head at hook time,
+	// which precedes the import, so use the parent header here (#1456).
+	if !w.engine.IsV2Block(block.Header()) {
+		parent := w.miner.chain.GetHeader(block.ParentHash(), block.NumberU64()-1)
+		if parent != nil && w.engine.IsAuthorisedAddress(w.miner.chain, parent, w.coinbase) {
+			w.broadcastSigningTx(block)
+		}
+		return
+	}
+	if w.engine.EngineV2 == nil {
 		return
 	}
 	v2, ok := w.engine.EngineV2.(*engine_v2.XDPoS_v2)
@@ -1008,6 +1147,17 @@ func (w *XdcWorker) maybeBroadcastImportedSignTx(block *types.Block) {
 	// Reuse existing broadcastSigningTx — it already handles the freshness gate,
 	// nil-safe wiring, and CreateTransactionSign call.
 	w.broadcastSigningTx(block)
+}
+
+// createTransactionSign is contracts.CreateTransactionSign; a variable so tests
+// can observe sign-tx emission without a keystore.
+var createTransactionSign = contracts.CreateTransactionSign
+
+// isSignBlock reports whether a sign tx is due for block num: every
+// MergeSignRange blocks, or every block before TIP2019 (canonical XDPoSChain
+// eth/backend.go:372 and miner/worker.go:616).
+func isSignBlock(config *params.ChainConfig, num *big.Int) bool {
+	return num.Uint64()%common.MergeSignRange == 0 || !config.IsTIP2019(num)
 }
 
 // signingFreshnessBound is the maximum lag (in blocks) between the chain head

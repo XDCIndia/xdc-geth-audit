@@ -21,6 +21,7 @@ import (
 	"testing"
 
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/params"
@@ -399,6 +400,8 @@ func TestV1V2SwitchBlockBoundary(t *testing.T) {
 // callVerifyHeaderSafe calls engine.verifyHeader and recovers from any panic
 // that may arise from a nil chain reference in the V1 cascading-fields path.
 // We only need to distinguish "V2 sentinel error" from "V1-path error / nil-chain panic".
+// A minimal chain is passed so that verifyNoUnsealedFields can read the config
+// without panicking (AmsterdamBlock is nil → no Amsterdam exception applies).
 func callVerifyHeaderSafe(engine *XDPoS, header *types.Header) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -407,7 +410,8 @@ func callVerifyHeaderSafe(engine *XDPoS, header *types.Header) (err error) {
 			err = nil
 		}
 	}()
-	return engine.verifyHeader(nil, header, nil)
+	minimalChain := &unsealedChain{cfg: &params.ChainConfig{XDPoS: engine.config}}
+	return engine.verifyHeader(minimalChain, header, nil)
 }
 
 // containsString reports whether s contains substr.
@@ -421,4 +425,27 @@ func containsString(s, substr string) bool {
 		}
 	}
 	return false
+}
+
+// TestForceFullVerifyOverridesBulkSync pins the replay-parity switch (#1430):
+// XdcForceFullVerify keeps strict verification on even while the bulk-sync and
+// checkpoint-no-state flags would otherwise relax it.
+func TestForceFullVerifyOverridesBulkSync(t *testing.T) {
+	prevBulk, prevNoState, prevForce := core.XdcBulkSyncMode.Load(), core.CheckpointSyncNoStateActive.Load(), core.XdcForceFullVerify.Load()
+	defer func() {
+		core.XdcBulkSyncMode.Store(prevBulk)
+		core.CheckpointSyncNoStateActive.Store(prevNoState)
+		core.XdcForceFullVerify.Store(prevForce)
+	}()
+	core.XdcBulkSyncMode.Store(true)
+	core.CheckpointSyncNoStateActive.Store(true)
+
+	core.XdcForceFullVerify.Store(false)
+	if xdcFullVerify() {
+		t.Fatal("precondition: bulk sync should relax verification without the switch")
+	}
+	core.XdcForceFullVerify.Store(true)
+	if !xdcFullVerify() {
+		t.Fatal("xdcFullVerify() = false with XdcForceFullVerify set")
+	}
 }

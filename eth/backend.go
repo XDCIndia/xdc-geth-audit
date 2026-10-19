@@ -153,6 +153,32 @@ type Ethereum struct {
 	shutdownTracker *shutdowncheck.ShutdownTracker // Tracks if and when the node has shutdown ungracefully
 }
 
+// logXDCEffectiveTIPs logs every effective TIP fork activation block at startup
+// (#1528 G0.3). For registered chains these are the constants set by
+// CopyXDCConstants; for custom geneses they come from ChainConfig fields.
+func logXDCEffectiveTIPs(c *params.ChainConfig) {
+	effBlock := func(field, fallback *big.Int) interface{} {
+		if field != nil {
+			return field
+		}
+		if fallback != nil {
+			return fallback
+		}
+		return "nil"
+	}
+	log.Info("XDC effective TIP fork values",
+		"tipSigning", effBlock(c.TIPSigningBlock, common.TIPSigning),
+		"tip2019", effBlock(c.TIP2019Block, common.TIP2019Block),
+		"tipNoHalvingMNReward", effBlock(c.TIPNoHalvingMNRewardBlock, common.TIPNoHalvingMNReward),
+		"tipRandomize", effBlock(c.TIPRandomizeBlock, common.TIPRandomize),
+		"tipXDCX", effBlock(c.TIPXDCXBlock, common.TIPXDCX),
+		"tipTRC21Fee", effBlock(c.TIPTRC21FeeBlock, common.TIPTRC21Fee),
+		"gas50x", effBlock(c.Gas50xBlock, common.BlockNumberGas50x),
+		"dynamicGasLimit", c.DynamicGasLimitBlock,
+		"tipEpochHalving", c.TIPEpochHalvingBlock,
+	)
+}
+
 // New creates a new Ethereum object (including the initialisation of the common Ethereum object),
 // whose lifecycle will be managed by the provided node.
 func New(stack *node.Node, config *ethconfig.Config) (*Ethereum, error) {
@@ -227,6 +253,21 @@ func New(stack *node.Node, config *ethconfig.Config) (*Ethereum, error) {
 			common.TIPSigning = new(big.Int).Set(chainConfig.TIPSigningBlock)
 			log.Info("XDC: genesis tipSigningBlock override applied", "block", common.TIPSigning)
 		}
+		// XDC: canonical XDPoSChain applies the address denylist from the
+		// genesis "denylistBlock" (params/config_forks.go:97 IsDenylist, used by
+		// core/state_processor.go:170-180, the miner and the txpool). Honour it
+		// over the per-chainID BlackListHFNumber, which for an unregistered chain
+		// ID is the mainnet 38,383,838: before this, a private net with
+		// denylistBlock set accepted, pooled and minted denylisted txs that the
+		// canonical nodes reject. nil (every built-in network) keeps the default.
+		if chainConfig.DenylistBlock != nil {
+			common.BlackListHFNumber = chainConfig.DenylistBlock.Uint64()
+			log.Info("XDC: genesis denylistBlock override applied", "block", common.BlackListHFNumber)
+		}
+		// Log all effective TIP values (#1528 G0.3). For registered chains these
+		// are the constants set by CopyXDCConstants; for custom geneses they come
+		// from the genesis ChainConfig fields via xdcTIPBlock.
+		logXDCEffectiveTIPs(chainConfig)
 	}
 	engine, err := ethconfig.CreateConsensusEngine(chainConfig, chainDb)
 	if err != nil {

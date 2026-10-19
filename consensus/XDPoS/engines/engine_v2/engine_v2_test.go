@@ -397,16 +397,8 @@ func TestSendVote_HighestVotedRound_F2026_19622(t *testing.T) {
 	// Mock chain: only GetHeaderByHash(blockHash) needs to return a header.
 	// All other lookups (parent, grandparent) are never reached because
 	// commitBlocks exits early for block 2 (2-2=0 <= SwitchBlock=0).
-	// The vote handler checks our own vote against the gap snapshot, so the
-	// chain must serve the gap header (block 0) by number and its snapshot
-	// must list our address.
-	gapHeader := &types.Header{Number: big.NewInt(0), Difficulty: big.NewInt(1)}
-	eng.snapshots.Add(gapHeader.Hash(), newSnapshot(0, gapHeader.Hash(), []common.Address{ourAddr}))
-	chain := &gapChain19622{
-		mockChainForA894: mockChainForA894{
-			headers: map[common.Hash]*types.Header{blockHash: proposedHeader, gapHeader.Hash(): gapHeader},
-		},
-		gap: gapHeader,
+	chain := &mockChainForA894{
+		headers: map[common.Hash]*types.Header{blockHash: proposedHeader},
 	}
 
 	// sendVote is the function under test. It will:
@@ -451,17 +443,4 @@ func TestSendVote_HighestVotedRound_F2026_19622(t *testing.T) {
 			"highestVotedRound=%d currentRound=%d (blocked because highestVotedRound >= currentRound)",
 			eng.highestVotedRound, eng.currentRound)
 	}
-}
-
-// gapChain19622 serves the gap header by number for TestSendVote_HighestVotedRound_F2026_19622.
-type gapChain19622 struct {
-	mockChainForA894
-	gap *types.Header
-}
-
-func (c *gapChain19622) GetHeaderByNumber(n uint64) *types.Header {
-	if n == 0 {
-		return c.gap
-	}
-	return nil
 }

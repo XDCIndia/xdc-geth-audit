@@ -177,6 +177,27 @@ func RecoverUniqueSigners(signedHash common.Hash, signatureList []types.Signatur
 	return uniqueSigners, duplicates, nil
 }
 
+// countPoolSigners returns the number of distinct signers among the pooled
+// messages that are in masternodes. The pool keys entries by message hash,
+// which includes the signature bytes, so one signer can hold several entries;
+// the vote and timeout threshold gates must count signers, not entries (#1552).
+// Signers were recovered when each message was admitted, so no ecrecover here.
+func countPoolSigners(pooled map[common.Hash]utils.PoolObj, masternodes []common.Address) int {
+	member := make(map[common.Address]struct{}, len(masternodes))
+	for _, mn := range masternodes {
+		member[mn] = struct{}{}
+	}
+	seen := make(map[common.Address]struct{}, len(pooled))
+	for _, obj := range pooled {
+		if signer := obj.GetSigner(); signer != (common.Address{}) {
+			if _, ok := member[signer]; ok {
+				seen[signer] = struct{}{}
+			}
+		}
+	}
+	return len(seen)
+}
+
 // verifyQC verifies a quorum certificate
 // inCheckpointCatchup reports whether the given block number falls within the
 // "catchup window" after a trusted-checkpoint anchor — i.e. the chain was started
@@ -395,10 +416,12 @@ func (x *XDPoS_v2) processQC(chain consensus.ChainReader, incomingQuorumCert *ty
 	// Get proposed block header
 	proposedBlockHeader := chain.GetHeaderByHash(incomingQuorumCert.ProposedBlockInfo.Hash)
 	if proposedBlockHeader == nil {
-		log.Warn("[processQC] Proposed block not yet available, skipping QC processing",
+		// Canonical XDPoSChain returns an error here (engine.go processQC);
+		// returning nil made callers treat an unprocessed QC as processed.
+		log.Warn("[processQC] Proposed block not found",
 			"hash", incomingQuorumCert.ProposedBlockInfo.Hash,
 			"number", incomingQuorumCert.ProposedBlockInfo.Number)
-		return nil
+		return fmt.Errorf("block not found, number: %v, hash: %v", incomingQuorumCert.ProposedBlockInfo.Number, incomingQuorumCert.ProposedBlockInfo.Hash)
 	}
 
 	// Update lock QC for blocks after V2 switch
@@ -696,26 +719,6 @@ func (x *XDPoS_v2) GetSignersFromSnapshot(chain consensus.ChainReader, header *t
 		return nil, err
 	}
 	return snap.NextEpochCandidates, nil
-}
-
-// UniqueSignatures deduplicates signatures by their byte content.
-// Returns unique signatures and any duplicates found.
-// Matches v2.6.8 engines/engine_v2/utils.go conceptually.
-func UniqueSignatures(signatureSlice []types.Signature) ([]types.Signature, []types.Signature) {
-	seen := make(map[common.Hash]bool)
-	unique := make([]types.Signature, 0, len(signatureSlice))
-	duplicates := make([]types.Signature, 0)
-
-	for _, sig := range signatureSlice {
-		sigHash := common.BytesToHash(sig)
-		if seen[sigHash] {
-			duplicates = append(duplicates, sig)
-		} else {
-			seen[sigHash] = true
-			unique = append(unique, sig)
-		}
-	}
-	return unique, duplicates
 }
 
 // CalculateMissingRounds computes which consensus rounds were missed in the current epoch.
