@@ -41,7 +41,9 @@ func TestSetupGenesis(t *testing.T) {
 
 func testSetupGenesis(t *testing.T, scheme string) {
 	var (
-		customghash = common.HexToHash("0x89c99d90b79719238d2645c7642f2c9295246e80775b38cfd162b696817fbd50")
+		// XDC: extended header RLP (Validators/Penalties/SlotNumber fields) changes the
+		// genesis hash. This is the XDC-encoded hash of this custom genesis block.
+		customghash = common.HexToHash("0xfc8a143549950b0d3e3e7b70b0067b152e6b903ab5438f1ea87f0448ec93da48")
 		customg     = Genesis{
 			Config: &params.ChainConfig{HomesteadBlock: big.NewInt(3), Ethash: &params.EthashConfig{}},
 			Alloc: types.GenesisAlloc{
@@ -72,7 +74,9 @@ func testSetupGenesis(t *testing.T, scheme string) {
 			fn: func(db ethdb.Database) (*params.ChainConfig, common.Hash, *params.ConfigCompatError, error) {
 				return SetupGenesisBlock(db, triedb.NewDatabase(db, newDbConfig(scheme)), nil)
 			},
-			wantHash:   params.MainnetGenesisHash,
+			// XDC: extended header RLP changes the hash of the Ethereum mainnet genesis.
+			// params.MainnetGenesisHash is the Ethereum canonical value; XDC encodes as below.
+			wantHash:   common.HexToHash("0x8d13370621558f4ed0da587934473c0404729f28b0ff1d50e5fdd840457a2f17"),
 			wantConfig: params.MainnetChainConfig,
 		},
 		{
@@ -81,7 +85,8 @@ func testSetupGenesis(t *testing.T, scheme string) {
 				DefaultGenesisBlock().MustCommit(db, triedb.NewDatabase(db, newDbConfig(scheme)))
 				return SetupGenesisBlock(db, triedb.NewDatabase(db, newDbConfig(scheme)), nil)
 			},
-			wantHash:   params.MainnetGenesisHash,
+			// XDC: extended header RLP changes the hash of the Ethereum mainnet genesis.
+			wantHash:   common.HexToHash("0x8d13370621558f4ed0da587934473c0404729f28b0ff1d50e5fdd840457a2f17"),
 			wantConfig: params.MainnetChainConfig,
 		},
 		{
@@ -101,7 +106,8 @@ func testSetupGenesis(t *testing.T, scheme string) {
 				customg.Commit(db, tdb, nil)
 				return SetupGenesisBlock(db, tdb, DefaultSepoliaGenesisBlock())
 			},
-			wantErr: &GenesisMismatchError{Stored: customghash, New: params.SepoliaGenesisHash},
+			// XDC: New hash is the XDC-encoded Sepolia genesis, not the canonical Ethereum value.
+			wantErr: &GenesisMismatchError{Stored: customghash, New: common.HexToHash("0x7cd5d13c645a4ae75314cc4696d59598e1f0b3096fd937e565105e95c1367407")},
 		},
 		{
 			name: "custom block in DB, genesis == hoodi",
@@ -110,7 +116,8 @@ func testSetupGenesis(t *testing.T, scheme string) {
 				customg.Commit(db, tdb, nil)
 				return SetupGenesisBlock(db, tdb, DefaultHoodiGenesisBlock())
 			},
-			wantErr: &GenesisMismatchError{Stored: customghash, New: params.HoodiGenesisHash},
+			// XDC: New hash is the XDC-encoded Hoodi genesis, not the canonical Ethereum value.
+			wantErr: &GenesisMismatchError{Stored: customghash, New: common.HexToHash("0x5480f38aa532f2e2f1892384645842678a8709f726befd7d4784223d29288ef0")},
 		},
 		{
 			name: "compatible config in DB",
@@ -179,14 +186,21 @@ func testSetupGenesis(t *testing.T, scheme string) {
 
 // TestGenesisHashes checks the congruity of default genesis data to
 // corresponding hardcoded genesis hash values.
+//
+// XDC note: the "want" hashes here are the XDC-RLP-encoded hashes of each
+// genesis block. They differ from the canonical Ethereum values stored in
+// params.MainnetGenesisHash / params.SepoliaGenesisHash / params.HoodiGenesisHash
+// because XDC's extended header RLP adds Validators, Penalties and SlotNumber
+// fields, changing the block hash. The canonical params.* constants are kept
+// as-is for chain-ID and fork-ID checks; only these test expectations change.
 func TestGenesisHashes(t *testing.T) {
 	for i, c := range []struct {
 		genesis *Genesis
 		want    common.Hash
 	}{
-		{DefaultGenesisBlock(), params.MainnetGenesisHash},
-		{DefaultSepoliaGenesisBlock(), params.SepoliaGenesisHash},
-		{DefaultHoodiGenesisBlock(), params.HoodiGenesisHash},
+		{DefaultGenesisBlock(), common.HexToHash("0x8d13370621558f4ed0da587934473c0404729f28b0ff1d50e5fdd840457a2f17")},
+		{DefaultSepoliaGenesisBlock(), common.HexToHash("0x7cd5d13c645a4ae75314cc4696d59598e1f0b3096fd937e565105e95c1367407")},
+		{DefaultHoodiGenesisBlock(), common.HexToHash("0x5480f38aa532f2e2f1892384645842678a8709f726befd7d4784223d29288ef0")},
 	} {
 		// Test via MustCommit
 		db := rawdb.NewMemoryDatabase()

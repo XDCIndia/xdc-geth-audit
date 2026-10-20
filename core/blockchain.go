@@ -2661,7 +2661,12 @@ func (bc *BlockChain) setupExecutionState(parentRoot common.Hash, block *types.B
 	noop := func(*blockProcessingResult) {}
 
 	var sdb state.Database
-	if bc.chainConfig.IsUBT(block.Number(), block.Time()) {
+	// XDC: IsUBT is stubbed to always return false on this fork. Fall back to
+	// EnableUBTAtGenesis so that non-XDC test chains that use the binary trie
+	// from genesis open the correct UBT database. The !IsXDC() guard ensures
+	// an XDC genesis with EnableUBTAtGenesis=true cannot switch to UBT
+	// (XDC mainnet/Apothem have EnableUBTAtGenesis=false in any case).
+	if bc.chainConfig.IsUBT(block.Number(), block.Time()) || (bc.chainConfig.EnableUBTAtGenesis && !bc.chainConfig.IsXDC()) {
 		sdb = state.NewUBTDatabase(bc.triedb, bc.codedb)
 	} else {
 		sdb = state.NewMPTDatabase(bc.triedb, bc.codedb).WithSnapshot(bc.snaps)

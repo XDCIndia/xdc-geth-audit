@@ -1618,13 +1618,24 @@ func (x *XDPoS_v2) GetMasternodesWithParents(chain consensus.ChainReader, header
 			return info.Masternodes
 		}
 	}
-	// Try the DB path (already-synced blocks).
-	epochSwitchInfo, err := x.getEpochSwitchInfo(chain, header, header.Hash())
-	if err == nil {
-		return epochSwitchInfo.Masternodes
+	// Try the DB path (already-synced blocks) only when no in-batch parents
+	// are available.  With parents present, the synthetic fallback inside
+	// getEpochSwitchInfoInner can walk backward past an in-batch epoch switch
+	// (not yet committed to the DB) and return the PREVIOUS epoch's masternodes
+	// without error, silently bypassing the parents scan (issue #1660).
+	// When parents is empty there is nothing to scan, so the DB path is the
+	// only option.
+	var epochSwitchInfo *types.EpochSwitchInfo
+	var err error
+	if len(parents) == 0 {
+		epochSwitchInfo, err = x.getEpochSwitchInfo(chain, header, header.Hash())
+		if err == nil {
+			return epochSwitchInfo.Masternodes
+		}
 	}
-	// Fallback: parents-scan path for in-batch epoch switch.
-	log.Debug("[GetMasternodesWithParents] DB path failed, trying parents fallback", "number", header.Number.Uint64(), "err", err)
+	// Parents-scan path: resolves in-batch epoch switches (not yet in DB) via
+	// the O(N) parents scan, and falls back to the DB for cross-batch switches.
+	log.Debug("[GetMasternodesWithParents] trying parents-scan path", "number", header.Number.Uint64())
 	epochSwitchInfo, err = x.getEpochSwitchInfoWithParents(chain, header, header.Hash(), parents)
 	if err != nil {
 		// v142 DEEP FALLBACK: If parents contain the epoch switch header directly,

@@ -79,10 +79,11 @@ var (
 		PetersburgBlock:     big.NewInt(76321000),
 		IstanbulBlock:       big.NewInt(76321000),
 		MuirGlacierBlock:    nil,
-		BerlinBlock:         big.NewInt(76321000),   // XDPoSChain MainnetConstant.berlinBlock — Target 19th June 2024
-		LondonBlock:         big.NewInt(76321000),   // XDPoSChain MainnetConstant.londonBlock — Target 19th June 2024
-		Eip1559Block:        big.NewInt(98_800_200), // XDPoSChain MainnetConstant.eip1559Block — Target 28th Jan 2026
-		CancunBlock:         big.NewInt(98_802_000), // XDPoSChain MainnetConstant.cancunBlock — Target 28th Jan 2026
+		BerlinBlock:         big.NewInt(76321000),       // XDPoSChain MainnetConstant.berlinBlock — Target 19th June 2024
+		LondonBlock:         big.NewInt(76321000),       // XDPoSChain MainnetConstant.londonBlock — Target 19th June 2024
+		Eip1559Block:        big.NewInt(98_800_200),     // XDPoSChain MainnetConstant.eip1559Block — Target 28th Jan 2026
+		CancunBlock:         big.NewInt(98_802_000),     // XDPoSChain MainnetConstant.cancunBlock — Target 28th Jan 2026
+		AmsterdamBlock:      big.NewInt(99_999_999_999), // Glamsterdam incl. EIP-7928 BAL: placeholder far-future block, not scheduled (#1644)
 		XDPoS: &XDPoSConfig{
 			Period:              2,                                                                 // 2 second block time
 			Epoch:               900,                                                               // 900 blocks per epoch (~30 minutes)
@@ -1037,15 +1038,16 @@ var (
 		PetersburgBlock:        big.NewInt(61_290_000),
 		IstanbulBlock:          big.NewInt(61_290_000),
 		MuirGlacierBlock:       nil,
-		BerlinBlock:            big.NewInt(61_290_000), // XDPoSChain TestnetConstant.berlinBlock — Target 31st March 2024
-		LondonBlock:            big.NewInt(61_290_000), // XDPoSChain TestnetConstant.londonBlock — Target 31st March 2024
-		Eip1559Block:           big.NewInt(71_550_000), // XDPoSChain TestnetConstant.eip1559Block — Target 14th Feb 2025
-		CancunBlock:            big.NewInt(71_551_800), // XDPoSChain TestnetConstant.cancunBlock
-		TIPUpgradeRewardBlock:  big.NewInt(83_600_000), // XinFinOrg/XDPoSChain#2383 (v2.8.0); activation verified on canonical (round>27,360,000; header@83,577,112 carries 25 validators)
-		TIPUpgradePenaltyBlock: big.NewInt(83_600_000), // XinFinOrg/XDPoSChain#2383 (v2.8.0)
-		Gas2500xBlock:          big.NewInt(83_600_000), // XinFinOrg/XDPoSChain#2516 #2695 (v2.9.0-testnet): base fee 625 gwei
-		DynamicGasLimitBlock:   big.NewInt(83_600_000), // XDPoSChain v2.9.3-testnet genesis/testnet.json dynamicGasLimitBlock
-		PragueBlock:            big.NewInt(87_633_000), // XDPoSChain v3.0.0-testnet genesis/testnet.json pragueBlock
+		BerlinBlock:            big.NewInt(61_290_000),     // XDPoSChain TestnetConstant.berlinBlock — Target 31st March 2024
+		LondonBlock:            big.NewInt(61_290_000),     // XDPoSChain TestnetConstant.londonBlock — Target 31st March 2024
+		Eip1559Block:           big.NewInt(71_550_000),     // XDPoSChain TestnetConstant.eip1559Block — Target 14th Feb 2025
+		CancunBlock:            big.NewInt(71_551_800),     // XDPoSChain TestnetConstant.cancunBlock
+		TIPUpgradeRewardBlock:  big.NewInt(83_600_000),     // XinFinOrg/XDPoSChain#2383 (v2.8.0); activation verified on canonical (round>27,360,000; header@83,577,112 carries 25 validators)
+		TIPUpgradePenaltyBlock: big.NewInt(83_600_000),     // XinFinOrg/XDPoSChain#2383 (v2.8.0)
+		Gas2500xBlock:          big.NewInt(83_600_000),     // XinFinOrg/XDPoSChain#2516 #2695 (v2.9.0-testnet): base fee 625 gwei
+		DynamicGasLimitBlock:   big.NewInt(83_600_000),     // XDPoSChain v2.9.3-testnet genesis/testnet.json dynamicGasLimitBlock
+		PragueBlock:            big.NewInt(87_633_000),     // XDPoSChain v3.0.0-testnet genesis/testnet.json pragueBlock
+		AmsterdamBlock:         big.NewInt(99_999_999_999), // Glamsterdam incl. EIP-7928 BAL: placeholder far-future block, not scheduled (#1644)
 		XDPoS: &XDPoSConfig{
 			Period:              2,                                                                 // 2 second block time
 			Epoch:               900,                                                               // 900 blocks per epoch (~30 minutes)
@@ -1571,8 +1573,12 @@ var (
 	//     reward + penalty upgrade lands together with the v2.8.0 DevnetV2Configs
 	//     round-50000 tier). Osaka and TIPEpochHalving are disabled (nil) on devnet.
 	//
-	// Note: the XDPoSChain dev-upgrade DynamicGasLimitBlock = 50000 and the
-	// block-0 base forks (TIPSigning/TIPRandomize/TIPIncreaseMasternodes/Denylist/
+	// Note: DynamicGasLimitBlock is deliberately unset. The canonical
+	// DynamicGasLimitBlock = 50000 belongs to devnet 551 (XDPoSChain v2.9.3/v3.0.0
+	// DevnetChainConfig, see XDCDevnet551ChainConfig); canonical has no 5551 profile
+	// and the live 5551 sealers (v2.7.0-devnet) predate dynamic gas limits, so
+	// setting it would make a modern 5551 sealer diverge from them (#1538).
+	// The block-0 base forks (TIPSigning/TIPRandomize/TIPIncreaseMasternodes/Denylist/
 	// TIPNoHalvingMNReward/Gas50x/Merge/Shanghai) are XDPoSChain-specific gates that
 	// are not modelled as fields on this go-ethereum ChainConfig struct; they are
 	// handled via the XDPoS engine's global TIP sentinels / consensus paths and so
@@ -3177,8 +3183,12 @@ func (c *ChainConfig) IsVerkleGenesis() bool {
 }
 
 // IsEIP4762 returns whether eip 4762 has been activated at given block.
+// XDC: UBT is never active on XDC chains, so IsEIP4762 only fires for Verkle
+// on XDC. For non-XDC chains we check UBTTime directly (upstream checks via
+// IsUBT, which is stubbed to false here). This only affects non-XDC test chains
+// that explicitly set UBTTime (e.g. testUBTChainConfig).
 func (c *ChainConfig) IsEIP4762(num *big.Int, time uint64) bool {
-	return c.IsVerkle(num, time)
+	return c.IsVerkle(num, time) || (!c.IsXDC() && c.IsLondon(num) && isTimestampForked(c.UBTTime, time))
 }
 
 // xdcTIPBlock returns the per-genesis value if c is non-nil and the field is
@@ -3887,6 +3897,12 @@ type Rules struct {
 	// schedule), EIP-2565 (cheaper MODEXP), and EIP-3860 (initcode word
 	// cost) all in newEip1559InstructionSet — not at Cancun. Issue #716.
 	IsEIP1559 bool
+	// IsXDCxMinerDisable is true at-or-after TIPXDCXMinerDisableBlock
+	// (mainnet 80,370,000 / Apothem 61,290,000). At that block the four
+	// XDC-specific precompiles (0x1e, 0x28, 0x29, 0x2a) are removed from
+	// the active precompile set, matching canonical XDPoSChain's
+	// PrecompiledContractsXDCv2 selection. Issue #1524.
+	IsXDCxMinerDisable bool
 }
 
 // Rules ensures c's ChainID is not nil.
@@ -3894,15 +3910,23 @@ func (c *ChainConfig) Rules(num *big.Int, isMerge bool, timestamp uint64) Rules 
 	// disallow setting Merge out of order
 	isMerge = isMerge && c.IsLondon(num)
 	isVerkle := isMerge && c.IsVerkle(num, timestamp)
+	// XDC: UBT is never active on XDC chains (IsUBT is hardcoded false, UBTTime
+	// is nil for mainnet/Apothem). Gate isUBT on !c.IsXDC() so that an XDC
+	// genesis carrying ubtTime or --override.ubt cannot accidentally enable
+	// witness-gas rules or disable EIP-2929 — both are consensus changes.
+	// Non-XDC test chains with UBTTime set (e.g. testUBTChainConfig) still work.
+	isUBT := !c.IsXDC() && isMerge && c.IsLondon(num) && isTimestampForked(c.UBTTime, timestamp)
 	// XDC chains defer EIP-2929 (cold/warm state access) from Berlin to
 	// the EIP-1559 block — canonical XDPoSChain's newEip1559InstructionSet
 	// enables it together with EIP-3529 and EIP-3860. Berlin/London/
 	// Merge/Shanghai on XDC are marker-only opcode boundaries until
 	// IsEIP1559 flips on. Issue #716 (supersedes #705/#710's earlier
 	// IsCancunBlock gating). Non-XDC chains keep upstream behaviour.
-	isEIP2929 := c.IsBerlin(num) && !isVerkle
+	// EIP-2929 is also mutually exclusive with EIP-4762 (UBT): verkle/UBT
+	// replaces cold/warm access list tracking with witness costs.
+	isEIP2929 := c.IsBerlin(num) && !isVerkle && !isUBT
 	if c.IsXDC() {
-		isEIP2929 = c.IsEIP1559(num) && !isVerkle
+		isEIP2929 = c.IsEIP1559(num) && !isVerkle && !isUBT
 	}
 	// Default upstream wiring: Merge/Shanghai/Cancun all gated on the
 	// caller-supplied isMerge bool plus a timestamp-based check.
@@ -3944,30 +3968,31 @@ func (c *ChainConfig) Rules(num *big.Int, isMerge bool, timestamp uint64) Rules 
 		isAmsterdam = c.IsAmsterdamBlock(num)
 	}
 	return Rules{
-		IsHomestead:      c.IsHomestead(num),
-		IsEIP150:         c.IsEIP150(num),
-		IsEIP155:         c.IsEIP155(num),
-		IsEIP158:         c.IsEIP158(num),
-		IsByzantium:      c.IsByzantium(num),
-		IsConstantinople: c.IsConstantinople(num),
-		IsPetersburg:     c.IsPetersburg(num),
-		IsIstanbul:       c.IsIstanbul(num),
-		IsBerlin:         c.IsBerlin(num),
-		IsEIP2929:        isEIP2929,
-		IsEIP3860:        isEIP3860,
-		IsXDC:            c.IsXDC(),
-		IsEIP1559:        c.IsEIP1559(num),
-		IsLondon:         c.IsLondon(num),
-		IsMerge:          isMergeRule,
-		IsShanghai:       isShanghai,
-		IsCancun:         isCancun,
-		IsPrague:         isPrague,
-		IsOsaka:          isOsaka,
-		IsAmsterdam:      isAmsterdam,
-		IsVerkle:         isVerkle,
-		IsEIP4762:        isVerkle,
-		IsBogota:         isMerge && c.IsBogota(num, timestamp),
-		IsUBT:            false, // XDC never activates UBT; see the IsUBT stub below
+		IsHomestead:        c.IsHomestead(num),
+		IsEIP150:           c.IsEIP150(num),
+		IsEIP155:           c.IsEIP155(num),
+		IsEIP158:           c.IsEIP158(num),
+		IsByzantium:        c.IsByzantium(num),
+		IsConstantinople:   c.IsConstantinople(num),
+		IsPetersburg:       c.IsPetersburg(num),
+		IsIstanbul:         c.IsIstanbul(num),
+		IsBerlin:           c.IsBerlin(num),
+		IsEIP2929:          isEIP2929,
+		IsEIP3860:          isEIP3860,
+		IsXDC:              c.IsXDC(),
+		IsEIP1559:          c.IsEIP1559(num),
+		IsLondon:           c.IsLondon(num),
+		IsMerge:            isMergeRule,
+		IsShanghai:         isShanghai,
+		IsCancun:           isCancun,
+		IsPrague:           isPrague,
+		IsOsaka:            isOsaka,
+		IsAmsterdam:        isAmsterdam,
+		IsVerkle:           isVerkle,
+		IsEIP4762:          isVerkle || isUBT,
+		IsBogota:           isMerge && c.IsBogota(num, timestamp),
+		IsUBT:              isUBT, // XDC mainnet/Apothem: UBTTime=nil → false; test chains with UBTTime activate UBT rules
+		IsXDCxMinerDisable: c.IsXDC() && c.IsTIPXDCXMiner(num),
 	}
 }
 

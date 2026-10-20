@@ -700,7 +700,16 @@ func (evm *EVM) initNewContract(contract *Contract, address common.Address) ([]b
 	}
 	// Check prefix before gas calculation.
 	// Reject code starting with 0xEF if EIP-3541 is enabled.
-	if len(ret) >= 1 && ret[0] == 0xEF && evm.chainRules.IsLondon {
+	// XDC chains activate EIP-3541 at Eip1559Block, matching canonical
+	// XDPoSChain (core/vm/evm.go:537-539 v2.9.3-testnet). IsLondon fires
+	// earlier on XDC (76,321,000) than EIP-1559 (98,800,200); gating on
+	// IsLondon would reject valid 0xEF deployments too early.
+	// Non-XDC chains keep the upstream IsLondon behaviour.
+	eip3541Active := evm.chainRules.IsLondon
+	if evm.chainRules.IsXDC {
+		eip3541Active = evm.chainRules.IsEIP1559
+	}
+	if len(ret) >= 1 && ret[0] == 0xEF && eip3541Active {
 		return ret, ErrInvalidCode
 	}
 	if evm.chainRules.IsEIP4762 {

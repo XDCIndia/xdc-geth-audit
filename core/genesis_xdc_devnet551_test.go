@@ -145,14 +145,16 @@ func TestXDCRegisteredGenesisProfilesUnchanged(t *testing.T) {
 	}{
 		{"mainnet", DefaultXDCMainnetGenesisBlock, params.XDCMainnetChainConfig,
 			"0x4a9d748bd78a8d0385b67788c2435dcdb914f98a96250b68863a1f8b7642d6b1",
-			"fe7509729ef35d852218d8165b29095c5c5443b961a3564ad2d91de5d6c693e6",
-			"fe7509729ef35d852218d8165b29095c5c5443b961a3564ad2d91de5d6c693e6"},
+			// amsterdamBlock 99,999,999,999: far-future placeholder (#1644).
+			"e2d0cf678f18867257b30db4359a6df2dc75e5b6fa05cc548fa998e7349cae35",
+			"e2d0cf678f18867257b30db4359a6df2dc75e5b6fa05cc548fa998e7349cae35"},
 		{"apothem", DefaultXDCApothemGenesisBlock, params.XDCApothemChainConfig,
 			"0xbdea512b4f12ff1135ec92c00dc047ffb93890c2ea1aa0eefe9b013d80640075",
 			// dynamicGasLimitBlock 83,600,000 added for the v2.9 reset (#1539),
-			// pragueBlock 87,633,000 from XDPoSChain v3.0.0-testnet.
-			"da640af00043f85eb9bf5698b8d2182cfe585ec89e3d69f22f718ce1867d8d89",
-			"da640af00043f85eb9bf5698b8d2182cfe585ec89e3d69f22f718ce1867d8d89"},
+			// pragueBlock 87,633,000 from XDPoSChain v3.0.0-testnet,
+			// amsterdamBlock 99,999,999,999 far-future placeholder (#1644).
+			"35a0538f878655ec44b35403e28292d13d72c8ece797b08ac3ff6d154a160524",
+			"35a0538f878655ec44b35403e28292d13d72c8ece797b08ac3ff6d154a160524"},
 		{"devnet5551", DefaultXDCDevnetGenesisBlock, params.XDCDevnetChainConfig,
 			"0xb8be003946a9c2688e9f1e255a5567c3d144293ccde2ffb38452a5840081b402",
 			"fff564302f00f0707421fa0214a3abf5444189c319b81aa5dcd365f8def165c2",

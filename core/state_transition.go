@@ -1338,7 +1338,17 @@ func (st *stateTransition) applyAuthorizations(rules params.Rules, auths []types
 // calcRefund computes the EIP-3529 refund cap against tx_gas_used_before_refund.
 func (st *stateTransition) calcRefund(gasUsedBeforeRefund uint64) uint64 {
 	quotient := params.RefundQuotient
-	if st.evm.ChainConfig().IsLondon(st.evm.Context.BlockNumber) {
+	num := st.evm.Context.BlockNumber
+	// XDC chains activate the EIP-3529 /5 refund cap at Eip1559Block, matching
+	// canonical XDPoSChain (core/state_transition.go:594-603 v2.9.3-testnet).
+	// London fires earlier on XDC (76,321,000) than EIP-1559 (98,800,200);
+	// using IsLondon here would apply the cap 22.48M blocks too early.
+	// Non-XDC chains keep the upstream IsLondon behaviour.
+	if st.evm.ChainConfig().IsXDC() {
+		if st.evm.ChainConfig().IsEIP1559(num) {
+			quotient = params.RefundQuotientEIP3529
+		}
+	} else if st.evm.ChainConfig().IsLondon(num) {
 		quotient = params.RefundQuotientEIP3529
 	}
 	refund := gasUsedBeforeRefund / quotient

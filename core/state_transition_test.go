@@ -342,7 +342,10 @@ func TestIntrinsicGas(t *testing.T) {
 			rules := params.Rules{
 				IsHomestead: tt.isHomestead,
 				IsIstanbul:  tt.isEIP2028,
+				// XDC: IsEIP3860 is a separate Rules field gated on IsEIP1559, not
+				// IsShanghai. IntrinsicGas checks rules.IsEIP3860, not rules.IsShanghai.
 				IsShanghai:  tt.isEIP3860,
+				IsEIP3860:   tt.isEIP3860,
 				IsAmsterdam: tt.isAmsterdam,
 			}
 			var to *common.Address

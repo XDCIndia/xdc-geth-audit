@@ -139,6 +139,36 @@ func TestConfigRules(t *testing.T) {
 	}
 }
 
+// TestXDCUBTInvariant verifies that UBT is impossible on XDC chains even when
+// UBTTime=0 and EnableUBTAtGenesis=true are set in the config. On XDC the
+// isUBT gate in Rules() is unconditionally false (guarded on !c.IsXDC()), so
+// witness-gas rules cannot fire and EIP-2929 cannot be disabled by a UBT flag.
+func TestXDCUBTInvariant(t *testing.T) {
+	// Clone XDCMainnetChainConfig and force-arm every UBT knob.
+	cfg := *XDCMainnetChainConfig
+	zero := uint64(0)
+	cfg.UBTTime = &zero           // would activate UBT at timestamp 0 on a non-XDC chain
+	cfg.EnableUBTAtGenesis = true // would switch genesis to binary trie on a non-XDC chain
+
+	// Use a block number and timestamp well past all XDC fork activations.
+	// Block 99_000_000 is past EIP-1559 (98_800_200) so IsEIP2929 would be true.
+	num := big.NewInt(99_000_000)
+	r := cfg.Rules(num, true, 0)
+
+	if r.IsUBT {
+		t.Error("IsUBT must be false on XDC chains regardless of UBTTime")
+	}
+	if r.IsEIP4762 {
+		t.Error("IsEIP4762 must be false on XDC chains when VerkleTime is nil")
+	}
+	if !r.IsEIP2929 {
+		t.Error("IsEIP2929 must still be true on XDC chains past EIP-1559 when UBT is armed but blocked")
+	}
+	if cfg.IsEIP4762(num, 0) {
+		t.Error("ChainConfig.IsEIP4762 must be false on XDC chains when VerkleTime is nil")
+	}
+}
+
 func TestTimestampCompatError(t *testing.T) {
 	require.Equal(t, new(ConfigCompatError).Error(), "")
 

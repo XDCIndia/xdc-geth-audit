@@ -464,7 +464,9 @@ func applyTransactionWithEVM(ctx context.Context, msg *Message, gp *GasPool, sta
 	}
 	// Merge the tx-local access event into the "block-local" one, in order to collect
 	// all values, so that the witness can be built.
-	if statedb.Database().Type().Is(state.TypeUBT) {
+	// XDC: evm.AccessEvents is nil on UBT chains because the EVM only initialises it
+	// when IsEIP4762 is true; UBT uses UBTTime, not IsEIP4762. Guard both sides.
+	if statedb.Database().Type().Is(state.TypeUBT) && evm.AccessEvents != nil {
 		statedb.AccessEvents().Merge(evm.AccessEvents)
 	}
 	receipt = makeReceipt(evm, result, statedb, blockNumber, blockHash, blockTime, tx, gp.CumulativeUsed(), root)
@@ -573,7 +575,9 @@ func ProcessBeaconBlockRoot(beaconRoot common.Hash, evm *vm.EVM, blockAccessList
 
 	// Unchecked system call (EIP-4788), failures are ignored as spec
 	_, _, _ = evm.Call(msg.From, *msg.To, msg.Data, gasBudget, common.U2560)
-	if evm.StateDB.AccessEvents() != nil {
+	// XDC: evm.AccessEvents is nil on UBT chains because the EVM only initialises it
+	// when IsEIP4762 is true; UBT uses UBTTime, not IsEIP4762. Guard both sides.
+	if evm.StateDB.AccessEvents() != nil && evm.AccessEvents != nil {
 		evm.StateDB.AccessEvents().Merge(evm.AccessEvents)
 	}
 	accessList := evm.StateDB.Finalise(evm.GetRules())
@@ -654,7 +658,7 @@ func ProcessParentBlockHash(prevHash common.Hash, evm *vm.EVM, blockAccessList *
 
 	// Unchecked system call (EIP-2935), failures are ignored as spec
 	_, _, _ = evm.Call(msg.From, *msg.To, msg.Data, gasBudget, common.U2560)
-	if evm.StateDB.AccessEvents() != nil {
+	if evm.StateDB.AccessEvents() != nil && evm.AccessEvents != nil {
 		evm.StateDB.AccessEvents().Merge(evm.AccessEvents)
 	}
 	accessList := evm.StateDB.Finalise(evm.GetRules())
@@ -720,7 +724,7 @@ func processRequestsSystemCall(requests *[][]byte, rules params.Rules, evm *vm.E
 	evm.StateDB.SetTxContext(common.Hash{}, 0, blockAccessIndex)
 	evm.StateDB.AddAddressToAccessList(addr)
 	ret, _, err := evm.Call(msg.From, *msg.To, msg.Data, gasBudget, common.U2560)
-	if evm.StateDB.AccessEvents() != nil {
+	if evm.StateDB.AccessEvents() != nil && evm.AccessEvents != nil {
 		evm.StateDB.AccessEvents().Merge(evm.AccessEvents)
 	}
 	bal := evm.StateDB.Finalise(evm.GetRules())

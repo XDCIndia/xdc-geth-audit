@@ -2,8 +2,9 @@
 //
 // Amsterdam on XDC (net2030 target: 31,500) uses a block-number gate rather
 // than the upstream timestamp-based AmsterdamTime. These tests verify:
-//   - Mainnet, Apothem, devnet, and the default private profile never get
-//     AmsterdamBlock set (IsAmsterdam returns false unless genesis sets it).
+//   - Mainnet and Apothem carry only the far-future AmsterdamBlock placeholder
+//     (99,999,999,999, #1644); devnet and the default private profile never
+//     get AmsterdamBlock set (IsAmsterdam returns false unless genesis sets it).
 //   - IsAmsterdamBlock and IsAmsterdam respond correctly to a set block.
 //   - IsAmsterdam on XDC ignores any AmsterdamTime and uses the block gate.
 //   - Amsterdam must follow Osaka in CheckConfigForkOrder.
@@ -66,13 +67,16 @@ func TestAmsterdamBlockNotSetOnRegisteredNetworks(t *testing.T) {
 		"apothem": params.XDCApothemChainConfig,
 		"devnet":  params.XDCDevnetChainConfig,
 	} {
-		if cfg.AmsterdamBlock != nil {
-			t.Errorf("%s: AmsterdamBlock should be nil (Amsterdam not yet scheduled), got %v", name, cfg.AmsterdamBlock)
+		// Mainnet and Apothem may only carry the far-future placeholder (#1644).
+		placeholder := name != "devnet" && cfg.AmsterdamBlock != nil && cfg.AmsterdamBlock.Cmp(big.NewInt(99_999_999_999)) == 0
+		if cfg.AmsterdamBlock != nil && !placeholder {
+			t.Errorf("%s: AmsterdamBlock should be nil or the 99,999,999,999 placeholder (Amsterdam not yet scheduled), got %v", name, cfg.AmsterdamBlock)
 		}
-		// IsAmsterdam must return false regardless of block/time.
-		b1M := big.NewInt(1_000_000)
-		if cfg.IsAmsterdam(b1M, ^uint64(0)) {
-			t.Errorf("%s: IsAmsterdam(1M, maxUint64) returned true; must be false until AmsterdamBlock is set", name)
+		// IsAmsterdam must return false at any realistic height, regardless of time.
+		for _, n := range []int64{1_000_000, 200_000_000} {
+			if cfg.IsAmsterdam(big.NewInt(n), ^uint64(0)) {
+				t.Errorf("%s: IsAmsterdam(%d, maxUint64) returned true; must be false until Amsterdam is scheduled", name, n)
+			}
 		}
 	}
 }
