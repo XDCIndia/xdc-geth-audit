@@ -3410,6 +3410,11 @@ func (bc *BlockChain) reorg(oldHead *types.Header, newHead *types.Header) error 
 		deletedLogs []*types.Log
 		rebirthLogs []*types.Log
 	)
+	// Collect deleted logs here; the actual rmLogsFeed.Send calls are deferred
+	// until after the canonical-index batch write so that subscribers querying
+	// canonical state on a RemovedLogsEvent see the already-updated indexes
+	// (XDC-26: removed-log events must be sent after canonical indexes are written).
+	//
 	// Deleted log emission on the API uses forward order, which is borked, but
 	// we'll leave it in for legacy reasons.
 	//
@@ -3423,13 +3428,6 @@ func (bc *BlockChain) reorg(oldHead *types.Header, newHead *types.Header) error 
 			if logs := bc.collectLogs(block, true); len(logs) > 0 {
 				deletedLogs = append(deletedLogs, logs...)
 			}
-			if len(deletedLogs) > 512 {
-				bc.rmLogsFeed.Send(RemovedLogsEvent{deletedLogs})
-				deletedLogs = nil
-			}
-		}
-		if len(deletedLogs) > 0 {
-			bc.rmLogsFeed.Send(RemovedLogsEvent{deletedLogs})
 		}
 	}
 	// Undo old blocks in reverse order
@@ -3460,19 +3458,12 @@ func (bc *BlockChain) reorg(oldHead *types.Header, newHead *types.Header) error 
 		for _, tx := range block.Transactions() {
 			rebirthTxs = append(rebirthTxs, tx.Hash())
 		}
-		// Collect inserted logs and emit them
+		// Collect inserted logs; they are emitted after the removed logs below.
 		if logs := bc.collectLogs(block, false); len(logs) > 0 {
 			rebirthLogs = append(rebirthLogs, logs...)
 		}
-		if len(rebirthLogs) > 512 {
-			bc.logsFeed.Send(rebirthLogs)
-			rebirthLogs = nil
-		}
 		// Update the head block
 		bc.writeHeadBlock(block)
-	}
-	if len(rebirthLogs) > 0 {
-		bc.logsFeed.Send(rebirthLogs)
 	}
 	// Delete useless indexes right now which includes the non-canonical
 	// transaction indexes, canonical chain indexes which above the head.
@@ -3501,6 +3492,24 @@ func (bc *BlockChain) reorg(oldHead *types.Header, newHead *types.Header) error 
 	}
 	// Reset the tx lookup cache to clear stale txlookup cache.
 	bc.txLookupCache.Purge()
+
+	// XDC-26: emit log events only after the canonical indexes are written, so
+	// a subscriber that queries on receipt sees the new chain. Removed logs go
+	// first, then the new chain's logs, as before.
+	for len(deletedLogs) > 512 {
+		bc.rmLogsFeed.Send(RemovedLogsEvent{deletedLogs[:512]})
+		deletedLogs = deletedLogs[512:]
+	}
+	if len(deletedLogs) > 0 {
+		bc.rmLogsFeed.Send(RemovedLogsEvent{deletedLogs})
+	}
+	for len(rebirthLogs) > 512 {
+		bc.logsFeed.Send(rebirthLogs[:512])
+		rebirthLogs = rebirthLogs[512:]
+	}
+	if len(rebirthLogs) > 0 {
+		bc.logsFeed.Send(rebirthLogs)
+	}
 
 	return nil
 }
