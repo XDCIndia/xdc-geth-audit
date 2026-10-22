@@ -80,11 +80,12 @@ func (x *XDPoS_v2) VerifyVoteMessage(chain consensus.ChainReader, vote *types.Vo
 
 // VoteHandler processes a vote message
 func (x *XDPoS_v2) VoteHandler(chain consensus.ChainReader, voteMsg *types.Vote) error {
-	x.lock.Lock()
-	defer x.lock.Unlock()
-
-	// Check round first (cheap), as voteHandler does.
-	if voteMsg.ProposedBlockInfo.Round != x.currentRound && voteMsg.ProposedBlockInfo.Round != x.currentRound+1 {
+	// Cheap round check under read lock before the expensive verify (#1665).
+	x.lock.RLock()
+	notInRange := voteMsg.ProposedBlockInfo.Round != x.currentRound &&
+		voteMsg.ProposedBlockInfo.Round != x.currentRound+1
+	x.lock.RUnlock()
+	if notInRange {
 		return &utils.ErrIncomingMessageRoundTooFarFromCurrentRound{
 			Type:          "vote",
 			IncomingRound: voteMsg.ProposedBlockInfo.Round,
@@ -92,25 +93,28 @@ func (x *XDPoS_v2) VoteHandler(chain consensus.ChainReader, voteMsg *types.Vote)
 		}
 	}
 
-	// Security fix (#92): verify a peer vote's signature BEFORE adding it to the pool.
-	// Without this check a malicious peer can flood the pool with syntactically valid
-	// but cryptographically invalid votes, causing unbounded memory growth (DoS).
-	// The node's own vote does not come through here: sendVote checks it against
-	// the voted block's epoch masternodes instead (#1457).
+	// Verify signature BEFORE taking the write lock (security fix #92, perf fix
+	// #1665).  VerifyVoteMessage needs only chain reads (snapshot + ECDSA); it
+	// does NOT need the consensus write lock.  Holding the write lock during
+	// ECDSA + snapshot lookup blocked YourTurn, Prepare, and
+	// FindParentBlockToAssign on the hot vote path.
 	verified, err := x.VerifyVoteMessage(chain, voteMsg)
 	if err != nil {
-		log.Warn("[voteHandler] Vote signature verification failed — dropping",
+		log.Warn("[VoteHandler] vote signature verification failed",
 			"blockNum", voteMsg.ProposedBlockInfo.Number,
 			"round", voteMsg.ProposedBlockInfo.Round,
 			"error", err)
 		return err
 	}
 	if !verified {
-		log.Warn("[voteHandler] Vote signature invalid or signer not in masternode set — dropping",
+		log.Warn("[VoteHandler] vote signer not in masternode set",
 			"blockNum", voteMsg.ProposedBlockInfo.Number,
 			"round", voteMsg.ProposedBlockInfo.Round)
 		return errors.New("vote signature not verified")
 	}
+
+	x.lock.Lock()
+	defer x.lock.Unlock()
 	return x.voteHandler(chain, voteMsg)
 }
 
@@ -365,6 +369,7 @@ func (x *XDPoS_v2) onVotePoolThresholdReached(chain consensus.ChainReader, poole
 	}
 
 	// Process QC
+	qcStart := time.Now()
 	if err := x.processQC(chain, quorumCert); err != nil {
 		log.Error("[onVotePoolThresholdReached] Failed to process QC", "error", err)
 		return err
@@ -373,7 +378,8 @@ func (x *XDPoS_v2) onVotePoolThresholdReached(chain consensus.ChainReader, poole
 	log.Info("Successfully created QC",
 		"round", quorumCert.ProposedBlockInfo.Round,
 		"signatures", len(quorumCert.Signatures),
-		"hash", quorumCert.ProposedBlockInfo.Hash)
+		"hash", quorumCert.ProposedBlockInfo.Hash,
+		"processQCDur", time.Since(qcStart))
 	return nil
 }
 

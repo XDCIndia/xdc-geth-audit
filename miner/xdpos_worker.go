@@ -590,6 +590,7 @@ func (w *XdcWorker) commitNewWork() {
 	// (If Prepare returned ErrNotReadyToPropose we do NOT mark it, allowing
 	// a retry once the QC advances and Prepare might succeed.)
 	w.lastParentBlockCommit = parentHex
+	mintStart := time.Now() // #1665: per-phase timing
 
 	// Detect epoch switch to decide whether to include transactions.
 	// Mirrors XDPoSChain worker.go:719-727; design Q5.
@@ -630,6 +631,16 @@ func (w *XdcWorker) commitNewWork() {
 			interrupt.Store(commitInterruptTimeout)
 		})
 		defer recommitTimer.Stop()
+
+		// XDPoS V2 soft gas cap (#1665): limit block gas so voters can
+		// re-execute the block before the round timeout.  The cap only
+		// reduces env.gasPool; the header.GasLimit is untouched, so the
+		// resulting block is fully valid.  At 21 000 gas/tx and a 100 M cap
+		// that is ~4 762 txs, keeping voter execution under ~1 s on a loaded
+		// node.  Zero (default) means no cap.
+		applyBlockVoteGasCap(env, w.miner.config.BlockVoteGasCap)
+
+		fillStart := time.Now()
 		if fillErr := w.miner.fillTransactions(ctx, interrupt, env); fillErr != nil {
 			if fillErr.Error() != errBlockInterruptedByTimeout.Error() {
 				log.Error("XDPoS2: fillTransactions failed", "err", fillErr)
@@ -637,6 +648,7 @@ func (w *XdcWorker) commitNewWork() {
 			}
 			// Timeout interrupt is normal — block is ready with what we have.
 		}
+		log.Debug("XDPoS2: fillTransactions", "block", header.Number, "txs", len(env.txs), "dur", time.Since(fillStart))
 	}
 
 	// Amsterdam: collect PostExecution BAL before Finalize (mirrors the
@@ -667,6 +679,7 @@ func (w *XdcWorker) commitNewWork() {
 		return
 	}
 	env.finalizeTRC21Fee()
+	finalizeStart := time.Now()
 	assembled, finErr := w.v2engine.Finalize(
 		chainReader, header, env.state, parentState,
 		env.txs, nil, env.receipts,
@@ -675,6 +688,7 @@ func (w *XdcWorker) commitNewWork() {
 		log.Error("XDPoS2: Finalize failed", "err", finErr, "block", header.Number)
 		return
 	}
+	log.Debug("XDPoS2: Finalize", "block", header.Number, "dur", time.Since(finalizeStart))
 
 	// Amsterdam: V2 Finalize calls types.NewBlock with no Withdrawals, so it
 	// sets WithdrawalsHash = nil. Rebuild the block with the filled header
@@ -691,6 +705,7 @@ func (w *XdcWorker) commitNewWork() {
 	// Seal: synchronous V2 seal writes header.Validator (ECDSA signature).
 	// Q7.2: worker does NOT pre-size or touch header.Validator.
 	// Pass w.quit as stop channel so we abort cleanly on shutdown.
+	sealStart := time.Now()
 	sealed, sealErr := w.v2engine.Seal(chainReader, assembled, w.quit)
 	if sealErr != nil {
 		if xdcSkipRound(sealErr) {
@@ -704,8 +719,10 @@ func (w *XdcWorker) commitNewWork() {
 		// quit was closed while Seal was running.
 		return
 	}
+	log.Debug("XDPoS2: Seal", "block", header.Number, "dur", time.Since(sealStart))
 
 	w.commitMinedBlock(sealed)
+	log.Debug("XDPoS2: mint complete", "block", header.Number, "totalDur", time.Since(mintStart), "txs", len(env.txs))
 }
 
 // makeMintEnv builds the execution environment for a block this node mints on
@@ -1189,4 +1206,17 @@ func xdcSkipRound(err error) bool {
 	return err == xdposutils.ErrNotReadyToMine ||
 		err == xdposutils.ErrNotReadyToPropose ||
 		err == xdposutils.ErrAlreadyMined
+}
+
+// applyBlockVoteGasCap makes the builder stop packing transactions into env
+// once their gas used reaches gasCap, when gasCap is non-zero and below the
+// header gas limit (#1665). header.GasLimit and the gas pool are unchanged, so
+// the block stays valid for every client, and a transaction that declares more
+// gas than the cap can still be included (shrinking the pool instead would
+// skip such a transaction, and its sender's later nonces, on every capped
+// validator). The cap is soft: the last transaction may take the block over it.
+func applyBlockVoteGasCap(env *environment, gasCap uint64) {
+	if gasCap > 0 && gasCap < env.header.GasLimit {
+		env.softGasCap = gasCap
+	}
 }

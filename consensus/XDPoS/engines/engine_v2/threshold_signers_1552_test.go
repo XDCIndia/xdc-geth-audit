@@ -171,8 +171,10 @@ func TestTimeoutGate_OneSignerManyEntries_1552(t *testing.T) {
 // Two distinct signers reach the threshold: exactly one TC, with 2 signatures.
 func TestTimeoutGate_DistinctSignersReachThreshold_1552(t *testing.T) {
 	eng, chain, keys, addrs, _ := setup1552(t)
+	// The head is its own epoch switch block, so getTCEpochInfo (round 5, in
+	// the head epoch) resolves the same cached entry.
 	eng.epochSwitches.Add(chain.head.Hash(), &types.EpochSwitchInfo{
-		Masternodes: addrs, MasternodesLen: len(addrs), EpochSwitchBlockInfo: &types.BlockInfo{Number: big.NewInt(0)},
+		Masternodes: addrs, MasternodesLen: len(addrs), EpochSwitchBlockInfo: &types.BlockInfo{Number: big.NewInt(0), Hash: chain.head.Hash()},
 	})
 	for i := 0; i < 2; i++ {
 		if err := eng.timeoutHandler(chain, timeout1552(t, eng, keys[0], addrs, 5)); err != nil {

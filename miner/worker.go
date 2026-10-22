@@ -95,11 +95,36 @@ type environment struct {
 	revertedIdx []uint32
 
 	witness *stateless.Witness
+
+	// softGasCap (XDC, --miner.blockvotegascap, #1665) stops packing once the
+	// gas used reaches it. It does not shrink gasPool, so a transaction whose
+	// declared gas exceeds the cap is still eligible and its sender is not
+	// stalled. Zero means no cap.
+	softGasCap uint64
+
+	// signingTxCount (XDC, F-2026-19467) counts the 0x89 BlockSigners signing
+	// transactions committed so far. Signing txs bypass the gas pool, so
+	// softGasCap and pool-depletion checks do not bound them; only txFitsSize
+	// bounds them by raw block size (~30 000 at 8 MiB). The per-block cap
+	// maxSigningTxsPerBlock keeps that under 2 × MaxMasternodesV2.
+	signingTxCount int
 }
 
 // txFitsSize reports whether the transaction fits into the block size limit.
 func (env *environment) txFitsSize(tx *types.Transaction) bool {
 	return env.size+tx.Size() < params.MaxBlockSize-maxBlockSizeBufferZone
+}
+
+// maxSigningTxsPerBlock returns the producer-side cap on 0x89 BlockSigners
+// signing transactions per block. It is set to twice the chain's
+// MaxMasternodesV2 (mainnet: 108 × 2 = 216) so every masternode can sign and
+// there is room for any future masternode-set expansion, while keeping the cap
+// far below what txFitsSize alone would allow (~30 000 txs at 8 MiB).
+func maxSigningTxsPerBlock(cfg *params.ChainConfig) int {
+	if cfg != nil && cfg.XDPoS != nil && cfg.XDPoS.MaxMasternodesV2 > 0 {
+		return 2 * cfg.XDPoS.MaxMasternodesV2
+	}
+	return 256 // non-XDC chains: generous fallback
 }
 
 // discard terminates the background threads before discarding it.
@@ -429,6 +454,10 @@ func (miner *Miner) commitTransaction(ctx context.Context, env *environment, tx 
 	env.receipts = append(env.receipts, receipt)
 	env.size += tx.Size()
 	env.tcount++
+	// Track committed signing txs for the per-block cap (F-2026-19467).
+	if core.RouteTransaction(miner.chainConfig, env.header.Number, tx) == core.TxRouteSign {
+		env.signingTxCount++
+	}
 	env.bal.Merge(bal)
 	return nil
 }
@@ -551,6 +580,11 @@ func (miner *Miner) commitTransactions(ctx context.Context, env *environment, pl
 			log.Trace("Not enough gas for further transactions", "have", env.gasPool, "want", minTxGas)
 			break
 		}
+		// XDC: stop once the soft per-block cap is reached (#1665).
+		if env.softGasCap > 0 && env.gasPool.Used() >= env.softGasCap {
+			log.Trace("Soft block gas cap reached", "used", env.gasPool.Used(), "cap", env.softGasCap)
+			break
+		}
 		// If we don't have enough blob space for any further blob transactions,
 		// skip that list altogether
 		if !blobTxs.Empty() && env.blobs >= miner.maxBlobsPerBlock(env.header.Time) {
@@ -636,6 +670,17 @@ func (miner *Miner) commitTransactions(ctx context.Context, env *environment, pl
 			}
 			if signed := new(big.Int).SetBytes(data[4:36]).Uint64(); signed >= env.header.Number.Uint64() {
 				log.Trace("Ignoring signing transaction for a future block", "hash", ltx.Hash, "signed", signed, "number", env.header.Number)
+				txs.Pop()
+				continue
+			}
+			// Cap signing txs per block at 2 × MaxMasternodesV2 (mainnet: 216).
+			// Signing txs bypass the gas pool so softGasCap and pool-depletion
+			// checks cannot bound them; txFitsSize alone allows ~30 000 at 8 MiB.
+			// This limit stops padding by spam accounts while leaving 2× headroom
+			// above the masternode ceiling for any legitimate signing burst
+			// (F-2026-19467). Import is not affected.
+			if env.signingTxCount >= maxSigningTxsPerBlock(miner.chainConfig) {
+				log.Trace("Signing tx per-block cap reached, skipping", "hash", ltx.Hash, "count", env.signingTxCount)
 				txs.Pop()
 				continue
 			}
@@ -750,18 +795,25 @@ func (miner *Miner) fillTransactions(ctx context.Context, interrupt *atomic.Int3
 	return nil
 }
 
-// splitSpecialTxs moves the special txs out of pending, keeping each account's
-// nonce order, and returns them. Accounts left without txs are removed.
+// splitSpecialTxs moves leading special txs (0x89/0x90) out of pending and
+// returns them for priority commit.  Only the uninterrupted run of special txs
+// at the front of each account's nonce queue is moved; a special tx that sits
+// behind a paid nonce is kept in pending so newTxWithMinerFee can include it
+// via Shift after the paid tx is committed (F-2026-19727).
+// Accounts left without txs are removed from pending.
 func splitSpecialTxs(pending map[common.Address][]*txpool.LazyTransaction) map[common.Address][]*txpool.LazyTransaction {
 	special := make(map[common.Address][]*txpool.LazyTransaction)
 	for from, txs := range pending {
 		var normal []*txpool.LazyTransaction
 		for _, ltx := range txs {
-			if tx := ltx.Resolve(); tx != nil && tx.IsSpecialTransaction() {
-				special[from] = append(special[from], ltx)
-			} else {
-				normal = append(normal, ltx)
+			if len(normal) == 0 {
+				// Still in the leading special-tx prefix for this account.
+				if tx := ltx.Resolve(); tx != nil && tx.IsSpecialTransaction() {
+					special[from] = append(special[from], ltx)
+					continue
+				}
 			}
+			normal = append(normal, ltx)
 		}
 		if len(normal) == 0 {
 			delete(pending, from)

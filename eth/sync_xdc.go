@@ -21,6 +21,7 @@ import (
 	"github.com/ethereum/go-ethereum/consensus"
 	"github.com/ethereum/go-ethereum/consensus/XDPoS"
 	"github.com/ethereum/go-ethereum/consensus/XDPoS/engines/engine_v2"
+	xdcutils "github.com/ethereum/go-ethereum/consensus/XDPoS/utils"
 	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/core/types"
@@ -30,6 +31,7 @@ import (
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/rlp"
+	"github.com/ethereum/go-ethereum/trie"
 )
 
 // snapsyncExperimentalEnv is the double-opt-in env var. Even with
@@ -124,6 +126,11 @@ const (
 	// that put us on the fork, post-rollback sync immediately re-imports the
 	// same fork-side block. Issue #802 task 2 — geth-aligned peer rotation.
 	xdcForkTaintTTL = 60 * time.Second
+
+	// maxConsensusFailedBlocks caps the consensusFailedBlocks map to prevent
+	// unbounded growth in the pathological case where many distinct bad blocks
+	// arrive. 256 entries is far more than needed in practice. Fixes #1670.
+	maxConsensusFailedBlocks = 256
 
 	// Snap-sync state machine thresholds (refs #807 Phase 3b).
 	//
@@ -222,15 +229,31 @@ type xdcSyncer struct {
 	// for the same fromBlock xdcUnknownAncestorThreshold times in a row, we
 	// infer the local tip is on a non-canonical competing-slot block and
 	// roll back. Tracked here so syncOnce stays stateless except for failures.
-	stuckFrom       uint64 // fromBlock that's been failing
-	stuckFailures   int    // consecutive InsertChain failures at stuckFrom
-	stuckRolledBack uint64 // cumulative rollback in current stuck-period
+	stuckFrom             uint64 // fromBlock that's been failing
+	stuckFailures         int    // consecutive InsertChain failures at stuckFrom
+	stuckRolledBack       uint64 // cumulative rollback in current stuck-period
+	stuckLastRollbackHead uint64 // head height at last rollback; resets window when chain advances past it
+	// singlePeerForkHead is the head hash at which only the triggering peer
+	// disagreed and no other peer was conclusive. The rollback is deferred once;
+	// a second such episode at the same head confirms the fork.
+	singlePeerForkHead common.Hash
 
 	// Fork-tainted peers: those that delivered the block leading to a rollback.
 	// Excluded from rankedPeers() for xdcForkTaintTTL so post-rollback bulk-sync
 	// picks a different peer instead of re-importing the same fork.
 	forkTaintedMu sync.Mutex
 	forkTainted   map[string]time.Time
+
+	// consensusFailedBlocksMu protects consensusFailedBlocks.
+	consensusFailedBlocksMu sync.Mutex
+	// consensusFailedBlocks is the set of block hashes that failed InsertChain
+	// with a definitive consensus error (not ErrUnknownAncestor, not ErrFutureBlock).
+	// Peers whose header batch starts with one of these hashes are on a fork with
+	// an invalid block; they must not be treated as "ahead of us". Checked in
+	// fetchHeadersParallel to discard such batches before they reach InsertChain.
+	// Bounded to maxConsensusFailedBlocks to prevent unbounded growth.
+	// Fixes #1670.
+	consensusFailedBlocks map[common.Hash]struct{}
 
 	// Snap-sync phase state (refs #807 Phase 3b). Default phaseFullSync;
 	// transitions only when ConfigSyncMode == SnapSync AND a sizeable
@@ -388,6 +411,34 @@ func newXDCSyncer(h *handler) *xdcSyncer {
 	}
 }
 
+// atTipFreshnessWindow returns the maximum age (in seconds) a local head may
+// have while the node still considers itself at the chain tip.
+//
+// On XDPoS V2 chains a leader-gap rotation can leave the head stale by up to
+// TimeoutPeriod×TimeoutSyncThreshold+MinePeriod seconds — ≈182 s on mainnet
+// (60 s × 3 + 2 s). A node that restarted mid-gap has a head that old but IS
+// genuinely at tip. The floor of 30 s preserves the original behaviour for V1
+// chains and for any V2 chain whose config is not yet available. Refs #1674.
+func atTipFreshnessWindow(cfg *params.ChainConfig) int64 {
+	const floor = int64(30)
+	if cfg == nil || cfg.XDPoS == nil || cfg.XDPoS.V2 == nil {
+		return floor
+	}
+	v2cfg := cfg.XDPoS.V2.CurrentConfig
+	if v2cfg == nil || v2cfg.TimeoutPeriod <= 0 {
+		return floor
+	}
+	tst := v2cfg.TimeoutSyncThreshold
+	if tst <= 0 {
+		tst = 1
+	}
+	budget := int64(v2cfg.TimeoutPeriod)*int64(tst) + int64(v2cfg.MinePeriod)
+	if budget < floor {
+		return floor
+	}
+	return budget
+}
+
 func (s *xdcSyncer) start() {
 	// XDC: enable bulk-sync optimization for the duration of initial sync.
 	// When true: signing-tx ECDSA recovery skipped, larger TriesInMemory
@@ -448,6 +499,15 @@ func (s *xdcSyncer) loop() {
 			if phase == phaseTipCatch || phase == phaseFullSync {
 				maxPeerHead := uint64(0)
 				for _, p := range s.handler.peers.all() {
+					// #1674: XDPOS2 peers (version==100) never receive
+					// BlockRangeUpdate — their BlockRange().LatestBlock holds
+					// the handshake Total Difficulty, not a block number. Using
+					// it as a block number makes peerAtTip always false on XDPoS
+					// V2 networks (TD ≫ head height), so skip them here and rely
+					// solely on headFresh for the at-tip signal.
+					if p.Version() == eth.XDPOS2 {
+						continue
+					}
 					rng := p.BlockRange()
 					if rng != nil && rng.LatestBlock > maxPeerHead {
 						maxPeerHead = rng.LatestBlock
@@ -466,16 +526,23 @@ func (s *xdcSyncer) loop() {
 				// Legacy XDPoSChain peers speak xpos2/100 and do NOT send the
 				// eth/69 BlockRangeUpdate, so maxPeerHead is 0 when all peers are
 				// legacy V1 nodes — peerAtTip can never fire. But if the local head
-				// block's timestamp is within headFreshnessSecs of now, we ARE
+				// block's timestamp is within the freshness window of now, we ARE
 				// importing current blocks (at tip); during genuine bulk historical
 				// sync the head timestamp is hours/days old, so this cannot
 				// false-trigger. This is what lets a modern producer peering only
 				// with legacy nodes release bulk-mode and seal.
-				const headFreshnessSecs = 30
+				//
+				// #1674: fixed 30 s is too small for XDPoS V2 chains with 60 s
+				// timeout periods. A node at tip during a leader-gap rotation can
+				// have a head that is TimeoutPeriod×TimeoutSyncThreshold+MinePeriod
+				// seconds old (≈182 s on mainnet) and still be genuinely at tip.
+				// Use the V2 timeout budget as the freshness window (floor 30 s so
+				// V1-only and unconfigured chains keep the original behaviour).
+				freshnessSecs := atTipFreshnessWindow(s.handler.chain.Config())
 				headFresh := false
 				if head := s.handler.chain.CurrentBlock(); head != nil {
 					age := time.Now().Unix() - int64(head.Time)
-					headFresh = age >= 0 && age <= headFreshnessSecs
+					headFresh = age >= 0 && age <= freshnessSecs
 				}
 
 				atTip := peerAtTip || headFresh
@@ -2385,28 +2452,68 @@ func (s *xdcSyncer) fullSyncOnce() {
 	if err != nil {
 		log.Warn("xdcSyncer: InsertChain failed",
 			"from", fromBlock, "attempted", len(blocks), "inserted", n, "err", err)
-		// #952 Option B: if the advertised NEXT block (at/just above our head) is
-		// persistently INVALID — a consensus-validation error, NOT a missing parent
-		// (ErrUnknownAncestor) — then the network is feeding bad blocks above our
-		// canonical tip and WE are at the valid tip. The at-tip XdcBulkSyncMode clear
-		// (#190) requires 3 consecutive at-tip heartbeats and never accumulates them
-		// under peer churn / a stale head when the chain is halted, so the miner stays
-		// gated forever. Clear XdcBulkSyncMode here so the producer can seal the valid
-		// successor and unwedge the chain (e.g. apothem halted at 83,088,791 by an
-		// out-of-bound 420M gas limit above our 419,589,845 head — #952). NON-MAINNET
-		// only: mainnet must never relax on a validation error. Guard on the peer being
-		// at the tip: fromBlock is always head+1, so it cannot tell "at tip" from "far
-		// behind" (#1427). A short header batch can: the peer has nothing past it, so
-		// the invalid block really sits at the network tip.
-		if !errors.Is(err, consensus.ErrUnknownAncestor) &&
-			!errors.Is(err, consensus.ErrFutureBlock) && // early, not invalid: retried next tick
-			s.handler.chain.Config().ChainID != nil &&
-			s.handler.chain.Config().ChainID.Uint64() != 50 {
-			if cur := s.handler.chain.CurrentBlock(); cur != nil && len(res.headers) < xdpos2MaxHeaderFetch {
-				if core.XdcBulkSyncMode.Load() {
-					log.Warn("xdcSyncer: #952 next block invalid at tip — clearing XdcBulkSyncMode so miner can seal the valid successor",
-						"from", fromBlock, "head", cur.Number.Uint64(), "err", err)
-					core.XdcBulkSyncMode.Store(false)
+		// #1670 / #952: if the delivering peer's block fails with a definitive
+		// consensus error (not ErrUnknownAncestor — missing parent; not
+		// ErrFutureBlock — early; not a transient local error such as a missing
+		// trie node or an already-known block), taint the peer to break the
+		// chainmu starvation loop.
+		//
+		// Root cause of #1670: the bad peer was never tainted, so rankedPeers()
+		// kept selecting it. Each selection held blockchain.chainmu for the
+		// duration of block execution (proportional to gas used in the block).
+		// The miner's commitMinedBlock→InsertChain calls TryLock — not Lock —
+		// and returned errChainStopped every time, so no valid successor block
+		// was ever produced. Tainting the peer lets rankedPeers() exclude it;
+		// subsequent cycles find no peer above us and the miner's TryLock wins.
+		//
+		// ONLY trigger on definitively invalid blocks (isDefinitiveInvalidBlockError).
+		// A missing trie node or an already-known block are OUR problem, not the
+		// peer's; tainting an honest peer for our own state gap silently forks us.
+		// ErrUnknownAncestor, ErrFutureBlock, ErrKnownBlock, MissingNodeError,
+		// errChainStopped, context errors, and I/O errors are all absent from the
+		// allowlist and return false — no taint, no bulk-mode change.
+		if isDefinitiveInvalidBlockError(err) {
+			// Taint on any chain: the chainmu-starvation problem is not specific
+			// to mainnet. Taint expires after xdcForkTaintTTL (60 s).
+			s.taintPeer(peer)
+
+			isMainnet := s.handler.chain.Config().ChainID != nil &&
+				s.handler.chain.Config().ChainID.Uint64() == 50
+			if !isMainnet {
+				// Hash blacklist: record the first failing block so
+				// fetchHeadersParallel can discard it even after the taint
+				// expires. NOT applied on mainnet — a local parity bug must not
+				// permanently blacklist a canonical block and split the node off.
+				if n < len(blocks) {
+					s.markConsensusFailedBlock(blocks[n].Hash())
+				}
+				// #952: clear XdcBulkSyncMode so the miner can seal the valid
+				// successor. "Mainnet must never relax on a validation error"
+				// (#952) — guard preserved.
+				// Two at-tip signals (#952 / #1427 / Hacken F-2026-19724):
+				//   (a) headFresh: the local head's timestamp is within the
+				//       atTipFreshnessWindow. This is local state — a peer
+				//       cannot influence it. A node far behind has a stale
+				//       head (hours old) and cannot pass this check regardless
+				//       of the peer's batch length. Replaces the old short-
+				//       batch check (len < 192), which was peer-controlled:
+				//       a malicious peer could return one invalid block and
+				//       clear bulk mode on a far-behind non-mainnet node.
+				//   (b) allNonTaintedPeersKnownBad: every remaining non-tainted
+				//       peer's head hash is in consensusFailedBlocks — handles
+				//       the multi-peer long-fork case where headFresh is false
+				//       but all valid-looking peers have bad heads.
+				if cur := s.handler.chain.CurrentBlock(); cur != nil {
+					freshnessSecs := atTipFreshnessWindow(s.handler.chain.Config())
+					age := time.Now().Unix() - int64(cur.Time)
+					headFresh := age >= 0 && age <= freshnessSecs
+					atTip := headFresh || s.allNonTaintedPeersKnownBad()
+					if atTip && core.XdcBulkSyncMode.Load() {
+						log.Warn("xdcSyncer: #1670 block invalid at peer head — tainting peer and clearing XdcBulkSyncMode so miner can seal the valid successor",
+							"peer", peer.ID(), "from", fromBlock,
+							"batch", len(res.headers), "err", err)
+						core.XdcBulkSyncMode.Store(false)
+					}
 				}
 			}
 		}
@@ -2893,18 +3000,46 @@ func (s *xdcSyncer) maybeRollbackOnUnknownAncestor(fromBlock uint64, peer *eth.P
 		return
 	}
 	if fromBlock != s.stuckFrom {
+		// A failure at a new height means the head moved since the last one, so
+		// we are not stuck on a fork: drop any pause raised for the old height.
+		// The flag was otherwise cleared only by a successful syncer batch, and a
+		// live validator gets most blocks by propagation, so it could stay set
+		// and silently skip every turn (Apothem 0x11C3 minted 4 blocks in an
+		// epoch and was penalised).
 		s.stuckFrom = fromBlock
 		s.stuckFailures = 1
+		core.XdcForkRecovering.Store(false)
 		return
 	}
 	s.stuckFailures++
-	// #951: signal the miner to pause sealing while we're fork-side. Set as soon
-	// as failures begin accumulating (before the rollback threshold) so a
-	// producer doesn't keep minting on the orphaned tip and recreate the fork.
-	core.XdcForkRecovering.Store(true)
+	// #951: signal the miner to pause sealing while we're fork-side, before the
+	// rollback threshold, so a producer doesn't keep minting on the orphaned tip
+	// and recreate the fork. Wait for half the threshold at the same height: a
+	// live validator sees 1-3 transient failures at most heights (propagation
+	// races), and pausing on the second one made it skip its turns. A real fork
+	// still repeats every ~0.5 s and reaches this within ~2 s.
+	if s.stuckFailures >= xdcUnknownAncestorThreshold/2 {
+		core.XdcForkRecovering.Store(true)
+	}
 	if s.stuckFailures < xdcUnknownAncestorThreshold {
 		return
 	}
+	cur := s.handler.chain.CurrentBlock()
+	if cur == nil {
+		return
+	}
+
+	// Reset window escalation once the chain has advanced past the head we had
+	// when we last rolled back — the previous stuck episode resolved, so the
+	// doubling counter should start fresh.  Must happen before computing window
+	// so the reset takes effect for the current trigger (refs #1667 accounting fix).
+	if s.stuckLastRollbackHead > 0 && cur.Number.Uint64() > s.stuckLastRollbackHead {
+		log.Debug("xdcSyncer: chain advanced past last rollback head — resetting rollback window",
+			"lastRollbackHead", s.stuckLastRollbackHead, "curHead", cur.Number.Uint64())
+		s.stuckRolledBack = 0
+		s.stuckLastRollbackHead = 0
+	}
+
 	if s.stuckRolledBack >= xdcRollbackWindowMax {
 		log.Error("xdcSyncer: stuck on fork past rollback cap — manual intervention required",
 			"from", fromBlock, "rolledBack", s.stuckRolledBack,
@@ -2916,20 +3051,148 @@ func (s *xdcSyncer) maybeRollbackOnUnknownAncestor(fromBlock uint64, peer *eth.P
 	if window+s.stuckRolledBack > xdcRollbackWindowMax {
 		window = xdcRollbackWindowMax - s.stuckRolledBack
 	}
-	cur := s.handler.chain.CurrentBlock()
-	if cur == nil || cur.Number.Uint64() <= window {
+	if cur.Number.Uint64() <= window {
 		return
 	}
+
 	target := cur.Number.Uint64() - window
+
+	// Items 2+3 (#1667): Positive fork evidence — only roll back when at least
+	// one peer reports a different canonical hash at our head height.
+	//
+	// Strategy:
+	//   1. Ask the triggering peer.  If it agrees on our head hash the failures
+	//      were transient (out-of-order delivery under 2K TPS load) — clear and
+	//      return.  If it disagrees, fork is confirmed.
+	//   2. If the triggering peer times out or is behind our head (inconclusive),
+	//      poll ranked peers in turn.  First conclusive answer wins: agree →
+	//      clear+return, disagree → confirmed.
+	//   3. If no peer gives a conclusive answer, skip the rollback entirely and
+	//      log at Debug — the inconclusive path under load must not trigger
+	//      spurious SetHead calls (refs #1667 network-load fix).
+	clearAndReturn := func(reason, peerID string) {
+		log.Debug("xdcSyncer: "+reason,
+			"head", cur.Number.Uint64(), "hash", cur.Hash(), "peer", peerID)
+		s.stuckFrom = 0
+		s.stuckFailures = 0
+		core.XdcForkRecovering.Store(false)
+	}
+
+	forkConfirmed := false
+	triggerDisagrees := false
+	if peer != nil {
+		peerAtHead := s.fetchHeaderBatchTimeout(peer, cur.Number.Uint64(), 1, xdcBulkReqTimeout)
+		if len(peerAtHead) > 0 && peerAtHead[0].Number.Uint64() == cur.Number.Uint64() {
+			if peerAtHead[0].Hash() == cur.Hash() {
+				clearAndReturn("peer agrees on head — ErrUnknownAncestor was transient (refs #1667)", peer.ID())
+				return
+			}
+			triggerDisagrees = true // triggering peer sees a different block at our height
+		}
+		// else: inconclusive — peer timed out or is behind our head
+	}
+
+	if !forkConfirmed {
+		// Consult ranked peers: when the triggering peer was nil or inconclusive,
+		// or when it disagrees with our head. A single peer on another branch (a
+		// stale pre-fork chain, a non-canonical third-party client) must not roll
+		// back a node that the rest of the network agrees with: on Apothem one such
+		// peer forced a rollback plus a 60 s mint cooldown every ~23 blocks, and the
+		// validator missed its turn each time. If another peer agrees with our head,
+		// taint the triggering peer and keep the head.
+		for _, altPeer := range s.rankedPeers() {
+			if altPeer == peer || s.isPeerTainted(altPeer.ID()) {
+				continue
+			}
+			altHdrs := s.fetchHeaderBatchTimeout(altPeer, cur.Number.Uint64(), 1, xdcBulkReqTimeout)
+			if len(altHdrs) == 0 || altHdrs[0].Number.Uint64() != cur.Number.Uint64() {
+				continue // inconclusive
+			}
+			if altHdrs[0].Hash() == cur.Hash() {
+				if triggerDisagrees {
+					s.taintPeer(peer)
+					log.Warn("xdcSyncer: triggering peer is on another branch but an alt peer agrees on our head — tainting peer, no rollback",
+						"head", cur.Number.Uint64(), "hash", cur.Hash(), "peer", peer.ID(), "altPeer", altPeer.ID())
+				}
+				clearAndReturn("alt peer agrees on head — ErrUnknownAncestor was transient (refs #1667)", altPeer.ID())
+				return
+			}
+			forkConfirmed = true
+			break
+		}
+		// No other peer was conclusive. Right after a new head, alt peers often
+		// do not have it yet, so a single peer on a side branch rolled back a
+		// canonical head every few minutes on Apothem (60 s mint cooldown each).
+		// Defer once and re-check at the next episode; if the head has not moved
+		// and still only the triggering peer is conclusive, trust it (e.g. a node
+		// with a single peer).
+		if !forkConfirmed && triggerDisagrees {
+			if s.singlePeerForkHead == cur.Hash() {
+				forkConfirmed = true
+			} else {
+				s.singlePeerForkHead = cur.Hash()
+				clearAndReturn("only the triggering peer disagrees and no other peer is conclusive — deferring rollback to the next episode", peer.ID())
+				return
+			}
+		}
+	}
+
+	if !forkConfirmed {
+		log.Debug("xdcSyncer: no peer gave conclusive fork evidence — skipping rollback (inconclusive under load) (refs #1667)",
+			"head", cur.Number.Uint64(), "hash", cur.Hash(), "failedFrom", fromBlock)
+		s.stuckFrom = 0
+		s.stuckFailures = 0
+		core.XdcForkRecovering.Store(false)
+		return
+	}
+
+	// Item 1 (#1667, revised): Finality clamp — clamp the rollback target to
+	// the last committed (QC-finalized) block rather than skipping the rollback.
+	//
+	// On XDPoS V2 the committed tip trails head by only ~3 rounds, far less than
+	// the 128-block window, so a plain "skip if target ≤ finalized" would
+	// disable #801/#802/#951 fork recovery on every V2 trigger.  A real BFT fork
+	// can only exist above the committed tip; clamping is both safe and sufficient.
+	// When CurrentFinalBlock is nil (V1 era / no commits yet) keep existing
+	// unclamped behaviour.
+	if finalized := s.handler.chain.CurrentFinalBlock(); finalized != nil {
+		finalN := finalized.Number.Uint64()
+		if target < finalN {
+			log.Debug("xdcSyncer: clamping rollback target to finalized block (refs #1667)",
+				"unclamped", target, "finalized", finalN,
+				"localHead", cur.Number.Uint64(), "window", window)
+			target = finalN
+		}
+		// After clamping, if target is at or above the current head there is
+		// nothing to roll back.  Clear stuck state and miner gate instead.
+		if target >= cur.Number.Uint64() {
+			log.Warn("xdcSyncer: rollback target at or above head after finality clamp — clearing stuck state (refs #1667)",
+				"target", target, "localHead", cur.Number.Uint64())
+			core.XdcForkRecovering.Store(false)
+			s.stuckFrom = 0
+			s.stuckFailures = 0
+			return
+		}
+	}
+
+	// Real competing-slot fork confirmed.  Proceed with taint + rollback.
 	// Mark this peer as fork-tainted so rankedPeers() skips them for xdcForkTaintTTL.
 	// This is the geth-aligned peer rotation that prevents post-rollback bulk-sync
 	// from re-importing the same fork via the same peer (issue #802 task 2).
-	s.taintPeer(peer)
+	// Guard nil: when forkConfirmed came from an alt-peer and the triggering peer
+	// disconnected mid-check, peer may be nil.
+	taintedPeerID := ""
+	if peer != nil {
+		s.taintPeer(peer)
+		taintedPeerID = peer.ID()
+	}
+	actual := cur.Number.Uint64() - target // actual distance moved, not the intended window
 	log.Warn("xdcSyncer: fork detected — rolling back to escape competing-slot block (refs #801)",
 		"localHead", cur.Number.Uint64(), "localHash", cur.Hash(),
 		"failedFrom", fromBlock, "consecutiveFailures", s.stuckFailures,
-		"rollbackTo", target, "window", window, "cumulative", s.stuckRolledBack+window,
-		"taintedPeer", peer.ID(),
+		"rollbackTo", target, "window", window, "actual", actual,
+		"cumulative", s.stuckRolledBack+actual,
+		"taintedPeer", taintedPeerID,
 		"trigger", err.Error())
 	if err := s.handler.chain.SetHead(target); err != nil {
 		log.Error("xdcSyncer: SetHead failed during rollback", "target", target, "err", err)
@@ -2940,7 +3203,13 @@ func (s *xdcSyncer) maybeRollbackOnUnknownAncestor(fromBlock uint64, peer *eth.P
 	// this, the miner re-mints its superseded in-turn block the instant it re-reaches
 	// the contested height, recreating the fork (head bounced 143↔784, never past 785).
 	core.XdcLastForkRollbackUnix.Store(time.Now().Unix())
-	s.stuckRolledBack += window
+	// Accounting fix (#1667): add the ACTUAL blocks rolled back (cur − target), not
+	// the intended window.  Under V2 finality clamp the actual distance is typically
+	// only 3-4 blocks while the window is 128+; using window caused stuckRolledBack
+	// to hit xdcRollbackWindowMax after a handful of tiny rollbacks, permanently
+	// stalling an otherwise-healthy node.
+	s.stuckRolledBack += actual
+	s.stuckLastRollbackHead = cur.Number.Uint64()
 	s.stuckFrom = 0
 	s.stuckFailures = 0
 }
@@ -2978,6 +3247,158 @@ func (s *xdcSyncer) isPeerTainted(peerID string) bool {
 		return true
 	}
 	return false
+}
+
+// isDefinitiveInvalidBlockError reports whether err from InsertChain proves
+// that the block itself is invalid — not a local state gap, a liveness
+// failure, or a transient condition. Uses an explicit allowlist: only errors
+// known to originate from VerifyHeader, VerifyBody, or ValidateState checks
+// are considered definitive. Everything else (ErrUnknownAncestor,
+// ErrFutureBlock, ErrKnownBlock, MissingNodeError, errChainStopped,
+// errInsertionInterrupted, context errors, I/O errors) returns false — the
+// peer is not tainted for our own failures.
+//
+// Call sites use errors.Is where the sentinel is exported. Unexported
+// engine_v1 sentinels are matched by their fixed Error() strings; format
+// errors from block_validator.go (no sentinel) are matched by string prefix,
+// annotated with the source file:line.
+func isDefinitiveInvalidBlockError(err error) bool {
+	if err == nil {
+		return false
+	}
+	// A missing trie node means our own state is incomplete, not that the block
+	// is invalid. block_validator.go:251 wraps statedb.Error() (which may be a
+	// MissingNodeError) inside "invalid merkle root" via %w — check first so
+	// the merkle-root prefix match below is not reached for that case.
+	var missing *trie.MissingNodeError
+	if errors.As(err, &missing) {
+		return false
+	}
+
+	// Typed sentinels (errors.Is unwraps chains).
+
+	// consensus/errors.go
+	if errors.Is(err, consensus.ErrInvalidNumber) ||
+		errors.Is(err, consensus.ErrInvalidTerminalBlock) {
+		return true
+	}
+	// consensus/XDPoS/xdpos.go
+	if errors.Is(err, XDPoS.ErrInvalidTimestamp) ||
+		errors.Is(err, XDPoS.ErrInvalidCheckpointValidators) {
+		return true
+	}
+	// consensus/XDPoS/utils/errors.go — V2 errors
+	if errors.Is(err, xdcutils.ErrInvalidQC) ||
+		errors.Is(err, xdcutils.ErrInvalidQCSignatures) ||
+		errors.Is(err, xdcutils.ErrInvalidTC) ||
+		errors.Is(err, xdcutils.ErrInvalidTCSignatures) ||
+		errors.Is(err, xdcutils.ErrInvalidVote) ||
+		errors.Is(err, xdcutils.ErrInvalidTimeout) ||
+		errors.Is(err, xdcutils.ErrInvalidUncleHash) ||
+		errors.Is(err, xdcutils.ErrInvalidDifficulty) ||
+		errors.Is(err, xdcutils.ErrInvalidV2Extra) ||
+		errors.Is(err, xdcutils.ErrInvalidQuorumCert) ||
+		errors.Is(err, xdcutils.ErrInvalidTimestamp) ||
+		errors.Is(err, xdcutils.ErrRoundInvalid) ||
+		errors.Is(err, xdcutils.ErrInvalidCheckpointVote) ||
+		errors.Is(err, xdcutils.ErrEmptyEpochSwitchValidators) ||
+		errors.Is(err, xdcutils.ErrInvalidMixDigest) ||
+		errors.Is(err, xdcutils.ErrInvalidSignature) ||
+		errors.Is(err, xdcutils.ErrNoValidatorSignatureV2) {
+		return true
+	}
+	// consensus/XDPoS/utils/errors.go — V1 engine errors (exported there even
+	// though engine_v1/engine.go may carry private copies with identical strings)
+	if errors.Is(err, xdcutils.ErrInvalidCheckpointBeneficiary) ||
+		errors.Is(err, xdcutils.ErrMissingVanity) ||
+		errors.Is(err, xdcutils.ErrMissingSignature) ||
+		errors.Is(err, xdcutils.ErrExtraSigners) ||
+		errors.Is(err, xdcutils.ErrInvalidCheckpointPenalties) ||
+		errors.Is(err, xdcutils.ErrInvalidVotingChain) ||
+		errors.Is(err, xdcutils.ErrUnauthorized) ||
+		errors.Is(err, xdcutils.ErrInvalidCheckpointSigners) ||
+		errors.Is(err, xdcutils.ErrFailedDoubleValidation) {
+		return true
+	}
+
+	// String-matched errors: fmt.Errorf format strings without exported
+	// sentinels, and engine_v1 private sentinel strings that cannot be reached
+	// via errors.Is from outside the package.
+	msg := err.Error()
+
+	// engine_v1/engine.go private ErrUnauthorized — identical string to
+	// xdcutils.ErrUnauthorized but a separate errors.New instance; the
+	// errors.Is check above catches the utils copy, this catches the private one.
+	if msg == "unauthorized" {
+		return true
+	}
+
+	// fmt.Errorf format errors from consensus engines (no exported sentinel):
+	//   ethash/consensus.go: "invalid difficulty: have %v, want %v"
+	//   engine_v1/engine.go: "invalid difficulty" (same prefix, private sentinel)
+	//   engine_v1/engine.go: "invalid timestamp" (same prefix as utils sentinel)
+	return strings.HasPrefix(msg, "invalid difficulty") || // ethash + engine_v1
+		strings.HasPrefix(msg, "invalid timestamp") || // engine_v1 (also utils via errors.Is above)
+		// core/block_validator.go ValidateState (no sentinel):
+		strings.HasPrefix(msg, "invalid merkle root") || // block_validator.go:251 (%w, MissingNode excluded above)
+		strings.HasPrefix(msg, "invalid gas used") || // block_validator.go:203
+		strings.HasPrefix(msg, "invalid bloom") || // block_validator.go:210
+		strings.HasPrefix(msg, "invalid receipt root hash") || // block_validator.go:220
+		// core/block_validator.go ValidateBody (no sentinel):
+		strings.HasPrefix(msg, "uncle root hash mismatch") || // block_validator.go:69
+		strings.HasPrefix(msg, "transaction root hash mismatch") // block_validator.go:72
+}
+
+// allNonTaintedPeersKnownBad returns true if every non-tainted peer's
+// advertised head hash is in consensusFailedBlocks. When true, no valid peer
+// is advertising a head above ours that we should sync to — the bad peer we
+// just tainted was the last one with a valid-looking head. Used to clear
+// XdcBulkSyncMode in the multi-peer long-fork case (len ≥ 192) where the
+// short-batch #1427 guard alone is insufficient.
+//
+// Returns false when there are no non-tainted peers, to avoid the degenerate
+// case where all peers are tainted for unrelated reasons (we might genuinely
+// be far behind).
+func (s *xdcSyncer) allNonTaintedPeersKnownBad() bool {
+	peers := s.rankedPeers() // excludes tainted peers
+	if len(peers) == 0 {
+		return false // all peers tainted — can't conclude we're at canonical tip
+	}
+	for _, p := range peers {
+		rng := p.BlockRange()
+		if rng == nil || rng.LatestBlockHash == (common.Hash{}) {
+			return false // unknown head hash — conservatively treat as valid
+		}
+		if !s.isConsensusFailedBlock(rng.LatestBlockHash) {
+			return false // this peer's head is not known-bad
+		}
+	}
+	return true
+}
+
+// markConsensusFailedBlock records hash as a block that failed InsertChain with
+// a definitive consensus error. Capped at maxConsensusFailedBlocks to bound memory.
+// Fixes #1670.
+func (s *xdcSyncer) markConsensusFailedBlock(hash common.Hash) {
+	s.consensusFailedBlocksMu.Lock()
+	defer s.consensusFailedBlocksMu.Unlock()
+	if s.consensusFailedBlocks == nil {
+		s.consensusFailedBlocks = make(map[common.Hash]struct{})
+	}
+	if len(s.consensusFailedBlocks) < maxConsensusFailedBlocks {
+		s.consensusFailedBlocks[hash] = struct{}{}
+	}
+}
+
+// isConsensusFailedBlock returns true if hash was recorded by markConsensusFailedBlock.
+func (s *xdcSyncer) isConsensusFailedBlock(hash common.Hash) bool {
+	s.consensusFailedBlocksMu.Lock()
+	defer s.consensusFailedBlocksMu.Unlock()
+	if s.consensusFailedBlocks == nil {
+		return false
+	}
+	_, ok := s.consensusFailedBlocks[hash]
+	return ok
 }
 
 // snapPivotBackoff is the number of blocks to step BACK from peer's
@@ -3802,6 +4223,17 @@ func (s *xdcSyncer) fetchHeadersParallel(candidates []*eth.Peer, fromBlock uint6
 			if hdrs[0].Number.Uint64() != fromBlock {
 				log.Debug("xdcSyncer: header batch does not start at requested block",
 					"peer", p.ID(), "want", fromBlock, "got", hdrs[0].Number)
+				s.taintPeer(p)
+				return
+			}
+			// #1670: if the first block in the batch is a known consensus-failed
+			// block, this peer is on a fork with an invalid block at our target
+			// height. Taint it and discard the batch so we do not acquire chainmu
+			// for 40s on a block we know will fail, allowing the miner's TryLock
+			// to succeed and seal the valid successor.
+			if s.isConsensusFailedBlock(hdrs[0].Hash()) {
+				log.Debug("xdcSyncer: header batch starts with a known consensus-failed block — discarding",
+					"peer", p.ID(), "block", hdrs[0].Number, "hash", hdrs[0].Hash())
 				s.taintPeer(p)
 				return
 			}

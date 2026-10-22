@@ -5,7 +5,9 @@
 package XDPoS
 
 import (
+	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math/big"
 	"os"
@@ -17,6 +19,7 @@ import (
 	"github.com/ethereum/go-ethereum/consensus/XDPoS/utils"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/log"
+	"github.com/ethereum/go-ethereum/rlp"
 	"github.com/ethereum/go-ethereum/rpc"
 )
 
@@ -114,6 +117,13 @@ func (api *API) GetV2BlockByHeader(header *types.Header, uncle bool) *V2BlockInf
 			info.Round = round
 		}
 		info.Masternodes = api.xdpos.GetMasternodes(api.chain, header)
+		// F-2026-19639: return the quorum certificate carried in the header.
+		var extra types.ExtraFields_v2
+		if err := utils.DecodeBytesExtraFields(header.Extra, &extra); err == nil && extra.QuorumCert != nil {
+			if enc, err := rlp.EncodeToBytes(extra.QuorumCert); err == nil {
+				info.EncodedQC = base64.StdEncoding.EncodeToString(enc)
+			}
+		}
 	}
 
 	return info
@@ -194,15 +204,10 @@ func (api *API) GetEpochNumbersBetween(begin, end *rpc.BlockNumber) ([]uint64, e
 		return result, nil
 	}
 
-	// V1: block-number arithmetic.
-	beginNum := beginHeader.Number.Uint64()
-	endNum := endHeader.Number.Uint64()
-	epoch := api.xdpos.config.Epoch
-	epochs := make([]uint64, 0)
-	for i := beginNum / epoch; i <= endNum/epoch; i++ {
-		epochs = append(epochs, i)
-	}
-	return epochs, nil
+	// F-2026-19639: a range that starts at or before the V2 switch has no
+	// round-based epoch switches to report, and block-number division gave
+	// wrong values. Return the canonical XDPoSChain error instead.
+	return nil, errors.New("not supported in the v1 consensus")
 }
 
 // GetMissedRoundsInEpochByBlockNum returns missed rounds info for the epoch containing the given block.
@@ -263,16 +268,16 @@ func (api *API) NetworkInformation() NetworkInfo {
 	return info
 }
 
-// GetRewardByAccount returns reward history for an account by scanning reward files in StoreRewardFolder.
+// GetRewardByAccount returns reward history for an account by scanning reward files in the --store-reward folder.
 // Fix #65: Reads per-block reward JSON files written by Finalize and filters by account address.
 // Reward file format: map[string]map[string]map[string]*big.Int (validator -> voter -> field -> amount)
 // TODO: Support reward DB lookup for non-file-based storage.
 func (api *API) GetRewardByAccount(account common.Address, begin rpc.BlockNumber, end rpc.BlockNumber) (AccountRewardResponse, error) {
 	log.Debug("[GetRewardByAccount]", "account", account.Hex(), "begin", begin, "end", end)
 
-	if len(StoreRewardFolder) == 0 {
+	if len(common.StoreRewardFolder) == 0 {
 		return AccountRewardResponse{Rewards: make([]AccountEpochReward, 0)},
-			fmt.Errorf("StoreRewardFolder not configured; start node with --store-reward-folder to enable reward history")
+			fmt.Errorf("reward folder not configured; start node with --store-reward to enable reward history")
 	}
 
 	// Resolve block range
@@ -298,10 +303,10 @@ func (api *API) GetRewardByAccount(account common.Address, begin rpc.BlockNumber
 	accountHex := strings.ToLower(account.Hex())
 
 	// Read all reward files in the folder and match by block range and account
-	entries, err := os.ReadDir(StoreRewardFolder)
+	entries, err := os.ReadDir(common.StoreRewardFolder)
 	if err != nil {
 		return AccountRewardResponse{Rewards: make([]AccountEpochReward, 0)},
-			fmt.Errorf("cannot read StoreRewardFolder %s: %w", StoreRewardFolder, err)
+			fmt.Errorf("cannot read reward folder %s: %w", common.StoreRewardFolder, err)
 	}
 
 	rewards := make([]AccountEpochReward, 0)
@@ -319,7 +324,7 @@ func (api *API) GetRewardByAccount(account common.Address, begin rpc.BlockNumber
 			continue
 		}
 
-		data, err := os.ReadFile(filepath.Join(StoreRewardFolder, name))
+		data, err := os.ReadFile(filepath.Join(common.StoreRewardFolder, name))
 		if err != nil {
 			log.Warn("[GetRewardByAccount] cannot read reward file", "file", name, "err", err)
 			continue
@@ -370,4 +375,18 @@ func (api *API) GetRewardByAccount(account common.Address, begin rpc.BlockNumber
 	}
 
 	return AccountRewardResponse{Rewards: rewards}, nil
+}
+
+// GetCheckpointByEpochNumber returns the epoch-switch block of a V2 epoch
+// (epochNum >= V2.SwitchEpoch) from the round-based V2 engine. ok is false
+// for V1 epochs, which keep the block-number formula. F-2026-19639.
+func (x *XDPoS) GetCheckpointByEpochNumber(chain consensus.ChainReader, epochNum uint64) (number uint64, ok bool, err error) {
+	if x.config.V2 == nil || x.config.V2.SwitchBlock == nil || epochNum < x.config.V2.SwitchEpoch || x.EngineV2 == nil {
+		return 0, false, nil
+	}
+	info, err := x.EngineV2.GetBlockByEpochNumber(chain, epochNum)
+	if err != nil {
+		return 0, true, err
+	}
+	return info.Number.Uint64(), true, nil
 }

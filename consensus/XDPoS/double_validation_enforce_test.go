@@ -186,11 +186,12 @@ func TestV1DoubleValidationCheckpointInBatch(t *testing.T) {
 }
 
 // TestV1VerifyHeaderBulkSyncRefusesEmptyValidator: in bulk sync VerifyHeader
-// still refuses a V1 block past the first epoch with an empty header.Validator,
-// as the VerifyHeaders light path does. The NewBlock handler relies on it to
-// wait for the M2 co-signed block instead of importing (and reporting as a BAD
-// BLOCK) the un-co-signed one (#1624). The co-signer identity check stays
-// full-verify only.
+// refuses a V1 block past the first epoch with an empty header.Validator, and
+// also refuses a block whose Validator recovers to the wrong M2 co-signer
+// (F-2026-19614). The NewBlock handler relies on the empty-Validator check to
+// wait for the M2 co-signed block instead of importing it as a BAD BLOCK
+// (#1624); the identity check now closes the complementary gap where a non-empty
+// wrong co-signature was previously accepted on the bulk-sync path.
 func TestV1VerifyHeaderBulkSyncRefusesEmptyValidator(t *testing.T) {
 	saved := core.XdcBulkSyncMode.Load()
 	core.XdcBulkSyncMode.Store(true)
@@ -242,8 +243,8 @@ func TestV1VerifyHeaderBulkSyncRefusesEmptyValidator(t *testing.T) {
 	if err := verify(2002, keyB); err != nil {
 		t.Errorf("bulk sync, assigned M2 co-signer rejected: %v", err)
 	}
-	if err := verify(2002, keyA); err != nil {
-		t.Errorf("bulk sync, co-signer identity is full-verify only: got %v, want nil", err)
+	if err := verify(2002, keyA); !errors.Is(err, errFailedDoubleValidation) {
+		t.Errorf("bulk sync, wrong M2: got %v, want %v", err, errFailedDoubleValidation)
 	}
 	if err := verify(51, nil); err != nil {
 		t.Errorf("chain 51, empty Validator: got %v, want nil", err)

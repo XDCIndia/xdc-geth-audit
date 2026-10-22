@@ -24,16 +24,45 @@ func (x *XDPoS_v2) getPreviousEpochSwitchInfoByHash(chain consensus.ChainReader,
 		return nil, err
 	}
 	for i := 0; i < limit; i++ {
-		if epochSwitchInfo.EpochSwitchParentBlockInfo == nil {
+		parentHash, ok := x.epochSwitchParentHash(chain, epochSwitchInfo)
+		if !ok {
 			break
 		}
-		epochSwitchInfo, err = x.getEpochSwitchInfo(chain, nil, epochSwitchInfo.EpochSwitchParentBlockInfo.Hash)
+		epochSwitchInfo, err = x.getEpochSwitchInfo(chain, nil, parentHash)
 		if err != nil {
 			log.Error("[getPreviousEpochSwitchInfoByHash] recursive getEpochSwitchInfo error", "err", err, "iteration", i)
 			return nil, err
 		}
 	}
 	return epochSwitchInfo, nil
+}
+
+// epochSwitchParentHash returns the hash of the block before the epoch switch
+// block in info, which lies in the previous epoch. ok is false when there is no
+// previous V2 epoch (the V1->V2 switch block or genesis).
+//
+// Some cache entries carry no EpochSwitchParentBlockInfo: the in-batch path
+// getEpochSwitchInfoWithParents (#1636) builds them without it. Treating a
+// missing link as "no previous epoch" made getPreviousEpochSwitchInfoByHash
+// return the current epoch for every limit, so HookPenalty counted the last
+// penalty list LimitPenaltyEpoch times and released penalised signers one
+// epoch after they were penalised ("validators not legit" on canonical Apothem
+// 83,665,617 and 83,738,378). The epoch switch header's ParentHash is the same
+// block (a V2 header's QC certifies its parent), so fall back to it.
+func (x *XDPoS_v2) epochSwitchParentHash(chain consensus.ChainReader, info *types.EpochSwitchInfo) (common.Hash, bool) {
+	if info.EpochSwitchParentBlockInfo != nil {
+		return info.EpochSwitchParentBlockInfo.Hash, true
+	}
+	es := info.EpochSwitchBlockInfo
+	if es == nil || es.Number == nil || es.Number.Cmp(x.config.V2.SwitchBlock) <= 0 {
+		return common.Hash{}, false
+	}
+	header := chain.GetHeaderByHash(es.Hash)
+	if header == nil {
+		log.Warn("[epochSwitchParentHash] epoch switch header not found; cannot walk to previous epoch", "number", es.Number, "hash", es.Hash)
+		return common.Hash{}, false
+	}
+	return header.ParentHash, true
 }
 
 // GetCurrentEpochSwitchBlock returns the epoch switch block number and epoch number
@@ -71,10 +100,11 @@ func (x *XDPoS_v2) GetEpochSwitchInfoBetween(chain consensus.ChainReader, begin,
 			return nil, err
 		}
 		iteratorHeader = nil
-		if epochSwitchInfo.EpochSwitchParentBlockInfo == nil {
+		parentHash, ok := x.epochSwitchParentHash(chain, epochSwitchInfo)
+		if !ok {
 			break
 		}
-		iteratorHash = epochSwitchInfo.EpochSwitchParentBlockInfo.Hash
+		iteratorHash = parentHash
 		iteratorNum = epochSwitchInfo.EpochSwitchBlockInfo.Number
 		if iteratorNum.Cmp(begin.Number) >= 0 {
 			infos = append(infos, epochSwitchInfo)

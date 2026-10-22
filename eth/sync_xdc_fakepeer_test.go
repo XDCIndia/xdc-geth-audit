@@ -112,6 +112,20 @@ func newXDCFakeNet(t *testing.T, local, remote int) *xdcFakeNet {
 	return newXDCFakeNetEngine(t, local, remote, ethash.NewFaker())
 }
 
+// newXDCFakeNetTime is newXDCFakeNet with a custom genesis timestamp. Use it
+// when tests need a fresh (recent) or explicitly stale head timestamp — for
+// example, to exercise the headFresh at-tip signal in fullSyncOnce.
+func newXDCFakeNetTime(t *testing.T, local, remote int, genesisTime uint64) *xdcFakeNet {
+	t.Helper()
+	gspec := &core.Genesis{
+		Config:     params.AllEthashProtocolChanges,
+		Difficulty: common.Big1,
+		GasLimit:   8_000_000,
+		Timestamp:  genesisTime,
+	}
+	return newXDCFakeNetGspec(t, local, remote, ethash.NewFaker(), gspec)
+}
+
 // newXDCFakeNetEngine is newXDCFakeNet with the local chain verifying blocks with engine.
 func newXDCFakeNetEngine(t *testing.T, local, remote int, engine consensus.Engine) *xdcFakeNet {
 	t.Helper()
@@ -120,6 +134,13 @@ func newXDCFakeNetEngine(t *testing.T, local, remote int, engine consensus.Engin
 		Difficulty: common.Big1,
 		GasLimit:   8_000_000,
 	}
+	return newXDCFakeNetGspec(t, local, remote, engine, gspec)
+}
+
+// newXDCFakeNetGspec is the shared builder used by newXDCFakeNetEngine and
+// newXDCFakeNetTime. Callers supply the fully-configured genesis.
+func newXDCFakeNetGspec(t *testing.T, local, remote int, engine consensus.Engine, gspec *core.Genesis) *xdcFakeNet {
+	t.Helper()
 	_, blocks, _ := core.GenerateChainWithGenesis(gspec, ethash.NewFaker(), remote, nil)
 	db := rawdb.NewMemoryDatabase()
 	chain, err := core.NewBlockChain(db, gspec, engine, nil)

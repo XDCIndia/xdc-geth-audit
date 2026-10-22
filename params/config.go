@@ -1046,7 +1046,7 @@ var (
 		TIPUpgradePenaltyBlock: big.NewInt(83_600_000),     // XinFinOrg/XDPoSChain#2383 (v2.8.0)
 		Gas2500xBlock:          big.NewInt(83_600_000),     // XinFinOrg/XDPoSChain#2516 #2695 (v2.9.0-testnet): base fee 625 gwei
 		DynamicGasLimitBlock:   big.NewInt(83_600_000),     // XDPoSChain v2.9.3-testnet genesis/testnet.json dynamicGasLimitBlock
-		PragueBlock:            big.NewInt(87_633_000),     // XDPoSChain v3.0.0-testnet genesis/testnet.json pragueBlock
+		PragueBlock:            big.NewInt(84_333_000),     // XDPoSChain v3.0.0-testnet-1 genesis/testnet.json pragueBlock (#2815, moved from 87,633,000)
 		AmsterdamBlock:         big.NewInt(99_999_999_999), // Glamsterdam incl. EIP-7928 BAL: placeholder far-future block, not scheduled (#1644)
 		XDPoS: &XDPoSConfig{
 			Period:              2,                                                                 // 2 second block time

@@ -613,3 +613,79 @@ func TestXDCSpecialTxFullPoolCap(t *testing.T) {
 		t.Fatalf("signer special tx rejected: %v", err)
 	}
 }
+
+// TestXDCSpecialTxSignSelectorFastPath verifies Hacken F-2026-19457 residual fix:
+// the IsSigner fast path is restricted to calldata matching a known method selector.
+//
+// Observable: the fast path routes through promoteSpecialTx which returns
+// ErrDuplicateSpecialTransaction on a same-nonce conflict.  The normal add() path
+// routes through list.Add whose price-bump check returns ErrReplaceUnderpriced.
+//
+// Setup:
+//  1. A masternode sends a sign tx (correct HexSignMethod calldata, 68 bytes, nonce=0)
+//     → fast path → admitted to pending.
+//  2. The same masternode sends a wrong-calldata tx at nonce=0 (arbitrary selector)
+//     → must NOT take the fast path → goes to list.Add → ErrReplaceUnderpriced.
+//
+// Before the fix the wrong-calldata tx would take the fast path and return
+// ErrDuplicateSpecialTransaction instead.
+func TestXDCSpecialTxSignSelectorFastPath(t *testing.T) {
+	t.Parallel()
+
+	pool, close := xdcSpecialPool(t)
+	defer close()
+
+	masterKey, _ := crypto.GenerateKey()
+	master := crypto.PubkeyToAddress(masterKey.PublicKey)
+
+	pool.IsSigner = func(addr common.Address) bool { return addr == master }
+
+	pool.mu.Lock()
+	pool.currentState.AddBalance(master, new(uint256.Int).SetUint64(1), tracing.BalanceChangeUnspecified)
+	pool.mu.Unlock()
+
+	// Step 1: correct sign calldata (4-byte HexSignMethod selector + 32-byte blockNumber
+	// + 32-byte blockHash = 68 bytes total, matching contracts.CreateTxSign).
+	signData := make([]byte, 68)
+	copy(signData[:4], common.Hex2Bytes(common.HexSignMethod))
+	copy(signData[4:36], common.LeftPadBytes(big.NewInt(100).Bytes(), 32))
+	// signData[36:68] stays zero (blockHash placeholder)
+
+	rawSign := types.NewTransaction(0, common.BlockSignersBinary, big.NewInt(0), 200000, big.NewInt(0), signData)
+	signTx, _ := types.SignTx(rawSign, types.HomesteadSigner{}, masterKey)
+
+	// Correct calldata → fast path → admitted.
+	if errs := pool.Add([]*types.Transaction{signTx}, true); errs[0] != nil {
+		t.Fatalf("sign tx with correct calldata rejected: %v", errs[0])
+	}
+	pending, _ := pool.Pending(txpool.PendingFilter{})
+	if _, ok := pending[master]; !ok {
+		t.Fatal("sign tx not in pending after IsSigner fast path")
+	}
+
+	// Step 2: wrong calldata — same sender, same nonce=0, non-sign 4-byte selector.
+	// After the fix: NOT fast-pathed → normal list.Add → price-bump check fails
+	// (0-tip can't replace 0-tip incumbent) → ErrReplaceUnderpriced.
+	// Before the fix: would take the fast path → ErrDuplicateSpecialTransaction.
+	wrongData := make([]byte, 68)
+	wrongData[0] = 0xDE // not 0xe3 (first byte of sign selector)
+	wrongData[1] = 0xAD
+	wrongData[2] = 0xBE
+	wrongData[3] = 0xEF
+
+	rawWrong := types.NewTransaction(0, common.BlockSignersBinary, big.NewInt(0), 200000, big.NewInt(0), wrongData)
+	wrongTx, _ := types.SignTx(rawWrong, types.HomesteadSigner{}, masterKey)
+
+	err := pool.addRemoteSync(wrongTx)
+	if err == nil {
+		t.Fatal("0x89 tx with wrong calldata must be rejected (non-fast-path, no price bump)")
+	}
+	// The rejection must come from the normal pending-replacement price-bump check,
+	// not from promoteSpecialTx's ErrDuplicateSpecialTransaction.
+	if errors.Is(err, ErrDuplicateSpecialTransaction) {
+		t.Fatalf("wrong calldata must NOT take the fast path: got ErrDuplicateSpecialTransaction, want ErrReplaceUnderpriced")
+	}
+	if !errors.Is(err, txpool.ErrReplaceUnderpriced) {
+		t.Fatalf("wrong calldata took unexpected path: %v", err)
+	}
+}

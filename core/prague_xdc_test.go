@@ -206,8 +206,8 @@ func TestU5_XDCRejectsTimestampForks(t *testing.T) {
 // Prague or Osaka scheduled, and Apothem has only Prague, at 87,633,000 as in
 // canonical XDPoSChain v3.0.0-testnet.
 func TestXDCMainnetApothemNoPrague(t *testing.T) {
-	if got := params.XDCApothemChainConfig.PragueBlock; got == nil || got.Cmp(big.NewInt(87_633_000)) != 0 {
-		t.Errorf("apothem PragueBlock = %v, want 87633000", got)
+	if got := params.XDCApothemChainConfig.PragueBlock; got == nil || got.Cmp(big.NewInt(84_333_000)) != 0 {
+		t.Errorf("apothem PragueBlock = %v, want 84333000", got)
 	}
 	if params.XDCApothemChainConfig.IsOsaka(big.NewInt(100_000_000), 0) {
 		t.Error("apothem IsOsaka=true at block 100M, want false")

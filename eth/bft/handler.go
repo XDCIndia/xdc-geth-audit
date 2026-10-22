@@ -37,6 +37,24 @@ const (
 	maxKnownSyncInfos = 131072
 )
 
+// bcastWorkers is the number of concurrent peer-broadcast goroutines in the
+// worker pool. A small fixed pool prevents goroutine exhaustion under flood
+// (Hacken F-2026-19460 residual).
+// ponytail: fixed pool; scale if per-peer send latency under load warrants it.
+const bcastWorkers = 4
+
+// bcastQueueSize caps the bounded forward queue for peer-relayed messages.
+//
+// Sizing: the XDC V2 committee holds at most MaxMasternodesV2 = 108 nodes.
+// In a single round each masternode may send one vote, one timeout, and one
+// syncInfo, giving 108 × 3 = 324 messages per round burst. We round up to
+// the next power-of-two and add a 3× burst buffer to absorb overlap between
+// consecutive rounds: 324 × 4 ≈ 1296 → 1024 is the minimum; use 1024.
+//
+// Own-originated messages from the engine's broadcastCh never enter this
+// drop path: the loop uses a blocking enqueue for them.
+const bcastQueueSize = 1024
+
 // EngineV2 is the narrow surface of the V2 engine that the BFT dispatcher
 // requires. Defined here (rather than imported from consensus/XDPoS) to
 // keep the dependency one-way: eth -> eth/bft -> {core/types, consensus},
@@ -86,6 +104,17 @@ type Bfter struct {
 	broadcastCh chan interface{}
 	quit        chan struct{}
 
+	// fwdQueue is the bounded forward queue shared by the inbound-forward path
+	// (Vote/Timeout/SyncInfo) and the engine-broadcast loop.
+	//
+	// Peer-relayed messages: try-send; dropped and counted when full.
+	// Own-originated messages (from broadcastCh): blocking enqueue with quit
+	// select so this node's own vote/timeout/syncInfo is never silently lost.
+	//
+	// bcastWorkers goroutines drain the queue and call the broadcast callbacks.
+	// (Hacken F-2026-19460 residual)
+	fwdQueue chan interface{}
+
 	// Known-message caches deduplicate inbound BFT messages before verification.
 	// Mirrors XDPoSChain/eth/handler.go knownVotes/knownTimeouts/knownSyncInfos
 	// (F-2026-19460). The cache is keyed by message hash (which includes all
@@ -105,6 +134,7 @@ func New(broadcasts BroadcastFns, chain consensus.ChainReader, chainHeight Chain
 		chainHeight:    chainHeight,
 		quit:           make(chan struct{}),
 		broadcastCh:    make(chan interface{}),
+		fwdQueue:       make(chan interface{}, bcastQueueSize),
 		knownVotes:     lru.NewCache[common.Hash, struct{}](maxKnownVotes),
 		knownTimeouts:  lru.NewCache[common.Hash, struct{}](maxKnownTimeouts),
 		knownSyncInfos: lru.NewCache[common.Hash, struct{}](maxKnownSyncInfos),
@@ -138,20 +168,17 @@ func (b *Bfter) Engine() EngineV2 {
 	return b.engine
 }
 
-// enqueueForBroadcast sends msg to the broadcast channel, selecting on quit
-// so that sends do not block after Stop(). Returns true if the message was
-// enqueued, false if the Bfter has stopped. Mirrors canonical
-// XDPoSChain/eth/bft/bft_handler.go:enqueueForBroadcast.
-//
-// Called from a per-message goroutine (Vote/Timeout/SyncInfo spawn one) to
-// keep the eth handler goroutine non-blocking while ensuring the goroutine
-// itself exits cleanly after Stop instead of leaking (F-2026-19460).
-func (b *Bfter) enqueueForBroadcast(msg interface{}) bool {
+// tryForward enqueues msg on fwdQueue without blocking. Used for peer-relayed
+// messages only: if the queue is full the message is dropped and counted
+// (Hacken F-2026-19460 residual). Own-originated messages from the engine's
+// broadcastCh must NOT use this path; the loop uses a blocking enqueue for
+// them so this node's own vote is never silently discarded.
+func (b *Bfter) tryForward(msg interface{}, kind string) {
 	select {
-	case <-b.quit:
-		return false
-	case b.broadcastCh <- msg:
-		return true
+	case b.fwdQueue <- msg:
+	default:
+		log.Debug("BFT forward queue full, dropping peer-relayed message", "type", kind)
+		forwardDropped.Inc(1)
 	}
 }
 
@@ -192,10 +219,8 @@ func (b *Bfter) Vote(peer string, vote *types.Vote) error {
 		return nil
 	}
 
-	// Enqueue for broadcast via a quit-aware goroutine. This keeps the eth
-	// handler goroutine non-blocking while ensuring the goroutine exits after
-	// Stop (F-2026-19460). Mirrors canonical enqueueForBroadcast pattern.
-	go b.enqueueForBroadcast(vote)
+	// Peer-relayed: try-send, drop if fwdQueue is full (F-2026-19460 residual).
+	b.tryForward(vote, "vote")
 	if err := b.engine.VoteHandler(b.chain, vote); err != nil {
 		log.Debug("handle BFT Vote", "error", err)
 		return err
@@ -237,8 +262,8 @@ func (b *Bfter) Timeout(peer string, timeout *types.Timeout) error {
 		return nil
 	}
 
-	// Quit-aware enqueue; see Vote() (F-2026-19460).
-	go b.enqueueForBroadcast(timeout)
+	// Peer-relayed: try-send, drop if full (F-2026-19460 residual).
+	b.tryForward(timeout, "timeout")
 	if err := b.engine.TimeoutHandler(b.chain, timeout); err != nil {
 		log.Debug("handle BFT Timeout", "error", err)
 		return err
@@ -279,8 +304,8 @@ func (b *Bfter) SyncInfo(peer string, syncInfo *types.SyncInfo) error {
 		return nil
 	}
 
-	// Quit-aware enqueue; see Vote() (F-2026-19460).
-	go b.enqueueForBroadcast(syncInfo)
+	// Peer-relayed: try-send, drop if full (F-2026-19460 residual).
+	b.tryForward(syncInfo, "syncinfo")
 	if err := b.engine.SyncInfoHandler(b.chain, syncInfo); err != nil {
 		log.Debug("handle BFT SyncInfo", "error", err)
 		return err
@@ -288,15 +313,41 @@ func (b *Bfter) SyncInfo(peer string, syncInfo *types.SyncInfo) error {
 	return nil
 }
 
-// Start launches the engine-broadcast forwarding loop. Safe to skip if
-// the engine never emits BFT messages (read-only / sync-only mode).
+// Start launches the worker pool and the engine-broadcast forwarding loop.
+// Safe to skip if the engine never emits BFT messages (read-only/sync-only).
 func (b *Bfter) Start() {
+	for i := 0; i < bcastWorkers; i++ {
+		go b.broadcastWorker()
+	}
 	go b.loop()
 }
 
-// Stop terminates the loop.
+// Stop terminates the loop and all workers.
 func (b *Bfter) Stop() {
 	close(b.quit)
+}
+
+// broadcastWorker drains fwdQueue and delivers each message to the broadcast
+// layer. bcastWorkers of these run concurrently; the pool size is the hard
+// upper bound on concurrent peer-send goroutines (Hacken F-2026-19460 residual).
+func (b *Bfter) broadcastWorker() {
+	for {
+		select {
+		case <-b.quit:
+			return
+		case msg := <-b.fwdQueue:
+			switch v := msg.(type) {
+			case *types.Vote:
+				b.broadcast.Vote(v)
+			case *types.Timeout:
+				b.broadcast.Timeout(v)
+			case *types.SyncInfo:
+				b.broadcast.SyncInfo(v)
+			default:
+				log.Error("Unknown BFT message type in forward queue", "value", v)
+			}
+		}
+	}
 }
 
 func (b *Bfter) loop() {
@@ -305,17 +356,26 @@ func (b *Bfter) loop() {
 		select {
 		case <-b.quit:
 			log.Warn("BFT Loop Close")
-			return
+			// Drain any messages that engine goroutines are currently blocked
+			// trying to send on broadcastCh. Without this drain, those goroutines
+			// (spawned by broadcastToBftChannel) block indefinitely after Stop
+			// (Hacken F-2026-19460 residual). Non-blocking: only picks up senders
+			// that are already waiting; later sends may still block briefly until
+			// the engine itself shuts down.
+			for {
+				select {
+				case <-b.broadcastCh:
+				default:
+					return
+				}
+			}
 		case obj := <-b.broadcastCh:
-			switch v := obj.(type) {
-			case *types.Vote:
-				go b.broadcast.Vote(v)
-			case *types.Timeout:
-				go b.broadcast.Timeout(v)
-			case *types.SyncInfo:
-				go b.broadcast.SyncInfo(v)
-			default:
-				log.Error("Unknown BFT message type received", "value", v)
+			// Own-originated message (engine's own vote/timeout/syncInfo).
+			// Block until fwdQueue accepts or quit fires: dropping this node's
+			// own vote costs the network a QC and a 60 s V2 timeout round.
+			select {
+			case b.fwdQueue <- obj:
+			case <-b.quit:
 			}
 		}
 	}

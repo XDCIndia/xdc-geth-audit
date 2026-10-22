@@ -151,10 +151,10 @@ func TestXDCRegisteredGenesisProfilesUnchanged(t *testing.T) {
 		{"apothem", DefaultXDCApothemGenesisBlock, params.XDCApothemChainConfig,
 			"0xbdea512b4f12ff1135ec92c00dc047ffb93890c2ea1aa0eefe9b013d80640075",
 			// dynamicGasLimitBlock 83,600,000 added for the v2.9 reset (#1539),
-			// pragueBlock 87,633,000 from XDPoSChain v3.0.0-testnet,
+			// pragueBlock 84,333,000 from XDPoSChain v3.0.0-testnet-1 (#1673),
 			// amsterdamBlock 99,999,999,999 far-future placeholder (#1644).
-			"35a0538f878655ec44b35403e28292d13d72c8ece797b08ac3ff6d154a160524",
-			"35a0538f878655ec44b35403e28292d13d72c8ece797b08ac3ff6d154a160524"},
+			"647af3eb97871d95f3cf6912185802fe4be3eb4a9857fe1d0a80560267177824",
+			"647af3eb97871d95f3cf6912185802fe4be3eb4a9857fe1d0a80560267177824"},
 		{"devnet5551", DefaultXDCDevnetGenesisBlock, params.XDCDevnetChainConfig,
 			"0xb8be003946a9c2688e9f1e255a5567c3d144293ccde2ffb38452a5840081b402",
 			"fff564302f00f0707421fa0214a3abf5444189c319b81aa5dcd365f8def165c2",

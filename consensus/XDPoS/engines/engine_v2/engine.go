@@ -1007,10 +1007,44 @@ func (x *XDPoS_v2) getSnapshot(chain consensus.ChainReader, number uint64, forSi
 					return snap, nil
 				}
 			}
-			// Both state rebuild and forward seed failed; fall through to stale
-			// cache/DB snapshot. The stale snapshot is benign for non-signing
-			// callers; signing callers will see a spurious rejection until the
-			// epoch switch header is available in the DB.
+			// Third fallback: direct lookup at the checkpoint (epoch-switch) block.
+			// findEpochSwitchAfter may return nil if the epoch-switch block is above
+			// the node's current DB head (e.g. after a restart with a pruned state).
+			// Once the node has synced to checkpointNumber via xdcSyncer this path
+			// succeeds immediately without rescanning up to 2*Epoch blocks (#1665).
+			if epochSwitchHdr := chain.GetHeaderByNumber(checkpointNumber); epochSwitchHdr != nil {
+				isSwitch, _, _ := x.IsEpochSwitch(epochSwitchHdr)
+				if isSwitch {
+					masternodes := x.GetMasternodesFromEpochSwitchHeader(chain, epochSwitchHdr)
+					penalties := contracts.ExtractAddressFromBytes(epochSwitchHdr.Penalties)
+					stored, ok := x.snapshots.Get(gapHeader.Hash())
+					if !ok || stored == nil {
+						stored, _ = loadSnapshot(x.db, gapHeader.Hash())
+					}
+					if stored != nil && len(masternodes) > 0 && len(removeItemFromArray(masternodes, stored.NextEpochCandidates)) == 0 {
+						kept := *stored
+						kept.Version = 6
+						x.snapshots.Add(kept.Hash, &kept)
+						return &kept, nil
+					}
+					if len(masternodes) > 0 {
+						snap := newSnapshotWithPenalties(gapNumber, gapHeader.Hash(), masternodes, penalties)
+						snap.Version = 6
+						x.snapshots.Add(snap.Hash, snap)
+						if serr := storeSnapshot(snap, x.db); serr != nil {
+							log.Error("[getSnapshot] live-mn-set: failed to persist checkpoint-seed snapshot",
+								"gap", gapNumber, "checkpoint", checkpointNumber, "err", serr)
+						}
+						log.Warn("[getSnapshot] live-mn-set: seeded from checkpoint direct-lookup",
+							"gap", gapNumber, "checkpoint", checkpointNumber,
+							"validators", len(masternodes))
+						return snap, nil
+					}
+				}
+			}
+			// Both state rebuild, forward scan, and direct checkpoint lookup failed;
+			// fall through to stale cache/DB snapshot.  Signing callers will see
+			// spurious rejections until the epoch switch header reaches the DB.
 			log.Warn("[getSnapshot] live-mn-set: state rebuild and forward seed both failed, using stale snapshot",
 				"gap", gapNumber, "checkpoint", checkpointNumber)
 		}

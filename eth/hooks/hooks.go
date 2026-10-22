@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"sync"
 
 	"github.com/ethereum/go-ethereum/common"
 	xdc_sort "github.com/ethereum/go-ethereum/common/sort"
@@ -18,7 +19,21 @@ import (
 	"github.com/ethereum/go-ethereum/core/state"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/log"
+	"github.com/ethereum/go-ethereum/metrics"
 	"github.com/ethereum/go-ethereum/params"
+)
+
+// Counters for HookVerifyMNs skip paths so operators can observe silent bypasses
+// (Hacken F-2026-19462 residual).
+var (
+	// hookVerifyMNsApothemSkips counts checkpoints skipped on Apothem (chain 51)
+	// because canonical XDPoSChain disables full V1 verification on testnet.
+	hookVerifyMNsApothemSkips = metrics.NewRegisteredCounter("eth/hooks/verify_mns/apothem_skips", nil)
+	// hookVerifyMNsMissingStateSkips counts checkpoints skipped because the
+	// parent header or its state is not available on this node.
+	hookVerifyMNsMissingStateSkips = metrics.NewRegisteredCounter("eth/hooks/verify_mns/missing_state_skips", nil)
+
+	hookVerifyMNsApothemSkipOnce sync.Once
 )
 
 // AttachConsensusV1Hooks attaches V1 consensus hooks to XDPoS engine. (#72)
@@ -64,18 +79,32 @@ func AttachConsensusV1Hooks(adaptor *XDPoS.XDPoS, bc *core.BlockChain, chainConf
 			chainID = chainConfig.ChainID.Uint64()
 		}
 		if chainID == params.XDCApothemChainConfig.ChainID.Uint64() || XDPoS.IsIgnoreSignerCheckBlock(chainID, number) {
+			// Canonical XDPoSChain disables full V1 verification on Apothem
+			// (chain 51) via shouldDisableFullVerify (engine_v1/engine.go).
+			// Running the check retroactively would reject valid canonical
+			// Apothem V1 blocks whose Validators bytes were never enforced.
+			// Hacken F-2026-19462: bypass is intentional; made observable here.
+			// Warn once: a replay from genesis hits this at every V1 checkpoint
+			// (~63k on Apothem). The counter records every skip.
+			hookVerifyMNsApothemSkipOnce.Do(func() {
+				log.Warn("[V1 HookVerifyMNs] skipping validator check: Apothem or ignore-listed checkpoint (logged once; see metric eth/hooks/verify_mns/apothem_skips)",
+					"number", number, "chainID", chainID)
+			})
+			hookVerifyMNsApothemSkips.Inc(1)
 			return nil
 		}
 		// Enforce only when the parent's state is here. Without it the
 		// randomize values cannot be read (e.g. a checkpoint-synced node).
 		parent := bc.GetHeaderByHash(header.ParentHash)
 		if parent == nil {
-			log.Debug("[V1 HookVerifyMNs] parent unknown, skipping", "number", number)
+			log.Warn("[V1 HookVerifyMNs] parent header unknown, skipping validator check", "number", number)
+			hookVerifyMNsMissingStateSkips.Inc(1)
 			return nil
 		}
 		statedb, err := bc.StateAt(parent.Root, parent.Number, parent.Time)
 		if err != nil {
-			log.Debug("[V1 HookVerifyMNs] parent state unavailable, skipping", "number", number, "err", err)
+			log.Warn("[V1 HookVerifyMNs] parent state unavailable, skipping validator check", "number", number, "err", err)
+			hookVerifyMNsMissingStateSkips.Inc(1)
 			return nil
 		}
 		validators, err := validatorsFromState(statedb, signers)

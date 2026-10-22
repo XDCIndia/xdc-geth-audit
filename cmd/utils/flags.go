@@ -650,6 +650,12 @@ var (
 		Value:    ethconfig.Defaults.Miner.Recommit,
 		Category: flags.MinerCategory,
 	}
+	MinerBlockVoteGasCapFlag = &cli.Uint64Flag{
+		Name:     "miner.blockvotegascap",
+		Usage:    "XDPoS V2: soft per-block gas ceiling to keep voter re-execution fast (0 = disabled)",
+		Value:    0,
+		Category: flags.MinerCategory,
+	}
 	MinerPendingFeeRecipientFlag = &cli.StringFlag{
 		Name:     "miner.pending.feeRecipient",
 		Usage:    "0x prefixed public address for the pending block producer (not used for actual block production)",
@@ -1901,6 +1907,9 @@ func setMiner(ctx *cli.Context, cfg *miner.Config) {
 	}
 	if ctx.IsSet(MinerMaxBlobsFlag.Name) {
 		cfg.MaxBlobsPerBlock = ctx.Int(MinerMaxBlobsFlag.Name)
+	}
+	if ctx.IsSet(MinerBlockVoteGasCapFlag.Name) {
+		cfg.BlockVoteGasCap = ctx.Uint64(MinerBlockVoteGasCapFlag.Name)
 	}
 }
 

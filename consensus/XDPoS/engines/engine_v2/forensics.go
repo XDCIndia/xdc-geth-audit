@@ -221,6 +221,10 @@ func (f *Forensics) findAncestorQCs(chain consensus.ChainReader, currentQc types
 		err := utils.DecodeBytesExtraFields(parentHeader.Extra, &decodedExtraField)
 		if err != nil {
 			log.Error("[findAncestorQCs] Error while trying to decode from parent block extra", "BlockNum", parentHeader.Number.Int64(), "ParentHash", parentHash.Hex())
+			return nil, err
+		}
+		if decodedExtraField.QuorumCert == nil {
+			return nil, errors.New("parent block extra has no quorum certificate")
 		}
 		quorumCertificate = *decodedExtraField.QuorumCert
 		quorumCerts = append(quorumCerts, quorumCertificate)

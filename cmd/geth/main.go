@@ -129,6 +129,7 @@ var (
 		utils.MinerExtraDataFlag,
 		utils.MinerMaxBlobsFlag,
 		utils.MinerRecommitIntervalFlag,
+		utils.MinerBlockVoteGasCapFlag,
 		utils.MinerPendingFeeRecipientFlag,
 		utils.NATFlag,
 		utils.NoDiscoverFlag,
