@@ -136,7 +136,17 @@ func TestPoolSignerDedup_Timeout(t *testing.T) {
 		t2.Hash(): t2,
 	}
 
-	if err := eng.onTimeoutPoolThresholdReached(&mockChainForA894{}, pooledTimeouts, t1, gapNumber); err != nil {
+	// onTimeoutPoolThresholdReached now requires the active masternode list so it
+	// can filter non-member signers (F-2026-19596). The signer here (addrs[0]) must
+	// be in the active set for the TC to be built at all. Use a 1-element active set
+	// so the dedup test is independent of threshold math: 1 unique signer / 1 total
+	// always meets the 2/3 threshold (0.67 rounds to 1 with the >= comparison).
+	epochInfo := &types.EpochSwitchInfo{
+		Masternodes:          addrs[:1], // only addrs[0] is active
+		MasternodesLen:       1,
+		EpochSwitchBlockInfo: &types.BlockInfo{Number: big.NewInt(0)},
+	}
+	if err := eng.onTimeoutPoolThresholdReached(&mockChainForA894{}, pooledTimeouts, t1, gapNumber, epochInfo); err != nil {
 		t.Fatalf("unexpected error from onTimeoutPoolThresholdReached: %v", err)
 	}
 
