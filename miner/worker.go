@@ -95,11 +95,30 @@ type environment struct {
 	revertedIdx []uint32
 
 	witness *stateless.Witness
+
+	// signingTxCount (XDC, F-2026-19467) counts the 0x89 BlockSigners signing
+	// transactions committed so far. Signing txs bypass the gas pool, so
+	// pool-depletion checks do not bound them; only txFitsSize bounds them by
+	// raw block size (~30 000 at 8 MiB). The per-block cap
+	// maxSigningTxsPerBlock keeps that under 2 × the V2 MaxMasternodes.
+	signingTxCount int
 }
 
 // txFitsSize reports whether the transaction fits into the block size limit.
 func (env *environment) txFitsSize(tx *types.Transaction) bool {
 	return env.size+tx.Size() < params.MaxBlockSize-maxBlockSizeBufferZone
+}
+
+// maxSigningTxsPerBlock returns the producer-side cap on 0x89 BlockSigners
+// signing transactions per block. It is set to twice the V2
+// MaxMasternodes (mainnet: 108 × 2 = 216) so every masternode can sign and
+// there is room for any future masternode-set expansion, while keeping the cap
+// far below what txFitsSize alone would allow (~30 000 txs at 8 MiB).
+func maxSigningTxsPerBlock(cfg *params.ChainConfig) int {
+	if cfg != nil && cfg.XDPoS != nil && cfg.XDPoS.V2 != nil && cfg.XDPoS.V2.CurrentConfig != nil && cfg.XDPoS.V2.CurrentConfig.MaxMasternodes > 0 {
+		return 2 * cfg.XDPoS.V2.CurrentConfig.MaxMasternodes
+	}
+	return 256 // non-XDC chains: generous fallback
 }
 
 // discard terminates the background threads before discarding it.
@@ -418,6 +437,10 @@ func (miner *Miner) commitTransaction(ctx context.Context, env *environment, tx 
 	env.receipts = append(env.receipts, receipt)
 	env.size += tx.Size()
 	env.tcount++
+	// Track committed signing txs for the per-block cap (F-2026-19467).
+	if core.RouteTransaction(miner.chainConfig, env.header.Number, tx) == core.TxRouteSign {
+		env.signingTxCount++
+	}
 	env.bal.Merge(bal)
 	return nil
 }
@@ -617,6 +640,17 @@ func (miner *Miner) commitTransactions(ctx context.Context, env *environment, pl
 			}
 			if signed := new(big.Int).SetBytes(data[4:36]).Uint64(); signed >= env.header.Number.Uint64() {
 				log.Trace("Ignoring signing transaction for a future block", "hash", ltx.Hash, "signed", signed, "number", env.header.Number)
+				txs.Pop()
+				continue
+			}
+			// Cap signing txs per block at 2 × the V2 MaxMasternodes (mainnet: 216).
+			// Signing txs bypass the gas pool so pool-depletion checks cannot
+			// bound them; txFitsSize alone allows ~30 000 at 8 MiB.
+			// This limit stops padding by spam accounts while leaving 2× headroom
+			// above the masternode ceiling for any legitimate signing burst
+			// (F-2026-19467). Import is not affected.
+			if env.signingTxCount >= maxSigningTxsPerBlock(miner.chainConfig) {
+				log.Trace("Signing tx per-block cap reached, skipping", "hash", ltx.Hash, "count", env.signingTxCount)
 				txs.Pop()
 				continue
 			}
