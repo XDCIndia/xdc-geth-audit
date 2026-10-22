@@ -86,9 +86,10 @@ func TestSupplyOmittedFields(t *testing.T) {
 		t.Fatalf("failed to test supply tracer: %v", err)
 	}
 
+	// Hash reflects XDC header encoding (Validators/Validator/Penalties fields always present).
 	expected := supplyInfo{
 		Number:     0,
-		Hash:       common.HexToHash("0x15b41f6dfb24667e4b631d45f847b7afcc63fa2abbc95692bb8bf0ac0c0e35ef"),
+		Hash:       common.HexToHash("0xa4b260db1b6b00b46798c27b7ad9219895186cbe79e8ebb00af5f400d382de7e"),
 		ParentHash: common.HexToHash("0x0000000000000000000000000000000000000000000000000000000000000000"),
 	}
 	actual := out[expected.Number]
@@ -115,12 +116,13 @@ func TestSupplyGenesisAlloc(t *testing.T) {
 		}
 	)
 
+	// Hash reflects XDC header encoding (Validators/Validator/Penalties fields always present).
 	expected := supplyInfo{
 		Issuance: &supplyInfoIssuance{
 			GenesisAlloc: (*hexutil.Big)(new(big.Int).Mul(common.Big2, big.NewInt(params.Ether))),
 		},
 		Number:     0,
-		Hash:       common.HexToHash("0xbcc9466e9fc6a8b56f4b29ca353a421ff8b51a0c1a58ca4743b427605b08f2ca"),
+		Hash:       common.HexToHash("0x07daaf0172af796b671b0f52aefe35c6c65fde9487672d5c6313ac2ee7caf510"),
 		ParentHash: common.HexToHash("0x0000000000000000000000000000000000000000000000000000000000000000"),
 	}
 
@@ -143,13 +145,14 @@ func TestSupplyRewards(t *testing.T) {
 		}
 	)
 
+	// Hash and ParentHash reflect XDC header encoding (Validators/Validator/Penalties fields always present).
 	expected := supplyInfo{
 		Issuance: &supplyInfoIssuance{
 			Reward: (*hexutil.Big)(new(big.Int).Mul(common.Big2, big.NewInt(params.Ether))),
 		},
 		Number:     1,
-		Hash:       common.HexToHash("0xcbb08370505be503dafedc4e96d139ea27aba3cbc580148568b8a307b3f51052"),
-		ParentHash: common.HexToHash("0xadeda0a83e337b6c073e3f0e9a17531a04009b397a9588c093b628f21b8bc5a3"),
+		Hash:       common.HexToHash("0xaef7758cd79e3676a03a03dfa88202d5558f1cb4c523adfd36a5984c94031e8a"),
+		ParentHash: common.HexToHash("0x5712544353d84ece690f53f5e9a2ca95f93665716c1f022f776f2ce813c0a73b"),
 	}
 
 	out, _, err := testSupplyTracer(t, gspec, emptyBlockGenerationFunc, 1)
@@ -181,13 +184,14 @@ func TestSupplyRewardsWithUncle(t *testing.T) {
 
 	totalReward := baseReward.Add(baseReward, uncleInclusionReward).Add(baseReward, uncleReward)
 
+	// Hash and ParentHash reflect XDC header encoding (Validators/Validator/Penalties fields always present).
 	expected := supplyInfo{
 		Issuance: &supplyInfoIssuance{
 			Reward: (*hexutil.Big)(totalReward),
 		},
 		Number:     3,
-		Hash:       common.HexToHash("0x0737d31f8671c18d32b5143833cfa600e4264df62324c9de569668c6de9eed6d"),
-		ParentHash: common.HexToHash("0x45af6557df87719cb3c7e6f8a98b61508ea74a797733191aececb4c2ec802447"),
+		Hash:       common.HexToHash("0x6c91152a0b3053a15ed4a4fcbbe0e645136ebe1027c22a34885727d45852b68d"),
+		ParentHash: common.HexToHash("0x057c5f3124df16fa9392815359d1334740d96a5bb7d057b268153099536039a1"),
 	}
 
 	// Generate a new chain where block 3 includes an uncle

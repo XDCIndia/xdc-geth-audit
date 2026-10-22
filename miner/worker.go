@@ -685,6 +685,16 @@ func (miner *Miner) commitTransactions(ctx context.Context, env *environment, pl
 				continue
 			}
 		}
+		// XDC: empty-route txs (0x91-0x94, ApplyEmptyTransaction) do not advance
+		// the sender's nonce. Skip any such tx already in the canonical chain so
+		// the same payload is never included in two consecutive blocks (Fixes #1702).
+		if core.RouteTransaction(miner.chainConfig, env.header.Number, tx) == core.TxRouteEmpty {
+			if lookup, _ := miner.chain.GetCanonicalTransaction(tx.Hash()); lookup != nil {
+				log.Trace("Skipping already-included empty-route tx", "hash", ltx.Hash)
+				txs.Pop()
+				continue
+			}
+		}
 		// Start executing the transaction
 		env.state.SetTxContext(tx.Hash(), env.tcount, uint32(env.tcount+1))
 
