@@ -476,10 +476,10 @@ func newFastStateSync(d *Downloader, root common.Hash) *fastStateSync {
 		// time — combined with the dropped-on-default fastStateCh, throughput
 		// collapsed under load. Buffer 64 mirrors maxParallelInflightSlots × 4
 		// (worst case all slots returning at once across 4 peers). Refs A.67.
-		deliver:        make(chan *stateReq, 64),
-		cancel:         make(chan struct{}),
-		done:           make(chan struct{}),
-		started:        make(chan struct{}),
+		deliver: make(chan *stateReq, 64),
+		cancel:  make(chan struct{}),
+		done:    make(chan struct{}),
+		started: make(chan struct{}),
 	}
 }
 
@@ -849,6 +849,19 @@ func (s *fastStateSync) process(req *stateReq) (int, error) {
 			delete(s.inflightHashes, task.hash)
 		}
 	}()
+
+	// XDC-16: reject responses that contain more blobs than were requested.
+	// A compliant peer must never exceed nItems; an oversized response wastes
+	// CPU hashing blobs we didn't ask for and signals a misbehaving peer.
+	// Drop the peer and return 0 so all tasks requeue via the deferred cleanup.
+	if len(req.response) > int(req.nItems) {
+		req.peer.log.Warn("Peer sent more NodeData blobs than requested",
+			"requested", req.nItems, "received", len(req.response))
+		if s.d.dropPeer != nil {
+			s.d.dropPeer(req.peer.id)
+		}
+		return 0, nil
+	}
 
 	// Iterate over all the delivered data and inject one-by-one into the trie.
 	// Phase A: processNodeData now owns the per-blob delete of the matching
