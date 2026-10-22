@@ -1587,6 +1587,20 @@ func (pool *LegacyPool) runReorg(done chan struct{}, reset *txpoolResetRequest, 
 	pool.truncatePending()
 	pool.truncateQueue()
 
+	// XDC-31: filter out promoted txs that were evicted by truncatePending or
+	// truncateQueue so we do not announce them to peers. Evicted txs are removed
+	// from pool.all; anything still present there survived truncation.
+	{
+		n := 0
+		for _, tx := range promoted {
+			if pool.all.Get(tx.Hash()) != nil {
+				promoted[n] = tx
+				n++
+			}
+		}
+		promoted = promoted[:n]
+	}
+
 	dropBetweenReorgHistogram.Update(int64(pool.changesSinceReorg))
 	pool.changesSinceReorg = 0 // Reset change counter
 	pool.mu.Unlock()
