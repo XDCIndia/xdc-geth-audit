@@ -19,6 +19,7 @@ package eth
 import (
 	"math/big"
 	"testing"
+	"time"
 
 	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/core/types"
@@ -26,19 +27,20 @@ import (
 
 // TestFullSyncInvalidNextBlockBulkMode checks the #952 relaxation on a
 // non-mainnet chain: an invalid block at head+1 clears XdcBulkSyncMode only
-// when the peer is at the tip (short header batch), not while we are far
-// behind. Refs #1427.
+// when the local head is fresh (within atTipFreshnessWindow), not while we
+// are far behind (F-2026-19724).
 func TestFullSyncInvalidNextBlockBulkMode(t *testing.T) {
 	for _, tc := range []struct {
-		name     string
-		remote   int
-		wantBulk bool
+		name        string
+		remote      int
+		genesisTime uint64 // 0: stale head (far behind); now: fresh head (at tip)
+		wantBulk    bool
 	}{
-		{"far behind", 640, true},
-		{"at tip", 5, false},
+		{"far behind", 640, 0, true},
+		{"at tip", 5, uint64(time.Now().Unix()), false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			n := newXDCFakeNet(t, 0, tc.remote)
+			n := newXDCFakeNetTime(t, 0, tc.remote, tc.genesisTime)
 			// Block 1 with a wrong difficulty: a validation error, not a missing parent.
 			h := types.CopyHeader(n.remote[0].Header())
 			h.Difficulty = new(big.Int).Add(h.Difficulty, big.NewInt(1))

@@ -106,10 +106,18 @@ type xdcFakeNet struct {
 // `remote`-block canonical chain, and a handler (not started) around it.
 func newXDCFakeNet(t *testing.T, local, remote int) *xdcFakeNet {
 	t.Helper()
+	return newXDCFakeNetTime(t, local, remote, 0)
+}
+
+// newXDCFakeNetTime is newXDCFakeNet with the given genesis timestamp. A
+// recent timestamp makes the local head fresh (at tip).
+func newXDCFakeNetTime(t *testing.T, local, remote int, genesisTime uint64) *xdcFakeNet {
+	t.Helper()
 	gspec := &core.Genesis{
 		Config:     params.AllEthashProtocolChanges,
 		Difficulty: common.Big1,
 		GasLimit:   8_000_000,
+		Timestamp:  genesisTime,
 	}
 	_, blocks, _ := core.GenerateChainWithGenesis(gspec, ethash.NewFaker(), remote, nil)
 	chain, err := core.NewBlockChain(rawdb.NewMemoryDatabase(), gspec, ethash.NewFaker(), nil)
