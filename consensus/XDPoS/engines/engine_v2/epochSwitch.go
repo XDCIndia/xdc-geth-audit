@@ -93,6 +93,23 @@ func (x *XDPoS_v2) GetEpochSwitchInfoBetween(chain consensus.ChainReader, begin,
 	iteratorHash := end.Hash()
 	iteratorNum := end.Number
 
+	// Special case: begin == end.  The main loop below uses strict > so it never
+	// processes a header whose number equals begin.Number.  When both point to
+	// the same epoch-switch block the caller expects [epochSwitchInfo] not [].
+	// Return immediately to avoid the trivial no-op loop and any risk of a
+	// duplicate entry (CertiK XDC-30).
+	if begin.Number.Cmp(end.Number) == 0 {
+		epochSwitchInfo, err := x.getEpochSwitchInfo(chain, end, iteratorHash)
+		if err != nil {
+			log.Error("[GetEpochSwitchInfoBetween] getEpochSwitchInfo error (begin==end)", "err", err)
+			return nil, err
+		}
+		if epochSwitchInfo.EpochSwitchBlockInfo.Number.Cmp(end.Number) == 0 {
+			return []*types.EpochSwitchInfo{epochSwitchInfo}, nil
+		}
+		return infos, nil
+	}
+
 	for iteratorNum.Cmp(begin.Number) > 0 {
 		epochSwitchInfo, err := x.getEpochSwitchInfo(chain, iteratorHeader, iteratorHash)
 		if err != nil {
