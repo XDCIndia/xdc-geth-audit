@@ -40,11 +40,17 @@ func (x *XDPoS_v2) VerifyTimeoutMessage(chain consensus.ChainReader, timeoutMsg 
 		x.lock.Unlock()
 	}
 
+	// Snapshot currentRound under RLock.  setNewRound writes x.currentRound
+	// under x.lock.Lock(); reading it without any lock is a data race.
+	x.lock.RLock()
+	currentRound := x.currentRound
+	x.lock.RUnlock()
+
 	// Check if timeout round is current
-	if timeoutMsg.Round < x.currentRound {
+	if timeoutMsg.Round < currentRound {
 		log.Debug("[VerifyTimeoutMessage] Timeout round too old",
 			"timeoutRound", timeoutMsg.Round,
-			"currentRound", x.currentRound)
+			"currentRound", currentRound)
 		return false, nil
 	}
 

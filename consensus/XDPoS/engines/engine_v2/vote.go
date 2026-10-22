@@ -38,11 +38,17 @@ func (x *XDPoS_v2) VerifyVoteMessage(chain consensus.ChainReader, vote *types.Vo
 		x.lock.Unlock()
 	}
 
+	// Snapshot currentRound under RLock.  setNewRound writes x.currentRound
+	// under x.lock.Lock(); reading it without any lock is a data race.
+	x.lock.RLock()
+	currentRound := x.currentRound
+	x.lock.RUnlock()
+
 	// Check if vote round is valid
-	if vote.ProposedBlockInfo.Round < x.currentRound {
+	if vote.ProposedBlockInfo.Round < currentRound {
 		log.Debug("[VerifyVoteMessage] Vote round too old",
 			"voteRound", vote.ProposedBlockInfo.Round,
-			"currentRound", x.currentRound)
+			"currentRound", currentRound)
 		return false, nil
 	}
 
