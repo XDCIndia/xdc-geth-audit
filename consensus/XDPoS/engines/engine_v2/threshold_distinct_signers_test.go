@@ -184,7 +184,7 @@ func TestTimeoutGate_OneSignerManyEntries(t *testing.T) {
 func TestTimeoutGate_DistinctSignersReachThreshold(t *testing.T) {
 	eng, chain, keys, addrs, _ := setupGate(t)
 	eng.epochSwitches.Add(chain.head.Hash(), &types.EpochSwitchInfo{
-		Masternodes: addrs, MasternodesLen: len(addrs), EpochSwitchBlockInfo: &types.BlockInfo{Number: big.NewInt(0)},
+		Masternodes: addrs, MasternodesLen: len(addrs), EpochSwitchBlockInfo: &types.BlockInfo{Number: big.NewInt(0), Hash: chain.head.Hash()},
 	})
 	for i := 0; i < 2; i++ {
 		if err := eng.timeoutHandler(chain, timeoutGate(t, eng, keys[0], addrs, 5)); err != nil {

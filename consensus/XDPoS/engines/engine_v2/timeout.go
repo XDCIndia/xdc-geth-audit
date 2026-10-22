@@ -123,7 +123,15 @@ func (x *XDPoS_v2) timeoutHandler(chain consensus.ChainReader, timeout *types.Ti
 			"signers", signers,
 			"threshold", float64(epochInfo.MasternodesLen)*certThreshold)
 
-		if err := x.onTimeoutPoolThresholdReached(chain, pooledTimeouts, timeout, timeout.GapNumber); err != nil {
+		// Build the TC against the epoch that contains the timeout round, the
+		// set verifyTC checks it against, as in canonical XDPoSChain
+		// onTimeoutPoolThresholdReached. The head epoch can differ at an
+		// epoch boundary.
+		tcEpochInfo, err := x.getTCEpochInfo(chain, &types.TimeoutCert{Round: timeout.Round})
+		if err != nil {
+			return err
+		}
+		if err := x.onTimeoutPoolThresholdReached(chain, pooledTimeouts, timeout, timeout.GapNumber, tcEpochInfo); err != nil {
 			return err
 		}
 	}
@@ -131,18 +139,36 @@ func (x *XDPoS_v2) timeoutHandler(chain consensus.ChainReader, timeout *types.Ti
 	return nil
 }
 
-// onTimeoutPoolThresholdReached generates a TC when enough timeouts are collected
-func (x *XDPoS_v2) onTimeoutPoolThresholdReached(chain consensus.ChainReader, pooledTimeouts map[common.Hash]utils.PoolObj, currentTimeoutMsg utils.PoolObj, gapNumber uint64) error {
-	// Collect signatures, deduped by recovered signer address.
-	// The pool keys entries by message hash (which includes signature bytes), so
-	// one signer can produce multiple pool entries with distinct nonces. Only one
-	// signature per unique signer may count toward the threshold (F-2026-19525).
+// onTimeoutPoolThresholdReached generates a TC when enough timeouts are collected.
+// epochInfo is the epoch switch info of the epoch containing the timeout round
+// (getTCEpochInfo); it carries the active (non-penalized) masternode set.
+func (x *XDPoS_v2) onTimeoutPoolThresholdReached(chain consensus.ChainReader, pooledTimeouts map[common.Hash]utils.PoolObj, currentTimeoutMsg utils.PoolObj, gapNumber uint64, epochInfo *types.EpochSwitchInfo) error {
+	timeoutRound := currentTimeoutMsg.(*types.Timeout).Round
+
+	// F-2026-19596, F-2026-19612: bind TC membership to the active masternode set
+	// of the round's epoch, not the full candidate pool (which includes penalized
+	// addresses). A TC built with penalized signers would be rejected by verifyTC
+	// on this and canonical nodes, causing a liveness stall.
+	activeMNs := make(map[common.Address]struct{}, len(epochInfo.Masternodes))
+	for _, mn := range epochInfo.Masternodes {
+		activeMNs[mn] = struct{}{}
+	}
+
+	// Collect signatures, deduped by recovered signer address, restricted to
+	// the active masternode set. The pool keys entries by message hash (which
+	// includes signature bytes), so one signer can produce multiple pool entries
+	// with distinct nonces. Only one signature per unique active signer is kept.
 	emptySigner := common.Address{}
 	seenSigners := make(map[common.Address]struct{})
 	signatures := make([]types.Signature, 0, len(pooledTimeouts))
 	for _, v := range pooledTimeouts {
 		signer := v.GetSigner()
 		if signer == emptySigner {
+			continue
+		}
+		if _, active := activeMNs[signer]; !active {
+			log.Warn("[onTimeoutPoolThresholdReached] Signer not in active masternode set, skipping (F-2026-19596)",
+				"signer", signer, "tcRound", timeoutRound)
 			continue
 		}
 		if _, seen := seenSigners[signer]; seen {
@@ -153,9 +179,19 @@ func (x *XDPoS_v2) onTimeoutPoolThresholdReached(chain consensus.ChainReader, po
 		signatures = append(signatures, v.(*types.Timeout).Signature)
 	}
 
-	// Generate TC
+	// Re-check threshold with active-only signatures: timeoutHandler counted
+	// against the head epoch, which can differ from the round's epoch.
+	certThreshold := x.config.V2.Config(uint64(timeoutRound)).CertThreshold
+	if float64(len(signatures)) < float64(epochInfo.MasternodesLen)*certThreshold {
+		log.Warn("[onTimeoutPoolThresholdReached] Not enough active signatures after membership filter",
+			"numValid", len(signatures), "certThreshold", float64(epochInfo.MasternodesLen)*certThreshold,
+			"tcRound", timeoutRound)
+		return nil
+	}
+
+	// Generate TC with only active-masternode signatures.
 	timeoutCert := &types.TimeoutCert{
-		Round:      currentTimeoutMsg.(*types.Timeout).Round,
+		Round:      timeoutRound,
 		Signatures: signatures,
 		GapNumber:  gapNumber,
 	}
