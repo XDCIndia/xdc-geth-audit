@@ -263,16 +263,16 @@ func (api *API) NetworkInformation() NetworkInfo {
 	return info
 }
 
-// GetRewardByAccount returns reward history for an account by scanning reward files in StoreRewardFolder.
+// GetRewardByAccount returns reward history for an account by scanning reward files in the --store-reward folder.
 // Fix #65: Reads per-block reward JSON files written by Finalize and filters by account address.
 // Reward file format: map[string]map[string]map[string]*big.Int (validator -> voter -> field -> amount)
 // TODO: Support reward DB lookup for non-file-based storage.
 func (api *API) GetRewardByAccount(account common.Address, begin rpc.BlockNumber, end rpc.BlockNumber) (AccountRewardResponse, error) {
 	log.Debug("[GetRewardByAccount]", "account", account.Hex(), "begin", begin, "end", end)
 
-	if len(StoreRewardFolder) == 0 {
+	if len(common.StoreRewardFolder) == 0 {
 		return AccountRewardResponse{Rewards: make([]AccountEpochReward, 0)},
-			fmt.Errorf("StoreRewardFolder not configured; start node with --store-reward-folder to enable reward history")
+			fmt.Errorf("reward folder not configured; start node with --store-reward to enable reward history")
 	}
 
 	// Resolve block range
@@ -298,10 +298,10 @@ func (api *API) GetRewardByAccount(account common.Address, begin rpc.BlockNumber
 	accountHex := strings.ToLower(account.Hex())
 
 	// Read all reward files in the folder and match by block range and account
-	entries, err := os.ReadDir(StoreRewardFolder)
+	entries, err := os.ReadDir(common.StoreRewardFolder)
 	if err != nil {
 		return AccountRewardResponse{Rewards: make([]AccountEpochReward, 0)},
-			fmt.Errorf("cannot read StoreRewardFolder %s: %w", StoreRewardFolder, err)
+			fmt.Errorf("cannot read reward folder %s: %w", common.StoreRewardFolder, err)
 	}
 
 	rewards := make([]AccountEpochReward, 0)
@@ -319,7 +319,7 @@ func (api *API) GetRewardByAccount(account common.Address, begin rpc.BlockNumber
 			continue
 		}
 
-		data, err := os.ReadFile(filepath.Join(StoreRewardFolder, name))
+		data, err := os.ReadFile(filepath.Join(common.StoreRewardFolder, name))
 		if err != nil {
 			log.Warn("[GetRewardByAccount] cannot read reward file", "file", name, "err", err)
 			continue
