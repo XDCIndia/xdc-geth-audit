@@ -843,15 +843,24 @@ func (x *XDPoS_v2) calcDifficulty(chain consensus.ChainReader, parent *types.Hea
 
 // YourTurn checks if it's the signer's turn
 func (x *XDPoS_v2) YourTurn(chain consensus.ChainReader, parent *types.Header, signer common.Address) (bool, error) {
-	x.lock.RLock()
-	defer x.lock.RUnlock()
-
+	// Initialise under write lock so concurrent callers cannot execute
+	// initial() simultaneously. initial() writes isInitialized, currentRound,
+	// highestQuorumCert and lockQuorumCert; running it under RLock alone
+	// permits concurrent writers, which is a data race.  We do the check
+	// entirely under Lock (no outer unlocked read) to avoid a race between the
+	// check and the write inside initial().
+	x.lock.Lock()
 	if !x.isInitialized {
 		if err := x.initial(chain, parent); err != nil {
+			x.lock.Unlock()
 			log.Error("[YourTurn] Error initializing", "error", err)
 			return false, err
 		}
 	}
+	x.lock.Unlock()
+
+	x.lock.RLock()
+	defer x.lock.RUnlock()
 
 	// Check if enough time has passed (use per-round config, fix #117)
 	waitedTime := time.Now().Unix() - int64(parent.Time)
