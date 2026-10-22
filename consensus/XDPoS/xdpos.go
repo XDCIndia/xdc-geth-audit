@@ -1599,10 +1599,10 @@ func (c *XDPoS) FinalizeAndAssemble(chain consensus.ChainHeaderReader, header *t
 		if err != nil {
 			return nil, err
 		}
-		if len(StoreRewardFolder) > 0 {
+		if len(common.StoreRewardFolder) > 0 {
 			data, err := json.Marshal(rewards)
 			if err == nil {
-				err = os.WriteFile(filepath.Join(StoreRewardFolder, header.Number.String()+"."+header.Hash().Hex()), data, 0644)
+				err = os.WriteFile(filepath.Join(common.StoreRewardFolder, header.Number.String()+"."+header.Hash().Hex()), data, 0644)
 			}
 			if err != nil {
 				log.Error("Error when save reward info", "number", header.Number, "hash", header.Hash().Hex(), "err", err)
