@@ -388,6 +388,36 @@ func newXDCSyncer(h *handler) *xdcSyncer {
 	}
 }
 
+// atTipFreshnessWindow is how old (seconds) the local head may be while the
+// node still counts as at the tip: one V2 timeout-sync budget plus a mine
+// period, with a 30 s floor.
+func atTipFreshnessWindow(cfg *params.ChainConfig) int64 {
+	const floor = int64(30)
+	if cfg == nil || cfg.XDPoS == nil || cfg.XDPoS.V2 == nil {
+		return floor
+	}
+	v2cfg := cfg.XDPoS.V2.CurrentConfig
+	if v2cfg == nil || v2cfg.TimeoutPeriod <= 0 {
+		return floor
+	}
+	tst := v2cfg.TimeoutSyncThreshold
+	if tst <= 0 {
+		tst = 1
+	}
+	budget := int64(v2cfg.TimeoutPeriod)*int64(tst) + int64(v2cfg.MinePeriod)
+	if budget < floor {
+		return floor
+	}
+	return budget
+}
+
+// headFreshAt reports whether a head with timestamp headTime is within the
+// at-tip freshness window.
+func headFreshAt(headTime uint64, cfg *params.ChainConfig) bool {
+	age := time.Now().Unix() - int64(headTime)
+	return age >= 0 && age <= atTipFreshnessWindow(cfg)
+}
+
 func (s *xdcSyncer) start() {
 	// XDC: enable bulk-sync optimization for the duration of initial sync.
 	// When true: signing-tx ECDSA recovery skipped, larger TriesInMemory
@@ -2381,7 +2411,10 @@ func (s *xdcSyncer) fullSyncOnce() {
 		if !errors.Is(err, consensus.ErrUnknownAncestor) &&
 			s.handler.chain.Config().ChainID != nil &&
 			s.handler.chain.Config().ChainID.Uint64() != 50 {
-			if cur := s.handler.chain.CurrentBlock(); cur != nil && len(res.headers) < xdpos2MaxHeaderFetch {
+			// F-2026-19724: "at tip" is the local head's age, not the peer's batch
+			// length. A short batch is peer-controlled: a peer could return one
+			// invalid block and clear bulk mode on a far-behind node.
+			if cur := s.handler.chain.CurrentBlock(); cur != nil && headFreshAt(cur.Time, s.handler.chain.Config()) {
 				if core.XdcBulkSyncMode.Load() {
 					log.Warn("xdcSyncer: #952 next block invalid at tip — clearing XdcBulkSyncMode so miner can seal the valid successor",
 						"from", fromBlock, "head", cur.Number.Uint64(), "err", err)
