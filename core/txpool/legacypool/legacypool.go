@@ -1525,6 +1525,9 @@ func (pool *LegacyPool) runReorg(done chan struct{}, reset *txpoolResetRequest, 
 func (pool *LegacyPool) reset(oldHead, newHead *types.Header) {
 	// If we're reorging an old state, reinject all dropped transactions
 	var reinject types.Transactions
+	// included tracks txs in the newly confirmed chain (populated during reorg;
+	// used later for the XDC empty-route-tx drop).
+	var included types.Transactions
 
 	if oldHead != nil && oldHead.Hash() != newHead.ParentHash {
 		// If the reorg is too deep, avoid doing it (will happen during fast sync)
@@ -1563,7 +1566,7 @@ func (pool *LegacyPool) reset(oldHead, newHead *types.Header) {
 					log.Warn("Transaction pool reset with missing new head", "number", newHead.Number, "hash", newHead.Hash())
 					return
 				}
-				var discarded, included types.Transactions
+				var discarded types.Transactions
 				for rem.NumberU64() > add.NumberU64() {
 					discarded = append(discarded, rem.Transactions()...)
 					if rem = pool.chain.GetBlock(rem.ParentHash(), rem.NumberU64()-1); rem == nil {
@@ -1621,10 +1624,45 @@ func (pool *LegacyPool) reset(oldHead, newHead *types.Header) {
 	pool.currentState = statedb
 	pool.pendingNonces = newNoncer(statedb)
 
+	// XDC: empty-route txs (0x91-0x94) do not advance the sender's nonce
+	// (ApplyEmptyTransaction is canonical). Once such a tx appears in the
+	// confirmed chain, drop it from pending so the miner does not include it
+	// again in subsequent blocks (Fixes #1702).
+	// Do this before re-injecting discarded txs: TxDifference already excludes
+	// txs in the new chain from reinject, so order does not matter for
+	// correctness, but pruning first is cleaner.
+	if pool.chainconfig.IsXDC() && newHead != nil {
+		var toCheck types.Transactions
+		if oldHead != nil && oldHead.Hash() != newHead.ParentHash {
+			// Reorg: the walk above already collected all txs added in the new chain.
+			toCheck = included
+		} else {
+			// Simple advance: inspect the single newly confirmed block.
+			if blk := pool.chain.GetBlock(newHead.Hash(), newHead.Number.Uint64()); blk != nil {
+				toCheck = blk.Transactions()
+			}
+		}
+		for _, tx := range toCheck {
+			if to := tx.To(); to != nil && isXDCEmptyRouteAddr(*to) {
+				pool.removeTx(tx.Hash(), false, true)
+			}
+		}
+	}
+
 	// Inject any transactions discarded due to reorgs
 	log.Debug("Reinjecting stale transactions", "count", len(reinject))
 	core.SenderCacher().Recover(pool.signer, reinject)
 	pool.addTxsLocked(reinject, make([]error, len(reinject)))
+}
+
+// isXDCEmptyRouteAddr reports whether addr is one of the four XDCx contracts
+// (0x91-0x94) that ApplyEmptyTransaction handles while IsTIPXDCXReceiver is
+// active. Used to detect pending txs that will not advance the sender's nonce.
+func isXDCEmptyRouteAddr(addr common.Address) bool {
+	return addr == common.XDCXAddrBinary ||
+		addr == common.TradingStateAddrBinary ||
+		addr == common.XDCXLendingAddressBinary ||
+		addr == common.XDCXLendingFinalizedTradeAddressBinary
 }
 
 // promoteExecutables moves transactions that have become processable from the
