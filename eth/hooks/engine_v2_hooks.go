@@ -334,7 +334,7 @@ func AttachConsensusV2Hooks(adaptor *XDPoS.XDPoS, bc *core.BlockChain, chainConf
 			for {
 				parentHeader := chain.GetHeader(parentHash, parentNumber)
 				if parentHeader == nil {
-					break
+					return []common.Address{}, fmt.Errorf("hook penalty fail to get parent header at number: %v, hash: %v", parentNumber, parentHash)
 				}
 				isEpochSwitch, _, err := adaptor.EngineV2.IsEpochSwitch(parentHeader)
 				if err != nil {
