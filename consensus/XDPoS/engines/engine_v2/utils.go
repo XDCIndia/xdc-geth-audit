@@ -677,13 +677,22 @@ func (x *XDPoS_v2) VerifyBlockInfo(chain consensus.ChainReader, blockInfo *types
 
 // VerifySyncInfoMessage verifies a sync info message
 func (x *XDPoS_v2) VerifySyncInfoMessage(chain consensus.ChainReader, syncInfo *types.SyncInfo) (bool, error) {
+	// Snapshot the local QC and TC rounds under RLock.  processQC and processTC
+	// (called from SyncInfoHandler/ProposedBlockHandler under Lock) replace
+	// x.highestQuorumCert and x.highestTimeoutCert; reading them without any
+	// lock is a data race.
+	x.lock.RLock()
+	localQCRound := x.highestQuorumCert.ProposedBlockInfo.Round
+	localTCRound := x.highestTimeoutCert.Round
+	x.lock.RUnlock()
+
 	// Check if we need to update
-	if x.highestQuorumCert.ProposedBlockInfo.Round >= syncInfo.HighestQuorumCert.ProposedBlockInfo.Round &&
-		x.highestTimeoutCert.Round >= syncInfo.HighestTimeoutCert.Round {
+	if localQCRound >= syncInfo.HighestQuorumCert.ProposedBlockInfo.Round &&
+		localTCRound >= syncInfo.HighestTimeoutCert.Round {
 		log.Debug("[VerifySyncInfoMessage] SyncInfo not newer",
-			"localQCRound", x.highestQuorumCert.ProposedBlockInfo.Round,
+			"localQCRound", localQCRound,
 			"incomingQCRound", syncInfo.HighestQuorumCert.ProposedBlockInfo.Round,
-			"localTCRound", x.highestTimeoutCert.Round,
+			"localTCRound", localTCRound,
 			"incomingTCRound", syncInfo.HighestTimeoutCert.Round)
 		return false, nil
 	}
