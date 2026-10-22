@@ -19,6 +19,17 @@ import (
 	"github.com/ethereum/go-ethereum/params"
 )
 
+// checkpointHeader builds a minimal checkpoint header with the given number and
+// optional Validators bytes for use in hook tests.
+func makeCheckpointHeader(number uint64, validators []byte) *types.Header {
+	h := &types.Header{
+		Number:     new(big.Int).SetUint64(number),
+		ParentHash: common.Hash{0x01},
+		Validators: validators,
+	}
+	return h
+}
+
 // TestV1HookVerifyMNsRecomputesValidators: the checkpoint Validators field is
 // checked against the M2 list derived from the parent's 0x90 randomize values;
 // wrong bytes are rejected and the header is never rewritten (#1412).
@@ -78,5 +89,85 @@ func TestV1HookVerifyMNsRecomputesValidators(t *testing.T) {
 	}
 	if err := adaptor.HookVerifyMNs(checkpoint(correct), masternodes); err != nil {
 		t.Fatalf("canonical Validators rejected: %v", err)
+	}
+}
+
+// TestV1HookVerifyMNsApothemSkip: on Apothem (chain 51) the hook returns nil
+// and increments the apothem-skips counter even when Validators bytes are
+// wrong. This mirrors canonical shouldDisableFullVerify behaviour.
+// Hacken F-2026-19462 residual: the bypass is now observable via Warn + metric.
+func TestV1HookVerifyMNsApothemSkip(t *testing.T) {
+	db := rawdb.NewMemoryDatabase()
+	gspec := &core.Genesis{
+		Config:     params.AllEthashProtocolChanges,
+		Difficulty: common.Big1,
+		GasLimit:   8_000_000,
+	}
+	bc, err := core.NewBlockChain(db, gspec, ethash.NewFaker(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer bc.Stop()
+
+	// Chain ID 51 = Apothem testnet.
+	chainConfig := *params.AllEthashProtocolChanges
+	chainConfig.ChainID = new(big.Int).Set(params.XDCApothemChainConfig.ChainID)
+	chainConfig.XDPoS = &params.XDPoSConfig{Epoch: 900, Gap: 450, Period: 2}
+	adaptor := XDPoS.New(chainConfig.XDPoS, db)
+	AttachConsensusV1Hooks(adaptor, bc, &chainConfig)
+
+	before := hookVerifyMNsApothemSkips.Snapshot().Count()
+
+	// A clearly wrong Validators field: the hook must accept it on chain 51.
+	h := makeCheckpointHeader(900, []byte("wrong"))
+	if err := adaptor.HookVerifyMNs(h, nil); err != nil {
+		t.Fatalf("Apothem skip: expected nil, got %v", err)
+	}
+
+	after := hookVerifyMNsApothemSkips.Snapshot().Count()
+	if after-before != 1 {
+		t.Fatalf("apothem_skips counter: got delta %d, want 1", after-before)
+	}
+}
+
+// TestV1HookVerifyMNsMissingParentSkip: when the parent header is unknown the
+// hook returns nil and increments the missing-state-skips counter.
+// Hacken F-2026-19462 residual: the bypass is now observable via Warn + metric.
+func TestV1HookVerifyMNsMissingParentSkip(t *testing.T) {
+	db := rawdb.NewMemoryDatabase()
+	gspec := &core.Genesis{
+		Config:     params.AllEthashProtocolChanges,
+		Difficulty: common.Big1,
+		GasLimit:   8_000_000,
+	}
+	bc, err := core.NewBlockChain(db, gspec, ethash.NewFaker(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer bc.Stop()
+
+	// Mainnet-like chain (not Apothem), so the bypass does not short-circuit.
+	chainConfig := *params.AllEthashProtocolChanges
+	chainConfig.ChainID = big.NewInt(50)
+	chainConfig.XDPoS = &params.XDPoSConfig{Epoch: 900, Gap: 450, Period: 2}
+	adaptor := XDPoS.New(chainConfig.XDPoS, db)
+	AttachConsensusV1Hooks(adaptor, bc, &chainConfig)
+
+	before := hookVerifyMNsMissingStateSkips.Snapshot().Count()
+
+	// ParentHash 0xff…ff does not exist in the chain: parent lookup returns nil.
+	h := &types.Header{
+		Number:     big.NewInt(900),
+		ParentHash: common.Hash{0xff},
+		Validators: []byte("irrelevant"),
+	}
+	masternodes := []common.Address{{0x01}}
+	if err := adaptor.HookVerifyMNs(h, masternodes); err != nil {
+		t.Fatalf("missing-parent skip: expected nil, got %v", err)
+	}
+
+	after := hookVerifyMNsMissingStateSkips.Snapshot().Count()
+	if after-before != 1 {
+		t.Fatalf("missing_state_skips counter: got delta %d, want 1", after-before)
 	}
 }
