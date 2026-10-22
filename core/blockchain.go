@@ -145,6 +145,14 @@ const (
 	receiptsCacheLimit = 32
 	txLookupCacheLimit = 1024
 
+	// sidechainChildCap is the maximum number of side-chain children stored for
+	// a single parent hash via writeBlockWithoutState. Beyond this limit,
+	// insertSideChain refuses to store more and returns an error. The per-parent
+	// counter is held in an LRU of sidechainParentCacheSize entries so the map
+	// itself is bounded (XDC-19).
+	sidechainChildCap        = 8
+	sidechainParentCacheSize = 1024
+
 	// BlockChainVersion ensures that an incompatible database forces a resync from scratch.
 	//
 	// Changelog:
@@ -402,6 +410,10 @@ type BlockChain struct {
 	txLookupLock  sync.RWMutex
 	txLookupCache *lru.Cache[common.Hash, txLookup]
 
+	// sidechainKids counts how many side-chain blocks have been stored without
+	// state for each parent hash (XDC-19: unbounded disk growth guard).
+	sidechainKids *lru.Cache[common.Hash, int]
+
 	stopping      atomic.Bool // false if chain is running, true when stopped
 	procInterrupt atomic.Bool // interrupt signaler for block processing
 
@@ -480,6 +492,7 @@ func NewBlockChain(db ethdb.Database, genesis *Genesis, engine consensus.Engine,
 		receiptsCache:      lru.NewCache[common.Hash, []*types.Receipt](receiptsCacheLimit),
 		blockCache:         lru.NewCache[common.Hash, *types.Block](blockCacheLimit),
 		txLookupCache:      lru.NewCache[common.Hash, txLookup](txLookupCacheLimit),
+		sidechainKids:      lru.NewCache[common.Hash, int](sidechainParentCacheSize),
 		engine:             engine,
 		logger:             cfg.VmConfig.Tracer,
 		slowBlockThreshold: cfg.SlowBlockThreshold,
@@ -3070,10 +3083,22 @@ func (bc *BlockChain) insertSideChain(ctx context.Context, block *types.Block, i
 			}
 		}
 		if !bc.HasBlock(block.Hash(), block.NumberU64()) {
+			// XDC-19: refuse to store more than sidechainChildCap blocks from the
+			// same parent without state. Beyond the cap the block is from a spam
+			// attack (legitimate competing forks are at most a handful deep).
+			parent := block.ParentHash()
+			count, _ := bc.sidechainKids.Get(parent)
+			if count >= sidechainChildCap {
+				log.Warn("Too many sidechain children over pruned parent; dropping block",
+					"number", block.Number(), "hash", block.Hash(), "parent", parent, "cap", sidechainChildCap)
+				return nil, it.index, fmt.Errorf("sidechain child cap %d exceeded for parent %s at number %d",
+					sidechainChildCap, parent, block.NumberU64())
+			}
 			start := time.Now()
 			if err := bc.writeBlockWithoutState(block); err != nil {
 				return nil, it.index, err
 			}
+			bc.sidechainKids.Add(parent, count+1)
 			log.Debug("Injected sidechain block", "number", block.Number(), "hash", block.Hash(),
 				"diff", block.Difficulty(), "elapsed", common.PrettyDuration(time.Since(start)),
 				"txs", len(block.Transactions()), "gas", block.GasUsed(), "uncles", len(block.Uncles()),
