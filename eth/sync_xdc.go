@@ -3586,13 +3586,24 @@ func (s *xdcSyncer) prefetchAncestorEpochs(peer *eth.Peer, primeBase *types.Head
 			s.seedMasternodeSnapshotsFromPrefetch(allHeaders, lo, originalHi, nil, primeBase)
 			return
 		}
-		// Verify the last header's hash matches the expected parent of the
-		// next-higher block (primeBase.ParentHash for the first batch).
+		// Require the batch to reach hi. A short response leaves the batch
+		// unanchored: the caller controls headers[0].ParentHash of the next
+		// batch, so a malicious peer could inject fabricated epoch-switch
+		// headers. Taint and stop on any short response.
 		last := headers[len(headers)-1]
-		if last.Number.Uint64() == hi && last.Hash() != expectedParent {
+		if last.Number.Uint64() != hi {
+			log.Warn("xdcSyncer: A.68.2 ancestor pre-fetch — short batch from peer, stopping",
+				"want_top", hi, "got_top", last.Number.Uint64(), "batchStart", batchStart)
+			s.taintPeer(peer)
+			s.seedMasternodeSnapshotsFromPrefetch(allHeaders, lo, originalHi, nil, primeBase)
+			return
+		}
+		// Always verify the anchor: top header must hash to expectedParent.
+		if last.Hash() != expectedParent {
 			log.Warn("xdcSyncer: A.68.2 ancestor pre-fetch — top header doesn't link to prime base",
 				"expected_parent_hash", expectedParent.Hex(),
 				"got_hash", last.Hash().Hex(), "stopping")
+			s.taintPeer(peer)
 			s.seedMasternodeSnapshotsFromPrefetch(allHeaders, lo, originalHi, nil, primeBase)
 			return
 		}
