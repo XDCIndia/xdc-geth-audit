@@ -208,6 +208,20 @@ func SealHash(header *types.Header) (hash common.Hash) {
 }
 
 // encodeSigHeader encodes the header for signing, excluding the signature
+//
+// F-2026-19621 (Accepted): header.Penalties is intentionally excluded.
+// Including it would change the digest for every historical V1 block, invalidating
+// every seal on mainnet and Apothem — that is never allowed.  The V1 seal therefore
+// does not bind Penalties.  Instead, checkSignersOnCheckpoint (called from
+// verifyCascadingFields under full verify on non-Apothem chains) computes the
+// expected penalty list via the penalty hook and rejects a checkpoint whose
+// header.Penalties differs from that list (errInvalidCheckpointPenalties).  This
+// hook-compare is the only binding of Penalties to the block's content; it is
+// unavoidably skipped on the bulk-sync light path (hook needs state not yet
+// available), when ErrPenaltyDataUnavailable is returned (non-archive after rewind),
+// and on Apothem (historical Apothem blocks may carry penalties that do not match
+// the computed set).  These residuals are the minimum necessary to stay compatible
+// with the canonical chain.
 func encodeSigHeader(w io.Writer, header *types.Header) {
 	// V1 blocks store the proposer signature in the last 65 bytes of header.Extra.
 	// This function is ONLY used for V1 code paths.
@@ -626,8 +640,12 @@ func (c *XDPoS) VerifyHeaders(chain consensus.ChainHeaderReader, headers []*type
 }
 
 // verifyHeaderLightV1 performs V1 header verification for bulk sync. It skips
-// the checkpoint signer-list checks (penalty hooks need state) but always
-// verifies the seal, matching canonical engine_v1 with fullVerify=false.
+// the checkpoint signer-list checks (penalty hooks need state) but verifies
+// the seal and, past the first epoch on non-Apothem chains, also checks M2
+// co-signature identity (F-2026-19614, empirically validated on 530k mainnet
+// V1 headers). This matches canonical engine_v1 with fullVerify=false except
+// that we now verify M2 identity, which canonical v2.9.3 also does under
+// fullVerify.
 func (c *XDPoS) verifyHeaderLightV1(chain consensus.ChainHeaderReader, header *types.Header, parents []*types.Header) error {
 	if _, check := c.verifiedHeaders.Get(header.Hash()); check {
 		return nil
@@ -980,7 +998,19 @@ func (c *XDPoS) checkSignersOnCheckpoint(chain consensus.ChainHeaderReader, head
 	// Get penalties with the hook canonical selects by IsTIPSigning
 	// (engine_v1/engine.go:306-326) and reject a checkpoint whose Penalties differ
 	// from the computed list. Penalties are not in the V1 seal hash (canonical
-	// too), so this compare is what binds them.
+	// too), so this compare is what binds them (#1422).
+	//
+	// F-2026-19621 residuals (Accepted):
+	//   • ErrPenaltyDataUnavailable: the compare is skipped and header.Penalties is
+	//     trusted when the penalty hook cannot access parent state (non-archive node
+	//     after a rewind).  Rejecting would permanently wedge such nodes.
+	//   • Apothem: v1FullVerifyChain returns false for chain 51; this function is
+	//     only called when that returns true, so Apothem never runs this compare.
+	//     Historical Apothem checkpoints carry penalties that the live penalty hook
+	//     no longer reproduces.
+	//   • Bulk-sync light path: verifyHeaderLightV1 does not call verifyCascadingFields
+	//     and therefore never reaches this function.  The penalty hook requires parent
+	//     state, which is unavailable during bulk sync.
 	penPenalties, ok, penErr := c.v1CheckpointPenalties(chain, header, signers, parents)
 	if errors.Is(penErr, ErrPenaltyDataUnavailable) {
 		// Same policy as a missing parent state: a node without the data
@@ -1201,7 +1231,26 @@ func (c *XDPoS) verifySeal(chain consensus.ChainHeaderReader, header *types.Head
 		}
 	}
 
-	// Get masternodes for this header (include parents for sync scenarios)
+	// Get masternodes for this header (include parents for sync scenarios).
+	//
+	// F-2026-19602 (Accepted): for a checkpoint block, GetMasternodesWithParents
+	// reads from the checkpoint's own header.Extra — the very list being verified.
+	// The primary membership check is snap.Signers (the parent epoch's set).  The
+	// GetMasternodesWithParents fallback only fires when snap.Signers does not
+	// contain the creator, which should never happen for a legitimate block under
+	// normal operation.  Three cases where the fallback is nevertheless needed and
+	// correct:
+	//   1. Ignore-listed checkpoints: IsIgnoreSignerCheckBlock skips the signer-list
+	//      compare in checkSignersOnCheckpoint; these specific historical blocks have
+	//      a creator that is not in the preceding snapshot.
+	//   2. Light/bulk-sync path: verifyCascadingFields and its signer-list compare
+	//      are not run; the snapshot may be derived from a stale ancestor.
+	//   3. Snapshot corruption: nodes that ran code predating commit 5fbbf8d may have
+	//      a poisoned snapshot that is missing the creator; the fallback prevents a
+	//      permanent wedge while keeping the creator in the checkpoint's Extra.
+	// Tightening the fallback (e.g., rejecting when creator is not in snap.Signers
+	// for non-ignore-listed, non-Apothem, full-verify checkpoints) would not improve
+	// security for cases 1–3 and risks wedging nodes with stale snapshots.
 	masternodes := c.GetMasternodesWithParents(chain, header, parents)
 
 	// Check if creator is authorized
@@ -1236,16 +1285,29 @@ func (c *XDPoS) verifySeal(chain consensus.ChainHeaderReader, header *types.Head
 	// (engine_v1/engine.go:185-188, 667-680) rejects, for Number > Epoch under
 	// fullVerify, an empty header.Validator (ErrNoValidatorSignature) and a
 	// co-signer other than the creator's assigned M2 (ErrFailedDoubleValidation).
-	// fullVerify mirrors verifyHeaderV2 (not during bulk sync); canonical turns it
-	// off on chain 51 (engine.go:162-167).
+	// Canonical turns fullVerify off on chain 51 (engine.go:162-167).
 	//
 	// Like canonical v2.9.3, this applies on every chain but Apothem. (v2.7.x
 	// skipped it on custom chains through a verify-cache quirk that v2.9.3 removed:
 	// engine_v1 verifyHeaderWithCache now caches full verifications only.)
-	if xdcFullVerify() && v1DoubleValidation(chain.Config()) && number > c.config.Epoch {
-		if len(header.Validator) == 0 {
-			return errNoValidatorSignature
-		}
+	//
+	// An empty header.Validator is refused in bulk sync too, as verifyHeaderLightV1
+	// does: VerifyHeader must agree with the VerifyHeaders path that InsertChain
+	// uses, or the NewBlock handler imports a block that still waits for its M2
+	// co-signature and reports it as a BAD BLOCK (#1624).
+	//
+	// F-2026-19614: M2 co-signature identity check now runs regardless of
+	// xdcFullVerify(), closing the residual where a non-empty wrong co-signature
+	// was accepted on the bulk-sync light path (verifyHeaderLightV1 → verifySeal).
+	// Empirically backed: 530k mainnet V1 headers scanned, 0 M2 mismatches.
+	// On the bulk-sync light path only, the compare is skipped when the creator
+	// has no M2 assignment in the checkpoint set (ignore-listed epoch blocks,
+	// pre-TIPRandomize epochs), the blocks the scan classified as skip. Under full
+	// verification a missing assignment still fails, as in canonical XDPoSChain.
+	if v1DoubleValidation(chain.Config()) && number > c.config.Epoch && len(header.Validator) == 0 {
+		return errNoValidatorSignature
+	}
+	if v1DoubleValidation(chain.Config()) && number > c.config.Epoch {
 		validator, err := c.RecoverValidator(header)
 		if err != nil {
 			return err
@@ -1254,7 +1316,7 @@ func (c *XDPoS) verifySeal(chain consensus.ChainHeaderReader, header *types.Head
 		if err != nil {
 			return err
 		}
-		if validator != assigned {
+		if validator != assigned && (xdcFullVerify() || assigned != (common.Address{})) {
 			log.Debug("Bad block detected. Header contains wrong pair of creator-validator", "number", number, "creator", creator, "assigned validator", assigned, "wrong validator", validator)
 			return errFailedDoubleValidation
 		}

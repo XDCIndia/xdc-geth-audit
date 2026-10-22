@@ -184,3 +184,69 @@ func TestV1DoubleValidationCheckpointInBatch(t *testing.T) {
 		t.Fatalf("checkpoint stored but not canonical: got %v, want nil", err)
 	}
 }
+
+// TestV1VerifyHeaderBulkSyncRefusesEmptyValidator: in bulk sync VerifyHeader
+// refuses a V1 block past the first epoch with an empty header.Validator, and
+// also refuses a block whose Validator recovers to the wrong M2 co-signer
+// (F-2026-19614). The NewBlock handler relies on the empty-Validator check to
+// wait for the M2 co-signed block instead of importing it as a BAD BLOCK
+// (#1624); the identity check now closes the complementary gap where a non-empty
+// wrong co-signature was previously accepted on the bulk-sync path.
+func TestV1VerifyHeaderBulkSyncRefusesEmptyValidator(t *testing.T) {
+	saved := core.XdcBulkSyncMode.Load()
+	core.XdcBulkSyncMode.Store(true)
+	defer core.XdcBulkSyncMode.Store(saved)
+
+	keyA, _ := crypto.GenerateKey()
+	keyB, _ := crypto.GenerateKey()
+	a, b := crypto.PubkeyToAddress(keyA.PublicKey), crypto.PubkeyToAddress(keyB.PublicKey)
+	extra := make([]byte, extraVanity+2*common.AddressLength+extraSeal)
+	copy(extra[extraVanity:], a[:])
+	copy(extra[extraVanity+common.AddressLength:], b[:])
+	cp := &types.Header{
+		Number:     big.NewInt(int64(testConfig.Epoch)),
+		Difficulty: big.NewInt(1),
+		Extra:      extra,
+		Validators: []byte("\x00\x00\x001\x00\x00\x000"),
+		UncleHash:  types.EmptyUncleHash,
+		GasLimit:   420000000,
+		Time:       1000,
+	}
+	verify := func(chainID int64, m2Key *ecdsa.PrivateKey) error {
+		chain := m2Chain{&params.ChainConfig{ChainID: big.NewInt(chainID), XDPoS: testConfig}, cp}
+		engine := New(testConfig, rawdb.NewMemoryDatabase())
+		engine.recents.Add(cp.Hash(), newSnapshot(testConfig, engine.signatures, cp.Number.Uint64(), cp.Hash(), []common.Address{a, b}))
+		h := &types.Header{
+			ParentHash: cp.Hash(),
+			Number:     big.NewInt(int64(testConfig.Epoch) + 1),
+			Time:       cp.Time + testConfig.Period,
+			Extra:      make([]byte, extraVanity+extraSeal),
+			UncleHash:  types.EmptyUncleHash,
+			GasLimit:   cp.GasLimit,
+			Difficulty: engine.calcDifficulty(chain, cp, a),
+		}
+		sig, err := crypto.Sign(sigHash(h).Bytes(), keyA)
+		if err != nil {
+			t.Fatal(err)
+		}
+		copy(h.Extra[len(h.Extra)-extraSeal:], sig)
+		if m2Key != nil {
+			if h.Validator, err = crypto.Sign(sigHash(h).Bytes(), m2Key); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return engine.VerifyHeader(chain, h)
+	}
+	if err := verify(2002, nil); !errors.Is(err, errNoValidatorSignature) {
+		t.Errorf("bulk sync, empty Validator: got %v, want %v", err, errNoValidatorSignature)
+	}
+	if err := verify(2002, keyB); err != nil {
+		t.Errorf("bulk sync, assigned M2 co-signer rejected: %v", err)
+	}
+	if err := verify(2002, keyA); !errors.Is(err, errFailedDoubleValidation) {
+		t.Errorf("bulk sync, wrong M2: got %v, want %v", err, errFailedDoubleValidation)
+	}
+	if err := verify(51, nil); err != nil {
+		t.Errorf("chain 51, empty Validator: got %v, want nil", err)
+	}
+}
