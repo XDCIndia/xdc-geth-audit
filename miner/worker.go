@@ -731,18 +731,25 @@ func (miner *Miner) fillTransactions(ctx context.Context, interrupt *atomic.Int3
 	return nil
 }
 
-// splitSpecialTxs moves the special txs out of pending, keeping each account's
-// nonce order, and returns them. Accounts left without txs are removed.
+// splitSpecialTxs moves leading special txs (0x89/0x90) out of pending and
+// returns them for priority commit.  Only the uninterrupted run of special txs
+// at the front of each account's nonce queue is moved; a special tx that sits
+// behind a paid nonce is kept in pending so newTxWithMinerFee can include it
+// via Shift after the paid tx is committed (F-2026-19727).
+// Accounts left without txs are removed from pending.
 func splitSpecialTxs(pending map[common.Address][]*txpool.LazyTransaction) map[common.Address][]*txpool.LazyTransaction {
 	special := make(map[common.Address][]*txpool.LazyTransaction)
 	for from, txs := range pending {
 		var normal []*txpool.LazyTransaction
 		for _, ltx := range txs {
-			if tx := ltx.Resolve(); tx != nil && tx.IsSpecialTransaction() {
-				special[from] = append(special[from], ltx)
-			} else {
-				normal = append(normal, ltx)
+			if len(normal) == 0 {
+				// Still in the leading special-tx prefix for this account.
+				if tx := ltx.Resolve(); tx != nil && tx.IsSpecialTransaction() {
+					special[from] = append(special[from], ltx)
+					continue
+				}
 			}
+			normal = append(normal, ltx)
 		}
 		if len(normal) == 0 {
 			delete(pending, from)
