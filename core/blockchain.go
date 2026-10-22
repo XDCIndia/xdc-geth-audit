@@ -3139,7 +3139,9 @@ func (bc *BlockChain) insertSideChain(ctx context.Context, block *types.Block, i
 	for i := len(hashes) - 1; i >= 0; i-- {
 		// Append the next block to our batch
 		block := bc.GetBlock(hashes[i], numbers[i])
-
+		if block == nil {
+			return nil, 0, fmt.Errorf("missing sidechain block %s (number %d)", hashes[i], numbers[i])
+		}
 		blocks = append(blocks, block)
 		memory += block.Size()
 
