@@ -1699,8 +1699,16 @@ func (c *XDPoS) FinalizeAndAssemble(chain consensus.ChainHeaderReader, header *t
 	}
 
 	if c.HookReward != nil && number%rCheckpoint == 0 {
-		// Use statedb copy as parentState for reading owner/voter info
-		parentState := statedb.Copy()
+		// Use the pre-transaction parentState so reward reads reflect contract
+		// state before any txs in this block, matching the import path (Finalize)
+		// and canonical's miner.  Fall back to statedb.Copy() when the miner has
+		// not provided a pre-tx snapshot (e.g. tests that call FinalizeAndAssemble
+		// directly without going through the miner).
+		parentState := c.parentStateForReward
+		if parentState == nil {
+			parentState = statedb.Copy()
+		}
+		c.parentStateForReward = nil
 		rewards, err := c.HookReward(chain, statedb, parentState, header)
 		if err != nil {
 			return nil, err

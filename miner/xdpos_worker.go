@@ -854,6 +854,14 @@ func (w *XdcWorker) commitV1Work(parent *types.Block) {
 	env.coinbaseOwner = state.GetCandidateOwner(env.state, w.coinbase)
 	env.initTRC21Fee()
 
+	// Store a pre-transaction state copy for V1 reward calculation at checkpoint
+	// blocks.  The import path (core/state_processor.go) does this via
+	// SetParentState immediately before Finalize; the V2 miner path calls
+	// StateAtForkBoundary before fillTransactions.  Matching that ordering here
+	// ensures FinalizeAndAssemble reads validator-contract state before any txs
+	// in this block modify it (#1753).
+	w.engine.SetParentState(env.state.Copy())
+
 	// Fill transactions from the pool. V1 includes txs in every block (rewards
 	// are applied in Finalize at rCheckpoint blocks, not gated on tx presence).
 	ctx := context.Background()
