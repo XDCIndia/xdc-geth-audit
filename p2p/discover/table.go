@@ -425,6 +425,14 @@ loop:
 
 		case r := <-tab.revalResponseCh:
 			tab.revalidation.handleResponse(tab, r)
+			// XDC-33: if revalidation just emptied the table, trigger an
+			// immediate refresh instead of waiting up to nextRefreshTime()
+			// (~30 min). A node without static peers can otherwise sit at
+			// zero peers for the full refresh interval after a partition.
+			if refreshDone == nil && tab.len() == 0 {
+				refreshDone = make(chan struct{})
+				go tab.doRefresh(refreshDone)
+			}
 
 		case op := <-tab.addNodeCh:
 			tab.mutex.Lock()
