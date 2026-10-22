@@ -13,6 +13,7 @@ import (
 	"github.com/ethereum/go-ethereum/consensus/XDPoS/utils"
 	"github.com/ethereum/go-ethereum/consensus/misc/eip1559"
 	"github.com/ethereum/go-ethereum/contracts"
+	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/params"
@@ -369,11 +370,20 @@ func (x *XDPoS_v2) verifyHeader(chain consensus.ChainReader, header *types.Heade
 		// GetMasternodesWithParents / calcMasternodes may differ from canonical by one
 		// swap when a penalised candidate rejoins via the "comeback" mechanic between
 		// gap-N and the next epoch switch. The pivot hash chain already establishes
-		// canonicality; the proposer's signature was verified above. Hard-fail only in
-		// fullVerify (steady-state tip processing) where HookPenalty has full state.
+		// canonicality; the proposer's signature was verified above.
+		//
+		// The tolerance is gated on XdcBulkSyncMode (actively fetching a batch of
+		// historical blocks), NOT on CheckpointSyncNoStateActive. After a fast-sync or
+		// snapshot restore, CheckpointSyncNoStateActive stays set until state healing
+		// completes, but the node can already be at the tip receiving new single headers.
+		// Skipping the leader check at the tip would let any masternode propose without
+		// turn enforcement — the Hacken F-2026-19463 residual. Canonical XDPoSChain
+		// (verifyHeader.go:199-204) enforces the check unconditionally; we mirror that
+		// at the tip by only tolerating the mismatch while XdcBulkSyncMode is set.
+		//
 		// #1413: the tolerance only covers lists taken from headers; a list computed
 		// locally (localList) is checked as in canonical (verifyHeader.go:199-204).
-		if !fullVerify && !localList {
+		if core.XdcBulkSyncMode.Load() && !localList {
 			log.Warn("[verifyHeader] A.87 leader mismatch tolerated during bulk sync",
 				"block", header.Number, "curIndex", curIndex, "leaderIndex", leaderIndex,
 				"expected", masterNodes[leaderIndex], "actual", validatorAddress)

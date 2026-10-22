@@ -17,6 +17,7 @@ import (
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/consensus/XDPoS/utils"
+	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
@@ -159,15 +160,23 @@ func TestVerifyHeaderLeaderTurn_WrongTurnRejectedUnderFullVerify(t *testing.T) {
 	}
 }
 
-// A wrong-turn header first seen without full verification (bulk sync /
-// checkpoint-sync-no-state) must not be cached as verified: a later full
-// verification of the same header has to reject it.
+// A wrong-turn header first seen during bulk sync (XdcBulkSyncMode=true) must
+// not be cached as verified: a later full verification of the same header must
+// still reject it as out-of-turn rather than short-circuiting via the cache.
 func TestVerifyHeaderLeaderTurn_SkippedCheckNotCached(t *testing.T) {
+	savedBulk := core.XdcBulkSyncMode.Load()
+	core.XdcBulkSyncMode.Store(true)
+	t.Cleanup(func() { core.XdcBulkSyncMode.Store(savedBulk) })
+
 	eng, chain, keys, _, p, h := ltFixture(t, 1799)
 	ltSeal(t, h, keys[0])
+	// First call: bulk sync, A.87 tolerates the wrong-turn proposer.
 	if err := eng.verifyHeader(chain, h, []*types.Header{p}, false); err != nil {
-		t.Fatalf("!fullVerify keeps the A.87 tolerance for header-derived lists, got %v", err)
+		t.Fatalf("XdcBulkSyncMode keeps the A.87 tolerance for header-derived lists, got %v", err)
 	}
+	// Header must not have been added to verifiedHeaders; later fullVerify must
+	// run the check and catch the wrong-turn proposer.
+	core.XdcBulkSyncMode.Store(false)
 	if err := eng.verifyHeader(chain, h, []*types.Header{p}, true); !errors.Is(err, utils.ErrNotItsTurn) {
 		t.Fatalf("later fullVerify of a wrong-turn header: want ErrNotItsTurn, got %v (served from verifiedHeaders cache)", err)
 	}
@@ -193,5 +202,55 @@ func TestVerifyHeaderLeaderTurn_InTurnAccepted(t *testing.T) {
 		if err := eng.verifyHeader(chain, h, []*types.Header{p}, full); err != nil {
 			t.Fatalf("in-turn leader (fullVerify=%v): %v", full, err)
 		}
+	}
+}
+
+// F-2026-19463 residual: CheckpointSyncNoStateActive=true after fast-sync /
+// snapshot-restore keeps xdcFullVerify() false even at the live tip. A new
+// tip header from a non-leader must be rejected; only XdcBulkSyncMode earns
+// the A.87 tolerance.
+//
+// Before the fix the A.87 branch fired on `!fullVerify`, which is true for
+// both CheckpointSyncNoStateActive and XdcBulkSyncMode; after the fix it
+// requires XdcBulkSyncMode specifically.
+func TestVerifyHeaderLeaderTurn_CheckpointSyncEnforcesLeader(t *testing.T) {
+	savedBulk := core.XdcBulkSyncMode.Load()
+	savedCkpt := core.CheckpointSyncNoStateActive.Load()
+	core.XdcBulkSyncMode.Store(false)
+	core.CheckpointSyncNoStateActive.Store(true)
+	t.Cleanup(func() {
+		core.XdcBulkSyncMode.Store(savedBulk)
+		core.CheckpointSyncNoStateActive.Store(savedCkpt)
+	})
+
+	eng, chain, keys, _, p, h := ltFixture(t, 1799)
+	// Round 1799 leader is mns[3]; sign with mns[0] (wrong turn).
+	ltSeal(t, h, keys[0])
+
+	// fullVerify=false (CheckpointSyncNoStateActive makes xdcFullVerify false),
+	// but XdcBulkSyncMode=false → must enforce ErrNotItsTurn.
+	if err := eng.verifyHeader(chain, h, []*types.Header{p}, false); !errors.Is(err, utils.ErrNotItsTurn) {
+		t.Fatalf("wrong-turn tip header during checkpoint-sync-no-state: want ErrNotItsTurn, got %v", err)
+	}
+}
+
+// F-2026-19463 control: XdcBulkSyncMode=true still earns the A.87 tolerance.
+func TestVerifyHeaderLeaderTurn_BulkSyncStillTolerated(t *testing.T) {
+	savedBulk := core.XdcBulkSyncMode.Load()
+	savedCkpt := core.CheckpointSyncNoStateActive.Load()
+	core.XdcBulkSyncMode.Store(true)
+	core.CheckpointSyncNoStateActive.Store(false)
+	t.Cleanup(func() {
+		core.XdcBulkSyncMode.Store(savedBulk)
+		core.CheckpointSyncNoStateActive.Store(savedCkpt)
+	})
+
+	eng, chain, keys, _, p, h := ltFixture(t, 1799)
+	// Wrong-turn: mns[0] instead of mns[3].
+	ltSeal(t, h, keys[0])
+
+	// XdcBulkSyncMode=true → A.87 tolerance still applies, no error.
+	if err := eng.verifyHeader(chain, h, []*types.Header{p}, false); err != nil {
+		t.Fatalf("bulk-sync wrong-turn tolerance removed unexpectedly: %v", err)
 	}
 }
