@@ -1458,7 +1458,10 @@ func (pool *LegacyPool) scheduleReorgLoop() {
 	for {
 		// Launch next background reorg if needed
 		if curDone == nil && launchNextRun {
-			// Run the background reorg and announcements
+			// Run the background reorg and announcements.
+			// XDC-15: pool.wg tracks the goroutine so pool.Close waits for event
+			// delivery to finish even though done is signalled before txFeed.Send.
+			pool.wg.Add(1)
 			go pool.runReorg(nextDone, reset, dirtyAccounts, queuedEvents)
 
 			// Prepare everything for the next round of reorg
@@ -1515,10 +1518,10 @@ func (pool *LegacyPool) scheduleReorgLoop() {
 
 // runReorg runs reset and promoteExecutables on behalf of scheduleReorgLoop.
 func (pool *LegacyPool) runReorg(done chan struct{}, reset *txpoolResetRequest, dirtyAccounts *accountSet, events map[common.Address]*SortedMap) {
+	defer pool.wg.Done()
 	defer func(t0 time.Time) {
 		reorgDurationTimer.Update(time.Since(t0))
 	}(time.Now())
-	defer close(done)
 
 	var promoteAddrs []common.Address
 	if dirtyAccounts != nil && reset == nil {
@@ -1612,6 +1615,12 @@ func (pool *LegacyPool) runReorg(done chan struct{}, reset *txpoolResetRequest, 
 	dropBetweenReorgHistogram.Update(int64(pool.changesSinceReorg))
 	pool.changesSinceReorg = 0 // Reset change counter
 	pool.mu.Unlock()
+
+	// XDC-15: signal done before delivering events so callers of requestReset /
+	// requestPromoteExecutables are not blocked by a slow txFeed subscriber.
+	// pool.wg tracks this goroutine (see scheduleReorgLoop) so pool.Close still
+	// waits for txFeed.Send to finish, preserving clean shutdown.
+	close(done)
 
 	// Notify subsystems for newly added transactions
 	for _, tx := range promoted {
