@@ -1527,6 +1527,9 @@ func (pool *LegacyPool) runReorg(done chan struct{}, reset *txpoolResetRequest, 
 		// the flatten operation can be avoided.
 		promoteAddrs = dirtyAccounts.flatten()
 	}
+	// resetOK is set to true when pool.reset successfully loads new-head state.
+	// Head-specific post-processing is skipped when it is false (CertiK XDC-36).
+	var resetOK bool
 	pool.mu.Lock()
 	if reset != nil {
 		if reset.newHead != nil && reset.oldHead != nil {
@@ -1546,14 +1549,19 @@ func (pool *LegacyPool) runReorg(done chan struct{}, reset *txpoolResetRequest, 
 				}
 			}
 		}
-		// Reset from the old head to the new, rescheduling any reorged transactions
-		pool.reset(reset.oldHead, reset.newHead)
+		// Reset from the old head to the new, rescheduling any reorged transactions.
+		// XDC-36: capture whether reset succeeded; skip head-specific post-processing
+		// (nonce forwarding, demotion, base-fee repricing) when it did not, so we do
+		// not operate on stale currentState / pendingNonces for the requested head.
+		resetOK = pool.reset(reset.oldHead, reset.newHead)
 
-		// Nonces were reset, discard any events that became stale
-		for addr := range events {
-			events[addr].Forward(pool.pendingNonces.get(addr))
-			if events[addr].Len() == 0 {
-				delete(events, addr)
+		if resetOK {
+			// Nonces were reset, discard any events that became stale
+			for addr := range events {
+				events[addr].Forward(pool.pendingNonces.get(addr))
+				if events[addr].Len() == 0 {
+					delete(events, addr)
+				}
 			}
 		}
 		// Reset needs promote for all addresses
@@ -1565,7 +1573,7 @@ func (pool *LegacyPool) runReorg(done chan struct{}, reset *txpoolResetRequest, 
 	// If a new block appeared, validate the pool of pending transactions. This will
 	// remove any transaction that has been included in the block or was invalidated
 	// because of another transaction (e.g. higher gas price).
-	if reset != nil {
+	if reset != nil && resetOK {
 		pool.demoteUnexecutables()
 		if reset.newHead != nil {
 			if pool.chainconfig.IsLondon(new(big.Int).Add(reset.newHead.Number, big.NewInt(1))) {
@@ -1624,7 +1632,11 @@ func (pool *LegacyPool) runReorg(done chan struct{}, reset *txpoolResetRequest, 
 
 // reset retrieves the current state of the blockchain and ensures the content
 // of the transaction pool is valid with regard to the chain state.
-func (pool *LegacyPool) reset(oldHead, newHead *types.Header) {
+// It returns true when the pool's currentState and pendingNonces were updated
+// to newHead, and false when an error prevented that update.  Callers must
+// skip head-specific post-processing (nonce forwarding, demotion, base-fee
+// repricing) when reset returns false (CertiK XDC-36).
+func (pool *LegacyPool) reset(oldHead, newHead *types.Header) bool {
 	// If we're reorging an old state, reinject all dropped transactions
 	var reinject types.Transactions
 	// included tracks txs in the newly confirmed chain (populated during reorg;
@@ -1653,7 +1665,7 @@ func (pool *LegacyPool) reset(oldHead, newHead *types.Header) {
 					// If we reorged to a same or higher number, then it's not a case of setHead
 					log.Warn("Transaction pool reset with missing old head",
 						"old", oldHead.Hash(), "oldnum", oldNum, "new", newHead.Hash(), "newnum", newNum)
-					return
+					return false
 				}
 				// If the reorg ended up on a lower number, it's indicative of setHead being the cause
 				log.Debug("Skipping transaction reset caused by setHead",
@@ -1666,33 +1678,33 @@ func (pool *LegacyPool) reset(oldHead, newHead *types.Header) {
 					// reorg caused by sync-reversion or explicit sethead back to an
 					// earlier block.
 					log.Warn("Transaction pool reset with missing new head", "number", newHead.Number, "hash", newHead.Hash())
-					return
+					return false
 				}
 				var discarded types.Transactions
 				for rem.NumberU64() > add.NumberU64() {
 					discarded = append(discarded, rem.Transactions()...)
 					if rem = pool.chain.GetBlock(rem.ParentHash(), rem.NumberU64()-1); rem == nil {
 						log.Error("Unrooted old chain seen by tx pool", "block", oldHead.Number, "hash", oldHead.Hash())
-						return
+						return false
 					}
 				}
 				for add.NumberU64() > rem.NumberU64() {
 					included = append(included, add.Transactions()...)
 					if add = pool.chain.GetBlock(add.ParentHash(), add.NumberU64()-1); add == nil {
 						log.Error("Unrooted new chain seen by tx pool", "block", newHead.Number, "hash", newHead.Hash())
-						return
+						return false
 					}
 				}
 				for rem.Hash() != add.Hash() {
 					discarded = append(discarded, rem.Transactions()...)
 					if rem = pool.chain.GetBlock(rem.ParentHash(), rem.NumberU64()-1); rem == nil {
 						log.Error("Unrooted old chain seen by tx pool", "block", oldHead.Number, "hash", oldHead.Hash())
-						return
+						return false
 					}
 					included = append(included, add.Transactions()...)
 					if add = pool.chain.GetBlock(add.ParentHash(), add.NumberU64()-1); add == nil {
 						log.Error("Unrooted new chain seen by tx pool", "block", newHead.Number, "hash", newHead.Hash())
-						return
+						return false
 					}
 				}
 				lost := make([]*types.Transaction, 0, len(discarded))
@@ -1717,10 +1729,10 @@ func (pool *LegacyPool) reset(oldHead, newHead *types.Header) {
 		if core.CheckpointSyncNoStateActive.Load() {
 			log.Debug("legacypool: head state not yet available (snap-heal pending), skipping reset",
 				"block", newHead.Number, "root", newHead.Root)
-			return
+			return false
 		}
 		log.Error("Failed to reset txpool state", "err", err)
-		return
+		return false
 	}
 	pool.currentHead.Store(newHead)
 	pool.currentState = statedb
@@ -1755,6 +1767,7 @@ func (pool *LegacyPool) reset(oldHead, newHead *types.Header) {
 	log.Debug("Reinjecting stale transactions", "count", len(reinject))
 	core.SenderCacher().Recover(pool.signer, reinject)
 	pool.addTxsLocked(reinject, make([]error, len(reinject)))
+	return true
 }
 
 // isXDCEmptyRouteAddr reports whether addr is one of the four XDCx contracts
