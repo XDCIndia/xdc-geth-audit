@@ -559,6 +559,17 @@ func (s *BlockChainAPI) GetCheckpointFromEpoch(ctx context.Context, epochNum rpc
 		checkpointNumber = 0
 	} else {
 		checkpointNumber = epoch * (uint64(epochNum) - 1)
+		// F-2026-19639: a V2 epoch's switch block follows rounds, not
+		// multiples of Epoch; ask the V2 engine.
+		if engine, ok := s.b.Engine().(*XDPoS.XDPoS); ok {
+			if n, isV2, err := engine.GetCheckpointByEpochNumber(s.b.BlockChain(), uint64(epochNum)); isV2 {
+				if err != nil {
+					log.Error("[GetCheckpointFromEpoch] GetBlockByEpochNumber failed", "epoch", epochNum, "err", err)
+					return 0, epochNum
+				}
+				checkpointNumber = n
+			}
+		}
 	}
 	return rpc.BlockNumber(checkpointNumber), epochNum
 }
