@@ -1987,13 +1987,20 @@ func (d *Downloader) processFastSyncContent() error {
 		}
 		if P != nil {
 			// If new pivot block found, cancel old state retrieval and restart.
-			// Operator-pinned pivot: use pivotRoot as the state-sync target instead
-			// of the pivot block's Root field (refs #844 §3.4).
+			// Operator-pinned pivot: Hacken F-2026-19471 residual — verify the
+			// served header hash matches the compiled anchor before choosing the
+			// state root.  On a match, use the served header's root (on-chain truth)
+			// instead of the compiled operatorPivotRoot.  On a mismatch, abort
+			// immediately rather than wasting trie bandwidth on the wrong block.
 			if oldPivot != P {
 				sync.Cancel()
-				stateRoot := P.Header.Root
-				if d.operatorPivotRoot != (common.Hash{}) {
-					stateRoot = d.operatorPivotRoot
+				stateRoot, err := pivotStateRoot(P.Header, d.operatorPivotHash, d.operatorPivotRoot)
+				if err != nil {
+					return err
+				}
+				if d.operatorPivotRoot != (common.Hash{}) && stateRoot != d.operatorPivotRoot {
+					log.Warn("XDC fast-sync: compiled pivot root differs from served header root; using on-chain root (F-2026-19471)",
+						"compiled", d.operatorPivotRoot.Hex(), "onchain", stateRoot.Hex())
 				}
 				sync = d.syncFastState(stateRoot)
 
