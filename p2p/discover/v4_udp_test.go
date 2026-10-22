@@ -507,6 +507,12 @@ func TestUDPv4_pingEndpointStatementRequiresBond(t *testing.T) {
 
 // This test checks that EIP-868 requests work.
 func TestUDPv4_EIP868(t *testing.T) {
+	// XDC reuses packet type 5 for its ping (v4wire.UseXDCPing), which is the
+	// EIP-868 ENRRequest slot. Run this upstream test on the EIP-868 path.
+	saved := v4wire.UseXDCPing
+	v4wire.UseXDCPing = false
+	t.Cleanup(func() { v4wire.UseXDCPing = saved })
+
 	test := newUDPTest(t)
 	defer test.close()
 
