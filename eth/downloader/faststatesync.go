@@ -35,6 +35,7 @@
 package downloader
 
 import (
+	"errors"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -43,12 +44,25 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/core/state"
+	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/ethdb"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/trie"
 	"golang.org/x/crypto/sha3"
 )
+
+// errPathSchemeNodeData is returned by fastStateSync.loop() when the local
+// database uses path-scheme (PBSS) and no pivot header is attached (gap-block
+// state download). Path-scheme databases cannot consume NodeData trie blobs —
+// trie nodes delivered via GetNodeData are hash-keyed and are unreadable by
+// the path-keyed storage layer, producing "non existent state" after an
+// apparently successful download.
+//
+// This error is a defensive guard; in normal operation, processFastSyncContent
+// bypasses fastStateSync entirely for path-scheme gap blocks and dispatches
+// snap/1 directly, so this path should not be reached.
+var errPathSchemeNodeData = errors.New("path-scheme database: gap-block state cannot be synced via NodeData; caller must use snap/1 or A.97.4 embedded-header fallback")
 
 // fastStatePoolLogInterval throttles the A.37 "peer pool gated" INFO log.
 // 30s is roughly twice the typical fast-sync request cycle on Apothem so the
@@ -66,6 +80,14 @@ var fastStatePoolLastLog atomic.Int64
 // (one ~100-byte RLP overwrite per minute is noise versus the GBs of trie
 // nodes being committed every batch). Refs A.42 / #844.
 const fastSyncCheckpointInterval = 60 * time.Second
+
+// fastStateNoDataPeerTimeout is the duration fastStateSync.loop() waits for
+// NodeData-eligible peers before pivoting to a snap/1 state download.
+// 90s is generous: trusted XDC peers typically dial within 20-60s. Beyond this
+// the connected fleet is almost certainly all path-scheme (PBSS) nodes that
+// cannot serve GetNodeData.  Snap/1 is tried only when pivotHdr is set (main
+// pivot state, not gap-block state) and snap peers are registered. Refs #1850.
+const fastStateNoDataPeerTimeout = 90 * time.Second
 
 // fastSyncCheckpointEveryN is the chunk size (in processed trie/code nodes)
 // at which an extra checkpoint flush is forced, regardless of the 60s wall
@@ -161,6 +183,24 @@ type codeTask struct {
 // which is used by snap sync.
 func (d *Downloader) syncFastState(root common.Hash) *fastStateSync {
 	s := newFastStateSync(d, root)
+	select {
+	case d.fastStateSyncStart <- s:
+		<-s.started
+	case <-d.quitCh:
+		s.err = errCancelStateFetch
+		close(s.done)
+	}
+	return s
+}
+
+// syncFastStateWithPivot is like syncFastState but attaches the full pivot
+// header so loop() can fall back to snap/1 when no NodeData-eligible peer
+// exists.  Use for the main pivot state download; gap-block downloads use
+// syncFastState (snap fallback is inappropriate there — A.97.4 applies).
+// Refs #1850 (SYNC-07).
+func (d *Downloader) syncFastStateWithPivot(root common.Hash, pivot *types.Header) *fastStateSync {
+	s := newFastStateSync(d, root)
+	s.pivotHdr = pivot
 	select {
 	case d.fastStateSyncStart <- s:
 		<-s.started
@@ -447,6 +487,20 @@ type fastStateSync struct {
 	cancelOnce sync.Once      // Ensures cancel only ever gets called once
 	done       chan struct{}  // Channel to signal termination completion
 	err        error          // Any error hit during sync (set before completion)
+
+	// #1850: snap/1 fallback for all-path-scheme (PBSS) fleets.
+	//
+	// pivotHdr is the full pivot block header, set only when this fastStateSync
+	// is for the main pivot state download (not gap-block downloads). When
+	// non-nil and no NodeData-eligible peer is observed for noDataPeerTimeout,
+	// loop() falls back to d.snapSyncer.Sync(pivotHdr, …) so a fresh node on a
+	// modern fleet completes state download via snap/1 range requests instead of
+	// stalling indefinitely on GetNodeData.
+	pivotHdr *types.Header
+
+	// noDataPeerTimeout overrides fastStateNoDataPeerTimeout in tests so they
+	// do not have to wait 90 s for the stall-detector to fire.
+	noDataPeerTimeout time.Duration
 }
 
 // newFastStateSync creates a new fast-sync state trie download scheduler. This
@@ -476,10 +530,11 @@ func newFastStateSync(d *Downloader, root common.Hash) *fastStateSync {
 		// time — combined with the dropped-on-default fastStateCh, throughput
 		// collapsed under load. Buffer 64 mirrors maxParallelInflightSlots × 4
 		// (worst case all slots returning at once across 4 peers). Refs A.67.
-		deliver: make(chan *stateReq, 64),
-		cancel:  make(chan struct{}),
-		done:    make(chan struct{}),
-		started: make(chan struct{}),
+		deliver:           make(chan *stateReq, 64),
+		cancel:            make(chan struct{}),
+		done:              make(chan struct{}),
+		started:           make(chan struct{}),
+		noDataPeerTimeout: fastStateNoDataPeerTimeout,
 	}
 }
 
@@ -513,6 +568,51 @@ func (s *fastStateSync) Cancel() error {
 // downloader and pushed here async. The reason is to decouple processing from
 // data receipt and timeouts.
 func (s *fastStateSync) loop() (err error) {
+	// SYNC-07 (path-scheme source selection): path-scheme (PBSS) databases
+	// are incompatible with NodeData trie sync. GetNodeData delivers hash-keyed
+	// blobs; the path-scheme storage layer uses path-keyed addressing. Writing
+	// hash-keyed nodes into a PBSS database writes successfully (trie.Sync
+	// handles the path→hash direction), but reading them back later fails with
+	// "non existent state" because pathdb looks up by path, not hash.
+	//
+	// Route the main pivot to snap/1 immediately, regardless of NodeData peer
+	// availability, when the local DB uses path-scheme. This is the correct
+	// upstream behaviour: pathdb requires snap sync and never NodeData.
+	//
+	// For gap-block downloads (pivotHdr == nil): return errPathSchemeNodeData so
+	// processFastSyncContent can dispatch gap state via snap/1 instead. In
+	// normal operation, processFastSyncContent bypasses fastStateSync for
+	// path-scheme gap blocks, so this branch is a defensive safety net.
+	// Refs #1850 (SYNC-07 path-scheme).
+	if s.d.blockchain.TrieDB().Scheme() == rawdb.PathScheme {
+		if s.pivotHdr == nil {
+			return errPathSchemeNodeData
+		}
+		log.Info("Fast sync SYNC-07: path-scheme DB — downloading pivot state via snap/1 (bypassing NodeData)",
+			"root", s.root, "pivot", s.pivotHdr.Number.Uint64())
+		snapCancel := make(chan struct{})
+		snapDone := make(chan struct{})
+		go func() {
+			select {
+			case <-s.cancel:
+				close(snapCancel)
+			case <-s.d.cancelCh:
+				close(snapCancel)
+			case <-snapDone:
+			}
+		}()
+		snapErr := s.d.snapSyncer.Sync(s.pivotHdr, snapCancel)
+		close(snapDone)
+		if snapErr != nil {
+			log.Warn("Fast sync SYNC-07: snap/1 pivot state download failed (path-scheme)",
+				"root", s.root, "err", snapErr)
+		} else {
+			log.Info("Fast sync SYNC-07: snap/1 pivot state download complete (path-scheme)",
+				"root", s.root)
+		}
+		return snapErr
+	}
+
 	// Listen for new peer events to assign tasks to them
 	newPeer := make(chan *peerConnection, 1024)
 	peerSub := s.d.peers.SubscribeNewPeers(newPeer)
@@ -554,6 +654,26 @@ func (s *fastStateSync) loop() (err error) {
 		}
 	}()
 
+	// #1850: stall detector — snap/1 fallback when no NodeData-eligible peer exists.
+	//
+	// An all-path-scheme (PBSS) fleet never serves GetNodeData; assignTasks
+	// dispatches nothing, no deliver events arrive, and the loop spins on
+	// newPeer forever.  The timer fires after s.noDataPeerTimeout of no
+	// NodeData-eligible peer and, when s.pivotHdr is set and snap peers are
+	// registered, calls d.snapSyncer.Sync inline as the fallback.
+	//
+	// The timer is reset every time we observe at least one NodeData-eligible
+	// peer (inside the loop via the newPeer case).  It is effectively disabled
+	// when s.pivotHdr == nil (gap-block state downloads) since gap-block
+	// failures already have A.97.4 embedded-header fallback.
+	noDataTimer := time.NewTimer(s.noDataPeerTimeout)
+	defer noDataTimer.Stop()
+	// If NodeData peers are already present on entry, disable the timer: we
+	// have a real chance of serving via NodeData.
+	if idle, _ := s.d.peers.NodeDataIdlePeers(); len(idle) > 0 {
+		noDataTimer.Reset(25 * time.Hour) // effectively disable
+	}
+
 	// Keep assigning new tasks until the sync completes or aborts
 	for s.sched.Pending() > 0 {
 		if err = s.commit(false); err != nil {
@@ -565,6 +685,70 @@ func (s *fastStateSync) loop() (err error) {
 		case p := <-newPeer:
 			// New peer arrived, try to assign it download tasks
 			log.Info("Fast state sync: peer joined", "peer", p.id, "total", s.d.peers.Len())
+			// #1850: a new NodeData-eligible peer appeared — reset the stall
+			// timer so we give NodeData a full window before considering snap.
+			if idle, _ := s.d.peers.NodeDataIdlePeers(); len(idle) > 0 {
+				if !noDataTimer.Stop() {
+					select {
+					case <-noDataTimer.C:
+					default:
+					}
+				}
+				noDataTimer.Reset(s.noDataPeerTimeout)
+			}
+
+		case <-noDataTimer.C:
+			// #1850: timer fired — no NodeData-eligible peer was observed for
+			// s.noDataPeerTimeout.  Try snap/1 if conditions are met.
+			if s.pivotHdr == nil {
+				// Gap-block download: no snap fallback; A.97.4 covers this.
+				noDataTimer.Reset(s.noDataPeerTimeout)
+				continue
+			}
+			// Re-check: NodeData peers might have appeared since last assignTasks.
+			if idle, _ := s.d.peers.NodeDataIdlePeers(); len(idle) > 0 {
+				log.Info("Fast state sync: NodeData peers appeared — cancelling snap fallback",
+					"peers", len(idle))
+				noDataTimer.Reset(s.noDataPeerTimeout)
+				continue
+			}
+			if s.d.snapSyncer.PeerCount() == 0 {
+				log.Warn("Fast sync: no NodeData or snap peers after timeout; waiting for peers",
+					"timeout", s.noDataPeerTimeout, "root", s.root)
+				noDataTimer.Reset(s.noDataPeerTimeout)
+				continue
+			}
+			// All conditions met: pivot download stalled on NodeData and snap
+			// peers are available.  Switch to snap/1 for this pivot state.
+			log.Info("Fast sync SYNC-07: no NodeData-capable peers — falling back to snap/1 state download",
+				"source", "snap/1",
+				"timeout", s.noDataPeerTimeout,
+				"total_peers", s.d.peers.Len(),
+				"snap_peers", s.d.snapSyncer.PeerCount(),
+				"root", s.root,
+				"pivot", s.pivotHdr.Number.Uint64())
+			snapCancel := make(chan struct{})
+			snapDone := make(chan struct{})
+			// Forward external cancellation to the snap syncer.
+			go func() {
+				select {
+				case <-s.cancel:
+					close(snapCancel)
+				case <-s.d.cancelCh:
+					close(snapCancel)
+				case <-snapDone:
+					// snap finished normally; goroutine exits.
+				}
+			}()
+			snapErr := s.d.snapSyncer.Sync(s.pivotHdr, snapCancel)
+			close(snapDone) // unblock cancel-watcher goroutine
+			if snapErr != nil {
+				log.Warn("Fast sync SYNC-07: snap/1 state fallback failed", "root", s.root, "err", snapErr)
+				return snapErr
+			}
+			log.Info("Fast sync SYNC-07: snap/1 state fallback complete", "root", s.root,
+				"source", "snap/1")
+			return nil
 
 		case <-ckptTicker.C:
 			s.flushCheckpoint()
