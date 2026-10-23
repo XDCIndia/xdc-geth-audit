@@ -3616,6 +3616,15 @@ func (c *ChainConfig) checkCompatible(newcfg *ChainConfig, headNumber *big.Int, 
 	if isForkBlockIncompatible(c.AmsterdamBlock, newcfg.AmsterdamBlock, headNumber) {
 		return newBlockCompatError("Amsterdam fork block", c.AmsterdamBlock, newcfg.AmsterdamBlock)
 	}
+	if isForkBlockIncompatible(c.SigningTxBoundBlock, newcfg.SigningTxBoundBlock, headNumber) {
+		return newBlockCompatError("SigningTxBound fork block", c.SigningTxBoundBlock, newcfg.SigningTxBoundBlock)
+	}
+	if isForkBlockIncompatible(c.ValidatorOrderBlock, newcfg.ValidatorOrderBlock, headNumber) {
+		return newBlockCompatError("ValidatorOrder fork block", c.ValidatorOrderBlock, newcfg.ValidatorOrderBlock)
+	}
+	if isForkBlockIncompatible(c.ParoleDedupBlock, newcfg.ParoleDedupBlock, headNumber) {
+		return newBlockCompatError("ParoleDedup fork block", c.ParoleDedupBlock, newcfg.ParoleDedupBlock)
+	}
 	if isForkTimestampIncompatible(c.ShanghaiTime, newcfg.ShanghaiTime, headTimestamp) {
 		return newTimestampCompatError("Shanghai fork timestamp", c.ShanghaiTime, newcfg.ShanghaiTime)
 	}
