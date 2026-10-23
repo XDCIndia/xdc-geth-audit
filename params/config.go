@@ -2029,6 +2029,8 @@ type ChainConfig struct {
 	TIPUpgradeRewardBlock  *big.Int `json:"tipUpgradeRewardBlock,omitempty"`  // Tiered (masternode/protector/observer) reward fork; XDPoSChain v2.8.0 apothem: 83,600,000 (held disabled)
 	TIPUpgradePenaltyBlock *big.Int `json:"tipUpgradePenaltyBlock,omitempty"` // Penalty-upgrade fork; XDPoSChain v2.8.0 apothem: 83,600,000 (held disabled)
 	Gas2500xBlock          *big.Int `json:"gas2500xBlock,omitempty"`          // XDC gas price tier x2500 (base fee 625 gwei); XDPoSChain v2.9.x apothem: 83,600,000
+	// CertiK XDC-12 per-network fork-block field. nil = disabled on all networks.
+	ParoleDedupBlock *big.Int `json:"paroleDedupBlock,omitempty"` // Parole counting deduplicates (signer, signed-block-hash) pairs (CertiK XDC-12)
 	// CertiK XDC-11 per-network fork-block field. nil = disabled on all networks.
 	ValidatorOrderBlock *big.Int `json:"validatorOrderBlock,omitempty"` // Epoch-switch Validators must match calcMasternodes order exactly (CertiK XDC-11)
 	// CertiK XDC-04 / XDC-09 per-network fork-block field. nil = disabled on all networks.
@@ -3323,6 +3325,18 @@ func (c *ChainConfig) IsGas2500x(num *big.Int) bool {
 // (nil = disabled), superseding the disabled global common.TipUpgradePenalty.
 func (c *ChainConfig) IsTIPUpgradePenalty(num *big.Int) bool {
 	return isBlockForked(c.TIPUpgradePenaltyBlock, num)
+}
+
+// IsParoleDedup reports whether the parole-deduplication fork is active at num.
+// When active, HookPenalty counts each (signer, signed-block-hash) pair at most
+// once toward MinimumSigningTx, preventing a penalised candidate from satisfying
+// the threshold with duplicate signing transactions. nil = disabled on all
+// networks (CertiK XDC-12).
+func (c *ChainConfig) IsParoleDedup(num *big.Int) bool {
+	if c == nil {
+		return false
+	}
+	return isBlockForked(c.ParoleDedupBlock, num)
 }
 
 // IsValidatorOrder reports whether the validator-order enforcement fork is
