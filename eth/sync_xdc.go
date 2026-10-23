@@ -4115,14 +4115,26 @@ func (s *xdcSyncer) fetchHeaderBatch(peer *eth.Peer, from uint64, count int) []*
 	}
 	defer req.Close()
 
-	select {
-	case headers := <-peer.XDCHeaderResp:
-		return headers
-	case <-time.After(xdcReqTimeout):
-		log.Debug("xdcSyncer.fetchHeaderBatch: timed out", "from", from)
-		return nil
-	case <-s.quitCh:
-		return nil
+	deadline := time.NewTimer(xdcReqTimeout)
+	defer deadline.Stop()
+	for {
+		select {
+		case headers := <-peer.XDCHeaderResp:
+			// Validate: first header must be the one we asked for, and count
+			// must not exceed the request. Accept fewer headers (e.g. peer at
+			// tip). Drop unsolicited batches and keep waiting.
+			if len(headers) == 0 || headers[0].Number.Uint64() != from || len(headers) > count {
+				log.Debug("xdcSyncer.fetchHeaderBatch: response mismatch, waiting",
+					"from", from, "got", len(headers))
+				continue
+			}
+			return headers
+		case <-deadline.C:
+			log.Debug("xdcSyncer.fetchHeaderBatch: timed out", "from", from)
+			return nil
+		case <-s.quitCh:
+			return nil
+		}
 	}
 }
 
@@ -4150,14 +4162,23 @@ func (s *xdcSyncer) fetchHeaderBatchTimeout(peer *eth.Peer, from uint64, count i
 		return nil
 	}
 	defer req.Close()
-	select {
-	case headers := <-peer.XDCHeaderResp:
-		return headers
-	case <-time.After(timeout):
-		log.Debug("xdcSyncer.fetchHeaderBatchTimeout: timed out", "from", from)
-		return nil
-	case <-s.quitCh:
-		return nil
+	deadline := time.NewTimer(timeout)
+	defer deadline.Stop()
+	for {
+		select {
+		case headers := <-peer.XDCHeaderResp:
+			if len(headers) == 0 || headers[0].Number.Uint64() != from || len(headers) > count {
+				log.Debug("xdcSyncer.fetchHeaderBatchTimeout: response mismatch, waiting",
+					"from", from, "got", len(headers))
+				continue
+			}
+			return headers
+		case <-deadline.C:
+			log.Debug("xdcSyncer.fetchHeaderBatchTimeout: timed out", "from", from)
+			return nil
+		case <-s.quitCh:
+			return nil
+		}
 	}
 }
 
@@ -4278,14 +4299,26 @@ func (s *xdcSyncer) fetchBodiesBatch(peer *eth.Peer, hashes []common.Hash) []eth
 	}
 	defer req.Close()
 
-	select {
-	case bodies := <-peer.XDCBodyResp:
-		return bodies
-	case <-time.After(xdcReqTimeout):
-		log.Debug("xdcSyncer.fetchBodiesBatch: timed out", "count", len(hashes))
-		return nil
-	case <-s.quitCh:
-		return nil
+	deadline := time.NewTimer(xdcReqTimeout)
+	defer deadline.Stop()
+	for {
+		select {
+		case bodies := <-peer.XDCBodyResp:
+			// Validate: body count must match the requested hash count.
+			// Accept a partial response only if it is a total match (for future
+			// batching). An unsolicited batch (wrong count) is discarded.
+			if len(bodies) != len(hashes) {
+				log.Debug("xdcSyncer.fetchBodiesBatch: response mismatch, waiting",
+					"want", len(hashes), "got", len(bodies))
+				continue
+			}
+			return bodies
+		case <-deadline.C:
+			log.Debug("xdcSyncer.fetchBodiesBatch: timed out", "count", len(hashes))
+			return nil
+		case <-s.quitCh:
+			return nil
+		}
 	}
 }
 
