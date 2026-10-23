@@ -1912,10 +1912,20 @@ func (c *XDPoS) Close() error {
 // must explicitly type-assert *XDPoS.XDPoS and append the result of this call.
 // See #814.
 func (c *XDPoS) APIs(chain consensus.ChainHeaderReader) []rpc.API {
-	return []rpc.API{{
-		Namespace: "XDPoS",
-		Service:   &API{chain: chain, xdpos: c},
-	}}
+	return []rpc.API{
+		{
+			Namespace: "XDPoS",
+			Service:   &API{chain: chain, xdpos: c},
+		},
+		{
+			// Propose and Discard are write operations; expose them only on the
+			// authenticated endpoint (IPC / --authrpc) to prevent public HTTP/WS
+			// callers from steering V1 votes or inflating the proposals map.
+			Namespace:     "XDPoS",
+			Authenticated: true,
+			Service:       &AdminAPI{chain: chain, xdpos: c},
+		},
+	}
 }
 
 // Authorize injects a private key into the consensus engine.
