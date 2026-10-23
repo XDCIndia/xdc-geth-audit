@@ -2074,33 +2074,6 @@ func (s *xdcSyncer) snapRunningCheck() {
 	}()
 }
 
-// snapKeepAlive issues a lightweight header request to each connected
-// peer using the xdcSyncer-style fetchHeaderBatch path. Phase 5 bench
-// found peers respond to that request format with 512-header batches,
-// while the downloader's skeleton-sync request format times out after
-// 60s. The keep-alive pings keep the eth subprotocol busy on a known-
-// working request format so peers don't time out the downloader's
-// own (slower / differently-formatted) requests.
-//
-// Refs #807 Phase 7. Fire-and-forget; we don't care about the
-// response, the request itself counts as activity.
-func (s *xdcSyncer) snapKeepAlive() {
-	pivot := s.snapPivotBlock()
-	if pivot == 0 {
-		return
-	}
-	// Request 1 header starting at pivot from each peer. Returns
-	// quickly; goroutine isolates each peer so a slow peer doesn't
-	// stall the tick.
-	for _, p := range s.handler.peers.all() {
-		ethP := p.Peer
-		go func() {
-			defer func() { _ = recover() }()
-			s.fetchHeaderBatch(ethP, pivot, 1)
-		}()
-	}
-}
-
 // snapEventLoop listens for downloader SyncEvents and transitions the
 // phase machine on completion. Started from xdcSyncer.start() and runs
 // for the lifetime of the syncer. Refs #807 Phase 3b.3.
