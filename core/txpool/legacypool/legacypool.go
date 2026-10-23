@@ -827,7 +827,7 @@ func (pool *LegacyPool) promoteSpecialTx(from common.Address, tx *types.Transact
 		pool.all.Add(tx)
 		pool.priced.Put(tx)
 	}
-	pool.pendingNonces.set(from, tx.Nonce()+1)
+	pool.pendingNonces.setIfHigher(from, tx.Nonce()+1)
 	pool.queueTxEvent(tx)
 	log.Trace("XDC: fast-pathed special signing tx to pending", "hash", tx.Hash(), "from", from, "to", tx.To(), "nonce", tx.Nonce())
 	return true, nil
