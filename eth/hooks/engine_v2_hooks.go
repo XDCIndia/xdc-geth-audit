@@ -251,7 +251,10 @@ func AttachConsensusV2Hooks(adaptor *XDPoS.XDPoS, bc *core.BlockChain, chainConf
 
 			log.Debug("Time Get Signers", "block", header.Number.Uint64(), "mode", map[bool]string{true: "v2", false: "v1"}[isV2], "time", common.PrettyDuration(time.Since(start)))
 			if err != nil {
-				log.Crit("Fail to get signers for reward checkpoint", "error", err)
+				// Reject the block instead of exiting: a missing header in the
+				// reward window is a local data gap, and the import can retry.
+				log.Error("Fail to get signers for reward checkpoint", "number", header.Number, "error", err)
+				return nil, err
 			}
 			rewards["signers"] = signers
 
