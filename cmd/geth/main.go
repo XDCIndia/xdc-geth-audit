@@ -339,8 +339,10 @@ func startNode(ctx *cli.Context, stack *node.Node, isConsole bool) {
 	// We re-implement the minimal unlock path here: read --password file and call
 	// ks.Unlock() directly — no HTTP exposure of the unlocked key (refs #894).
 	if ctx.Bool(utils.MiningEnabledFlag.Name) && ctx.Path(utils.PasswordFileFlag.Name) != "" {
+		// A validator that cannot sign never mints; stop instead of running
+		// on looking healthy (review R3-R03).
 		if err := utils.UnlockXDPoSMinerAccount(ctx, stack); err != nil {
-			log.Warn("XDPoS miner account unlock failed", "err", err)
+			utils.Fatalf("XDPoS miner account unlock failed: %v", err)
 		}
 	}
 
