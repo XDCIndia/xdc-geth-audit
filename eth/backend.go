@@ -557,26 +557,19 @@ func New(stack *node.Node, config *ethconfig.Config) (*Ethereum, error) {
 			config.FastSyncPivotNumber,
 			config.FastSyncPivotHash,
 		)
-	} else if config.SyncMode == ethconfig.FastSync && config.FastSyncPivotNumber != 0 {
-		// A.89 dynamic anchor is only installed in degraded mode (operator pivot set).
-		// A.97.5 (refs #894): on the clean path (operatorPivotNumber==0) no anchor is
-		// installed. QC verification runs unconditionally using header-derived masternodes
-		// from getEpochSwitchInfoWithParents → GetMasternodesFromEpochSwitchHeader →
-		// header.Validators. This is the pure geth-aligned fast-sync path: the masternode
-		// set is 100% derived from signed header bytes, no trust anchor required.
-		// inCheckpointCatchup returns false when no anchor is active, so the A.89
-		// commit-rule skip and the GetMasternodesWithParents anchor fallback are dormant.
-		//
-		// Degraded-recovery layer (operator-pin / A.96 / A.94 / checkpointSyncNoState /
-		// snap-heal) stays intact for scenarios where the clean path is unavailable
-		// (e.g. pruned-peer, no-archive, operatorPivotNumber != 0).
+	} else if config.SyncMode == ethconfig.FastSync {
+		// Clean fast-sync path: install the dynamic anchor callback so that when
+		// the downloader selects a pivot from peer heads, verifyHeader relaxes QC
+		// checks for the entire backfill range below it. Without this, BeaconSync
+		// rejects every pre-pivot header with a gap-number mismatch or epoch-switch
+		// error because the referenced epoch-switch blocks have not been downloaded
+		// yet. The downloader authenticates the backfill range via parent-hash chain
+		// from the pivot; this merely wires that trust signal to the consensus engine.
+		// refs #1847 #1851 #1859
 		bc := eth.blockchain
 		eth.handler.downloader.SetFastSyncAnchorFn(func(n uint64, h common.Hash) {
 			bc.SetFastSyncTrustedAnchor(n, h)
 		})
-	} else if config.SyncMode == ethconfig.FastSync {
-		// Clean fast-sync path: no anchor installed. Log for operator visibility.
-		log.Info("XDC fast-sync A.97.5: clean path — no trusted anchor installed; QC will be verified from header-derived masternodes (refs #894)")
 	}
 
 	eth.dropper = newDropper(eth.p2pServer.MaxDialedConns(), eth.p2pServer.MaxInboundConns())
