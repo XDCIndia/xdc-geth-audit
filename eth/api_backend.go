@@ -479,6 +479,26 @@ func (b *EthAPIBackend) SubscribeNewTxsEvent(ch chan<- core.NewTxsEvent) event.S
 
 func (b *EthAPIBackend) SyncProgress(ctx context.Context) ethereum.SyncProgress {
 	prog := b.eth.Downloader().Progress()
+
+	// Fixes #1841: if downloader is done but xdcSyncer still catching up,
+	// report progress to indicate sync is not complete.
+	const syncMargin = 64 // reuse fsMinFullBlocks constant concept
+	if prog.Done() {
+		xdcSync := b.eth.handler.xdcSync
+		if xdcSync != nil {
+			highestPeer, startBlock := xdcSync.SyncProgress()
+			localHead := b.eth.blockchain.CurrentBlock().Number.Uint64()
+			// If highest-seen peer is beyond local head + margin, we're still behind.
+			if highestPeer > localHead+syncMargin {
+				prog = ethereum.SyncProgress{
+					StartingBlock: startBlock,
+					CurrentBlock:  localHead,
+					HighestBlock:  highestPeer,
+				}
+			}
+		}
+	}
+
 	if txProg, err := b.eth.blockchain.TxIndexProgress(); err == nil {
 		prog.TxIndexFinishedBlocks = txProg.Indexed
 		prog.TxIndexRemainingBlocks = txProg.Remaining
