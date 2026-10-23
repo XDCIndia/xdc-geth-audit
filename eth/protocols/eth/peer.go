@@ -112,6 +112,11 @@ type Peer struct {
 	// xdcSyncer's fetchHeaderBatch/fetchBodiesBatch read directly from these.
 	XDCHeaderResp chan []*types.Header // BlockHeaders responses on XDPOS2
 	XDCBodyResp   chan []BlockBody     // BlockBodies responses on XDPOS2
+	// XDCHeaderReqMu / XDCBodyReqMu allow one XDPOS2 header and one body
+	// request in flight per peer: replies carry no request id, so two
+	// concurrent requesters would drain or consume each other's reply (#1857).
+	XDCHeaderReqMu sync.Mutex
+	XDCBodyReqMu   sync.Mutex
 
 	txpool      TxPool // Transaction pool used by the broadcasters for liveness checks
 	blobpool    BlobPool
