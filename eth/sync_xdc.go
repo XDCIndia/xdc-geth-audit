@@ -2526,6 +2526,28 @@ func (s *xdcSyncer) fullSyncOnce() {
 		}(blocks[len(blocks)-1].Header())
 	}
 
+	// CertiK XDC-10: re-verify any epoch-switch headers that were accepted during
+	// bulk sync without local masternode computation (calcMasternodes failed because
+	// the gap snapshot was absent). Now that InsertChain committed the batch, the
+	// snapshot should be available and calcMasternodes should succeed for those blocks.
+	// Steady-state fullVerify already accepts every canonical switch block, so reusing
+	// that exact check is the safety argument: if a canonical header fails here it was
+	// forged, not locally divergent.
+	if xdposE, ok := s.handler.chain.Engine().(*XDPoS.XDPoS); ok {
+		if v2E, ok2 := xdposE.EngineV2.(*engine_v2.XDPoS_v2); ok2 && v2E != nil {
+			if bad, recheckErr := v2E.RecheckDeferredSwitches(s.handler.chain); bad != nil {
+				log.Error("xdcSyncer: XDC-10 recheck: forged epoch-switch header detected, rolling back",
+					"block", bad.Number.Uint64(), "hash", bad.Hash(), "err", recheckErr)
+				if setHeadErr := s.handler.chain.SetHead(bad.Number.Uint64() - 1); setHeadErr != nil {
+					log.Error("xdcSyncer: XDC-10 SetHead failed after forged header",
+						"target", bad.Number.Uint64()-1, "err", setHeadErr)
+				}
+				s.taintPeer(peer)
+				return
+			}
+		}
+	}
+
 	// A.77: collect and import lookahead ranges in order.
 	// Wait up to xdcBulkReqTimeout for each range; stop at first failure or gap.
 	for _, ch := range lookaheadChs {
