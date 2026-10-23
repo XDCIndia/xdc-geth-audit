@@ -110,13 +110,15 @@ type Peer struct {
 	// Bypasses the dispatcher's pending-map + tracker (which is incompatible
 	// with the legacy bare-list wire format that has no RequestId). The
 	// xdcSyncer's fetchHeaderBatch/fetchBodiesBatch read directly from these.
-	XDCHeaderResp chan []*types.Header // BlockHeaders responses on XDPOS2
-	XDCBodyResp   chan []BlockBody     // BlockBodies responses on XDPOS2
+	XDCHeaderResp  chan []*types.Header  // BlockHeaders responses on XDPOS2
+	XDCBodyResp    chan []BlockBody      // BlockBodies responses on XDPOS2
+	XDCReceiptResp chan []types.Receipts // Receipts responses on XDPOS2
 	// XDCHeaderReqMu / XDCBodyReqMu allow one XDPOS2 header and one body
 	// request in flight per peer: replies carry no request id, so two
 	// concurrent requesters would drain or consume each other's reply (#1857).
-	XDCHeaderReqMu sync.Mutex
-	XDCBodyReqMu   sync.Mutex
+	XDCHeaderReqMu  sync.Mutex
+	XDCBodyReqMu    sync.Mutex
+	XDCReceiptReqMu sync.Mutex
 
 	txpool      TxPool // Transaction pool used by the broadcasters for liveness checks
 	blobpool    BlobPool
@@ -157,26 +159,27 @@ func NewPeer(version uint, p *p2p.Peer, rw p2p.MsgReadWriter, txpool TxPool, blo
 	cap := p2p.Cap{Name: ProtocolName, Version: version}
 	id := p.ID().String()
 	peer := &Peer{
-		id:            id,
-		Peer:          p,
-		rw:            rw,
-		version:       version,
-		knownTxs:      newKnownCache(maxKnownTxs),
-		knownNodes:    newKnownCache(MaxKnownNodes),
-		txBroadcast:   make(chan []common.Hash),
-		txAnnounce:    make(chan []common.Hash),
-		tracker:       tracker.New(cap, id, 5*time.Minute),
-		reqDispatch:   make(chan *request),
-		reqCancel:     make(chan *cancel),
-		reqResend:     make(chan *resend),
-		resDispatch:   make(chan *response),
-		txpool:        txpool,
-		blobpool:      blobpool,
-		chainConfig:   chainConfig,
-		receiptBuffer: make(map[uint64]*receiptRequest),
-		term:          make(chan struct{}),
-		XDCHeaderResp: make(chan []*types.Header, 1),
-		XDCBodyResp:   make(chan []BlockBody, 1),
+		id:             id,
+		Peer:           p,
+		rw:             rw,
+		version:        version,
+		knownTxs:       newKnownCache(maxKnownTxs),
+		knownNodes:     newKnownCache(MaxKnownNodes),
+		txBroadcast:    make(chan []common.Hash),
+		txAnnounce:     make(chan []common.Hash),
+		tracker:        tracker.New(cap, id, 5*time.Minute),
+		reqDispatch:    make(chan *request),
+		reqCancel:      make(chan *cancel),
+		reqResend:      make(chan *resend),
+		resDispatch:    make(chan *response),
+		txpool:         txpool,
+		blobpool:       blobpool,
+		chainConfig:    chainConfig,
+		receiptBuffer:  make(map[uint64]*receiptRequest),
+		term:           make(chan struct{}),
+		XDCHeaderResp:  make(chan []*types.Header, 1),
+		XDCBodyResp:    make(chan []BlockBody, 1),
+		XDCReceiptResp: make(chan []types.Receipts, 1),
 	}
 	// Start up all the broadcasters
 	go peer.broadcastTransactions()
