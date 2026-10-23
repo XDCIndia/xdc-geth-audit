@@ -300,23 +300,16 @@ func (x *XDPoS_v2) inCheckpointCatchup(chain consensus.ChainReader, blockNum uin
 	if !active || anchor == 0 {
 		return false
 	}
-	// Symmetric 2x-epoch window: BeaconSync walks BACK from the pivot to
-	// download historical headers before walking forward to state. Both
-	// directions need the same QC-skip relaxation while the pre-anchor
-	// epoch-switch headers haven't been ingested yet.
+	// All blocks at or below the anchor (plus a forward window) need relaxed
+	// QC verification. BeaconSync backfills the entire pre-pivot range top-down,
+	// and those headers reference epoch-switch blocks that have not been
+	// downloaded yet. The parent-hash chain from the trusted pivot authenticates
+	// the backfill range; individual QC gap and signature checks can only run
+	// once the referenced epoch-switch headers are locally available.
 	//
-	// A.60.5 follow-up (refs #857): the original check `blockNum >= anchor`
-	// only covered the forward walk; verifyHeader was still firing on
-	// every pre-anchor block (e.g. block anchor-1 with QC referencing
-	// anchor-2). With BeaconSync's reverse-walk pattern from operator-
-	// pinned pivot, those pre-anchor blocks dominate the verification
-	// volume and the failure cancels every sync attempt.
+	// refs #1847 #1851 #1859
 	window := x.config.Epoch * 2
-	lo := uint64(0)
-	if anchor > window {
-		lo = anchor - window
-	}
-	return blockNum >= lo && blockNum <= anchor+window
+	return blockNum <= anchor+window
 }
 
 func (x *XDPoS_v2) verifyQC(chain consensus.ChainReader, quorumCert *types.QuorumCert, parentHeader *types.Header, parents []*types.Header) error {
