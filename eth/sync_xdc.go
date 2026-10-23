@@ -2174,6 +2174,18 @@ func (s *xdcSyncer) snapEventLoop() {
 					s.snapPhase.Store(int32(phaseTipCatch))
 					s.fastEngagementResolved.Store(true)
 					s.fastBeaconStarted.Store(false)
+					// SYNC-06 (fast-sync): kick the post-fast-sync history backfill
+					// as a background goroutine so TIP_CATCH head-following is not
+					// blocked. The downloader writes rawdb.WriteLastPivotNumber
+					// during fast sync, so runSnapHistoryBackfill will find the
+					// pivot from rawdb even though snapHistoryPivot was never set
+					// in-memory. The one-shot CAS guard prevents double-execution.
+					// This backfills headers/bodies/receipts for [1, pivot−1] that
+					// the skeleton skipped (skeleton stopped at the terminate floor
+					// set by SetFastSyncPivot), making eth_getBlockByNumber(1) and
+					// old receipts available on the fully-synced node.
+					// Refs: #1848 (SYNC-06), #1850.
+					go s.runSnapHistoryBackfill()
 					// A.70 (refs #844 #859): re-apply cached V2 masternode-snapshot
 					// seeds. Fast-sync block-import's UpdateMasternodesFromHeader
 					// at gap blocks runs BEFORE this point and overwrites our
