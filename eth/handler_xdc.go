@@ -142,14 +142,14 @@ func (h *handler) BroadcastBlock(block *types.Block) {
 		Block: block,
 		TD:    td,
 	}
-	var sent int
 	for _, p := range peers {
-		if err := p.Peer.Send(eth.NewBlockMsg, pkt); err != nil {
-			log.Trace("[XDC-P2P] Send NewBlock failed", "peer", p.ID(), "err", err)
-			continue
-		}
-		sent++
+		p := p
+		go func() {
+			if err := p.Peer.Send(eth.NewBlockMsg, pkt); err != nil {
+				log.Trace("[XDC-P2P] Send NewBlock failed", "peer", p.ID(), "err", err)
+			}
+		}()
 	}
-	log.Debug("[XDC-P2P] Block broadcast complete",
-		"number", block.NumberU64(), "hash", block.Hash(), "peers", sent)
+	log.Debug("[XDC-P2P] Block broadcast started",
+		"number", block.NumberU64(), "hash", block.Hash(), "peers", len(peers))
 }
