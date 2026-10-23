@@ -333,10 +333,6 @@ type XDPoS struct {
 	// Used by verifyHeaderV2 for full V2 block verification.
 	EngineV2 EngineV2Iface
 
-	// ConsensusFeed exposes XDPoS consensus events over WebSocket (fix #87).
-	// External callers subscribe via SubscribeNewQC / SubscribeNewTC etc.
-	ConsensusFeed ConsensusFeed
-
 	// Testing flags
 	fakeDiff bool // Skip difficulty verifications (testing)
 
