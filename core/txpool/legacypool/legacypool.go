@@ -975,12 +975,31 @@ func (pool *LegacyPool) add(tx *types.Transaction) (replaced bool, err error) {
 		pendingN := pool.pendingNonces.get(from)
 		if pendingN == tx.Nonce() {
 			// Normal case: tx nonce matches the expected next pending nonce.
-			return pool.promoteSpecialTx(from, tx)
+			// Hold the subpool reservation for new senders before inserting into
+			// pending, so the reserver invariant (each account in at most one
+			// subpool) is maintained on this fast path too.  The normal add() path
+			// below holds the reservation at line 996; the expired-replacement
+			// branch below requires pool.pending[from] != nil (already held).
+			_, hasPending := pool.pending[from]
+			_, hasQueued := pool.queue.get(from)
+			newSender := !hasPending && !hasQueued
+			if newSender {
+				if err := pool.reserver.Hold(from); err != nil {
+					return false, err
+				}
+			}
+			ok, promErr := pool.promoteSpecialTx(from, tx)
+			if promErr != nil && newSender {
+				pool.reserver.Release(from)
+			}
+			return ok, promErr
 		}
 		if pendingN > tx.Nonce() && pool.pending[from] != nil {
 			if old := pool.pending[from].txs.Get(tx.Nonce()); old != nil && pool.isSigningTxExpired(old) {
 				// Expired special tx at a lower nonce — allow replacement via
 				// promoteSpecialTx which will evict the old tx and insert the new one.
+				// pool.pending[from] != nil guarantees hasPending, so the reservation
+				// is already held from a prior add(); no Hold needed here.
 				return pool.promoteSpecialTx(from, tx)
 			}
 		}
