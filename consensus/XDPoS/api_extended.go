@@ -268,8 +268,15 @@ func (api *API) NetworkInformation() NetworkInfo {
 		api.xdpos.config.V2.CurrentConfig.MaxMasternodes > 0 {
 		maxValidators = api.xdpos.config.V2.CurrentConfig.MaxMasternodes
 	}
+	// Use the configured chain ID (review R1-R03): Apothem (51), devnets and
+	// private networks must not report 50. Fall back to 50 only when the chain
+	// config is unavailable, which should not happen in production.
+	networkID := big.NewInt(50)
+	if cfg := api.chain.Config(); cfg != nil && cfg.ChainID != nil {
+		networkID = new(big.Int).Set(cfg.ChainID)
+	}
 	info := NetworkInfo{
-		NetworkId:     big.NewInt(50), // XDC Mainnet chain ID
+		NetworkId:     networkID,
 		XDCValidators: maxValidators,
 		Epoch:         api.xdpos.config.Epoch,
 	}
