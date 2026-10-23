@@ -2572,6 +2572,19 @@ func (x *XDPoS_v2) getEpochSwitchInfoInner(chain consensus.ChainReader, header *
 							}
 							isES, _, _ := x.IsEpochSwitch(esHeader)
 							if isES {
+								// SYNC-05 (#1847): skip switches belonging to a different epoch than h.
+								// During BeaconSync backfill, epoch N-1's switch block is in the
+								// canonical DB but epoch N's switch has not yet been downloaded; the
+								// walk finds epoch N-1 and overwrites the correct epoch-N masternodes
+								// (loaded from Source B0/B) with epoch N-1's masternodes, causing
+								// recoverUniqueSigners to return "signature from a non-masternode".
+								if _, esRound, esErr := x.getExtraFieldsNoChain(esHeader); esErr == nil {
+									esEpochStart := esRound - esRound%types.Round(x.config.Epoch)
+									targetEpochStart := round - round%types.Round(x.config.Epoch)
+									if esEpochStart != targetEpochStart {
+										break // wrong epoch; preserve Source B0/B masternodes
+									}
+								}
 								esMN := x.GetMasternodesFromEpochSwitchHeader(chain, esHeader)
 								if len(esMN) > 0 {
 									masternodes = esMN
@@ -2884,6 +2897,18 @@ func (x *XDPoS_v2) getEpochSwitchInfoWithParents(chain consensus.ChainReader, he
 						masternodes := x.GetMasternodesFromEpochSwitchHeader(chain, esHeader)
 						if len(masternodes) > 0 {
 							_, fullRound, _, _ := x.getExtraFields(chain, esHeader)
+							// SYNC-05 (#1847): skip switches belonging to a different epoch than h.
+							// Same bug as in getEpochSwitchInfoInner's synthetic-fallback walk: when
+							// the parents slice does not span the epoch boundary, this walk finds the
+							// most-recent switch in the DB (which may be epoch N-1) and returns its
+							// masternodes for a block in epoch N, producing wrong QC verification.
+							if _, hRound, hErr := x.getExtraFieldsNoChain(h); hErr == nil && hRound > 0 {
+								hEpochStart := hRound - hRound%types.Round(x.config.Epoch)
+								esEpochStart := fullRound - fullRound%types.Round(x.config.Epoch)
+								if esEpochStart != hEpochStart {
+									break // wrong epoch; stop backward walk
+								}
+							}
 							info = &types.EpochSwitchInfo{
 								Masternodes:    masternodes,
 								MasternodesLen: len(masternodes),
