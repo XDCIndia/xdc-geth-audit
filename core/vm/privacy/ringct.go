@@ -329,9 +329,9 @@ func GenKeyImage(privkey *ecdsa.PrivateKey) *ecdsa.PublicKey {
 
 func HashPoint(p *ecdsa.PublicKey) (*big.Int, *big.Int) {
 	input := append(PadTo32Bytes(p.X.Bytes()), PadTo32Bytes(p.Y.Bytes())...)
-	log.Info("HashPoint", "input ", common.Bytes2Hex(input))
+	log.Trace("HashPoint", "input", common.Bytes2Hex(input))
 	hash := crypto.Keccak256(input)
-	log.Info("HashPoint", "hash ", common.Bytes2Hex(hash))
+	log.Trace("HashPoint", "hash", common.Bytes2Hex(hash))
 	return p.Curve.ScalarBaseMult(hash[:])
 }
 
