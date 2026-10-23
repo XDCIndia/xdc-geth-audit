@@ -329,6 +329,33 @@ func BenchmarkEpochCalculation(b *testing.B) {
 	}
 }
 
+// TestGetStakerROIMasternode verifies that GetStakerROIMasternode uses its
+// masternode argument and returns an error for the current client.
+func TestGetStakerROIMasternode(t *testing.T) {
+	api := &BlockChainAPI{b: &signerOnlyBackend{}}
+
+	masternode := common.HexToAddress("0x1234567890123456789012345678901234567890")
+
+	roi, err := api.GetStakerROIMasternode(masternode)
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if roi != 0 {
+		t.Errorf("expected roi=0, got %v", roi)
+	}
+
+	// Verify error is clear about limitation
+	if err.Error() != "GetStakerROIMasternode: voter reward data not available in this client" {
+		t.Errorf("unexpected error message: %v", err)
+	}
+
+	// Verify that invalid address is rejected
+	_, err = api.GetStakerROIMasternode(common.Address{})
+	if err == nil {
+		t.Fatal("expected error for zero address, got nil")
+	}
+}
+
 // Context helpers for tests
 func testContext() context.Context {
 	return context.Background()
