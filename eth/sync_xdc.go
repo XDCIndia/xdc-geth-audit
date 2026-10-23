@@ -377,6 +377,15 @@ type xdcSyncer struct {
 	// set but XDC_EXPERIMENTAL_SNAPSYNC=1 is not. Prevents log spam at the
 	// 500ms tick cadence.
 	snapExpWarnOnce atomic.Bool
+
+	// Highest peer block number seen during FULL_SYNC phase. Atomic so eth_syncing
+	// can read safely without locking. Updated when fetchPeerHeadHeader or
+	// bulk sync learns real peer head numbers. Fixes #1841.
+	highestPeerBlockSeen atomic.Uint64
+
+	// bulkSyncStartBlock records the local head when bulk sync starts, once per
+	// catch-up cycle. Used to report progress in eth_syncing while behind peers.
+	bulkSyncStartBlock atomic.Uint64
 }
 
 // a70SeedRecord captures one V2 masternode-snapshot seed:
@@ -451,6 +460,13 @@ func (s *xdcSyncer) start() {
 func (s *xdcSyncer) stop() {
 	core.XdcBulkSyncMode.Store(false)
 	close(s.quitCh)
+}
+
+// SyncProgress returns the highest peer block seen and the starting block
+// for this bulk-sync cycle. Used by eth_syncing to report progress while
+// catching up. Returns (0, 0) if no peer head data is available. Fixes #1841.
+func (s *xdcSyncer) SyncProgress() (highestPeerBlock, startBlock uint64) {
+	return s.highestPeerBlockSeen.Load(), s.bulkSyncStartBlock.Load()
 }
 
 func (s *xdcSyncer) loop() {
@@ -2248,6 +2264,10 @@ func (s *xdcSyncer) fullSyncOnce() {
 	if len(candidates) == 0 {
 		return
 	}
+
+	// Record the starting block once per catch-up cycle (Fixes #1841).
+	// This is used to report progress in eth_syncing while behind peers.
+	s.bulkSyncStartBlock.CompareAndSwap(0, localHead)
 
 	// A.75: parallel fan-out to top xdcMaxPeerTriesPerSync candidates.
 	// Worst-case round time: xdcBulkReqTimeout (4s) instead of
@@ -4300,6 +4320,21 @@ func (s *xdcSyncer) fetchHeadersParallel(candidates []*eth.Peer, fromBlock uint6
 					"peer", p.ID(), "block", hdrs[0].Number, "hash", hdrs[0].Hash())
 				s.taintPeer(p)
 				return
+			}
+			// Track the highest peer block seen (Fixes #1841).
+			if len(hdrs) > 0 {
+				// Derive from the request, not the peer's last header number,
+				// which is not checked here and could be inflated.
+				highestInBatch := fromBlock + uint64(len(hdrs)) - 1
+				for {
+					current := s.highestPeerBlockSeen.Load()
+					if highestInBatch <= current {
+						break
+					}
+					if s.highestPeerBlockSeen.CompareAndSwap(current, highestInBatch) {
+						break
+					}
+				}
 			}
 			select {
 			case out <- &peerHeaderResult{peer: p, rng: rngs[p.ID()], headers: hdrs}:
