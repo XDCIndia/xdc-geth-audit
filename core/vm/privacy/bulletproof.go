@@ -11,6 +11,7 @@ import (
 	"math"
 	"math/big"
 	"strconv"
+	"sync"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/log"
@@ -24,6 +25,7 @@ type Bulletproof struct {
 }
 
 var EC CryptoParams
+var ecMu sync.Mutex // guards EC for concurrent prove/verify calls
 var VecLength = 512 // support maximum 8 spending value, each 64 bit (gwei is unit)
 var curve elliptic.Curve = crypto.S256()
 
@@ -974,6 +976,8 @@ func MRPProve(values []*big.Int) (MultiRangeProof, error) {
 		return MultiRangeProof{}, errors.New("value number is not supported - just 1, 2, 4, 8")
 	}
 
+	ecMu.Lock()
+	defer ecMu.Unlock()
 	EC = genECPrimeGroupKey(m * bitsPerValue)
 
 	// we concatenate the binary representation of the values
@@ -1162,6 +1166,8 @@ Takes in a MultiRangeProof and verifies its correctness
 */
 func MRPVerify(mrp *MultiRangeProof) bool {
 	m := len(mrp.Comms)
+	ecMu.Lock()
+	defer ecMu.Unlock()
 	EC = genECPrimeGroupKey(m * bitsPerValue)
 
 	//changes:
