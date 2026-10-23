@@ -126,13 +126,15 @@ func TestFetchHeaderBatchTimeoutIgnoresUnsolicitedHeaders(t *testing.T) {
 }
 
 // TestFetchBodiesBatchIgnoresUnsolicitedBodies verifies that fetchBodiesBatch
-// discards a response with the wrong body count and waits for the matching one.
+// discards a response that cannot answer the request (more bodies than
+// requested) and waits for the matching one. Fewer bodies are a valid partial
+// response, so they are not used as the unsolicited case.
 func TestFetchBodiesBatchIgnoresUnsolicitedBodies(t *testing.T) {
 	peer, remote := makeXDCPeerPair(t)
 	s := &xdcSyncer{quitCh: make(chan struct{})}
 
 	hashes := []common.Hash{{0x01}, {0x02}}
-	wrongBodies := []ethproto.BlockBody{{}} // count 1, want 2
+	wrongBodies := []ethproto.BlockBody{{}, {}, {}} // count 3, want at most 2
 	rightBodies := []ethproto.BlockBody{{}, {}}
 
 	go func() {
@@ -148,5 +150,28 @@ func TestFetchBodiesBatchIgnoresUnsolicitedBodies(t *testing.T) {
 	got := s.fetchBodiesBatch(peer, hashes)
 	if len(got) != len(rightBodies) {
 		t.Fatalf("want %d bodies, got %d", len(rightBodies), len(got))
+	}
+}
+
+// TestFetchBodiesBatchAcceptsPartial verifies that a response with fewer bodies
+// than requested (a peer's size limit) is accepted.
+func TestFetchBodiesBatchAcceptsPartial(t *testing.T) {
+	peer, remote := makeXDCPeerPair(t)
+	s := &xdcSyncer{quitCh: make(chan struct{})}
+
+	hashes := []common.Hash{{0x01}, {0x02}, {0x03}}
+	partial := []ethproto.BlockBody{{}, {}}
+
+	go func() {
+		msg, err := remote.ReadMsg()
+		if err != nil {
+			return
+		}
+		msg.Discard()
+		peer.XDCBodyResp <- partial
+	}()
+
+	if got := s.fetchBodiesBatch(peer, hashes); len(got) != len(partial) {
+		t.Fatalf("want %d bodies, got %d", len(partial), len(got))
 	}
 }

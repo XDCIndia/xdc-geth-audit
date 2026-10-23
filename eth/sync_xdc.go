@@ -4117,6 +4117,10 @@ func (s *xdcSyncer) fetchHeaderBatch(peer *eth.Peer, from uint64, count int) []*
 
 	deadline := time.NewTimer(xdcReqTimeout)
 	defer deadline.Stop()
+	// lastMismatch keeps the last response that did not match this request.
+	// If nothing matching arrives before the deadline it is returned, as
+	// before response matching, so the caller can judge (and taint) the peer.
+	var lastMismatch []*types.Header
 	for {
 		select {
 		case headers := <-peer.XDCHeaderResp:
@@ -4126,12 +4130,13 @@ func (s *xdcSyncer) fetchHeaderBatch(peer *eth.Peer, from uint64, count int) []*
 			if len(headers) == 0 || headers[0].Number.Uint64() != from || len(headers) > count {
 				log.Debug("xdcSyncer.fetchHeaderBatch: response mismatch, waiting",
 					"from", from, "got", len(headers))
+				lastMismatch = headers
 				continue
 			}
 			return headers
 		case <-deadline.C:
 			log.Debug("xdcSyncer.fetchHeaderBatch: timed out", "from", from)
-			return nil
+			return lastMismatch
 		case <-s.quitCh:
 			return nil
 		}
@@ -4164,18 +4169,23 @@ func (s *xdcSyncer) fetchHeaderBatchTimeout(peer *eth.Peer, from uint64, count i
 	defer req.Close()
 	deadline := time.NewTimer(timeout)
 	defer deadline.Stop()
+	// lastMismatch keeps the last response that did not match this request.
+	// If nothing matching arrives before the deadline it is returned, as
+	// before response matching, so the caller can judge (and taint) the peer.
+	var lastMismatch []*types.Header
 	for {
 		select {
 		case headers := <-peer.XDCHeaderResp:
 			if len(headers) == 0 || headers[0].Number.Uint64() != from || len(headers) > count {
 				log.Debug("xdcSyncer.fetchHeaderBatchTimeout: response mismatch, waiting",
 					"from", from, "got", len(headers))
+				lastMismatch = headers
 				continue
 			}
 			return headers
 		case <-deadline.C:
 			log.Debug("xdcSyncer.fetchHeaderBatchTimeout: timed out", "from", from)
-			return nil
+			return lastMismatch
 		case <-s.quitCh:
 			return nil
 		}
@@ -4301,21 +4311,25 @@ func (s *xdcSyncer) fetchBodiesBatch(peer *eth.Peer, hashes []common.Hash) []eth
 
 	deadline := time.NewTimer(xdcReqTimeout)
 	defer deadline.Stop()
+	// lastMismatch keeps the last response that did not match this request.
+	// If nothing matching arrives before the deadline it is returned, as
+	// before response matching, so the caller can judge the peer.
+	var lastMismatch []eth.BlockBody
 	for {
 		select {
 		case bodies := <-peer.XDCBodyResp:
-			// Validate: body count must match the requested hash count.
-			// Accept a partial response only if it is a total match (for future
-			// batching). An unsolicited batch (wrong count) is discarded.
-			if len(bodies) != len(hashes) {
+			// Validate: peers may return fewer bodies than requested (size
+			// limits), but more than requested cannot answer this request.
+			if len(bodies) > len(hashes) {
 				log.Debug("xdcSyncer.fetchBodiesBatch: response mismatch, waiting",
 					"want", len(hashes), "got", len(bodies))
+				lastMismatch = bodies
 				continue
 			}
 			return bodies
 		case <-deadline.C:
 			log.Debug("xdcSyncer.fetchBodiesBatch: timed out", "count", len(hashes))
-			return nil
+			return lastMismatch
 		case <-s.quitCh:
 			return nil
 		}
