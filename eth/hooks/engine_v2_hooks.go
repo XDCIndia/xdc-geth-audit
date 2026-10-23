@@ -467,8 +467,14 @@ func AttachConsensusV2Hooks(adaptor *XDPoS.XDPoS, bc *core.BlockChain, chainConf
 						}
 					}
 					// Count signing txs per signer over the current epoch's blocks.
+					// CertiK XDC-12 / ParoleDedupBlock: each (signer, signed-block-hash)
+					// pair counts at most once, so submitting MinimumSigningTx copies of
+					// the same signing tx for one block cannot satisfy the parole threshold.
 					mapBlockHash := map[common.Hash]bool{}
 					txSignerMap := map[common.Address]int{}
+					// seenPairs deduplicates (signer, target-block-hash) pairs when active.
+					seenPairs := map[common.Address]map[common.Hash]struct{}{}
+					dedupActive := chainConfig.IsParoleDedup(number)
 					startRange := int(chainConfig.XDPoS.Epoch) - 1
 					if startRange >= len(listBlockHash) {
 						startRange = len(listBlockHash) - 1
@@ -497,6 +503,15 @@ func AttachConsensusV2Hooks(adaptor *XDPoS.XDPoS, bc *core.BlockChain, chainConf
 								continue
 							}
 							if mapBlockHash[blkHash] {
+								if dedupActive {
+									if _, ok := seenPairs[from]; !ok {
+										seenPairs[from] = map[common.Hash]struct{}{}
+									}
+									if _, seen := seenPairs[from][blkHash]; seen {
+										continue // duplicate (signer, block-hash) pair
+									}
+									seenPairs[from][blkHash] = struct{}{}
+								}
 								txSignerMap[from]++
 							}
 						}
