@@ -217,7 +217,14 @@ func (h *ethHandler) Handle(peer *eth.Peer, packet eth.Packet) error {
 		// with ErrFutureBlock, so the assigned M2 never co-signs it and the
 		// un-co-signed block later arrives through the syncer.
 		if delay := time.Until(time.Unix(int64(block.Time()), 0)); delay > 0 && delay <= maxNewBlockDelay {
-			time.AfterFunc(delay, func() { h.Handle(peer, packet) })
+			time.AfterFunc(delay, func() {
+				select {
+				case <-h.quitSync:
+					return // handler stopped — skip
+				default:
+					h.Handle(peer, packet)
+				}
+			})
 			return nil
 		}
 		cur := h.chain.CurrentBlock()
