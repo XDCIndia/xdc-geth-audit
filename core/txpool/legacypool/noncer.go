@@ -82,6 +82,25 @@ func (txn *noncer) setIfLower(addr common.Address, nonce uint64) {
 	txn.nonces[addr] = nonce
 }
 
+// setIfHigher updates the virtual nonce for an account only when the new value
+// is strictly greater than the current tracked nonce. Used by promoteSpecialTx
+// on the expired-signing-tx replacement path so that replacing a stale signing
+// tx at nonce K does not lower the pending nonce below the current tip N+1.
+func (txn *noncer) setIfHigher(addr common.Address, nonce uint64) {
+	txn.lock.Lock()
+	defer txn.lock.Unlock()
+
+	if _, ok := txn.nonces[addr]; !ok {
+		if nonce := txn.fallback.GetNonce(addr); nonce != 0 {
+			txn.nonces[addr] = nonce
+		}
+	}
+	if txn.nonces[addr] >= nonce {
+		return
+	}
+	txn.nonces[addr] = nonce
+}
+
 // setAll sets the nonces for all accounts to the given map.
 func (txn *noncer) setAll(all map[common.Address]uint64) {
 	txn.lock.Lock()
