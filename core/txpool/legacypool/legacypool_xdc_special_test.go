@@ -689,3 +689,71 @@ func TestXDCSpecialTxSignSelectorFastPath(t *testing.T) {
 		t.Fatalf("wrong calldata took unexpected path: %v", err)
 	}
 }
+
+// ─── R1-M01: pending nonce must not be lowered on expired-tx replacement ──────
+
+// TestXDCPromoteSpecialTxDoesNotLowerPendingNonce verifies R1-M01: when a
+// signer replaces an expired signing tx at nonce K while later nonces K+1..N
+// are already pending, promoteSpecialTx must not lower pendingNonces to K+1.
+//
+// Before the fix, promoteSpecialTx called pendingNonces.set(from, K+1),
+// unconditionally overwriting the tip N+1.  That blocked the next tx at N+1
+// from taking the fast path (pendingNonces==tx.Nonce() check fails) until the
+// next pool reset re-synced nonces.
+//
+// After the fix, pendingNonces.setIfHigher is used, so K+1 < N+1 is ignored
+// and the tip remains N+1.
+func TestXDCPromoteSpecialTxDoesNotLowerPendingNonce(t *testing.T) {
+	t.Parallel()
+
+	const epoch = uint64(900)
+	pool, close := xdcSpecialPoolWithEpoch(t, epoch)
+	defer close()
+
+	privKey, _ := crypto.GenerateKey()
+	addr := crypto.PubkeyToAddress(privKey.PublicKey)
+
+	pool.IsSigner = func(a common.Address) bool { return a == addr }
+	pool.mu.Lock()
+	pool.currentState.AddBalance(addr, new(uint256.Int).SetUint64(1), tracing.BalanceChangeUnspecified)
+	pool.mu.Unlock()
+
+	// Insert signing tx at nonce 0, targeting block 15 (will be made expired).
+	tx0 := makeSigningTxForBlock(0, 15, privKey)
+	if errs := pool.Add([]*types.Transaction{tx0}, true); errs[0] != nil {
+		t.Fatalf("tx0 rejected: %v", errs[0])
+	}
+	// Insert signing tx at nonce 1 (fresh, targeting current head area).
+	tx1 := makeSigningTxForBlock(1, 100, privKey)
+	if errs := pool.Add([]*types.Transaction{tx1}, true); errs[0] != nil {
+		t.Fatalf("tx1 rejected: %v", errs[0])
+	}
+	// pendingNonces[addr] is now 2.
+
+	// Advance head past expiry of tx0: 15 + 900*2 + 1 = 1816.
+	pool.mu.Lock()
+	pool.currentHead.Store(&types.Header{Number: big.NewInt(1816), Difficulty: common.Big0, GasLimit: 10_000_000})
+	pool.mu.Unlock()
+
+	// Replace the now-expired tx0 with a fresh signing tx at the same nonce.
+	// This exercises the recovery path (pendingN > tx.Nonce() && expired).
+	tx0new := makeSigningTxForBlock(0, 1816, privKey)
+	if errs := pool.Add([]*types.Transaction{tx0new}, true); errs[0] != nil {
+		t.Fatalf("replacement of expired tx0 rejected: %v", errs[0])
+	}
+
+	// After replacement pendingNonces must still be 2, not 1.
+	// Verify by adding a signing tx at nonce 2 via the fast path: it is
+	// admitted only when pendingNonces[addr]==2.
+	tx2 := makeSigningTxForBlock(2, 1816, privKey)
+	if errs := pool.Add([]*types.Transaction{tx2}, true); errs[0] != nil {
+		t.Fatalf("tx2 (nonce=2) rejected — pendingNonce was lowered by the replacement (R1-M01): %v", errs[0])
+	}
+
+	// Confirm all three nonces are in pending.
+	pending, _ := pool.Pending(txpool.PendingFilter{})
+	got := len(pending[addr])
+	if got != 3 {
+		t.Fatalf("want 3 pending txs (nonces 0,1,2), got %d — R1-M01 regression", got)
+	}
+}
