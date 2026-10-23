@@ -477,6 +477,17 @@ func (b *EthAPIBackend) SubscribeNewTxsEvent(ch chan<- core.NewTxsEvent) event.S
 	return b.eth.txPool.SubscribeTransactions(ch, true)
 }
 
+// NodeSyncInfo reports the configured sync mode, the gc mode ("archive" when
+// state pruning is off, else "full") and the state scheme the chain uses.
+// ethstats sends it so dashboards can show each node's type.
+func (b *EthAPIBackend) NodeSyncInfo() (syncMode, gcMode, stateScheme string) {
+	gcMode = "full"
+	if b.eth.config.NoPruning {
+		gcMode = "archive"
+	}
+	return b.eth.config.SyncMode.String(), gcMode, b.eth.blockchain.TrieDB().Scheme()
+}
+
 func (b *EthAPIBackend) SyncProgress(ctx context.Context) ethereum.SyncProgress {
 	prog := b.eth.Downloader().Progress()
 
