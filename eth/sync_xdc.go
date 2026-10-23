@@ -3518,6 +3518,10 @@ func (s *xdcSyncer) fetchHeaderByHash(peer *eth.Peer, hash common.Hash) *types.H
 		if len(headers) == 0 {
 			return nil
 		}
+		if headers[0].Hash() != hash {
+			log.Debug("xdcSyncer.fetchHeaderByHash: hash mismatch", "peer", peer.ID(), "wanted", hash, "got", headers[0].Hash())
+			return nil
+		}
 		return headers[0]
 	case <-time.After(5 * time.Second):
 		return nil
