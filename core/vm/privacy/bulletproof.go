@@ -80,6 +80,11 @@ func (p ECPoint) Add(p2 ECPoint) ECPoint {
 
 // Neg returns the additive inverse of point p
 func (p ECPoint) Neg() ECPoint {
+	// The point at infinity (nil coordinates, e.g. Mult by a zero scalar) is
+	// its own inverse; Add already treats nil as infinity (review R4-P02).
+	if p.X == nil || p.Y == nil {
+		return p
+	}
 	negY := new(big.Int).Neg(p.Y)
 	modValue := negY.Mod(negY, EC.C.Params().P) // mod P is fine here because we're describing a curve point
 	return ECPoint{p.X, modValue}
