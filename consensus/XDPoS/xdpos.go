@@ -1429,7 +1429,10 @@ func (c *XDPoS) Prepare(chain consensus.ChainHeaderReader, header *types.Header)
 		return consensus.ErrUnknownAncestor
 	}
 
-	header.Difficulty = c.calcDifficulty(chain, parent, c.signer)
+	c.lock.RLock()
+	signer := c.signer
+	c.lock.RUnlock()
+	header.Difficulty = c.calcDifficulty(chain, parent, signer)
 	log.Debug("CalcDifficulty", "number", header.Number, "difficulty", header.Difficulty)
 
 	if len(header.Extra) < extraVanity {
@@ -1873,7 +1876,10 @@ func (c *XDPoS) CalcDifficulty(chain consensus.ChainHeaderReader, time uint64, p
 			return c.EngineV2.CalcDifficulty(cr, time, parent)
 		}
 	}
-	return c.calcDifficulty(chain, parent, c.signer)
+	c.lock.RLock()
+	signer := c.signer
+	c.lock.RUnlock()
+	return c.calcDifficulty(chain, parent, signer)
 }
 
 func (c *XDPoS) calcDifficulty(chain consensus.ChainHeaderReader, parent *types.Header, signer common.Address) *big.Int {
