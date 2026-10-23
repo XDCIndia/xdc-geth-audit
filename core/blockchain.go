@@ -966,7 +966,45 @@ func (bc *BlockChain) loadLastState() error {
 	if pruning := bc.historyPrunePoint.Load(); pruning != nil {
 		log.Info("Chain history is pruned", "earliest", pruning.BlockNumber, "hash", pruning.BlockHash)
 	}
+	// Sweep any canonical-hash and tx-lookup entries left above the header head
+	// by a prior crash during SetHead/reorg or an interrupted startup repair
+	// (CertiK XDC-21, XDC-27, XDC-28). Uses the header head so checkpoint-sync
+	// nodes keep their downloaded-but-not-executed headers.
+	bc.sweepStaleCanonicals(headHeader.Number.Uint64())
 	return nil
+}
+
+// sweepStaleCanonicals removes canonical-hash and tx-lookup entries that sit
+// above headNum. Such entries are left behind after a crash during SetHead, a
+// reorg, or a startup repair. It is a no-op on a consistent database and runs
+// only at startup, never on hot paths.
+func (bc *BlockChain) sweepStaleCanonicals(headNum uint64) {
+	batch := bc.db.NewBatch()
+	deleted := 0
+	for num := headNum + 1; ; num++ {
+		hash := rawdb.ReadCanonicalHash(bc.db, num)
+		if hash == (common.Hash{}) {
+			break
+		}
+		// Drop tx-lookup entries for this block when its body is available.
+		if body := rawdb.ReadBody(bc.db, hash, num); body != nil {
+			hashes := make([]common.Hash, len(body.Transactions))
+			for i, tx := range body.Transactions {
+				hashes[i] = tx.Hash()
+			}
+			rawdb.DeleteTxLookupEntries(batch, hashes)
+		}
+		rawdb.DeleteCanonicalHash(batch, num)
+		deleted++
+	}
+	if deleted == 0 {
+		return
+	}
+	if err := batch.Write(); err != nil {
+		log.Error("Failed to flush stale canonical sweep", "err", err)
+		return
+	}
+	log.Warn("Removed stale canonical entries above head", "count", deleted, "above", headNum)
 }
 
 // initializeHistoryPruning sets bc.historyPrunePoint.
