@@ -320,6 +320,15 @@ func (api *API) GetRewardByAccount(account common.Address, begin rpc.BlockNumber
 	epoch := api.xdpos.config.Epoch
 	accountHex := strings.ToLower(account.Hex())
 
+	// Reject ranges that span more than 1000 epochs to prevent a single RPC call
+	// from listing and decoding every reward file the node has stored (review R2-N01).
+	const maxEpochSpan = uint64(1000)
+	if endNum > beginNum && endNum-beginNum > maxEpochSpan*epoch {
+		return AccountRewardResponse{Rewards: make([]AccountEpochReward, 0)},
+			fmt.Errorf("range spans %d blocks, exceeding the %d-epoch limit of %d blocks",
+				endNum-beginNum, maxEpochSpan, maxEpochSpan*epoch)
+	}
+
 	// Read all reward files in the folder and match by block range and account
 	entries, err := os.ReadDir(common.StoreRewardFolder)
 	if err != nil {
