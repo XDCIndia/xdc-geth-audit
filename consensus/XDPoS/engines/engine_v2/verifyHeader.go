@@ -208,6 +208,13 @@ func (x *XDPoS_v2) verifyHeader(chain consensus.ChainReader, header *types.Heade
 			// already takes — both rely on the trusted-checkpoint boundary rather
 			// than per-block recomputation when state isn't yet built.
 			localPenalties = contracts.ExtractAddressFromBytes(header.Penalties)
+			// CertiK XDC-10: calcMasternodes failed, so we cannot verify header.Validators
+			// locally. Record this header for re-verification once the canonical DB is
+			// committed (RecheckDeferredSwitches, called from eth/sync_xdc.go after each
+			// successful InsertChain batch).
+			x.pendingSwitchRechecks.Add(header.Hash(), header.Number.Uint64())
+			log.Debug("[verifyHeader] XDC-10: recorded epoch-switch header for deferred recheck",
+				"block", header.Number.Uint64(), "hash", header.Hash())
 		}
 		// CompareSignersLists runs unconditionally for both calcMasternodes success AND fallback.
 		// This prevents malicious peers from feeding bogus Validators/Penalties during bulk sync.
@@ -253,6 +260,9 @@ func (x *XDPoS_v2) verifyHeader(chain consensus.ChainReader, header *types.Heade
 				masterNodes = validatorsAddress
 				localList = false
 				localPenalties = contracts.ExtractAddressFromBytes(header.Penalties)
+				// CertiK XDC-10: the header's lists are trusted here too; recheck
+				// them once the batch is committed.
+				x.pendingSwitchRechecks.Add(header.Hash(), header.Number.Uint64())
 			} else {
 				log.Warn("[verifyHeader DIAG]",
 					"block", header.Number.Uint64(),
@@ -322,6 +332,8 @@ func (x *XDPoS_v2) verifyHeader(chain consensus.ChainReader, header *types.Heade
 					"headerCount", len(penaltiesAddress),
 					"snapshotMissing", err != nil && errors.Is(err, utils.ErrV2SnapshotMissing))
 				localPenalties = penaltiesAddress
+				// CertiK XDC-10: recheck once the batch is committed.
+				x.pendingSwitchRechecks.Add(header.Hash(), header.Number.Uint64())
 			} else {
 				for i, addr := range localPenalties {
 					log.Warn("[verifyHeader] localPenalties", "i", i, "addr", addr.Hex())
