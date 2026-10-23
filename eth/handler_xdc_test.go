@@ -1,6 +1,7 @@
 // Copyright 2026 XDC Network
 // Tests for the non-blocking BFT broadcast helpers in handler_xdc.go.
 // CertiK XDC-13: BroadcastVote/Timeout/SyncInfo must not block on a stalled peer.
+// review R2-D03: BroadcastBlock must not block on a stalled peer.
 
 package eth
 
@@ -10,10 +11,14 @@ import (
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/consensus/ethash"
+	"github.com/ethereum/go-ethereum/core"
+	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/core/types"
 	ethproto "github.com/ethereum/go-ethereum/eth/protocols/eth"
 	"github.com/ethereum/go-ethereum/p2p"
 	"github.com/ethereum/go-ethereum/p2p/enode"
+	"github.com/ethereum/go-ethereum/params"
 )
 
 // makeBFTTestHandler builds a minimal handler whose only populated field is
@@ -100,5 +105,64 @@ func TestBroadcastVoteNonBlocking(t *testing.T) {
 		}
 	case <-time.After(500 * time.Millisecond):
 		t.Fatal("healthy peer did not receive the vote within deadline")
+	}
+}
+
+// TestBroadcastBlockNonBlocking verifies that a stalled peer does not block
+// BroadcastBlock, and that a healthy peer receives the NewBlock message.
+//
+// Without the goroutine fix (origin/main), the loop is synchronous: the
+// stalled peer's p2p.MsgPipe write blocks forever, so BroadcastBlock never
+// returns. With the fix, BroadcastBlock spawns per-peer goroutines and returns
+// immediately. (review R2-D03)
+func TestBroadcastBlockNonBlocking(t *testing.T) {
+	// Minimal chain — needed so h.chain.GetTd returns nil and the fallback TD
+	// path is taken (block.Difficulty()). No blocks inserted.
+	db := rawdb.NewMemoryDatabase()
+	gspec := &core.Genesis{Config: params.AllEthashProtocolChanges, Difficulty: common.Big1}
+	bc, err := core.NewBlockChain(db, gspec, ethash.NewFaker(), nil)
+	if err != nil {
+		t.Fatalf("NewBlockChain: %v", err)
+	}
+	defer bc.Stop()
+
+	stallPeer, stalledRW := makeBlockingPeer(enode.ID{3})
+	defer stalledRW.Close()
+	defer stallPeer.Close()
+
+	healthyPeer, msgCh := makeReadingPeer(enode.ID{4})
+	defer healthyPeer.Close()
+
+	ps := newPeerSet()
+	ps.peers[stallPeer.ID()] = stallPeer
+	ps.peers[healthyPeer.ID()] = healthyPeer
+	h := &handler{peers: ps, chain: bc}
+
+	block := types.NewBlockWithHeader(&types.Header{
+		Number:     big.NewInt(1),
+		Difficulty: big.NewInt(1),
+		Time:       1,
+	})
+
+	done := make(chan struct{})
+	go func() {
+		h.BroadcastBlock(block)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// Expected: spawned goroutines, returned immediately.
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("BroadcastBlock blocked: stalled peer held up the broadcast loop (R2-D03)")
+	}
+
+	select {
+	case msg := <-msgCh:
+		if msg.Code != ethproto.NewBlockMsg {
+			t.Fatalf("got msg code %d, want NewBlockMsg (%d)", msg.Code, ethproto.NewBlockMsg)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("healthy peer did not receive the block within deadline")
 	}
 }
