@@ -108,18 +108,20 @@ func (x *XDPoS_v2) verifyHeader(chain consensus.ChainReader, header *types.Heade
 	// A.97.5: QC verification always runs. The masternode set is 100% header-derived
 	// via getEpochSwitchInfoWithParents → GetMasternodesFromEpochSwitchHeader →
 	// header.Validators; no trusted anchor is required on the clean fast-sync path.
-	// The A.89 inCheckpointCatchup QC-skip is removed: when no anchor is installed,
-	// inCheckpointCatchup returns false and this branch was already dead.
-	// Removing it makes the intent explicit and eliminates the dead dependency on the
-	// anchor mechanism on the clean path (refs #894).
 	//
-	// Degraded-recovery note: when an operator anchor IS installed (operatorPivotNumber!=0),
-	// inCheckpointCatchup remains live in GetMasternodesWithParents (engine.go:1271)
-	// and the commit-rule skip in utils.go:336. Neither is part of the header verify path,
-	// so their behavior is unchanged.
-	if err := x.verifyQC(chain, quorumCert, parent, parents); err != nil {
-		log.Warn("[verifyHeader] fail to verify QC", "QCNumber", quorumCert.ProposedBlockInfo.Number, "QCsigLength", len(quorumCert.Signatures))
-		return err
+	// #1859: skip QC/TC signature and gap-number verification for headers below
+	// the BeaconSync pivot while the epoch-switch headers they reference have not
+	// yet been downloaded. The downloader authenticates the entire backfill range
+	// via the parent-hash chain from the trusted pivot; individual QC gap and
+	// signer checks can only run once the epoch-switch blocks are locally available.
+	// inCheckpointCatchup returns false when no anchor is active (full sync, post-
+	// sync, clean fast-sync with no dynamic pivot yet), preserving strict
+	// verification everywhere outside the backfill window.
+	if !x.inCheckpointCatchup(chain, header.Number.Uint64()) {
+		if err := x.verifyQC(chain, quorumCert, parent, parents); err != nil {
+			log.Warn("[verifyHeader] fail to verify QC", "QCNumber", quorumCert.ProposedBlockInfo.Number, "QCsigLength", len(quorumCert.Signatures))
+			return err
+		}
 	}
 
 	// Nonces must be 0x00..0 or 0xff..f, zeroes enforced on checkpoints
