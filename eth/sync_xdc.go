@@ -1744,8 +1744,39 @@ func (s *xdcSyncer) snapSelectOnce() {
 	if peer.BlockRange() == nil {
 		return
 	}
+	// SYNC-02 (#1842): determine peerHead for QC-verify pivot selection.
+	// Primary: peer's live head (most accurate; avoids stale compiled checkpoints).
+	// On net2040 the highest compiled checkpoint was 11,250 while the actual chain
+	// head was 89,000 — SelectSnapPivot received 11,250 and rejected every candidate
+	// as "pre-V2 history". Fetching the live head first fixes this.
+	// Fallback: compiled TrustedSyncCheckpoints (for mainnet/Apothem where checkpoints
+	// are near-tip and the live fetch may fail). Existing A.97 short-chain guard
+	// semantics are preserved: if the live head is below xdcSnapEngageMinGap we
+	// revert to FULL_SYNC immediately (#912).
 	var peerHead uint64
-	if cfg != nil {
+	if rng := peer.BlockRange(); rng != nil && rng.LatestBlockHash != (common.Hash{}) {
+		if hdr := s.fetchHeaderByHash(peer, rng.LatestBlockHash); hdr != nil {
+			actualPeer := hdr.Number.Uint64()
+			// A.97 short-chain guard (refs #912).
+			if actualPeer < xdcSnapEngageMinGap {
+				log.Info("xdcSyncer: snap pivot fallback skipped — peer head below xdcSnapEngageMinGap; reverting to FULL_SYNC",
+					"peerHead", actualPeer, "minGap", xdcSnapEngageMinGap,
+					"localHead", cur.Number.Uint64())
+				s.snapSelectFailures++
+				if s.snapSelectFailures >= xdcSnapSelectMaxRetries {
+					s.snapPermanentFullFallback.Store(true)
+					log.Warn("xdcSyncer: snap pivot selection failed repeatedly — permanently falling back to full-sync (no snap-capable peers)",
+						"attempts", s.snapSelectFailures)
+				}
+				s.snapPhase.Store(int32(phaseFullSync))
+				return
+			}
+			peerHead = actualPeer
+		}
+	}
+	// Fallback: compiled checkpoints — used when live fetch fails or on
+	// mainnet/Apothem where checkpoints are near-tip. Secondary priority only.
+	if peerHead == 0 && cfg != nil {
 		for _, cp := range cfg.TrustedSyncCheckpoints {
 			if cp.Number > peerHead {
 				peerHead = cp.Number
@@ -1753,41 +1784,8 @@ func (s *xdcSyncer) snapSelectOnce() {
 		}
 	}
 	if peerHead == 0 {
-		// A.97 short-chain guard (refs #912): clamp the synthetic peerHead to the
-		// peer's actual head block number. On short chains (devnet < 5000 blocks)
-		// the synthetic localHead+5000 target doesn't exist, SelectSnapPivot
-		// returns nil, and we fall back to FULL_SYNC — but maybeEngageSnap
-		// re-engages on the next tick, creating a loop.
-		//
-		// Fetch the peer's real head block number. If it is below
-		// xdcSnapEngageMinGap, fall back to FULL_SYNC immediately rather than
-		// passing an unreachable target to SelectSnapPivot. Production chains
-		// (mainnet > 73M, Apothem > 50M) are never affected by this guard.
-		rng := peer.BlockRange()
-		if rng != nil && rng.LatestBlockHash != (common.Hash{}) {
-			if hdr := s.fetchHeaderByHash(peer, rng.LatestBlockHash); hdr != nil {
-				actualPeer := hdr.Number.Uint64()
-				if actualPeer < xdcSnapEngageMinGap {
-					log.Info("xdcSyncer: snap pivot fallback skipped — peer head below xdcSnapEngageMinGap; reverting to FULL_SYNC",
-						"peerHead", actualPeer, "minGap", xdcSnapEngageMinGap,
-						"localHead", cur.Number.Uint64())
-					s.snapSelectFailures++
-					if s.snapSelectFailures >= xdcSnapSelectMaxRetries {
-						s.snapPermanentFullFallback.Store(true)
-						log.Warn("xdcSyncer: snap pivot selection failed repeatedly — permanently falling back to full-sync (no snap-capable peers)",
-							"attempts", s.snapSelectFailures)
-					}
-					s.snapPhase.Store(int32(phaseFullSync))
-					return
-				}
-				peerHead = actualPeer
-			}
-		}
-		if peerHead == 0 {
-			// Could not fetch real head; use synthetic but cap at xdcSnapEngageMinGap
-			// minimum so SelectSnapPivot always has a meaningful search space.
-			peerHead = cur.Number.Uint64() + xdcSnapEngageMinGap
-		}
+		// Last resort: synthetic target so SelectSnapPivot has a search space.
+		peerHead = cur.Number.Uint64() + xdcSnapEngageMinGap
 	}
 	fetchHeader := func(n uint64) *types.Header {
 		hdrs := s.fetchHeaderBatch(peer, n, 1)
