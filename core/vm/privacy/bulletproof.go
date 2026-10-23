@@ -444,6 +444,9 @@ we replace n separate exponentiations with a single multi-exponentiation.
 */
 
 func InnerProductVerifyFast(c *big.Int, P, U ECPoint, G, H []ECPoint, ipp InnerProdArg) bool {
+	if len(ipp.Challenges) == 0 {
+		return false
+	}
 	// input := append(PadTo32Bytes(P.X.Bytes()), PadTo32Bytes(P.Y.Bytes())...)
 	// s1 := crypto.Keccak256(input)
 	s1 := HashPointsToBytes([]ECPoint{P})
@@ -924,7 +927,9 @@ func (mrp *MultiRangeProof) Deserialize(proof []byte) error {
 	offset += 32
 
 	numChallenges := int(math.Log2(float64(len(mrp.Comms)*bitsPerValue))) + 1
-	mrp.IPP.Deserialize(proof[offset:], numChallenges)
+	if err := mrp.IPP.Deserialize(proof[offset:], numChallenges); err != nil {
+		return err
+	}
 	offset += len(mrp.IPP.L)*33 + len(mrp.IPP.R)*33 + len(mrp.IPP.Challenges)*32 + 2*32
 
 	mrp.Cy = new(big.Int).SetBytes(proof[offset : offset+32])
@@ -1166,6 +1171,9 @@ Takes in a MultiRangeProof and verifies its correctness
 */
 func MRPVerify(mrp *MultiRangeProof) bool {
 	m := len(mrp.Comms)
+	if m == 0 {
+		return false
+	}
 	ecMu.Lock()
 	defer ecMu.Unlock()
 	EC = genECPrimeGroupKey(m * bitsPerValue)
