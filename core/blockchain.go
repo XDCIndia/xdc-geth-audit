@@ -1575,10 +1575,19 @@ func (bc *BlockChain) SnapSyncComplete(hash common.Hash, isSnapV2 bool) error {
 // called first — the NodeData path writes trie nodes directly through the
 // key-value database, so the trie database and snapshots are never paused.
 //
+// For path-scheme (PBSS) databases, fast sync writes path-keyed trie nodes
+// directly to the raw KV store via trie.Sync — bypassing pathdb's layer
+// commit mechanism.  As a result pathdb's layer tree has no record of the
+// new state root, and HasState() returns false even though all trie data is
+// present on disk.  Calling triedb.Enable(root) registers the root as the
+// new disk layer (same call SnapSyncComplete makes for snap/1) without
+// requiring a prior SnapSyncStart. This also covers the SYNC-07 snap/1
+// fallback path, where snap.Sync() writes data but never calls
+// SnapSyncComplete. Refs: #1850 (SYNC-08).
+//
 // Ported from Geth v1.10.13 FastSyncCommitHead, adapted for v1.17.3:
 //   - Drops the trie.NewSecure state-check (v1.14+ uses bc.HasState instead)
 //   - Uses bc.currentBlock.Store(block.Header()) (atomics refactor)
-//   - No triedb.Enable() needed (SnapSyncStart was never called)
 //
 // Refs: #844, Phase A.3.
 func (bc *BlockChain) FastSyncCommitHead(hash common.Hash) error {
@@ -1587,8 +1596,20 @@ func (bc *BlockChain) FastSyncCommitHead(hash common.Hash) error {
 	if block == nil {
 		return fmt.Errorf("non existent block [%x..]", hash[:4])
 	}
-	if !bc.HasState(block.Root()) {
-		return fmt.Errorf("non existent state [%x..]", block.Root().Bytes()[:4])
+	root := block.Root()
+
+	// For path-scheme databases, fast sync writes path-keyed trie nodes directly
+	// to the raw KV store, bypassing pathdb's layer-commit mechanism. pathdb's
+	// layer tree never learns about the new root, so HasState returns false even
+	// though all data is present. Enable() registers the root as the new disk
+	// layer — no prior Disable/SnapSyncStart needed. Mirrors SnapSyncComplete.
+	if bc.triedb.Scheme() == rawdb.PathScheme {
+		if err := bc.triedb.Enable(root); err != nil {
+			return err
+		}
+	}
+	if !bc.HasState(root) {
+		return fmt.Errorf("non existent state [%x..]", root.Bytes()[:4])
 	}
 	if !bc.chainmu.TryLock() {
 		return errChainStopped
@@ -1597,7 +1618,7 @@ func (bc *BlockChain) FastSyncCommitHead(hash common.Hash) error {
 
 	// Rebuild any snapshot layer so that post-pivot full sync can use it.
 	if bc.snaps != nil {
-		bc.snaps.Rebuild(block.Root(), true) // fast sync: always generate snapshot
+		bc.snaps.Rebuild(root, true) // fast sync: always generate snapshot
 	}
 
 	// Manually set the head block.
