@@ -2959,6 +2959,20 @@ func (s *xdcSyncer) repairAnchorGapBodies(peer *eth.Peer) {
 	s.anchorGapRepaired.Store(true)
 }
 
+// rollbackWindow returns the exponential rollback window for a given cumulative
+// rolled-back count. The shift is capped so the result never exceeds
+// xdcRollbackWindowMax and never wraps to zero via uint64 overflow.
+// (For stuckRolledBack in 7296..8191 the shift would be 57..63, making
+// 128*(1<<shift) overflow to 0 in uint64 — issue #1762.)
+func rollbackWindow(rolledBack uint64) uint64 {
+	const maxShift = 6 // 128 << 6 == 8192 == xdcRollbackWindowMax
+	shift := rolledBack / xdcRollbackWindowInit
+	if shift > maxShift {
+		shift = maxShift
+	}
+	return uint64(xdcRollbackWindowInit) * (1 << shift)
+}
+
 // maybeRollbackOnUnknownAncestor implements geth-aligned self-healing for
 // the V2 BFT competing-slot fork issue (issue #801). When our local tip
 // lands on a non-canonical block produced in the same slot as canonical,
@@ -3047,9 +3061,18 @@ func (s *xdcSyncer) maybeRollbackOnUnknownAncestor(fromBlock uint64, peer *eth.P
 		return
 	}
 	// Window doubles each consecutive trigger so we escape quickly from deep forks.
-	window := uint64(xdcRollbackWindowInit) * (1 << (s.stuckRolledBack / xdcRollbackWindowInit))
+	// rollbackWindow caps the shift to prevent uint64 overflow when stuckRolledBack
+	// is in the range 7296..8191 (shift 57..63 would wrap 128*(1<<shift) to 0).
+	window := rollbackWindow(s.stuckRolledBack)
 	if window+s.stuckRolledBack > xdcRollbackWindowMax {
 		window = xdcRollbackWindowMax - s.stuckRolledBack
+	}
+	if window == 0 {
+		// Budget exhausted: treat as cap-path so no SetHead or cooldown stamp occurs.
+		log.Error("xdcSyncer: stuck on fork past rollback cap — manual intervention required",
+			"from", fromBlock, "rolledBack", s.stuckRolledBack,
+			"cap", xdcRollbackWindowMax)
+		return
 	}
 	if cur.Number.Uint64() <= window {
 		return
