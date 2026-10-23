@@ -743,7 +743,7 @@ func deserializePointArray(input []byte, numPoint uint32) ([]ECPoint, error) {
 		numPointSize = 4
 		numPoint = binary.BigEndian.Uint32(input[0:4])
 	}
-	if uint32(len(input)) < (numPointSize + 33*numPoint) {
+	if uint64(len(input)) < uint64(numPointSize)+33*uint64(numPoint) {
 		return []ECPoint{}, errors.New("input data too short")
 	}
 	ret := make([]ECPoint, numPoint)
