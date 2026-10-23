@@ -94,6 +94,7 @@ var (
 		utils.ExitWhenSyncedFlag,
 		utils.GCModeFlag,
 		utils.SnapshotFlag,
+		utils.SnapV2Flag,
 		utils.TransactionHistoryFlag,
 		utils.ChainHistoryFlag,
 		utils.LogHistoryFlag,
@@ -165,6 +166,7 @@ var (
 		utils.BeaconCheckpointFileFlag,
 		utils.LogSlowBlockFlag,
 		utils.StoreRewardFlag,
+		utils.StateSizeTrackingFlag, // deprecated (upstream)
 	}, utils.NetworkFlags, utils.DatabaseFlags)
 
 	rpcFlags = []cli.Flag{
@@ -209,25 +211,6 @@ var (
 		utils.RPCTelemetryInstanceIDFlag,
 		utils.RPCTelemetryTagsFlag,
 		utils.RPCTelemetrySampleRatioFlag,
-	}
-
-	metricsFlags = []cli.Flag{
-		utils.MetricsEnabledFlag,
-		utils.MetricsHTTPFlag,
-		utils.MetricsPortFlag,
-		utils.MetricsEnableInfluxDBFlag,
-		utils.MetricsInfluxDBEndpointFlag,
-		utils.MetricsInfluxDBDatabaseFlag,
-		utils.MetricsInfluxDBUsernameFlag,
-		utils.MetricsInfluxDBPasswordFlag,
-		utils.MetricsInfluxDBTagsFlag,
-		utils.MetricsInfluxDBIntervalFlag,
-		utils.MetricsEnableInfluxDBV2Flag,
-		utils.MetricsInfluxDBTokenFlag,
-		utils.MetricsInfluxDBBucketFlag,
-		utils.MetricsInfluxDBOrganizationFlag,
-		utils.SnapV2Flag,
-		utils.StateSizeTrackingFlag, // deprecated
 	}
 )
 
@@ -280,7 +263,7 @@ func init() {
 		rpcFlags,
 		consoleFlags,
 		debug.Flags,
-		metricsFlags,
+		utils.MetricsFlags,
 	)
 	flags.AutoEnvVars(app.Flags, "GETH")
 
