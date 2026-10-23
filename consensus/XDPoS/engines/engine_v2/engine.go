@@ -49,6 +49,9 @@ const (
 
 	// Periodic job interval
 	PeriodicJobPeriod = 60 // seconds
+
+	// CertiK XDC-10: cap on epoch-switch headers pending deferred re-verification.
+	deferredSwitchRecheckCap = 2048
 )
 
 // SignerFn is a signer callback function
@@ -120,6 +123,12 @@ type XDPoS_v2 struct {
 	// C12 FIX: singleflight.Group deduplicates concurrent getEpochSwitchInfo calls
 	// for the same hash, eliminating false-positive recursion errors under load.
 	epochSwitchSF singleflight.Group
+
+	// CertiK XDC-10: epoch-switch headers accepted during bulk sync without local
+	// masternode verification (calcMasternodes failed). RecheckDeferredSwitches
+	// re-verifies them once the canonical DB is committed.
+	// Thread-safe (lru.Cache uses an internal mutex).
+	pendingSwitchRechecks *lru.Cache[common.Hash, uint64]
 }
 
 // SetHookReward wires the reward hook for V2 epoch-switch blocks.
@@ -193,6 +202,9 @@ func createEngine(chainConfig *params.ChainConfig, db ethdb.Database, minePeriod
 		votePool:    utils.NewPool(),
 
 		highestSelfMinedRound: types.Round(0),
+
+		// CertiK XDC-10: bounded set of epoch-switch headers pending deferred re-verification.
+		pendingSwitchRechecks: lru.NewCache[common.Hash, uint64](deferredSwitchRecheckCap),
 
 		// Initialize recursion guard map
 		epochSwitchInProgress: make(map[common.Hash]struct{}),
