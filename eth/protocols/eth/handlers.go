@@ -869,6 +869,14 @@ func handleReceiptsXDPOS2(backend Backend, msg Decoder, peer *Peer) error {
 		return err
 	}
 	log.Info("XDPOS2 Receipts received", "peer", peer.ID()[:8], "count", len(raw))
+	// Route 1: push to peer.XDCReceiptResp where fetchReceiptsBatch waits.
+	// Non-blocking: if no reader is waiting, the response is dropped here and
+	// the dispatcher handles delivery to any registered sink (Route 2).
+	select {
+	case peer.XDCReceiptResp <- raw:
+	default:
+	}
+	// Route 2: dispatcher delivery for callers that registered a sink.
 	reqID := peer.legacyReceiptsReqID.Load()
 	return dispatchLegacyReceipts(reqID, raw, peer)
 }

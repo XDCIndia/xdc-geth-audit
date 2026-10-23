@@ -44,7 +44,9 @@ type fakeXDCPeer struct {
 	*eth.Peer
 	headersFor func(origin uint64, amount int) []*types.Header
 	blocks     map[common.Hash]*types.Block
+	receipts   map[common.Hash]types.Receipts // nil means "no receipts available"
 	bodyCap    int
+	corrupt    bool // if true, serve empty bodies (wrong hash) for every body request
 
 	mu         sync.Mutex
 	headerReqs []uint64 // origins of every GetBlockHeaders received
@@ -77,8 +79,18 @@ func (f *fakeXDCPeer) serve(rw p2p.MsgReadWriter) {
 			}
 			var bodies []eth.BlockBody
 			for _, h := range hashes {
+				if len(bodies) == f.bodyCap {
+					break
+				}
+				if f.corrupt {
+					// Serve an empty body regardless of the real block content.
+					// For blocks with TxHash != EmptyTxsHash this causes a hash
+					// mismatch in verifyBodyAgainstHeader, exercising peer tainting.
+					bodies = append(bodies, eth.BlockBody{})
+					continue
+				}
 				b := f.blocks[h]
-				if b == nil || len(bodies) == f.bodyCap {
+				if b == nil {
 					break
 				}
 				txs, _ := rlp.EncodeToRawList(b.Transactions())
@@ -89,6 +101,33 @@ func (f *fakeXDCPeer) serve(rw p2p.MsgReadWriter) {
 			case f.XDCBodyResp <- bodies:
 			default:
 			}
+		case eth.GetReceiptsMsg:
+			// XDPOS2 bare-hash receipt request (eth/63 wire shape, no RequestId).
+			// Rather than sending ReceiptsMsg on the wire (which would require
+			// the peer's read loop to be running for handleReceiptsXDPOS2 to
+			// dispatch it), write directly to XDCReceiptResp — mirroring how
+			// the body path writes to XDCBodyResp without the dispatcher.
+			var hashes eth.GetReceiptsRequest
+			if err := msg.Decode(&hashes); err != nil {
+				return
+			}
+			var out []types.Receipts
+			for _, h := range hashes {
+				if f.receipts == nil {
+					break
+				}
+				rcpts, ok := f.receipts[h]
+				if !ok {
+					break
+				}
+				out = append(out, rcpts)
+				break // serve at most 1 block of receipts per request (mirrors the
+				// soft-response-limit behaviour of production XDC peers under load)
+			}
+			select {
+			case f.XDCReceiptResp <- out:
+			default:
+			}
 		default:
 			msg.Discard()
 		}
@@ -97,12 +136,13 @@ func (f *fakeXDCPeer) serve(rw p2p.MsgReadWriter) {
 
 // xdcFakeNet is a local chain plus a canonical remote chain sharing its genesis.
 type xdcFakeNet struct {
-	gspec   *core.Genesis
-	db      ethdb.Database // the local chain's database
-	chain   *core.BlockChain
-	handler *handler
-	remote  []*types.Block // remote[i] is block i+1
-	bodyCap int            // bodies served per GetBlockBodies by peers added after it is set
+	gspec          *core.Genesis
+	db             ethdb.Database // the local chain's database
+	chain          *core.BlockChain
+	handler        *handler
+	remote         []*types.Block   // remote[i] is block i+1
+	remoteReceipts []types.Receipts // remoteReceipts[i] are the receipts for remote[i]
+	bodyCap        int              // bodies served per GetBlockBodies by peers added after it is set
 }
 
 // newXDCFakeNet builds a local chain holding the first `local` blocks of a
@@ -141,7 +181,14 @@ func newXDCFakeNetEngine(t *testing.T, local, remote int, engine consensus.Engin
 // newXDCFakeNetTime. Callers supply the fully-configured genesis.
 func newXDCFakeNetGspec(t *testing.T, local, remote int, engine consensus.Engine, gspec *core.Genesis) *xdcFakeNet {
 	t.Helper()
-	_, blocks, _ := core.GenerateChainWithGenesis(gspec, ethash.NewFaker(), remote, nil)
+	return newXDCFakeNetGspecGen(t, local, remote, engine, gspec, nil)
+}
+
+// newXDCFakeNetGspecGen is newXDCFakeNetGspec with a block generator function.
+// Pass nil generator for the default (no-transaction) behavior.
+func newXDCFakeNetGspecGen(t *testing.T, local, remote int, engine consensus.Engine, gspec *core.Genesis, gen func(int, *core.BlockGen)) *xdcFakeNet {
+	t.Helper()
+	_, blocks, receipts := core.GenerateChainWithGenesis(gspec, ethash.NewFaker(), remote, gen)
 	db := rawdb.NewMemoryDatabase()
 	chain, err := core.NewBlockChain(db, gspec, engine, nil)
 	if err != nil {
@@ -163,7 +210,7 @@ func newXDCFakeNetGspec(t *testing.T, local, remote int, engine consensus.Engine
 		t.Fatalf("newHandler: %v", err)
 	}
 	t.Cleanup(chain.Stop)
-	return &xdcFakeNet{gspec: gspec, db: db, chain: chain, handler: h, remote: blocks, bodyCap: 128}
+	return &xdcFakeNet{gspec: gspec, db: db, chain: chain, handler: h, remote: blocks, remoteReceipts: receipts, bodyCap: 128}
 }
 
 // canonicalHeaders serves the remote chain by number.
@@ -178,12 +225,27 @@ func (n *xdcFakeNet) canonicalHeaders(origin uint64, amount int) []*types.Header
 // addPeer handshakes and registers a fake XDPOS2 peer advertising the remote tip.
 func (n *xdcFakeNet) addPeer(t *testing.T, id byte, headersFor func(uint64, int) []*types.Header, extra ...*types.Block) *fakeXDCPeer {
 	t.Helper()
+	tip := n.remote[len(n.remote)-1]
+	return n.addPeerTD(t, id, new(big.Int).Add(tip.Number(), common.Big1), headersFor, extra...)
+}
+
+// addPeerTD is addPeer with a custom total-difficulty advertised in the
+// handshake.  A higher TD causes rankedPeers() to prefer this peer over
+// peers with a lower TD, giving tests deterministic peer-selection order.
+func (n *xdcFakeNet) addPeerTD(t *testing.T, id byte, td *big.Int, headersFor func(uint64, int) []*types.Header, extra ...*types.Block) *fakeXDCPeer {
+	t.Helper()
 	app, remote := p2p.MsgPipe()
 	t.Cleanup(func() { app.Close() })
 	p := eth.NewPeer(eth.XDPOS2, p2p.NewPeer(enode.ID{id}, "fake", nil), app, nil, nil, n.chain.Config())
 	t.Cleanup(p.Close)
-	f := &fakeXDCPeer{Peer: p, headersFor: headersFor, blocks: make(map[common.Hash]*types.Block), bodyCap: n.bodyCap}
-	for _, b := range append(append([]*types.Block(nil), n.remote...), extra...) {
+	f := &fakeXDCPeer{Peer: p, headersFor: headersFor, blocks: make(map[common.Hash]*types.Block), receipts: make(map[common.Hash]types.Receipts), bodyCap: n.bodyCap}
+	for i, b := range n.remote {
+		f.blocks[b.Hash()] = b
+		if i < len(n.remoteReceipts) {
+			f.receipts[b.Hash()] = n.remoteReceipts[i]
+		}
+	}
+	for _, b := range extra {
 		f.blocks[b.Hash()] = b
 	}
 	errc := make(chan error, 1)
@@ -197,7 +259,7 @@ func (n *xdcFakeNet) addPeer(t *testing.T, id byte, headersFor func(uint64, int)
 	if err := p2p.Send(remote, eth.StatusMsg, &eth.StatusPacket62{
 		ProtocolVersion: eth.XDPOS2,
 		NetworkID:       1,
-		TD:              new(big.Int).Add(tip.Number(), common.Big1),
+		TD:              td,
 		Head:            tip.Hash(),
 		Genesis:         n.chain.Genesis().Hash(),
 	}); err != nil {
