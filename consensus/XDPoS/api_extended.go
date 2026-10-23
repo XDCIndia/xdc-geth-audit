@@ -189,6 +189,17 @@ func (api *API) GetEpochNumbersBetween(begin, end *rpc.BlockNumber) ([]uint64, e
 
 	// Use V2 engine for ranges fully in V2 (both headers past the switch block).
 	if api.xdpos.IsV2Block(beginHeader) && api.xdpos.EngineV2 != nil {
+		// Reject ranges that span more than 1000 epochs to prevent a single RPC
+		// call from walking the entire chain (review R1-R02).
+		const maxEpochSpan = uint64(1000)
+		epoch := api.xdpos.config.Epoch
+		endNum := endHeader.Number.Uint64()
+		beginNum := beginHeader.Number.Uint64()
+		if endNum > beginNum && endNum-beginNum > maxEpochSpan*epoch {
+			return nil, fmt.Errorf("range spans %d blocks, exceeding the %d-epoch limit of %d blocks",
+				endNum-beginNum, maxEpochSpan, maxEpochSpan*epoch)
+		}
+
 		chainReader, ok := api.chain.(consensus.ChainReader)
 		if !ok {
 			return nil, fmt.Errorf("chain does not implement ChainReader")
