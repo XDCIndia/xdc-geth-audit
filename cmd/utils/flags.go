@@ -2259,6 +2259,18 @@ func SetEthConfig(ctx *cli.Context, stack *node.Node, cfg *ethconfig.Config) {
 		// XDC Apothem testnet (refs #740). NetworkId 51; XDC genesis.
 		cfg.NetworkId = 51
 		cfg.Genesis = core.DefaultXDCApothemGenesisBlock()
+		// Built-in required block: 83,665,617 is the first canonical block after
+		// the September 2026 Apothem reset (v2.9.x). Fast and snap nodes must not
+		// follow the abandoned pre-reset branch (stale v2.8.2 peers at ~87.4M).
+		// User-supplied --eth.requiredblocks entries override this on conflict.
+		const apothemResetBlockNum = uint64(83_665_617)
+		apothemResetBlockHash := common.HexToHash("0x2432ce6433608954ef6eaf2feba8f9a2fe90f5a913401eb07d5fa2f1bb499c3f")
+		if cfg.RequiredBlocks == nil {
+			cfg.RequiredBlocks = make(map[uint64]common.Hash)
+		}
+		if _, exists := cfg.RequiredBlocks[apothemResetBlockNum]; !exists {
+			cfg.RequiredBlocks[apothemResetBlockNum] = apothemResetBlockHash
+		}
 	case ctx.Bool(XDCDevnetFlag.Name):
 		// XDC devnet (chain ID 5551). NetworkId 5551; XDC genesis.
 		cfg.NetworkId = 5551
