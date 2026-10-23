@@ -339,8 +339,38 @@ func handleGetReceiptsXDPOS2(backend Backend, msg Decoder, peer *Peer) error {
 	if err := msg.Decode(&query); err != nil {
 		return err
 	}
-	response := ServiceGetReceiptsQuery69(backend.Chain(), query)
+	response := ServiceGetReceiptsQueryXDPOS2(backend.Chain(), query)
 	return peer.ReplyReceiptsRLPLegacy(response)
+}
+
+// ServiceGetReceiptsQueryXDPOS2 serves receipts in the consensus encoding
+// (with bloom), the bare-list shape legacy XDPoSChain sends and
+// handleReceiptsXDPOS2 decodes. The eth/69 network form drops the bloom, so a
+// modern peer could not decode a modern peer's reply (#1839).
+func ServiceGetReceiptsQueryXDPOS2(chain *core.BlockChain, query GetReceiptsRequest) []rlp.RawValue {
+	var (
+		bytes    int
+		receipts []rlp.RawValue
+	)
+	for lookups, hash := range query {
+		if bytes >= softResponseLimit || len(receipts) >= maxReceiptsServe || lookups >= 2*maxReceiptsServe {
+			break
+		}
+		results := chain.GetReceiptsByHash(hash)
+		if results == nil {
+			if header := chain.GetHeaderByHash(hash); header == nil || header.ReceiptHash != types.EmptyRootHash {
+				break // Don't have this block's receipts, stop serving.
+			}
+		}
+		encoded, err := rlp.EncodeToBytes(results)
+		if err != nil {
+			log.Error("Failed to encode receipts", "hash", hash, "err", err)
+			break
+		}
+		receipts = append(receipts, encoded)
+		bytes += len(encoded)
+	}
+	return receipts
 }
 
 // ServiceGetReceiptsQuery69 assembles the response to a receipt query.

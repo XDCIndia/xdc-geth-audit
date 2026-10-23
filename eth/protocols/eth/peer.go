@@ -537,7 +537,7 @@ func (p *Peer) ReplyReceiptsRLP70(id uint64, receipts rlp.RawList[*ReceiptList],
 // A.60.1 (refs #857): without this, msg code 0x10 sent to a legacy XDPOS2
 // peer trips its decoder on the leading RequestId varint, and the peer
 // disconnects us with the symmetric error to A.60's GetReceipts decode bug.
-func (p *Peer) ReplyReceiptsRLPLegacy(receipts rlp.RawList[*ReceiptList]) error {
+func (p *Peer) ReplyReceiptsRLPLegacy(receipts []rlp.RawValue) error {
 	return p2p.Send(p.rw, ReceiptsMsg, receipts)
 }
 
