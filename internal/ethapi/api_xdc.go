@@ -438,7 +438,9 @@ func (n *proofPairList) Put(key []byte, value []byte) error {
 }
 
 func (n *proofPairList) Delete(key []byte) error {
-	panic("proofPairList: Delete not supported")
+	// Return an error instead of panicking (review R1-R04): trie.Prove never
+	// calls Delete today, but returning an error is safe if that changes.
+	return errors.New("proofPairList: Delete not supported")
 }
 
 // deriveTrie builds a Merkle trie from a DerivableList (txs or receipts).
