@@ -831,9 +831,11 @@ func (x *XDPoS_v2) Authorize(signer common.Address, signFn SignerFn) {
 	x.signFn = signFn
 }
 
-// CalcDifficulty returns the block difficulty
+// CalcDifficulty returns the block difficulty.
+// V2 always uses difficulty 1; the signer is not involved in the result so we
+// do not read x.signer here (avoiding a data race with Authorize).
 func (x *XDPoS_v2) CalcDifficulty(chain consensus.ChainReader, time uint64, parent *types.Header) *big.Int {
-	return x.calcDifficulty(chain, parent, x.signer)
+	return big.NewInt(1)
 }
 
 func (x *XDPoS_v2) calcDifficulty(chain consensus.ChainReader, parent *types.Header, signer common.Address) *big.Int {
