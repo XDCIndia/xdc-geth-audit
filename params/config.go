@@ -2029,6 +2029,8 @@ type ChainConfig struct {
 	TIPUpgradeRewardBlock  *big.Int `json:"tipUpgradeRewardBlock,omitempty"`  // Tiered (masternode/protector/observer) reward fork; XDPoSChain v2.8.0 apothem: 83,600,000 (held disabled)
 	TIPUpgradePenaltyBlock *big.Int `json:"tipUpgradePenaltyBlock,omitempty"` // Penalty-upgrade fork; XDPoSChain v2.8.0 apothem: 83,600,000 (held disabled)
 	Gas2500xBlock          *big.Int `json:"gas2500xBlock,omitempty"`          // XDC gas price tier x2500 (base fee 625 gwei); XDPoSChain v2.9.x apothem: 83,600,000
+	// CertiK XDC-04 / XDC-09 per-network fork-block field. nil = disabled on all networks.
+	SigningTxBoundBlock *big.Int `json:"signingTxBoundBlock,omitempty"` // ValidateBody rejects blocks with >2*MaxMasternodesV2 signing txs or size >MaxBlockSize (CertiK XDC-04, XDC-09)
 	// TIPSigningBlock is an explicit per-genesis override for the BlockSigners
 	// (0x89) contract-wipe fork block. Historically this value came ONLY from
 	// the hardcoded per-chainID table in common.CopyXDCConstants /
@@ -3319,6 +3321,17 @@ func (c *ChainConfig) IsGas2500x(num *big.Int) bool {
 // (nil = disabled), superseding the disabled global common.TipUpgradePenalty.
 func (c *ChainConfig) IsTIPUpgradePenalty(num *big.Int) bool {
 	return isBlockForked(c.TIPUpgradePenaltyBlock, num)
+}
+
+// IsSigningTxBound reports whether the signing-tx count and block-size bounds
+// are active at num. When active, ValidateBody rejects blocks containing more
+// than 2×MaxMasternodesV2 signing transactions or whose RLP-encoded size
+// exceeds params.MaxBlockSize. nil = disabled on all networks (CertiK XDC-04, XDC-09).
+func (c *ChainConfig) IsSigningTxBound(num *big.Int) bool {
+	if c == nil {
+		return false
+	}
+	return isBlockForked(c.SigningTxBoundBlock, num)
 }
 
 // IsTIPXDCX checks if block number is past TIPXDCX fork (trading/lending enabled).
