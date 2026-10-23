@@ -131,6 +131,17 @@ type XDPoS_v2 struct {
 	pendingSwitchRechecks *lru.Cache[common.Hash, uint64]
 }
 
+// markSelfMined records round as the highest round this node sealed. The
+// write takes x.lock because yourturnAligned reads the field under it
+// (review R4-W02).
+func (x *XDPoS_v2) markSelfMined(round types.Round) {
+	x.lock.Lock()
+	x.highestSelfMinedRound = round
+	x.lock.Unlock()
+	// F-2026-19774: persist so a restart inside a round cannot produce a second seal.
+	rawdb.WriteBFTHighestSelfMinedRound(x.db, round)
+}
+
 // SetHookReward wires the reward hook for V2 epoch-switch blocks.
 func (x *XDPoS_v2) SetHookReward(fn func(chain consensus.ChainReader, state *state.StateDB, parentState *state.StateDB, header *types.Header) (map[string]interface{}, error)) {
 	x.HookReward = fn
@@ -828,9 +839,7 @@ func (x *XDPoS_v2) Seal(chain consensus.ChainReader, block *types.Block, stop <-
 		log.Error("[Seal] Error decoding extra field", "error", err)
 		return nil, err
 	}
-	x.highestSelfMinedRound = decodedExtra.Round
-	// F-2026-19774: persist so a restart inside a round cannot produce a second seal.
-	rawdb.WriteBFTHighestSelfMinedRound(x.db, x.highestSelfMinedRound)
+	x.markSelfMined(decodedExtra.Round)
 
 	return block.WithSeal(header), nil
 }
