@@ -84,6 +84,9 @@ var (
 		Eip1559Block:        big.NewInt(98_800_200),     // XDPoSChain MainnetConstant.eip1559Block — Target 28th Jan 2026
 		CancunBlock:         big.NewInt(98_802_000),     // XDPoSChain MainnetConstant.cancunBlock — Target 28th Jan 2026
 		AmsterdamBlock:      big.NewInt(99_999_999_999), // Glamsterdam incl. EIP-7928 BAL: placeholder far-future block, not scheduled (#1644)
+		SigningTxBoundBlock: big.NewInt(99_999_999_999), // CertiK XDC-04/XDC-09: placeholder far-future block, scheduled with legacy (#1721)
+		ValidatorOrderBlock: big.NewInt(99_999_999_999), // CertiK XDC-11: placeholder far-future block, scheduled with legacy (#1722)
+		ParoleDedupBlock:    big.NewInt(99_999_999_999), // CertiK XDC-12: placeholder far-future block, scheduled with legacy (#1723)
 		XDPoS: &XDPoSConfig{
 			Period:              2,                                                                 // 2 second block time
 			Epoch:               900,                                                               // 900 blocks per epoch (~30 minutes)
@@ -1048,6 +1051,9 @@ var (
 		DynamicGasLimitBlock:   big.NewInt(83_600_000),     // XDPoSChain v2.9.3-testnet genesis/testnet.json dynamicGasLimitBlock
 		PragueBlock:            big.NewInt(84_333_000),     // XDPoSChain v3.0.0-testnet-1 genesis/testnet.json pragueBlock (#2815, moved from 87,633,000)
 		AmsterdamBlock:         big.NewInt(99_999_999_999), // Glamsterdam incl. EIP-7928 BAL: placeholder far-future block, not scheduled (#1644)
+		SigningTxBoundBlock:    big.NewInt(99_999_999_999), // CertiK XDC-04/XDC-09: placeholder far-future block, scheduled with legacy (#1721)
+		ValidatorOrderBlock:    big.NewInt(99_999_999_999), // CertiK XDC-11: placeholder far-future block, scheduled with legacy (#1722)
+		ParoleDedupBlock:       big.NewInt(99_999_999_999), // CertiK XDC-12: placeholder far-future block, scheduled with legacy (#1723)
 		XDPoS: &XDPoSConfig{
 			Period:              2,                                                                 // 2 second block time
 			Epoch:               900,                                                               // 900 blocks per epoch (~30 minutes)
