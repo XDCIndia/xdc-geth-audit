@@ -32,3 +32,25 @@ func TestCertikRulesPlaceholderOnRegisteredNetworks(t *testing.T) {
 		}
 	}
 }
+
+// TestCertikRulesCheckCompatible checks that moving a CertiK rule block below
+// the current head is reported, so the node rewinds instead of keeping blocks
+// imported without the rule (review R3-C01).
+func TestCertikRulesCheckCompatible(t *testing.T) {
+	const at = 1000
+	for _, set := range []func(*ChainConfig, *big.Int){
+		func(c *ChainConfig, b *big.Int) { c.SigningTxBoundBlock = b },
+		func(c *ChainConfig, b *big.Int) { c.ValidatorOrderBlock = b },
+		func(c *ChainConfig, b *big.Int) { c.ParoleDedupBlock = b },
+	} {
+		stored, scheduled := *XDCApothemChainConfig, *XDCApothemChainConfig
+		set(&scheduled, big.NewInt(at))
+		if err := stored.CheckCompatible(&scheduled, at-1, 0); err != nil {
+			t.Errorf("head below the new block: unexpected error %v", err)
+		}
+		err := stored.CheckCompatible(&scheduled, at+5, 0)
+		if err == nil || err.RewindToBlock != at-1 {
+			t.Errorf("head past the new block: got %v, want rewind to %d", err, at-1)
+		}
+	}
+}
