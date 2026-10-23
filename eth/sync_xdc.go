@@ -3522,6 +3522,8 @@ func (s *xdcSyncer) fetchPeerHeadHeader() *types.Header {
 // same as fetchHeaderBatch — XDPOS2 wire has no RequestId so the
 // standard response sink can't route the response).
 func (s *xdcSyncer) fetchHeaderByHash(peer *eth.Peer, hash common.Hash) *types.Header {
+	peer.XDCHeaderReqMu.Lock()
+	defer peer.XDCHeaderReqMu.Unlock()
 	select {
 	case <-peer.XDCHeaderResp:
 	default:
@@ -4143,6 +4145,8 @@ func extractAddresses(buf []byte) []common.Address {
 // Reads from peer.XDCHeaderResp directly (bypasses dispatcher — XDPOS2 wire
 // has no RequestId so the dispatcher's pending-map can't route responses).
 func (s *xdcSyncer) fetchHeaderBatch(peer *eth.Peer, from uint64, count int) []*types.Header {
+	peer.XDCHeaderReqMu.Lock()
+	defer peer.XDCHeaderReqMu.Unlock()
 	// Drain any stale response in the channel before sending.
 	select {
 	case <-peer.XDCHeaderResp:
@@ -4198,6 +4202,8 @@ type peerHeaderResult struct {
 // Used by the A.75 parallel-fan-out path so that bulk-sync rounds use
 // xdcBulkReqTimeout (4s) while non-bulk callers keep xdcReqTimeout (8s).
 func (s *xdcSyncer) fetchHeaderBatchTimeout(peer *eth.Peer, from uint64, count int, timeout time.Duration) []*types.Header {
+	peer.XDCHeaderReqMu.Lock()
+	defer peer.XDCHeaderReqMu.Unlock()
 	select {
 	case <-peer.XDCHeaderResp:
 	default:
@@ -4356,6 +4362,8 @@ func (s *xdcSyncer) fetchHeadersParallel(candidates []*eth.Peer, fromBlock uint6
 // fetchBodiesBatch requests bodies for the given hashes from peer.
 // Reads from peer.XDCBodyResp directly (bypasses dispatcher).
 func (s *xdcSyncer) fetchBodiesBatch(peer *eth.Peer, hashes []common.Hash) []eth.BlockBody {
+	peer.XDCBodyReqMu.Lock()
+	defer peer.XDCBodyReqMu.Unlock()
 	// Drain any stale response.
 	select {
 	case <-peer.XDCBodyResp:
