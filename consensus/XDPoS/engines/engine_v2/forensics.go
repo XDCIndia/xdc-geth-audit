@@ -13,6 +13,7 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/consensus"
@@ -29,6 +30,7 @@ const (
 
 // Forensics instance. Placeholder for future properties to be added
 type Forensics struct {
+	mu                  sync.RWMutex // protects HighestCommittedQCs
 	HighestCommittedQCs []types.QuorumCert
 	forensicsFeed       event.Feed
 	scope               event.SubscriptionScope
@@ -81,7 +83,9 @@ func (f *Forensics) SetCommittedQCs(headers []types.Header, incomingQC types.Quo
 
 		committedQCs = append(committedQCs, *decodedExtraField.QuorumCert)
 	}
+	f.mu.Lock()
 	f.HighestCommittedQCs = append(committedQCs, incomingQC)
+	f.mu.Unlock()
 	return nil
 }
 
@@ -93,8 +97,10 @@ Link to the flow diagram: https://hashlabs.atlassian.net/wiki/spaces/HASHLABS/pa
 */
 func (f *Forensics) ProcessForensics(chain consensus.ChainReader, engine *XDPoS_v2, incomingQC types.QuorumCert) error {
 	log.Debug("Received a QC in forensics", "QC", incomingQC)
-	// Clone the values to a temporary variable
+	// Clone the values to a temporary variable under the read lock.
+	f.mu.RLock()
 	highestCommittedQCs := f.HighestCommittedQCs
+	f.mu.RUnlock()
 	if len(highestCommittedQCs) != NUM_OF_FORENSICS_QC {
 		log.Error("[ProcessForensics] HighestCommittedQCs value not set", "incomingQcProposedBlockHash", incomingQC.ProposedBlockInfo.Hash, "incomingQcProposedBlockNumber", incomingQC.ProposedBlockInfo.Number.Uint64(), "incomingQcProposedBlockRound", incomingQC.ProposedBlockInfo.Round)
 		return errors.New("HighestCommittedQCs value not set")
@@ -428,8 +434,10 @@ Link to the flow diagram: https://hashlabs.atlassian.net/wiki/spaces/HASHLABS/pa
 */
 func (f *Forensics) ProcessVoteEquivocation(chain consensus.ChainReader, engine *XDPoS_v2, incomingVote *types.Vote) error {
 	log.Debug("Received a vote in forensics", "vote", incomingVote)
-	// Clone the values to a temporary variable
+	// Clone the values to a temporary variable under the read lock.
+	f.mu.RLock()
 	highestCommittedQCs := f.HighestCommittedQCs
+	f.mu.RUnlock()
 	if len(highestCommittedQCs) != NUM_OF_FORENSICS_QC {
 		log.Error("[ProcessVoteEquivocation] HighestCommittedQCs value not set", "incomingVoteProposedBlockHash", incomingVote.ProposedBlockInfo.Hash, "incomingVoteProposedBlockNumber", incomingVote.ProposedBlockInfo.Number.Uint64(), "incomingVoteProposedBlockRound", incomingVote.ProposedBlockInfo.Round)
 		return errors.New("HighestCommittedQCs value not set")
