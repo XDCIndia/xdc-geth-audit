@@ -130,6 +130,7 @@ func (f *Forensics) ProcessForensics(chain consensus.ChainReader, engine *XDPoS_
 		ancestorQC, lowerRoundQCs, _, err := f.findAncestorQcThroughRound(chain, highestCommittedQCs, incomingQuorunCerts)
 		if err != nil {
 			log.Error("[ProcessForensics] Error while trying to find ancestor QC through round number", "err", err)
+			return err
 		}
 		f.SendForensicProof(chain, engine, ancestorQC, lowerRoundQCs[NUM_OF_FORENSICS_QC-1])
 	}
