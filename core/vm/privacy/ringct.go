@@ -237,6 +237,9 @@ func Deserialize(r []byte) (*RingSignature, error) {
 			compressedKey := r[offset : offset+33]
 			offset += 33
 			compressedPubKey := DeserializeCompressed(sig.Curve, compressedKey)
+			if compressedPubKey == nil {
+				return nil, errors.New("failed to deserialize ring member: invalid compressed point")
+			}
 			sig.Ring[i][j] = compressedPubKey
 		}
 	}
@@ -246,6 +249,9 @@ func Deserialize(r []byte) (*RingSignature, error) {
 		compressedKey := r[offset : offset+33]
 		offset += 33
 		compressedPubKey := DeserializeCompressed(sig.Curve, compressedKey)
+		if compressedPubKey == nil {
+			return nil, errors.New("failed to deserialize key image: invalid compressed point")
+		}
 		sig.I[i] = compressedPubKey
 	}
 
