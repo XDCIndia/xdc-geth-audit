@@ -316,6 +316,10 @@ func (f *Forensics) getQcSignerAddresses(quorumCert types.QuorumCert) []string {
 }
 
 // Check whether the given QCs are on the same chain as the stored committed QCs(f.HighestCommittedQCs) regardless their orders
+// forensicsMaxAncestorWalk bounds the header walk in findAncestorQcThroughRound
+// (two epochs at the default 900); real forks diverge far closer (#1854).
+const forensicsMaxAncestorWalk = 1800
+
 func (f *Forensics) findAncestorQcThroughRound(chain consensus.ChainReader, highestCommittedQCs []types.QuorumCert, incomingQCandItsParents []types.QuorumCert) (types.QuorumCert, []types.QuorumCert, []types.QuorumCert, error) {
 	/*
 		Re-order two sets of QCs by Round number
@@ -329,7 +333,10 @@ func (f *Forensics) findAncestorQcThroughRound(chain consensus.ChainReader, high
 
 	// Find the ancestorFromIncomingQC1 that matches round number < lowerRoundQCs3
 	ancestorQC := higherRoundQCs[0]
-	for ancestorQC.ProposedBlockInfo.Round >= lowerRoundQCs[NUM_OF_FORENSICS_QC-1].ProposedBlockInfo.Round {
+	for steps := 0; ancestorQC.ProposedBlockInfo.Round >= lowerRoundQCs[NUM_OF_FORENSICS_QC-1].ProposedBlockInfo.Round; steps++ {
+		if steps >= forensicsMaxAncestorWalk {
+			return ancestorQC, lowerRoundQCs, higherRoundQCs, fmt.Errorf("[findAncestorQcThroughRound] no ancestor QC within %d blocks", forensicsMaxAncestorWalk)
+		}
 		proposedBlock := chain.GetHeaderByHash(ancestorQC.ProposedBlockInfo.Hash)
 		if proposedBlock == nil {
 			log.Error("[findAncestorQcThroughRound] Header not found", "hash", ancestorQC.ProposedBlockInfo.Hash)
@@ -521,6 +528,9 @@ func (f *Forensics) isVoteBlamed(chain consensus.ChainReader, highestCommittedQC
 	if err != nil {
 		log.Error("[findAncestorVoteThroughRound] Error while trying to decode extra field", "ProposedBlockInfo.Hash", incomingVote.ProposedBlockInfo.Hash)
 		return false, nil, err
+	}
+	if decodedExtraField.QuorumCert == nil {
+		return false, nil, errors.New("nil QuorumCert in proposed block extra")
 	}
 	// Found the parent QC, if its round < hcqc3's round, return true
 	if decodedExtraField.QuorumCert.ProposedBlockInfo.Round < highestCommittedQCs[NUM_OF_FORENSICS_QC-1].ProposedBlockInfo.Round {
