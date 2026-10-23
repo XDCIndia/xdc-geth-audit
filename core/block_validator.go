@@ -54,6 +54,13 @@ func (v *BlockValidator) ValidateBody(block *types.Block) error {
 	if v.config.IsOsaka(block.Number(), block.Time()) && block.Size() > params.MaxBlockSize {
 		return ErrBlockOversized
 	}
+	// CertiK XDC-04 / XDC-09: from SigningTxBoundBlock, enforce a per-block cap
+	// on 0x89 BlockSigners (signing) transactions and a hard block-size limit.
+	// The miner already applies both caps on the production side; this check
+	// makes them consensus-enforceable so a malicious proposer cannot bypass them.
+	if err := checkSigningTxBound(v.config, block); err != nil {
+		return err
+	}
 	// Check whether the block is already imported.
 	if v.bc.HasBlockAndState(block.Hash(), block.NumberU64()) {
 		return ErrKnownBlock
@@ -277,4 +284,27 @@ func CalcGasLimit(parentGasLimit, desiredLimit uint64) uint64 {
 		}
 	}
 	return limit
+}
+
+// checkSigningTxBound enforces the CertiK XDC-04 / XDC-09 signing-transaction
+// and block-size caps introduced at SigningTxBoundBlock. It returns nil when
+// the fork is inactive (SigningTxBoundBlock is nil or num < fork block).
+func checkSigningTxBound(cfg *params.ChainConfig, block *types.Block) error {
+	if !cfg.IsSigningTxBound(block.Number()) || cfg.XDPoS == nil {
+		return nil
+	}
+	if block.Size() > params.MaxBlockSize {
+		return ErrBlockOversized
+	}
+	maxSignTxs := 2 * cfg.XDPoS.MaxMasternodesV2
+	var signTxCount int
+	for _, tx := range block.Transactions() {
+		if RouteTransaction(cfg, block.Number(), tx) == TxRouteSign {
+			signTxCount++
+			if signTxCount > maxSignTxs {
+				return fmt.Errorf("too many signing transactions in block: %d > %d", signTxCount, maxSignTxs)
+			}
+		}
+	}
+	return nil
 }
