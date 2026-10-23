@@ -470,7 +470,9 @@ func (h *handler) runEthPeer(peer *eth.Peer, handler eth.Handler) error {
 	dead := make(chan struct{})
 	defer close(dead)
 
-	// If we have any explicit peer required block hashes, request them
+	// If we have any explicit peer required block hashes, request them. Read the
+	// challenge timeout once here, not in each goroutine.
+	challengeTimeout := syncChallengeTimeout
 	for number, hash := range h.requiredBlocks {
 		resCh := make(chan *eth.Response)
 
@@ -489,7 +491,7 @@ func (h *handler) runEthPeer(peer *eth.Peer, handler eth.Handler) error {
 			// wire is not evidence of misbehaviour. Only an explicit hash
 			// mismatch at the requested number warrants a drop.
 			if peer.Version() == eth.XDPOS2 {
-				timeout := time.NewTimer(syncChallengeTimeout)
+				timeout := time.NewTimer(challengeTimeout)
 				defer timeout.Stop()
 				select {
 				case headers := <-peer.XDCHeaderResp:
@@ -517,7 +519,7 @@ func (h *handler) runEthPeer(peer *eth.Peer, handler eth.Handler) error {
 				return
 			}
 
-			timeout := time.NewTimer(syncChallengeTimeout)
+			timeout := time.NewTimer(challengeTimeout)
 			defer timeout.Stop()
 
 			select {
