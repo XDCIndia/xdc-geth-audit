@@ -23,7 +23,8 @@ func TestGetMasterNodes(t *testing.T) {
 }
 
 func TestStoreLoadSnapshot(t *testing.T) {
-	snap := newSnapshot(1, common.Hash{0x1}, nil)
+	// Use a non-empty candidate list: loadSnapshot rejects empty candidates (XDC-35).
+	snap := newSnapshot(1, common.Hash{0x1}, []common.Address{{0x01}})
 	dir := t.TempDir()
 	db, err := leveldb.New(dir, 256, 0, "", false)
 	if err != nil {
@@ -80,11 +81,11 @@ func TestActiveLen_DerivedFromPenalties(t *testing.T) {
 	pool := makeAddrs(46, 0)
 	penalties := pool[:14] // first 14 are penalised
 	snap := &SnapshotV2{
-		Version:             4, // old snapshot without ActiveMasternodesLen
-		Number:              1,
-		Hash:                common.Hash{0x2},
-		NextEpochCandidates: pool,
-		Penalties:           penalties,
+		Version:              4, // old snapshot without ActiveMasternodesLen
+		Number:               1,
+		Hash:                 common.Hash{0x2},
+		NextEpochCandidates:  pool,
+		Penalties:            penalties,
 		ActiveMasternodesLen: 0, // not set (legacy)
 	}
 	got := snap.ActiveLen()

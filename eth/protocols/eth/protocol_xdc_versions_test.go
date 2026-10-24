@@ -35,19 +35,21 @@ import (
 )
 
 // TestXDCProtocolVersionsConstruction asserts requirement 1 and 2 of Gate 3:
-// XDPOS2 and ETH63 are present (XDPOS2 primary/first), and ETH71/ETH72 are
-// deliberately absent from the advertised devp2p capability list even though
-// both are fully implemented (see protocol.go's ProtocolVersions comment).
+// XDPOS2RID (101, primary), XDPOS2 (100) and ETH63 are present; ETH71/ETH72
+// are deliberately absent. Two modern nodes negotiate XDPOS2RID (highest
+// common); a modern+legacy pair negotiates XDPOS2. Refs #1861.
 func TestXDCProtocolVersionsConstruction(t *testing.T) {
 	if len(ProtocolVersions) == 0 {
 		t.Fatal("ProtocolVersions is empty")
 	}
-	if ProtocolVersions[0] != XDPOS2 {
-		t.Fatalf("XDPOS2 must be the primary (first) advertised version, got ProtocolVersions[0]=%d", ProtocolVersions[0])
+	if ProtocolVersions[0] != XDPOS2RID {
+		t.Fatalf("XDPOS2RID (101) must be the primary (first) advertised version, got ProtocolVersions[0]=%d", ProtocolVersions[0])
 	}
-	var haveXDPOS2, haveETH63, haveETH71, haveETH72 bool
+	var haveXDPOS2RID, haveXDPOS2, haveETH63, haveETH71, haveETH72 bool
 	for _, v := range ProtocolVersions {
 		switch v {
+		case XDPOS2RID:
+			haveXDPOS2RID = true
 		case XDPOS2:
 			haveXDPOS2 = true
 		case ETH63:
@@ -58,8 +60,11 @@ func TestXDCProtocolVersionsConstruction(t *testing.T) {
 			haveETH72 = true
 		}
 	}
+	if !haveXDPOS2RID {
+		t.Error("ProtocolVersions must contain XDPOS2RID (101) — refs #1861")
+	}
 	if !haveXDPOS2 {
-		t.Error("ProtocolVersions must contain XDPOS2 (100)")
+		t.Error("ProtocolVersions must contain XDPOS2 (100) — legacy fleet compatibility")
 	}
 	if !haveETH63 {
 		t.Error("ProtocolVersions must contain ETH63 (63) — refs #857 A.59, required for XDC mainnet mesh acceptance")
@@ -73,8 +78,8 @@ func TestXDCProtocolVersionsConstruction(t *testing.T) {
 }
 
 // TestXDCProtocolLengthsConstruction asserts requirement 3: protocolLengths
-// has an entry for every advertised version, with the two XDC-critical
-// lengths pinned to their exact values.
+// has an entry for every advertised version, with the XDC-critical lengths
+// pinned to their exact values.
 func TestXDCProtocolLengthsConstruction(t *testing.T) {
 	for _, v := range ProtocolVersions {
 		if _, ok := protocolLengths[v]; !ok {
@@ -86,6 +91,9 @@ func TestXDCProtocolLengthsConstruction(t *testing.T) {
 	}
 	if got := protocolLengths[XDPOS2]; got != 229 {
 		t.Errorf("protocolLengths[XDPOS2] = %d, want 229", got)
+	}
+	if got := protocolLengths[XDPOS2RID]; got != 229 {
+		t.Errorf("protocolLengths[XDPOS2RID] = %d, want 229 (same code space as XDPOS2)", got)
 	}
 }
 
@@ -172,29 +180,100 @@ func TestXDPOS2HandlerRegistration(t *testing.T) {
 }
 
 // TestOtherVersionMapsUnperturbed is a light sanity check that the
-// eth69/eth70/eth71/eth72 handler maps introduced/kept by the merge are all
-// present and distinct from xdpos2, i.e. the union resolution in
-// eth/protocols/eth/handler.go did not accidentally collapse them.
+// eth69/eth70/eth71/eth72/xdpos2/xdpos2rid handler maps are all present and
+// distinct, i.e. the union resolution in handler.go did not accidentally
+// collapse them.
 func TestOtherVersionMapsUnperturbed(t *testing.T) {
 	maps := map[string]map[uint64]msgHandler{
-		"eth69":  eth69,
-		"eth70":  eth70,
-		"eth71":  eth71,
-		"eth72":  eth72,
-		"xdpos2": xdpos2,
+		"eth69":     eth69,
+		"eth70":     eth70,
+		"eth71":     eth71,
+		"eth72":     eth72,
+		"xdpos2":    xdpos2,
+		"xdpos2rid": xdpos2rid,
 	}
 	for name, m := range maps {
 		if len(m) == 0 {
 			t.Errorf("%s handler map is empty", name)
 		}
 	}
-	// eth71/eth72 must use the modern pooled-tx-hashes handlers, confirming
-	// they were additively merged rather than overwritten by the xdpos2 side.
+	// eth71/eth72 must use the modern pooled-tx-hashes handlers.
 	if funcName(eth71[NewPooledTransactionHashesMsg]) != funcName(handleNewPooledTransactionHashes) {
 		t.Error("eth71[NewPooledTransactionHashesMsg] should be the modern handler")
 	}
 	if funcName(eth72[GetCellsMsg]) != funcName(handleGetCells) {
 		t.Error("eth72[GetCellsMsg] should be handleGetCells (upstream eth-72 cells support)")
+	}
+}
+
+// TestXDPOS2RIDHandlerRegistration asserts that xdpos2rid uses request-ID
+// receipt handlers (not XDPOS2 bare-list ones), and still carries consensus
+// messages. Refs #1861.
+func TestXDPOS2RIDHandlerRegistration(t *testing.T) {
+	// Consensus messages must be present (unchanged from xdpos2).
+	for _, code := range []uint64{VoteMsg, TimeoutMsg, SyncInfoMsg} {
+		if xdpos2rid[code] == nil {
+			t.Errorf("xdpos2rid[%#x] is nil — consensus message must be registered", code)
+		}
+	}
+	// xdpos2rid must use the eth/70 request-ID receipt handlers.
+	if got, want := funcName(xdpos2rid[GetReceiptsMsg]), funcName(handleGetReceipts70); got != want {
+		t.Errorf("xdpos2rid[GetReceiptsMsg] = %s, want %s (eth/70 request-ID)", got, want)
+	}
+	if got, want := funcName(xdpos2rid[ReceiptsMsg]), funcName(handleReceipts70); got != want {
+		t.Errorf("xdpos2rid[ReceiptsMsg] = %s, want %s (eth/70 request-ID)", got, want)
+	}
+	// Must NOT use the XDPOS2 bare-list receipt handlers.
+	if funcName(xdpos2rid[GetReceiptsMsg]) == funcName(handleGetReceiptsXDPOS2) {
+		t.Error("xdpos2rid[GetReceiptsMsg] must not be the XDPOS2 bare-list handler")
+	}
+	if funcName(xdpos2rid[ReceiptsMsg]) == funcName(handleReceiptsXDPOS2) {
+		t.Error("xdpos2rid[ReceiptsMsg] must not be the XDPOS2 bare-list handler")
+	}
+	// GetBlockHeaders and GetBlockBodies must be the shared handlers (version
+	// check inside them naturally routes v101 to the request-ID path).
+	if got, want := funcName(xdpos2rid[GetBlockHeadersMsg]), funcName(handleGetBlockHeaders); got != want {
+		t.Errorf("xdpos2rid[GetBlockHeadersMsg] = %s, want %s", got, want)
+	}
+	if got, want := funcName(xdpos2rid[GetBlockBodiesMsg]), funcName(handleGetBlockBodies); got != want {
+		t.Errorf("xdpos2rid[GetBlockBodiesMsg] = %s, want %s", got, want)
+	}
+}
+
+// TestHandleMessageDispatchesXDPOS2RIDToXdpos2ridMap verifies that a peer at
+// XDPOS2RID (101) dispatches through the xdpos2rid handler map end-to-end.
+// BlockRangeUpdateMsg is used as the probe message (handler is side-effect-free).
+func TestHandleMessageDispatchesXDPOS2RIDToXdpos2ridMap(t *testing.T) {
+	backend := newTestBackend(1)
+	defer backend.close()
+
+	peer, errc := newTestPeer("xdpos2rid-dispatch-peer", XDPOS2RID, backend)
+	defer peer.close()
+
+	want := &BlockRangeUpdatePacket{
+		EarliestBlock:   0,
+		LatestBlock:     1,
+		LatestBlockHash: backend.chain.CurrentBlock().Hash(),
+	}
+	if err := p2p.Send(peer.app, BlockRangeUpdateMsg, want); err != nil {
+		t.Fatalf("failed to send BlockRangeUpdate: %v", err)
+	}
+
+	deadline := time.After(5 * time.Second)
+	for {
+		if got := peer.BlockRange(); got != nil {
+			if got.EarliestBlock != want.EarliestBlock || got.LatestBlock != want.LatestBlock || got.LatestBlockHash != want.LatestBlockHash {
+				t.Fatalf("BlockRange mismatch: got %+v, want %+v", got, want)
+			}
+			return
+		}
+		select {
+		case err := <-errc:
+			t.Fatalf("peer handler exited early: %v", err)
+		case <-deadline:
+			t.Fatal("timed out waiting for BlockRangeUpdateMsg dispatch via xdpos2rid map")
+		case <-time.After(10 * time.Millisecond):
+		}
 	}
 }
 
