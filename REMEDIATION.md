@@ -2,19 +2,47 @@
 
 Report: Hacken final report, 2026-10-13. Audited commit: `45e2b6ee`.
 
-## Third hand-over (24 October 2026): revalidate `a6666037f64c4574a3487d131ce0de0db4e4bb49`
+## Third hand-over (24 October 2026): revalidate `98116d29ea647fdc014555eea35bcdbd2b7b22bf`
 
-Please revalidate the codebase at **`a6666037f64c4574a3487d131ce0de0db4e4bb49`**, the head of branch **`audit/main-uplift-1179-xdc19-r2`**. It sits on top of the commit you last revalidated, `4bf67046816d5d2731c4f2bf78d9f327d7886618`, in two commits so that each diff is small:
+### Scope
 
-1. **`db3d5b68998df817fffbd8ce7b9ab5ab01a1d4a1`** (branch `audit/upstream-1179`): upstream go-ethereum v1.17.8 → v1.17.9.
-   - Applied only to paths that were still byte-identical to upstream: 63 files.
-   - Every changed file equals upstream v1.17.9 (`9dffe6e976cbbb87a84c5fd395448f0950290def`), so it can be checked mechanically: `git diff --stat db3d5b68998d 9dffe6e976cb -- $(git diff --name-only 4bf67046816d db3d5b68998d)` is empty.
-2. **`a6666037f64c4574a3487d131ce0de0db4e4bb49`**: the XDC changes, 69 files. **This is the diff to review.**
-   - Every code path equals XDCIndia/go-ethereum `24d7192e8c00` (release v1.17.9-xdc.19 plus later fixes).
-   - Includes the upstream merge resolutions in 19 files that XDC already modified.
-   - Removes 6 code files the source removed: the V1 engine path, the XDPoS event API, and node XDC config/health.
+| Item | Value |
+|---|---|
+| Repository | XDCIndia/xdc-geth-audit |
+| Branch | `audit/main-uplift-1179-xdc19-r3` |
+| Commit to revalidate | **`98116d29ea647fdc014555eea35bcdbd2b7b22bf`** |
+| Previously revalidated commit (base) | `4bf67046816d5d2731c4f2bf78d9f327d7886618` |
+| Source | XDCIndia/go-ethereum `24d7192e8c00`: release v1.17.9-xdc.19 plus later fixes |
+| Upstream base | go-ethereum v1.17.9 `9dffe6e976cbbb87a84c5fd395448f0950290def` (branch `1179`) |
+| In scope | the 69 files changed by the XDC commit below |
+| Out of scope | pure-upstream go-ethereum files (checked mechanically, see below); test files and testdata (unchanged in the review branch); docs, scripts, CI |
 
-**Nothing else changes.** Test files, testdata, .github, AUDIT.md and docs are unchanged from `4bf67046816d`; no file in them is added, edited or deleted. `go build ./...` passes. Tests were not updated with this uplift, so some may no longer compile against the new code; they are not part of this request.
+### Structure (base → head)
+
+1. **Upstream merge `1b63a35223e550fe488567e3a8a19bbae5a2ea61`** (branch `audit/upstream-1179-merge`).
+   - Parents: `4bf67046816d` and upstream v1.17.9, so it carries the 38 upstream commits v1.17.8..v1.17.9 with their history.
+   - Pre-resolved: upstream's version is taken only for the 63 paths that were still byte-identical to upstream, and each equals upstream v1.17.9.
+2. **XDC commit `98116d29ea647fdc014555eea35bcdbd2b7b22bf`**: 69 files. **This is the diff to review.**
+   - Every code path equals the source.
+   - It contains the upstream merge resolutions in 19 files XDC already modified, and removes 6 code files the source removed (V1 engine path, XDPoS event API, node XDC config/health).
+   - Test files, testdata, .github, AUDIT.md and docs are unchanged.
+3. **Optional tests commit `68c19b377d339941f10c6013b1e8ccb5223d695d`** (branch `audit/main-uplift-1179-xdc19-r3-tests`).
+   - One commit on top of the review head that brings 108 test and testdata paths to the source. Code is identical to `98116d29`.
+   - Use it to run the test suite.
+
+### How to verify
+
+```
+# upstream step is pure upstream: prints nothing
+git diff --stat 1b63a35223e5 9dffe6e976cb -- $(git diff --name-only 4bf67046816d 1b63a35223e5)
+# review diff: 69 files, no test or testdata paths
+git diff --name-only 1b63a35223e5 98116d29ea64 | wc -l
+git diff --name-only 4bf67046816d 98116d29ea64 | grep -cE '_test\.go$|/testdata/'      # 0
+# build
+git checkout 98116d29ea64 && go build ./...
+# tests (optional branch)
+git checkout 68c19b377d33 && go vet ./... && go test ./consensus/XDPoS/... ./core/... ./eth/...
+```
 
 Areas we advise including, all changed since the previous revalidation commit `4bf67046816d5d2731c4f2bf78d9f327d7886618`:
 
