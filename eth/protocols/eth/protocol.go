@@ -31,27 +31,41 @@ import (
 
 // Constants to match up protocol versions and messages
 const (
-	ETH63  = 63  // legacy eth/63 — required for XDC mainnet mesh acceptance (refs #857 A.59)
-	ETH69  = 69
-	ETH70  = 70
-	ETH71  = 71  // upstream eth/71 (additively included)
-	ETH72  = 72  // upstream eth/72 (sparse blobpool cells; not advertised on XDC, see below)
-	XDPOS2 = 100 // XDC consensus protocol (refs #740)
+	ETH63     = 63 // legacy eth/63 — required for XDC mainnet mesh acceptance (refs #857 A.59)
+	ETH69     = 69
+	ETH70     = 70
+	ETH71     = 71  // upstream eth/71 (additively included)
+	ETH72     = 72  // upstream eth/72 (sparse blobpool cells; not advertised on XDC, see below)
+	XDPOS2    = 100 // XDC consensus protocol v1 — eth/63-shaped data plane (refs #740)
+	XDPOS2RID = 101 // XDC consensus protocol v2 — data plane uses request-id (refs #1861)
 )
+
+// IsXDPOS2Family reports whether v belongs to the XDPoS2 protocol family
+// (XDPOS2=100 or XDPOS2RID=101). Use this instead of scattered `== XDPOS2`
+// checks wherever both versions share the same behaviour.
+func IsXDPOS2Family(v uint) bool { return v == XDPOS2 || v == XDPOS2RID }
 
 // ProtocolName is the official short name of the `eth` protocol used during
 // devp2p capability negotiation.
 const ProtocolName = "eth"
 
-// is primary). XDPOS2 is offered first so XDC peers prefer it over the
-// upstream ETH/* family; stock-geth peers fall back to ETH/70 or ETH/69.
+// XDPOS2RID (101) is offered first so two modern XDC nodes negotiate it;
+// legacy-only nodes (which don't advertise 101) fall back to XDPOS2/100.
+// XDPOS2RID is identical to XDPOS2 except that GetBlockHeaders/BlockHeaders,
+// GetBlockBodies/BlockBodies and GetReceipts/Receipts carry a RequestId and
+// are dispatched through the upstream request-id dispatcher — enabling several
+// concurrent in-flight requests per peer and eliminating XDCBodyReqMu
+// serialisation. Handshake (StatusPacket62, no ForkID) and all consensus
+// messages (VoteMsg, TimeoutMsg, SyncInfoMsg) are unchanged. Refs #1861.
+//
+// XDPOS2 (100) stays in the list so legacy fleet nodes remain peers.
 //
 // A.59 (refs #857): ETH63 is appended to the advertised capability list so
 // XDC public mesh peers — which expect `eth/63` in the cap list before
 // accepting an inbound connection — see a compatible legacy version. devp2p
 // version negotiation still picks the highest common version, which is
-// XDPOS2/100 for every XDC peer (they all carry it), so the runtime wire
-// protocol remains XDPOS2/100 and no eth/63 message handling is exercised.
+// XDPOS2RID/101 for two modern peers, or XDPOS2/100 for modern+legacy pairs,
+// so no eth/63 message handling is exercised at runtime.
 // Side-by-side experiment 2026-06-06 showed fresh XDPoSChain v2.7.0 with
 // `caps=[xdpos2,eth/63]` attracted 2 peers in 7 min while fresh modern
 // without ETH63 sat at 0 peers for 50+ min on the same bootnodes.
@@ -63,15 +77,16 @@ const ProtocolName = "eth"
 // A.59 above — perturbing it (by adding versions XDC peers don't speak and
 // gains nothing from) is a separate, unjustified change from defining the
 // constants/handlers upstream code needs to compile.
-var ProtocolVersions = []uint{XDPOS2, ETH70, ETH69, ETH63}
+var ProtocolVersions = []uint{XDPOS2RID, XDPOS2, ETH70, ETH69, ETH63}
 
 // protocolLengths are the number of implemented message corresponding to
 // different protocol versions. ETH63 uses 17 messages (msg codes 0x00..0x10)
 // per the legacy go-ethereum eth/63 protocol definition; this is advertised
 // for cap negotiation only and never runs at runtime on XDC peers because
-// XDPOS2/100 always wins highest-common-version selection.
+// XDPOS2RID/101 or XDPOS2/100 always wins highest-common-version selection.
+// XDPOS2RID (101) uses the same 229-message code space as XDPOS2 (100).
 // ETH71/ETH72 included additively for upstream compat (not advertised, see above).
-var protocolLengths = map[uint]uint64{ETH63: 17, ETH69: 18, ETH70: 18, ETH71: 20, ETH72: 22, XDPOS2: 229}
+var protocolLengths = map[uint]uint64{ETH63: 17, ETH69: 18, ETH70: 18, ETH71: 20, ETH72: 22, XDPOS2: 229, XDPOS2RID: 229}
 
 // maxMessageSize is the maximum cap on the size of a protocol message.
 const maxMessageSize = 10 * 1024 * 1024
@@ -97,13 +112,13 @@ const (
 	GetNodeDataMsg = 0x0d
 	NodeDataMsg    = 0x0e
 
-	GetReceiptsMsg                = 0x0f
-	ReceiptsMsg                   = 0x10
-	BlockRangeUpdateMsg           = 0x11
-	GetBlockAccessListsMsg        = 0x12
-	BlockAccessListsMsg           = 0x13
-	GetCellsMsg                   = 0x14
-	CellsMsg                      = 0x15
+	GetReceiptsMsg         = 0x0f
+	ReceiptsMsg            = 0x10
+	BlockRangeUpdateMsg    = 0x11
+	GetBlockAccessListsMsg = 0x12
+	BlockAccessListsMsg    = 0x13
+	GetCellsMsg            = 0x14
+	CellsMsg               = 0x15
 
 	// XDPOS2 consensus messages (refs #740). Numeric codes preserved from XDC
 	// fork to keep wire compatibility with existing XDC fleet nodes.

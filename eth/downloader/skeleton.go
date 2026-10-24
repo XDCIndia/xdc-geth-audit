@@ -724,7 +724,7 @@ func (s *skeleton) sync(head *types.Header) (*types.Header, error) {
 	var xdpos2Count, ethCount int
 	for _, peer := range s.peers.AllPeers() {
 		s.idles[peer.id] = peer
-		if peer.version == eth.XDPOS2 {
+		if eth.IsXDPOS2Family(peer.version) {
 			xdpos2Count++
 		} else {
 			ethCount++
