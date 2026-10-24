@@ -97,16 +97,25 @@ func isSnapHealTrustedChain(chainID uint64) bool {
 // eth.Peer.Request* primitives we already adapted for XDPOS2 legacy).
 
 const (
-	xdcForceSyncCycle      = 500 * time.Millisecond // dropped from 2s — bulk sync was bottlenecked by tick cadence
-	xdcHeartbeat           = 30 * time.Second       // periodic head/peer log
-	xdcBatchSize           = 4096                   // headers/bodies per round (XDC bulk-sync default)
-	xdpos2MaxHeaderFetch   = 192                    // #971: legacy XDPOS2 peers cap GetBlockHeaders at MaxHeaderFetch; requesting more returns an empty reply (count=0). Clamp header requests to this.
-	xdcReqTimeout          = 8 * time.Second        // kept for non-bulk callers: anchor repair, snap pivot, head probe
-	xdcBulkReqTimeout      = 4 * time.Second        // A.75: tighter per-peer budget in parallel fan-out; fully-synced peers respond <1s
-	xdcMaxPeerTriesPerSync = 8                      // A.96: raised 3→8 to compensate for ~3% XDPOS2 GetBlockHeaders serve rate on mainnet (1726 count=0 vs 55 count=192 in 2h); fan-out=3 gave 9% per-round hit rate, fan-out=8 gives ~26%. Was A.79: 4→3 to free a peer for lookahead.
-	xdcMaxBackToBackRounds = 8                      // A.75: max consecutive rounds per maybeSync invocation; avoids starving heartbeat
-	xdcLookaheadStreams    = 3                      // A.77: extra ranges pre-fetched concurrently from other peers while range-0 body+IC runs
-	xdcLookaheadRangeSize  = 128                    // A.77: assumed peer batch size per range (protocol cap observed in practice)
+	xdcForceSyncCycle    = 500 * time.Millisecond // dropped from 2s — bulk sync was bottlenecked by tick cadence
+	xdcHeartbeat         = 30 * time.Second       // periodic head/peer log
+	xdcBatchSize         = 4096                   // headers/bodies per round (XDC bulk-sync default)
+	xdpos2MaxHeaderFetch = 192                    // #971: legacy XDPOS2 peers cap GetBlockHeaders at MaxHeaderFetch; requesting more returns an empty reply (count=0). Clamp header requests to this.
+	xdcReqTimeout        = 8 * time.Second        // kept for non-bulk callers: anchor repair, snap pivot, head probe
+	xdcBulkReqTimeout    = 4 * time.Second        // A.75: tighter per-peer budget in parallel fan-out; fully-synced peers respond <1s
+	// SYNC-12 (#1869): hedging covers slow peers; 2 frees the rest for lookahead and body hedging.
+	// A.96 argument (~26% hit-rate with 8) still satisfied — hedging gives a fast fallback
+	// regardless of which peer wins the header race.
+	xdcHeaderRacePeers = 2 // SYNC-12: cap same-anchor parallel header race (was 8)
+
+	// SYNC-12 (#1869): if the primary body-response peer has not replied within this
+	// delay, issue the same request to the next-best idle peer and take the first valid
+	// answer. Hard timeout is still xdcBulkReqTimeout (4 s).
+	xdcBodyHedgeDelay = 800 * time.Millisecond
+
+	xdcMaxBackToBackRounds = 8   // A.75: max consecutive rounds per maybeSync invocation; avoids starving heartbeat
+	xdcLookaheadStreams    = 3   // A.77: extra ranges pre-fetched concurrently from other peers while range-0 body+IC runs
+	xdcLookaheadRangeSize  = 128 // A.77: assumed peer batch size per range (protocol cap observed in practice)
 
 	// Self-healing rollback when the local tip is stuck on a V2 BFT
 	// competing-slot fork. See issue #801. The xdc-network downloader has
@@ -399,6 +408,15 @@ type xdcSyncer struct {
 	// snapHistoryBackfillDone is a one-shot guard so the backfill goroutine
 	// runs at most once per snap-sync invocation.
 	snapHistoryBackfillDone atomic.Bool
+
+	// SYNC-12 (#1869): per-peer body request statistics for hedge peer ranking.
+	// bodyStatsMu guards bodyLatency and bodyTimeouts.
+	// bodyLatency is an EWMA of successful response times (α=0.25).
+	// bodyTimeouts counts consecutive body-request timeouts per peer.
+	// Both maps are lazily initialised in recordBodyStat.
+	bodyStatsMu  sync.Mutex
+	bodyLatency  map[string]time.Duration
+	bodyTimeouts map[string]int
 }
 
 // a70SeedRecord captures one V2 masternode-snapshot seed:
@@ -2412,13 +2430,19 @@ func (s *xdcSyncer) fullSyncOnce() {
 		headers = headers[:xdcLookaheadRangeSize]
 	}
 
-	// A.77+A.78: kick off lookahead header fetches for ranges 1..xdcLookaheadStreams
+	// A.77+A.78+SYNC-12: kick off lookahead goroutines for ranges 1..xdcLookaheadStreams
 	// from FRESH candidates — peers not queried in the fan-out round — concurrently
-	// with range-0 body fetch + InsertChain. Skipping raced peers prevents sending
-	// a second request to peers that already returned count=0 this round.
+	// with range-0 body fetch + InsertChain. Skipping raced peers prevents sending a
+	// second request to peers that already returned count=0 this round.
+	//
+	// SYNC-12 pipeline: each goroutine now fetches BOTH headers and bodies on its
+	// assigned peer, so range N's bodies are already in flight while range N-1 imports.
+	// The collection loop uses pre-fetched bodies and skips the per-range fetchBodiesBatch
+	// call. If the goroutine times out on bodies, the collection loop returns (no retry).
 	type lookaheadResult struct {
 		peer    *eth.Peer
 		headers []*types.Header
+		bodies  []eth.BlockBody // SYNC-12: pre-fetched; nil if header or body fetch failed
 	}
 	lookaheadChs := make([]chan *lookaheadResult, 0, xdcLookaheadStreams)
 	{
@@ -2442,7 +2466,17 @@ func (s *xdcSyncer) fullSyncOnce() {
 					s.taintPeer(lhPeer)
 					hdrs = nil
 				}
-				outCh <- &lookaheadResult{peer: lhPeer, headers: hdrs}
+				// SYNC-12: pipeline — fetch bodies on the same peer immediately after
+				// headers, while range-0 body+IC runs concurrently on a different peer.
+				var bodies []eth.BlockBody
+				if len(hdrs) > 0 {
+					lhHashes := make([]common.Hash, len(hdrs))
+					for i, h := range hdrs {
+						lhHashes[i] = h.Hash()
+					}
+					bodies = s.fetchBodiesBatchTimeout(lhPeer, lhHashes, xdcBulkReqTimeout)
+				}
+				outCh <- &lookaheadResult{peer: lhPeer, headers: hdrs, bodies: bodies}
 			}(ch, c, lhFrom)
 			lookaheadChs = append(lookaheadChs, ch)
 			lhIdx++
@@ -2454,11 +2488,15 @@ func (s *xdcSyncer) fullSyncOnce() {
 	}
 
 	// Fetch bodies for range 0 (concurrent with lookahead goroutines above).
+	// SYNC-12: use fetchBodiesHedged — if primary does not respond within
+	// xdcBodyHedgeDelay (800ms), issue the same request to the next-best candidate.
+	// Hard timeout is xdcBulkReqTimeout (4s). Verification is the same TxHash/UncleHash
+	// check in buildBlocks; the hedge peer must pass it or its blocks are dropped.
 	hashes := make([]common.Hash, len(headers))
 	for i, h := range headers {
 		hashes[i] = h.Hash()
 	}
-	bodies := s.fetchBodiesBatch(peer, hashes)
+	bodies := s.fetchBodiesHedged(peer, candidates, hashes)
 	if len(bodies) == 0 {
 		log.Debug("xdcSyncer: empty body batch", "headers", len(headers))
 		return
@@ -2615,13 +2653,16 @@ func (s *xdcSyncer) fullSyncOnce() {
 		}
 	}
 
-	// A.77: collect and import lookahead ranges in order.
-	// Wait up to xdcBulkReqTimeout for each range; stop at first failure or gap.
+	// A.77 + SYNC-12: collect and import lookahead ranges in order.
+	// Each goroutine pre-fetched both headers and bodies, so the collection loop
+	// just waits for the goroutine result and imports immediately.
+	// Wait up to 2×xdcBulkReqTimeout per range (goroutine does two serial requests).
+	// Stop at the first empty header/body batch or non-contiguous range.
 	for _, ch := range lookaheadChs {
 		var lhRes *lookaheadResult
 		select {
 		case lhRes = <-ch:
-		case <-time.After(xdcBulkReqTimeout):
+		case <-time.After(2 * xdcBulkReqTimeout):
 			return
 		case <-s.quitCh:
 			return
@@ -2639,11 +2680,8 @@ func (s *xdcSyncer) fullSyncOnce() {
 				"from", lhFrom, "head", head)
 			return
 		}
-		lhHashes := make([]common.Hash, len(lhRes.headers))
-		for i, h := range lhRes.headers {
-			lhHashes[i] = h.Hash()
-		}
-		lhBodies := s.fetchBodiesBatch(lhRes.peer, lhHashes)
+		// SYNC-12: use bodies pre-fetched by the goroutine; stop if unavailable.
+		lhBodies := lhRes.bodies
 		if len(lhBodies) == 0 {
 			return
 		}
@@ -4581,21 +4619,22 @@ func (s *xdcSyncer) fetchHeaderBatchTimeout(peer *eth.Peer, from uint64, count i
 	}
 }
 
-// fetchHeadersParallel fans out header requests to the top xdcMaxPeerTriesPerSync
+// fetchHeadersParallel fans out header requests to the top xdcHeaderRacePeers
 // candidates concurrently and returns the first non-empty result (A.75).
 // atTipPeers counts candidates whose LatestBlockHash == curHash (skipped from
 // the race). tried is the number of candidates evaluated (atTip + raced).
 //
-// Goroutines that lose the race complete within xdcBulkReqTimeout; the buffered
-// out channel absorbs their sends so they never block. No goroutine leak.
-// fetchHeadersParallel fans out header requests to the top xdcMaxPeerTriesPerSync
-// candidates concurrently and returns the first non-empty result (A.75).
+// SYNC-12: race capped at xdcHeaderRacePeers (2) instead of 8; body hedging
+// (fetchBodiesHedged) and pipeline (A.77 goroutines pre-fetch bodies) cover
+// slow peers without needing a large header fan-out. Goroutines that lose the
+// race complete within xdcBulkReqTimeout; the buffered out channel absorbs their
+// sends so they never block. No goroutine leak.
 // racedIDs is the set of peer IDs that were actually sent requests this round;
 // callers use it to avoid re-querying rate-limited peers in A.77 lookahead (A.78).
 func (s *xdcSyncer) fetchHeadersParallel(candidates []*eth.Peer, fromBlock uint64, curHash common.Hash) (*peerHeaderResult, int, int, map[string]bool) {
 	K := len(candidates)
-	if K > xdcMaxPeerTriesPerSync {
-		K = xdcMaxPeerTriesPerSync
+	if K > xdcHeaderRacePeers {
+		K = xdcHeaderRacePeers
 	}
 	raced := make([]*eth.Peer, 0, K)
 	rngs := make(map[string]*eth.BlockRangeUpdatePacket, K)
@@ -4700,7 +4739,17 @@ func (s *xdcSyncer) fetchHeadersParallel(candidates []*eth.Peer, fromBlock uint6
 
 // fetchBodiesBatch requests bodies for the given hashes from peer.
 // Reads from peer.XDCBodyResp directly (bypasses dispatcher).
+// Uses xdcReqTimeout for non-bulk callers (anchor repair, snap backfill).
+// Bulk-sync paths use fetchBodiesBatchTimeout with xdcBulkReqTimeout directly.
 func (s *xdcSyncer) fetchBodiesBatch(peer *eth.Peer, hashes []common.Hash) []eth.BlockBody {
+	return s.fetchBodiesBatchTimeout(peer, hashes, xdcReqTimeout)
+}
+
+// fetchBodiesBatchTimeout is fetchBodiesBatch with a caller-supplied deadline.
+// SYNC-12: the bulk body-fetch paths use xdcBulkReqTimeout so slow peers release
+// XDCBodyReqMu within the 4 s budget, leaving the mutex available for hedging and
+// lookahead goroutines sooner.
+func (s *xdcSyncer) fetchBodiesBatchTimeout(peer *eth.Peer, hashes []common.Hash, timeout time.Duration) []eth.BlockBody {
 	peer.XDCBodyReqMu.Lock()
 	defer peer.XDCBodyReqMu.Unlock()
 	// Drain any stale response.
@@ -4710,12 +4759,12 @@ func (s *xdcSyncer) fetchBodiesBatch(peer *eth.Peer, hashes []common.Hash) []eth
 	}
 	req, err := peer.RequestBodies(hashes, nil)
 	if err != nil {
-		log.Debug("xdcSyncer.fetchBodiesBatch: request failed", "count", len(hashes), "err", err)
+		log.Debug("xdcSyncer.fetchBodiesBatchTimeout: request failed", "count", len(hashes), "err", err)
 		return nil
 	}
 	defer req.Close()
 
-	deadline := time.NewTimer(xdcReqTimeout)
+	deadline := time.NewTimer(timeout)
 	defer deadline.Stop()
 	// lastMismatch keeps the last response that did not match this request.
 	// If nothing matching arrives before the deadline it is returned, as
@@ -4727,15 +4776,148 @@ func (s *xdcSyncer) fetchBodiesBatch(peer *eth.Peer, hashes []common.Hash) []eth
 			// Validate: peers may return fewer bodies than requested (size
 			// limits), but more than requested cannot answer this request.
 			if len(bodies) > len(hashes) {
-				log.Debug("xdcSyncer.fetchBodiesBatch: response mismatch, waiting",
+				log.Debug("xdcSyncer.fetchBodiesBatchTimeout: response mismatch, waiting",
 					"want", len(hashes), "got", len(bodies))
 				lastMismatch = bodies
 				continue
 			}
 			return bodies
 		case <-deadline.C:
-			log.Debug("xdcSyncer.fetchBodiesBatch: timed out", "count", len(hashes))
+			log.Debug("xdcSyncer.fetchBodiesBatchTimeout: timed out", "count", len(hashes))
 			return lastMismatch
+		case <-s.quitCh:
+			return nil
+		}
+	}
+}
+
+// recordBodyStat updates per-peer body request statistics used by
+// bodyRankedCandidates to order hedge candidates. On timeout, the consecutive
+// timeout count is incremented. On success, it is reset and the EWMA latency
+// is updated (α=0.25: new = 0.25*lat + 0.75*prev). SYNC-12 refs #1869.
+func (s *xdcSyncer) recordBodyStat(peerID string, lat time.Duration, timedOut bool) {
+	s.bodyStatsMu.Lock()
+	defer s.bodyStatsMu.Unlock()
+	if s.bodyTimeouts == nil {
+		s.bodyTimeouts = make(map[string]int)
+		s.bodyLatency = make(map[string]time.Duration)
+	}
+	if timedOut {
+		s.bodyTimeouts[peerID]++
+		return
+	}
+	s.bodyTimeouts[peerID] = 0
+	prev := s.bodyLatency[peerID]
+	if prev == 0 {
+		s.bodyLatency[peerID] = lat
+	} else {
+		s.bodyLatency[peerID] = (lat + 3*prev) / 4 // α=0.25 EWMA
+	}
+}
+
+// bodyRankedCandidates returns a copy of candidates sorted by body performance:
+// fewest consecutive timeouts first, then lowest EWMA latency.
+// Preserves the original slice; always returns all candidates. SYNC-12 refs #1869.
+func (s *xdcSyncer) bodyRankedCandidates(candidates []*eth.Peer) []*eth.Peer {
+	out := make([]*eth.Peer, len(candidates))
+	copy(out, candidates)
+	s.bodyStatsMu.Lock()
+	// Snapshot stats under the lock; insertion sort outside.
+	timeouts := make(map[string]int, len(out))
+	latency := make(map[string]time.Duration, len(out))
+	for _, p := range out {
+		timeouts[p.ID()] = s.bodyTimeouts[p.ID()]
+		latency[p.ID()] = s.bodyLatency[p.ID()]
+	}
+	s.bodyStatsMu.Unlock()
+	// Insertion sort: fewer timeouts first; equal timeouts → lower latency first.
+	// ponytail: O(n²) fine — n ≤ maxPeers (~50); a heap gains nothing here.
+	for i := 1; i < len(out); i++ {
+		for j := i; j > 0; j-- {
+			ai, aj := out[j-1].ID(), out[j].ID()
+			ti, tj := timeouts[ai], timeouts[aj]
+			li, lj := latency[ai], latency[aj]
+			if ti > tj || (ti == tj && li > lj && lj > 0) {
+				out[j-1], out[j] = out[j], out[j-1]
+			} else {
+				break
+			}
+		}
+	}
+	return out
+}
+
+// fetchBodiesHedged fetches bodies for hashes from primary, hedging to the best
+// idle candidate after xdcBodyHedgeDelay if primary has not responded.
+// Hard deadline is xdcBulkReqTimeout. Updates per-peer body statistics.
+// Respects XDCBodyReqMu serialisation per peer (SYNC-12 refs #1869, #1858).
+func (s *xdcSyncer) fetchBodiesHedged(primary *eth.Peer, candidates []*eth.Peer, hashes []common.Hash) []eth.BlockBody {
+	type bodyResult struct {
+		bodies   []eth.BlockBody
+		peerID   string
+		lat      time.Duration
+		timedOut bool
+	}
+	// Buffered so losing goroutines never block when we've already returned.
+	ch := make(chan bodyResult, 2)
+
+	fetchOne := func(p *eth.Peer) {
+		t0 := time.Now()
+		bodies := s.fetchBodiesBatchTimeout(p, hashes, xdcBulkReqTimeout)
+		lat := time.Since(t0)
+		ch <- bodyResult{bodies: bodies, peerID: p.ID(), lat: lat, timedOut: len(bodies) == 0}
+	}
+	go fetchOne(primary)
+
+	hedge := time.NewTimer(xdcBodyHedgeDelay)
+	defer hedge.Stop()
+	deadline := time.NewTimer(xdcBulkReqTimeout)
+	defer deadline.Stop()
+
+	hedgeStarted := false
+	startHedge := func() {
+		if hedgeStarted {
+			return
+		}
+		hedgeStarted = true
+		ranked := s.bodyRankedCandidates(candidates)
+		for _, c := range ranked {
+			if c.ID() != primary.ID() {
+				log.Debug("xdcSyncer.fetchBodiesHedged: launching hedge", "primary", primary.ID()[:8], "hedge", c.ID()[:8])
+				go fetchOne(c)
+				return
+			}
+		}
+		// No alternative candidate — hedge is a no-op.
+	}
+
+	for {
+		select {
+		case res := <-ch:
+			s.recordBodyStat(res.peerID, res.lat, res.timedOut)
+			if len(res.bodies) > 0 {
+				return res.bodies
+			}
+			// Primary returned early with no bodies — start hedge immediately.
+			startHedge()
+			if hedgeStarted {
+				// Wait for hedge result within remaining budget.
+				select {
+				case res2 := <-ch:
+					s.recordBodyStat(res2.peerID, res2.lat, res2.timedOut)
+					return res2.bodies // may be nil
+				case <-deadline.C:
+					return nil
+				case <-s.quitCh:
+					return nil
+				}
+			}
+			return nil
+		case <-hedge.C:
+			startHedge()
+		case <-deadline.C:
+			s.recordBodyStat(primary.ID(), xdcBulkReqTimeout, true)
+			return nil
 		case <-s.quitCh:
 			return nil
 		}
