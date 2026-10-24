@@ -1005,7 +1005,24 @@ func (x *XDPoS_v2) getSnapshot(chain consensus.ChainReader, number uint64, forSi
 			// gapNumber+Gap-1=22499 correctly finds the epoch-27 switch at block
 			// 22942 (7 validators including the newly-seated masternode).
 			forwardFrom := gapNumber + x.config.Gap - 1
-			if epochSwitchHdr := x.findEpochSwitchAfter(chain, forwardFrom, parents); epochSwitchHdr != nil &&
+			rawSwitchHdr := x.findEpochSwitchAfter(chain, forwardFrom, parents)
+			// SYNC-11: validate the found switch's gap formula before using it.
+			// The switch block drifts by round, so its derived gap may differ from
+			// gapNumber. Seeding from the wrong switch poisons the snapshot.
+			if rawSwitchHdr != nil {
+				swNum := rawSwitchHdr.Number.Uint64()
+				swBase := swNum - swNum%x.config.Epoch
+				var swDerivedGap uint64
+				if swBase >= x.config.Gap {
+					swDerivedGap = swBase - x.config.Gap
+				}
+				if swDerivedGap != gapNumber {
+					log.Warn("[getSnapshot] live-mn-set: SYNC-11 forward-seed refused — switch's derived gap != gapNumber",
+						"gap", gapNumber, "switch", swNum, "derivedGap", swDerivedGap)
+					rawSwitchHdr = nil
+				}
+			}
+			if epochSwitchHdr := rawSwitchHdr; epochSwitchHdr != nil &&
 				epochSwitchHdr.Number.Uint64() > x.config.V2.SwitchBlock.Uint64() {
 				masternodes := x.GetMasternodesFromEpochSwitchHeader(chain, epochSwitchHdr)
 				penalties := contracts.ExtractAddressFromBytes(epochSwitchHdr.Penalties)
@@ -1224,6 +1241,25 @@ func (x *XDPoS_v2) getSnapshot(chain consensus.ChainReader, number uint64, forSi
 			// to materialise the snapshot.
 			epochSwitchHeader = x.findEpochSwitchAfter(chain, gapNumber, parents)
 			seedDir = "forward"
+			// SYNC-11: verify the found switch's gap formula matches the requested gap.
+			// findEpochSwitchAfter walks forward by block number and may land on a switch
+			// header whose own gap (derived from its round/epoch) differs from gapNumber
+			// when the switch block number drifted away from the nominal gapNumber+Gap
+			// offset. Seeding the wrong switch here would poison the masternode snapshot
+			// at gapNumber and break TC/vote membership for the rest of the epoch.
+			if epochSwitchHeader != nil {
+				swNum := epochSwitchHeader.Number.Uint64()
+				base := swNum - swNum%x.config.Epoch
+				var derivedGap uint64
+				if base >= x.config.Gap {
+					derivedGap = base - x.config.Gap
+				}
+				if derivedGap != gapNumber {
+					log.Warn("[getSnapshot] SYNC-11: forward-seed refused — switch's derived gap != requested gap",
+						"gap", gapNumber, "switch", swNum, "derivedGap", derivedGap)
+					epochSwitchHeader = nil
+				}
+			}
 		case parents == nil:
 			// !isGapInput, non-bulk-sync caller (mining, public API,
 			// post-import). DB has ancestors at steady-state; walk back

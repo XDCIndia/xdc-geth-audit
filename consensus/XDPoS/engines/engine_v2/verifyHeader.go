@@ -14,15 +14,64 @@ import (
 	"github.com/ethereum/go-ethereum/consensus/misc/eip1559"
 	"github.com/ethereum/go-ethereum/contracts"
 	"github.com/ethereum/go-ethereum/core"
+	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/params"
 )
 
+// sync11ShouldRelax reports whether a calcMasternodes ErrV2SnapshotMissing error
+// under fullVerify may be relaxed for a snap-synced node: the gap block for the
+// given epoch-switch block (switchNum) is strictly below the last snap pivot, so
+// its state was never downloaded and the gap snapshot was never built.
+// When it returns true, the caller should trust header.Validators (fall through to
+// the bulk-sync path) and call sync11SeedGap once all remaining checks have passed.
+// Returns (true, gapNum) on a relaxable miss; (false, 0) otherwise.
+func (x *XDPoS_v2) sync11ShouldRelax(calcErr error, switchNum uint64) (bool, uint64) {
+	if !errors.Is(calcErr, utils.ErrV2SnapshotMissing) {
+		return false, 0
+	}
+	epoch := x.config.Epoch
+	gap := x.config.Gap
+	base := switchNum - switchNum%epoch
+	var gapNum uint64
+	if base >= gap {
+		gapNum = base - gap
+	}
+	pivot := rawdb.ReadLastPivotNumber(x.db)
+	if pivot == nil || gapNum >= *pivot {
+		return false, 0
+	}
+	return true, gapNum
+}
+
+// sync11SeedGap seeds the masternode snapshot for gapNum from the epoch-switch
+// header. It must only be called after every verifyHeader check has passed —
+// specifically after the proposer-signature check — so that a forged Validators
+// field cannot poison the snapshot without also forging the block seal.
+func (x *XDPoS_v2) sync11SeedGap(chain consensus.ChainReader, gapNum uint64, switchHdr *types.Header) {
+	gapHdr := chain.GetHeaderByNumber(gapNum)
+	if gapHdr == nil {
+		log.Warn("[verifyHeader] SYNC-11: gap header not in local DB, snapshot not seeded",
+			"gap", gapNum, "switch", switchHdr.Number)
+		return
+	}
+	mns := contracts.ExtractAddressFromBytes(switchHdr.Validators)
+	pens := contracts.ExtractAddressFromBytes(switchHdr.Penalties)
+	if err := x.UpdateMasternodesWithPenalties(chain, gapHdr, mns, pens); err != nil {
+		log.Warn("[verifyHeader] SYNC-11: UpdateMasternodesWithPenalties failed",
+			"gap", gapNum, "switch", switchHdr.Number, "err", err)
+	} else {
+		log.Info("[verifyHeader] SYNC-11: gap snapshot seeded from verified switch header",
+			"gap", gapNum, "switch", switchHdr.Number,
+			"masternodes", len(mns), "penalties", len(pens))
+	}
+}
+
 // verifyHeader performs comprehensive header verification aligned with XDPoSChain v2.6.8.
 // This function is the primary validation entrypoint for V2 blocks and must remain
 // strictly aligned with the official reference implementation to avoid consensus forks.
-func (x *XDPoS_v2) verifyHeader(chain consensus.ChainReader, header *types.Header, parents []*types.Header, fullVerify bool) error {
+func (x *XDPoS_v2) verifyHeader(chain consensus.ChainReader, header *types.Header, parents []*types.Header, fullVerify bool) (retErr error) {
 	if !x.isInitialized {
 		if err := x.initial(chain, header); err != nil {
 			return err
@@ -150,6 +199,23 @@ func (x *XDPoS_v2) verifyHeader(chain consensus.ChainReader, header *types.Heade
 	// localList: masterNodes was computed locally by calcMasternodes and matched
 	// header.Validators, i.e. it does not come from a header (#1413).
 	localList := false
+	// SYNC-11 (#1863): set when calcMasternodes fails with ErrV2SnapshotMissing
+	// under fullVerify AND the gap is below the snap pivot. In that case we fall
+	// through to the bulk-sync path (trusting header.Validators) and then seed
+	// the gap snapshot once ALL remaining checks pass.
+	var seedGapFromSwitch bool
+	var seedGapNum uint64
+	// Seed runs in a defer so it fires exactly once, only when retErr == nil
+	// (i.e. every check in this function has passed). A forged Validators field
+	// on a switch header that later fails the proposer-signature or leader check
+	// therefore cannot poison the gap snapshot — the defer sees retErr != nil
+	// and skips the seed entirely. This ordering is the SYNC-11 fix for item 1
+	// of the ordering bug identified in PR #1864 review.
+	defer func() {
+		if retErr == nil && seedGapFromSwitch {
+			x.sync11SeedGap(chain, seedGapNum, header)
+		}
+	}()
 	isEpochSwitch, _, err := x.IsEpochSwitch(header)
 	if err != nil {
 		log.Error("[verifyHeader] error when checking if header is epoch switch header", "Hash", header.Hash(), "Number", header.Number, "Error", err)
@@ -175,27 +241,48 @@ func (x *XDPoS_v2) verifyHeader(chain consensus.ChainReader, header *types.Heade
 			// (#1415). The fallback below derives the list from the header being
 			// verified, so it is only safe when the caller trusts the header (!fullVerify).
 			if fullVerify {
-				log.Error("[verifyHeader] calcMasternodes failed under fullVerify", "Number", header.Number, "Hash", header.Hash(), "err", err)
-				return err
-			}
-			// Bulk-sync fallback: snapshots may not yet be in the DB on a fresh node, so fall
-			// back to GetMasternodesWithParents. The CompareSignersLists checks below still run
-			// against the fallback list and header.Validators / header.Penalties, preventing
-			// a malicious peer from slipping bogus validator sets through the fallback path.
-			log.Debug("[verifyHeader] calcMasternodes failed during bulk sync, using GetMasternodesWithParents fallback", "Number", header.Number, "Hash", header.Hash(), "err", err)
-			masterNodes = x.GetMasternodesWithParents(chain, header, parents)
-			if len(masterNodes) == 0 {
-				// FIX #339-v2: When checkpoint sync crosses V2 epoch switch without state,
-				// GetMasternodesWithParents may also fail because epoch switch info is not
-				// yet in DB. Extract validators directly from header.Validators as last resort.
-				log.Warn("[verifyHeader] GetMasternodesWithParents returned empty, extracting from header.Validators", "Number", header.Number)
-				validatorsAddress := contracts.ExtractAddressFromBytes(header.Validators)
-				if len(validatorsAddress) > 0 {
-					log.Info("[verifyHeader] using header.Validators as final fallback", "Number", header.Number, "validators", len(validatorsAddress))
-					masterNodes = validatorsAddress
+				// SYNC-11 (#1863): if the failure is a missing gap snapshot AND the gap
+				// is below the snap pivot, use sync11ShouldRelax to decide whether to
+				// fall through to the bulk-sync path. The actual seeding happens in the
+				// deferred call to sync11SeedGap (only when retErr == nil).
+				if relax, gapN := x.sync11ShouldRelax(err, header.Number.Uint64()); relax {
+					seedGapFromSwitch = true
+					seedGapNum = gapN
+					log.Warn("[verifyHeader] SYNC-11: gap below snap pivot, deferring seed to after all checks",
+						"switch", header.Number, "gap", gapN)
 				} else {
-					log.Warn("[verifyHeader] header.Validators also empty, signature verification will fail", "Number", header.Number)
-					masterNodes = nil
+					log.Error("[verifyHeader] calcMasternodes failed under fullVerify", "Number", header.Number, "Hash", header.Hash(), "err", err)
+					return err
+				}
+			}
+			if seedGapFromSwitch {
+				// SYNC-11: gap is below snap pivot — trust header.Validators directly.
+				// The proposer-signature check below enforces that the signer's key
+				// belongs to this claimed set, so a forged Validators field cannot
+				// pass undetected.
+				masterNodes = contracts.ExtractAddressFromBytes(header.Validators)
+				localPenalties = contracts.ExtractAddressFromBytes(header.Penalties)
+				localList = false
+			} else {
+				// Bulk-sync fallback: snapshots may not yet be in the DB on a fresh node, so fall
+				// back to GetMasternodesWithParents. The CompareSignersLists checks below still run
+				// against the fallback list and header.Validators / header.Penalties, preventing
+				// a malicious peer from slipping bogus validator sets through the fallback path.
+				log.Debug("[verifyHeader] calcMasternodes failed during bulk sync, using GetMasternodesWithParents fallback", "Number", header.Number, "Hash", header.Hash(), "err", err)
+				masterNodes = x.GetMasternodesWithParents(chain, header, parents)
+				if len(masterNodes) == 0 {
+					// FIX #339-v2: When checkpoint sync crosses V2 epoch switch without state,
+					// GetMasternodesWithParents may also fail because epoch switch info is not
+					// yet in DB. Extract validators directly from header.Validators as last resort.
+					log.Warn("[verifyHeader] GetMasternodesWithParents returned empty, extracting from header.Validators", "Number", header.Number)
+					validatorsAddress := contracts.ExtractAddressFromBytes(header.Validators)
+					if len(validatorsAddress) > 0 {
+						log.Info("[verifyHeader] using header.Validators as final fallback", "Number", header.Number, "validators", len(validatorsAddress))
+						masterNodes = validatorsAddress
+					} else {
+						log.Warn("[verifyHeader] header.Validators also empty, signature verification will fail", "Number", header.Number)
+						masterNodes = nil
+					}
 				}
 			}
 			// FIX (loophole D): calcMasternodes errored, so localPenalties is nil.
