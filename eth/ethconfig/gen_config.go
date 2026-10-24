@@ -20,6 +20,11 @@ func (c Config) MarshalTOML() (interface{}, error) {
 		Genesis                 *core.Genesis `toml:",omitempty"`
 		NetworkId               uint64
 		SyncMode                SyncMode
+		FastSyncPivotNumber     uint64      `toml:",omitempty"`
+		FastSyncPivotHash       common.Hash `toml:",omitempty"`
+		FastSyncPivotRoot       common.Hash `toml:",omitempty"`
+		NoAutoPivot             bool        `toml:",omitempty"`
+		AutoCheckpointPivot     bool        `toml:",omitempty"`
 		HistoryMode             history.HistoryPolicy
 		EthDiscoveryURLs        []string
 		SnapDiscoveryURLs       []string
@@ -57,7 +62,7 @@ func (c Config) MarshalTOML() (interface{}, error) {
 		EnablePreimageRecording bool
 		EnableWitnessStats      bool
 		StatelessSelfValidation bool
-		SnapV2                  bool
+		SnapV2                  *bool `toml:",omitempty"`
 		VMTrace                 string
 		VMTraceJsonConfig       string
 		RPCGasCap               uint64
@@ -72,12 +77,16 @@ func (c Config) MarshalTOML() (interface{}, error) {
 		TxSyncDefaultTimeout    time.Duration `toml:",omitempty"`
 		TxSyncMaxTimeout        time.Duration `toml:",omitempty"`
 		RangeLimit              uint64        `toml:",omitempty"`
-		NoAutoPivot             bool          `toml:",omitempty"`
 	}
 	var enc Config
 	enc.Genesis = c.Genesis
 	enc.NetworkId = c.NetworkId
 	enc.SyncMode = c.SyncMode
+	enc.FastSyncPivotNumber = c.FastSyncPivotNumber
+	enc.FastSyncPivotHash = c.FastSyncPivotHash
+	enc.FastSyncPivotRoot = c.FastSyncPivotRoot
+	enc.NoAutoPivot = c.NoAutoPivot
+	enc.AutoCheckpointPivot = c.AutoCheckpointPivot
 	enc.HistoryMode = c.HistoryMode
 	enc.EthDiscoveryURLs = c.EthDiscoveryURLs
 	enc.SnapDiscoveryURLs = c.SnapDiscoveryURLs
@@ -130,7 +139,6 @@ func (c Config) MarshalTOML() (interface{}, error) {
 	enc.TxSyncDefaultTimeout = c.TxSyncDefaultTimeout
 	enc.TxSyncMaxTimeout = c.TxSyncMaxTimeout
 	enc.RangeLimit = c.RangeLimit
-	enc.NoAutoPivot = c.NoAutoPivot
 	return &enc, nil
 }
 
@@ -140,6 +148,11 @@ func (c *Config) UnmarshalTOML(unmarshal func(interface{}) error) error {
 		Genesis                 *core.Genesis `toml:",omitempty"`
 		NetworkId               *uint64
 		SyncMode                *SyncMode
+		FastSyncPivotNumber     *uint64      `toml:",omitempty"`
+		FastSyncPivotHash       *common.Hash `toml:",omitempty"`
+		FastSyncPivotRoot       *common.Hash `toml:",omitempty"`
+		NoAutoPivot             *bool        `toml:",omitempty"`
+		AutoCheckpointPivot     *bool        `toml:",omitempty"`
 		HistoryMode             *history.HistoryPolicy
 		EthDiscoveryURLs        []string
 		SnapDiscoveryURLs       []string
@@ -177,7 +190,7 @@ func (c *Config) UnmarshalTOML(unmarshal func(interface{}) error) error {
 		EnablePreimageRecording *bool
 		EnableWitnessStats      *bool
 		StatelessSelfValidation *bool
-		SnapV2                  *bool
+		SnapV2                  *bool `toml:",omitempty"`
 		VMTrace                 *string
 		VMTraceJsonConfig       *string
 		RPCGasCap               *uint64
@@ -192,7 +205,6 @@ func (c *Config) UnmarshalTOML(unmarshal func(interface{}) error) error {
 		TxSyncDefaultTimeout    *time.Duration `toml:",omitempty"`
 		TxSyncMaxTimeout        *time.Duration `toml:",omitempty"`
 		RangeLimit              *uint64        `toml:",omitempty"`
-		NoAutoPivot             *bool          `toml:",omitempty"`
 	}
 	var dec Config
 	if err := unmarshal(&dec); err != nil {
@@ -206,6 +218,21 @@ func (c *Config) UnmarshalTOML(unmarshal func(interface{}) error) error {
 	}
 	if dec.SyncMode != nil {
 		c.SyncMode = *dec.SyncMode
+	}
+	if dec.FastSyncPivotNumber != nil {
+		c.FastSyncPivotNumber = *dec.FastSyncPivotNumber
+	}
+	if dec.FastSyncPivotHash != nil {
+		c.FastSyncPivotHash = *dec.FastSyncPivotHash
+	}
+	if dec.FastSyncPivotRoot != nil {
+		c.FastSyncPivotRoot = *dec.FastSyncPivotRoot
+	}
+	if dec.NoAutoPivot != nil {
+		c.NoAutoPivot = *dec.NoAutoPivot
+	}
+	if dec.AutoCheckpointPivot != nil {
+		c.AutoCheckpointPivot = *dec.AutoCheckpointPivot
 	}
 	if dec.HistoryMode != nil {
 		c.HistoryMode = *dec.HistoryMode
@@ -319,7 +346,7 @@ func (c *Config) UnmarshalTOML(unmarshal func(interface{}) error) error {
 		c.StatelessSelfValidation = *dec.StatelessSelfValidation
 	}
 	if dec.SnapV2 != nil {
-		c.SnapV2 = *dec.SnapV2
+		c.SnapV2 = dec.SnapV2
 	}
 	if dec.VMTrace != nil {
 		c.VMTrace = *dec.VMTrace
@@ -362,9 +389,6 @@ func (c *Config) UnmarshalTOML(unmarshal func(interface{}) error) error {
 	}
 	if dec.RangeLimit != nil {
 		c.RangeLimit = *dec.RangeLimit
-	}
-	if dec.NoAutoPivot != nil {
-		c.NoAutoPivot = *dec.NoAutoPivot
 	}
 	return nil
 }
