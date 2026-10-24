@@ -2,14 +2,19 @@
 
 Report: Hacken final report, 2026-10-13. Audited commit: `45e2b6ee`.
 
-## Third hand-over (24 October 2026): revalidate `5afddf3113f4458b2507c2b219f3c9caec741eae`
+## Third hand-over (24 October 2026): revalidate `a6666037f64c4574a3487d131ce0de0db4e4bb49`
 
-Please revalidate the codebase at **`5afddf3113f4458b2507c2b219f3c9caec741eae`**, the head of branch **`audit/main-uplift-1179-xdc19`**. Its code commit is `e75e74047be864500d13af876880076c5b8def85`; the commit after it only adds a description at the top of AUDIT.md.
+Please revalidate the codebase at **`a6666037f64c4574a3487d131ce0de0db4e4bb49`**, the head of branch **`audit/main-uplift-1179-xdc19-r2`**. It sits on top of the commit you last revalidated, `4bf67046816d5d2731c4f2bf78d9f327d7886618`, in two commits so that each diff is small:
 
-- **Source:** XDCIndia/go-ethereum `24d7192e8c00`, which is release v1.17.9-xdc.19 plus later fixes.
-- **Code only, no tests.** This view excludes every `_test.go` file and every `testdata/` path (1,230 files), plus the non-code paths: docs, scripts, ops, CI and audit reports (182 paths).
-- Every remaining file is byte-identical to the source. `go build ./...` and `go vet ./...` pass on this tree.
-- **To check that no tests are included:** `git ls-tree -r --name-only 5afddf3113f4458b2507c2b219f3c9caec741eae | grep -cE '_test\.go$|(^|/)testdata/'` prints `0`.
+1. **`db3d5b68998df817fffbd8ce7b9ab5ab01a1d4a1`** (branch `audit/upstream-1179`): upstream go-ethereum v1.17.8 → v1.17.9.
+   - Applied only to paths that were still byte-identical to upstream: 63 files.
+   - Every changed file equals upstream v1.17.9 (`9dffe6e976cbbb87a84c5fd395448f0950290def`), so it can be checked mechanically: `git diff --stat db3d5b68998d 9dffe6e976cb -- $(git diff --name-only 4bf67046816d db3d5b68998d)` is empty.
+2. **`a6666037f64c4574a3487d131ce0de0db4e4bb49`**: the XDC changes, 69 files. **This is the diff to review.**
+   - Every code path equals XDCIndia/go-ethereum `24d7192e8c00` (release v1.17.9-xdc.19 plus later fixes).
+   - Includes the upstream merge resolutions in 19 files that XDC already modified.
+   - Removes 6 code files the source removed: the V1 engine path, the XDPoS event API, and node XDC config/health.
+
+**Nothing else changes.** Test files, testdata, .github, AUDIT.md and docs are unchanged from `4bf67046816d`; no file in them is added, edited or deleted. `go build ./...` passes. Tests were not updated with this uplift, so some may no longer compile against the new code; they are not part of this request.
 
 Areas we advise including, all changed since the previous revalidation commit `4bf67046816d5d2731c4f2bf78d9f327d7886618`:
 
@@ -20,7 +25,7 @@ Areas we advise including, all changed since the previous revalidation commit `4
    - **One trust change to review specifically:** under full verification, an epoch switch whose gap block lies below a snap or fast-sync pivot is accepted through the existing header fallback. No state exists locally for that gap. The leader seal, QC and signer-list checks all still run, and the gap snapshot is stored only after every check passes. All other full-verification failures remain fatal.
    - **XDPOS2 protocol version 101**: version 100 plus request ids on the header, body and receipt messages. Legacy peers stay on 100, and consensus messages are unchanged.
 
-### Changes since `4bf67046816d` (source commits on XDCIndia/go-ethereum main, oldest first)
+### Source changes behind the XDC commit (XDCIndia/go-ethereum main since the previously reviewed source, oldest first)
 
 | Source commit | Change |
 |---|---|
