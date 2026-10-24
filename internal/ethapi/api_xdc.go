@@ -438,7 +438,9 @@ func (n *proofPairList) Put(key []byte, value []byte) error {
 }
 
 func (n *proofPairList) Delete(key []byte) error {
-	panic("proofPairList: Delete not supported")
+	// Return an error instead of panicking (review R1-R04): trie.Prove never
+	// calls Delete today, but returning an error is safe if that changes.
+	return errors.New("proofPairList: Delete not supported")
 }
 
 // deriveTrie builds a Merkle trie from a DerivableList (txs or receipts).
@@ -625,11 +627,12 @@ func (s *BlockChainAPI) GetStakerROI() float64 {
 
 // GetStakerROIMasternode estimates annual ROI for stakers of a specific masternode.
 // Fix #66: Ported from v2.6.8 internal/ethapi/api.go PublicBlockChainAPI.GetStakerROIMasternode.
-func (s *BlockChainAPI) GetStakerROIMasternode(masternode common.Address) float64 {
-	// Full implementation requires XDC smart contract integration.
-	// For now, return the same as GetStakerROI() divided by masternode count.
-	roi := s.GetStakerROI()
-	return roi
+// Returns error because backend lacks voter reward data sources (GetVotersRewards, GetVotersCap, GetEpochDuration).
+func (s *BlockChainAPI) GetStakerROIMasternode(masternode common.Address) (float64, error) {
+	if masternode == (common.Address{}) {
+		return 0, errors.New("invalid masternode address")
+	}
+	return 0, errors.New("GetStakerROIMasternode: voter reward data not available in this client")
 }
 
 // GetStateHealStatus returns the current snap-heal status for diagnostic purposes.

@@ -969,6 +969,13 @@ func (d *Downloader) SubscribeSyncEvents(ch chan<- SyncEvent) event.Subscription
 	return d.scope.Track(d.feed.Subscribe(ch))
 }
 
+// isLocalPathScheme reports whether the local database uses path-based (PBSS)
+// trie storage. Path-scheme databases cannot consume NodeData trie blobs (hash-
+// keyed) and must use snap/1 range requests for all state downloads. Refs #1850.
+func (d *Downloader) isLocalPathScheme() bool {
+	return d.blockchain.TrieDB().Scheme() == rawdb.PathScheme
+}
+
 // syncToHead starts a block synchronization based on the hash chain from
 // the specified head hash.
 func (d *Downloader) syncToHead(beaconPing chan struct{}) (err error) {
@@ -1066,7 +1073,7 @@ func (d *Downloader) syncToHead(beaconPing chan struct{}) (err error) {
 	// the frozen header instead of a fresh one.
 	if mode == ethconfig.SnapSync && pivot != nil {
 		if frozen := d.snapSyncer.FrozenPivot(); frozen != nil {
-			if rawdb.ReadCanonicalHash(d.stateDB, frozen.Number.Uint64()) == frozen.Hash() {
+			if d.isFrozenPivotCanonical(frozen) {
 				log.Info("Resuming snap sync against frozen pivot", "number", frozen.Number, "hash", frozen.Hash())
 				pivot = frozen
 			} else {
@@ -1764,6 +1771,28 @@ func (d *Downloader) movePivotIfStale() error {
 	return nil
 }
 
+// isFrozenPivotCanonical reports whether the pivot frozen by the snap syncer is
+// still part of the chain being synced.
+//
+// The pivot block is only committed into the local chain once its state is
+// complete, so while frozen it is normally tracked by the skeleton chain alone,
+// with the local canonical chain covering only the blocks below it.
+func (d *Downloader) isFrozenPivotCanonical(frozen *types.Header) bool {
+	head, tail, _, err := d.skeleton.Bounds()
+	if err != nil {
+		return false
+	}
+	number := frozen.Number.Uint64()
+	if number > head.Number.Uint64() {
+		return false
+	}
+	if number >= tail.Number.Uint64() {
+		header := d.skeleton.Header(number)
+		return header != nil && header.Hash() == frozen.Hash()
+	}
+	return rawdb.ReadCanonicalHash(d.stateDB, number) == frozen.Hash()
+}
+
 func splitAroundPivot(pivot uint64, results []*fetchResult) (p *fetchResult, before, after []*fetchResult) {
 	if len(results) == 0 {
 		return nil, nil, nil
@@ -1878,11 +1907,16 @@ func (d *Downloader) processFastSyncContent() error {
 	// --syncmode fast (no --fastsyncpivot* flags) still state-syncs correctly.
 	d.pivotLock.RLock()
 	pivotRoot := d.pivotHeader.Root
+	initialPivotHdr := d.pivotHeader
 	d.pivotLock.RUnlock()
 	if d.operatorPivotNumber != 0 {
 		pivotRoot = d.operatorPivotRoot
 	}
-	sync := d.syncFastState(pivotRoot)
+	// #1850 SYNC-07: pass the pivot header so loop() can fall back to snap/1
+	// when no NodeData-eligible peer exists (all-path-scheme fleet).  For the
+	// operator-pinned case we pass the dynamic pivot header (its Root may differ
+	// from operatorPivotRoot); snap/1 uses only Root, so this is safe.
+	sync := d.syncFastStateWithPivot(pivotRoot, initialPivotHdr)
 
 	defer func() {
 		// The `sync` object is replaced every time the pivot moves. We need to
@@ -1939,8 +1973,14 @@ func (d *Downloader) processFastSyncContent() error {
 			}
 			if targetRoot != sync.root {
 				sync.Cancel()
-				sync = d.syncFastState(targetRoot)
-
+				// #1850 SYNC-07: for dynamic pivot pass the pivot header for snap/1
+				// fallback; operator-pinned pivot uses syncFastState (no fallback
+				// needed — operator controls the anchor choice).
+				if d.operatorPivotRoot == (common.Hash{}) {
+					sync = d.syncFastStateWithPivot(targetRoot, pivot)
+				} else {
+					sync = d.syncFastState(targetRoot)
+				}
 				go closeOnErr(sync)
 			}
 		} else {
@@ -2002,7 +2042,10 @@ func (d *Downloader) processFastSyncContent() error {
 					log.Warn("XDC fast-sync: compiled pivot root differs from served header root; using on-chain root (F-2026-19471)",
 						"compiled", d.operatorPivotRoot.Hex(), "onchain", stateRoot.Hex())
 				}
-				sync = d.syncFastState(stateRoot)
+				// #1850 SYNC-07: pass P.Header so loop() can fall back to snap/1
+				// when no NodeData-eligible peer exists.  P.Header.Root == stateRoot
+				// after pivotStateRoot() verification, so this is always safe.
+				sync = d.syncFastStateWithPivot(stateRoot, P.Header)
 
 				go closeOnErr(sync)
 				oldPivot = P
@@ -2098,6 +2141,36 @@ func (d *Downloader) processFastSyncContent() error {
 				}
 
 				// Download trie state at the gap block's state root.
+				//
+				// SYNC-07 (path-scheme gap blocks): path-scheme databases cannot
+				// consume NodeData blobs (hash-keyed storage is unreadable by the
+				// path-keyed DB layer). For gap blocks we cannot use snap/1 either:
+				// after FastSyncCommitHead calls triedb.Enable(pivotRoot), pathdb's
+				// disk layer is at the pivot; downloading an OLDER gap-block root via
+				// snap would conflict with that established disk-layer ordering.
+				// EVM re-execution from a known state is also unavailable because
+				// fast sync has no pre-pivot state to execute from.
+				//
+				// The correct approach is the A.97.4 embedded-header fallback:
+				// XDC epoch-switch headers carry the full masternode list directly in
+				// header.Validators / header.Penalties, making trie state unnecessary
+				// for the masternode-tracking purpose. Use A.97.4 unconditionally for
+				// path-scheme gap blocks. Refs #1850.
+				if d.isLocalPathScheme() {
+					if fallbackFn != nil {
+						mnCount, fallbackErr := fallbackFn(gapHeader)
+						if fallbackErr != nil {
+							log.Error("A.97.4 (path-scheme): gap header lacks embedded masternodes",
+								"number", gapNum, "err", fallbackErr)
+							return fmt.Errorf("fast sync: path-scheme gap %d: embedded-header fallback unavailable (use --fastsyncpivot* or connect an archive peer): %w", gapNum, fallbackErr)
+						}
+						log.Info("Fast Sync: path-scheme gap masternodes seeded from embedded header (A.97.4)",
+							"number", gapNum, "masternodes", mnCount)
+						continue
+					}
+					return fmt.Errorf("fast sync: path-scheme gap %d: no embedded-header fallback fn (cannot sync gap state on path-scheme DB without A.97.4)", gapNum)
+				}
+
 				gapSync := d.syncFastState(gapHeader.Root)
 				go closeOnErr(gapSync)
 				stateErr := gapSync.Wait()

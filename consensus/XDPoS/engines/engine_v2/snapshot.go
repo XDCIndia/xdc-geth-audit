@@ -139,8 +139,13 @@ func (s *SnapshotV2) CandidatePool() []common.Address {
 	return pool
 }
 
-// loadSnapshot loads a snapshot from the database
+// loadSnapshot loads a snapshot from the database.
 // Aligned with v2.6.8: DB key prefix is "XDPoS-V2-" + hash[:]
+//
+// A snapshot with no NextEpochCandidates is treated as missing and an error is
+// returned so the caller's rebuild path runs.  Such snapshots can exist in DBs
+// written by canonical v2.8.0/v2.8.2-testnet and would cause vote/timeout
+// checks to fail for the entire gap if returned as-is (CertiK XDC-35).
 func loadSnapshot(db ethdb.Database, hash common.Hash) (*SnapshotV2, error) {
 	key := append([]byte("XDPoS-V2-"), hash[:]...)
 	blob, err := db.Get(key)
@@ -150,6 +155,9 @@ func loadSnapshot(db ethdb.Database, hash common.Hash) (*SnapshotV2, error) {
 	snap := new(SnapshotV2)
 	if err := json.Unmarshal(blob, snap); err != nil {
 		return nil, err
+	}
+	if len(snap.NextEpochCandidates) == 0 {
+		return nil, errors.New("stored gap snapshot has empty NextEpochCandidates; treating as missing to trigger rebuild")
 	}
 	return snap, nil
 }

@@ -11,6 +11,7 @@ import (
 	"math"
 	"math/big"
 	"strconv"
+	"sync"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/log"
@@ -24,6 +25,7 @@ type Bulletproof struct {
 }
 
 var EC CryptoParams
+var ecMu sync.Mutex // guards EC for concurrent prove/verify calls
 var VecLength = 512 // support maximum 8 spending value, each 64 bit (gwei is unit)
 var curve elliptic.Curve = crypto.S256()
 
@@ -78,6 +80,11 @@ func (p ECPoint) Add(p2 ECPoint) ECPoint {
 
 // Neg returns the additive inverse of point p
 func (p ECPoint) Neg() ECPoint {
+	// The point at infinity (nil coordinates, e.g. Mult by a zero scalar) is
+	// its own inverse; Add already treats nil as infinity (review R4-P02).
+	if p.X == nil || p.Y == nil {
+		return p
+	}
 	negY := new(big.Int).Neg(p.Y)
 	modValue := negY.Mod(negY, EC.C.Params().P) // mod P is fine here because we're describing a curve point
 	return ECPoint{p.X, modValue}
@@ -442,6 +449,9 @@ we replace n separate exponentiations with a single multi-exponentiation.
 */
 
 func InnerProductVerifyFast(c *big.Int, P, U ECPoint, G, H []ECPoint, ipp InnerProdArg) bool {
+	if len(ipp.Challenges) == 0 {
+		return false
+	}
 	// input := append(PadTo32Bytes(P.X.Bytes()), PadTo32Bytes(P.Y.Bytes())...)
 	// s1 := crypto.Keccak256(input)
 	s1 := HashPointsToBytes([]ECPoint{P})
@@ -743,7 +753,7 @@ func deserializePointArray(input []byte, numPoint uint32) ([]ECPoint, error) {
 		numPointSize = 4
 		numPoint = binary.BigEndian.Uint32(input[0:4])
 	}
-	if uint32(len(input)) < (numPointSize + 33*numPoint) {
+	if uint64(len(input)) < uint64(numPointSize)+33*uint64(numPoint) {
 		return []ECPoint{}, errors.New("input data too short")
 	}
 	ret := make([]ECPoint, numPoint)
@@ -922,7 +932,9 @@ func (mrp *MultiRangeProof) Deserialize(proof []byte) error {
 	offset += 32
 
 	numChallenges := int(math.Log2(float64(len(mrp.Comms)*bitsPerValue))) + 1
-	mrp.IPP.Deserialize(proof[offset:], numChallenges)
+	if err := mrp.IPP.Deserialize(proof[offset:], numChallenges); err != nil {
+		return err
+	}
 	offset += len(mrp.IPP.L)*33 + len(mrp.IPP.R)*33 + len(mrp.IPP.Challenges)*32 + 2*32
 
 	mrp.Cy = new(big.Int).SetBytes(proof[offset : offset+32])
@@ -974,6 +986,8 @@ func MRPProve(values []*big.Int) (MultiRangeProof, error) {
 		return MultiRangeProof{}, errors.New("value number is not supported - just 1, 2, 4, 8")
 	}
 
+	ecMu.Lock()
+	defer ecMu.Unlock()
 	EC = genECPrimeGroupKey(m * bitsPerValue)
 
 	// we concatenate the binary representation of the values
@@ -1162,6 +1176,11 @@ Takes in a MultiRangeProof and verifies its correctness
 */
 func MRPVerify(mrp *MultiRangeProof) bool {
 	m := len(mrp.Comms)
+	if m == 0 {
+		return false
+	}
+	ecMu.Lock()
+	defer ecMu.Unlock()
 	EC = genECPrimeGroupKey(m * bitsPerValue)
 
 	//changes:

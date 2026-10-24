@@ -79,6 +79,12 @@ type fullNodeBackend interface {
 	SuggestGasTipCap(ctx context.Context) (*big.Int, error)
 }
 
+// ethConfigBackend is used to extract node configuration details when available.
+// It's satisfied by eth.EthAPIBackend but not required for basic ethstats operation.
+type ethConfigBackend interface {
+	BlockChain() *core.BlockChain
+}
+
 // Service implements an Ethereum netstats reporting daemon that pushes local
 // chain statistics up to a monitoring server.
 type Service struct {
@@ -96,6 +102,11 @@ type Service struct {
 	headSub       event.Subscription
 	txSub         event.Subscription
 	newPayloadSub event.Subscription
+
+	// Cached node configuration info
+	syncMode    string
+	gcMode      string
+	stateScheme string
 }
 
 // connWrapper is a wrapper to prevent concurrent-write or concurrent-read on the
@@ -172,7 +183,13 @@ func parseEthstatsURL(url string) (parts []string, err error) {
 	return []string{nodename, pass, host}, nil
 }
 
-// New returns a monitoring service ready for stats reporting.
+// syncInfoProvider is implemented by the eth backend: it reports the node's
+// configured sync mode, gc mode and the state scheme its chain uses. Other
+// backends do not implement it and report empty strings.
+type syncInfoProvider interface {
+	NodeSyncInfo() (syncMode, gcMode, stateScheme string)
+}
+
 func New(node *node.Node, backend backend, engine consensus.Engine, url string) error {
 	parts, err := parseEthstatsURL(url)
 	if err != nil {
@@ -187,6 +204,13 @@ func New(node *node.Node, backend backend, engine consensus.Engine, url string) 
 		host:    parts[2],
 		pongCh:  make(chan struct{}),
 		histCh:  make(chan []uint64, 1),
+	}
+
+	// Extract sync mode, gc mode, and state scheme from eth.Ethereum backend if available
+	// These values are cached at startup since they don't change at runtime.
+	// If backend is not *eth.Ethereum (e.g., light client), leave as empty strings.
+	if p, ok := backend.(syncInfoProvider); ok {
+		ethstats.syncMode, ethstats.gcMode, ethstats.stateScheme = p.NodeSyncInfo()
 	}
 
 	node.RegisterLifecycle(ethstats)
@@ -463,18 +487,21 @@ func (s *Service) readLoop(conn *connWrapper) {
 // nodeInfo is the collection of meta information about a node that is displayed
 // on the monitoring page.
 type nodeInfo struct {
-	Name     string `json:"name"`
-	Node     string `json:"node"`
-	Port     int    `json:"port"`
-	Network  string `json:"net"`
-	Protocol string `json:"protocol"`
-	API      string `json:"api"`
-	Os       string `json:"os"`
-	OsVer    string `json:"os_v"`
-	Client   string `json:"client"`
-	History  bool   `json:"canUpdateHistory"`
-	Coinbase string `json:"coinbase"` // node's own miner/etherbase address, lowercase 0x-hex; full zero address if none configured
-	Role     string `json:"role"`     // "validator" if this node is authorized and actively sealing blocks, else "follower"
+	Name        string `json:"name"`
+	Node        string `json:"node"`
+	Port        int    `json:"port"`
+	Network     string `json:"net"`
+	Protocol    string `json:"protocol"`
+	API         string `json:"api"`
+	Os          string `json:"os"`
+	OsVer       string `json:"os_v"`
+	Client      string `json:"client"`
+	History     bool   `json:"canUpdateHistory"`
+	Coinbase    string `json:"coinbase"` // node's own miner/etherbase address, lowercase 0x-hex; full zero address if none configured
+	Role        string `json:"role"`     // "validator" if this node is authorized and actively sealing blocks, else "follower"
+	SyncMode    string `json:"syncMode"`
+	GcMode      string `json:"gcMode"`
+	StateScheme string `json:"stateScheme"`
 }
 
 // signerProvider is implemented by consensus engines that can report the
@@ -534,18 +561,21 @@ func (s *Service) login(conn *connWrapper) error {
 	auth := &authMsg{
 		ID: s.node,
 		Info: nodeInfo{
-			Name:     s.node,
-			Node:     infos.Name,
-			Port:     infos.Ports.Listener,
-			Network:  network,
-			Protocol: strings.Join(protocols, ", "),
-			API:      "No",
-			Os:       runtime.GOOS,
-			OsVer:    runtime.GOARCH,
-			Client:   "0.1.1",
-			History:  true,
-			Coinbase: coinbase,
-			Role:     role,
+			Name:        s.node,
+			Node:        infos.Name,
+			Port:        infos.Ports.Listener,
+			Network:     network,
+			Protocol:    strings.Join(protocols, ", "),
+			API:         "No",
+			Os:          runtime.GOOS,
+			OsVer:       runtime.GOARCH,
+			Client:      "0.1.1",
+			History:     true,
+			Coinbase:    coinbase,
+			Role:        role,
+			SyncMode:    s.syncMode,
+			GcMode:      s.gcMode,
+			StateScheme: s.stateScheme,
 		},
 		Secret: s.pass,
 	}

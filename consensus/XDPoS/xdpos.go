@@ -333,10 +333,6 @@ type XDPoS struct {
 	// Used by verifyHeaderV2 for full V2 block verification.
 	EngineV2 EngineV2Iface
 
-	// ConsensusFeed exposes XDPoS consensus events over WebSocket (fix #87).
-	// External callers subscribe via SubscribeNewQC / SubscribeNewTC etc.
-	ConsensusFeed ConsensusFeed
-
 	// Testing flags
 	fakeDiff bool // Skip difficulty verifications (testing)
 
@@ -1429,7 +1425,10 @@ func (c *XDPoS) Prepare(chain consensus.ChainHeaderReader, header *types.Header)
 		return consensus.ErrUnknownAncestor
 	}
 
-	header.Difficulty = c.calcDifficulty(chain, parent, c.signer)
+	c.lock.RLock()
+	signer := c.signer
+	c.lock.RUnlock()
+	header.Difficulty = c.calcDifficulty(chain, parent, signer)
 	log.Debug("CalcDifficulty", "number", header.Number, "difficulty", header.Difficulty)
 
 	if len(header.Extra) < extraVanity {
@@ -1699,8 +1698,16 @@ func (c *XDPoS) FinalizeAndAssemble(chain consensus.ChainHeaderReader, header *t
 	}
 
 	if c.HookReward != nil && number%rCheckpoint == 0 {
-		// Use statedb copy as parentState for reading owner/voter info
-		parentState := statedb.Copy()
+		// Use the pre-transaction parentState so reward reads reflect contract
+		// state before any txs in this block, matching the import path (Finalize)
+		// and canonical's miner.  Fall back to statedb.Copy() when the miner has
+		// not provided a pre-tx snapshot (e.g. tests that call FinalizeAndAssemble
+		// directly without going through the miner).
+		parentState := c.parentStateForReward
+		if parentState == nil {
+			parentState = statedb.Copy()
+		}
+		c.parentStateForReward = nil
 		rewards, err := c.HookReward(chain, statedb, parentState, header)
 		if err != nil {
 			return nil, err
@@ -1865,7 +1872,10 @@ func (c *XDPoS) CalcDifficulty(chain consensus.ChainHeaderReader, time uint64, p
 			return c.EngineV2.CalcDifficulty(cr, time, parent)
 		}
 	}
-	return c.calcDifficulty(chain, parent, c.signer)
+	c.lock.RLock()
+	signer := c.signer
+	c.lock.RUnlock()
+	return c.calcDifficulty(chain, parent, signer)
 }
 
 func (c *XDPoS) calcDifficulty(chain consensus.ChainHeaderReader, parent *types.Header, signer common.Address) *big.Int {
@@ -1904,10 +1914,20 @@ func (c *XDPoS) Close() error {
 // must explicitly type-assert *XDPoS.XDPoS and append the result of this call.
 // See #814.
 func (c *XDPoS) APIs(chain consensus.ChainHeaderReader) []rpc.API {
-	return []rpc.API{{
-		Namespace: "XDPoS",
-		Service:   &API{chain: chain, xdpos: c},
-	}}
+	return []rpc.API{
+		{
+			Namespace: "XDPoS",
+			Service:   &API{chain: chain, xdpos: c},
+		},
+		{
+			// Propose and Discard are write operations; expose them only on the
+			// authenticated endpoint (IPC / --authrpc) to prevent public HTTP/WS
+			// callers from steering V1 votes or inflating the proposals map.
+			Namespace:     "XDPoS",
+			Authenticated: true,
+			Service:       &AdminAPI{chain: chain, xdpos: c},
+		},
+	}
 }
 
 // Authorize injects a private key into the consensus engine.

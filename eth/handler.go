@@ -470,7 +470,9 @@ func (h *handler) runEthPeer(peer *eth.Peer, handler eth.Handler) error {
 	dead := make(chan struct{})
 	defer close(dead)
 
-	// If we have any explicit peer required block hashes, request them
+	// If we have any explicit peer required block hashes, request them. Read the
+	// challenge timeout once here, not in each goroutine.
+	challengeTimeout := syncChallengeTimeout
 	for number, hash := range h.requiredBlocks {
 		resCh := make(chan *eth.Response)
 
@@ -482,7 +484,42 @@ func (h *handler) runEthPeer(peer *eth.Peer, handler eth.Handler) error {
 			// Ensure the request gets cancelled in case of error/drop
 			defer req.Close()
 
-			timeout := time.NewTimer(syncChallengeTimeout)
+			// XDPOS2 peers route BlockHeaders replies to peer.XDCHeaderResp
+			// rather than through the request-id dispatcher (the legacy wire
+			// has no RequestId on responses). Wait on XDCHeaderResp with a
+			// bounded timeout; on timeout keep the peer — silence on legacy
+			// wire is not evidence of misbehaviour. Only an explicit hash
+			// mismatch at the requested number warrants a drop.
+			if eth.IsXDPOS2Family(peer.Version()) {
+				timeout := time.NewTimer(challengeTimeout)
+				defer timeout.Stop()
+				select {
+				case headers := <-peer.XDCHeaderResp:
+					if len(headers) == 0 || headers[0].Number.Uint64() != number {
+						// Empty response or a different number than we asked for:
+						// this response is not ours (could belong to xdcSyncer).
+						// Do not steal more reads; keep the peer.
+						return
+					}
+					if headers[0].Hash() != hash {
+						peer.Log().Info("Required block mismatch on XDPOS2 peer, dropping",
+							"number", number, "hash", headers[0].Hash(), "want", hash)
+						h.removePeer(peer.ID())
+						return
+					}
+					peer.Log().Debug("XDPOS2 peer required block verified", "number", number, "hash", hash)
+				case <-timeout.C:
+					// Keep the peer — XDPOS2 peers are often slow to reply and
+					// absence of a timely response is not a chain-fork indicator.
+					peer.Log().Debug("Required block challenge timed out on XDPOS2 peer, keeping",
+						"addr", peer.RemoteAddr())
+				case <-dead:
+					// Peer handler terminated; abort.
+				}
+				return
+			}
+
+			timeout := time.NewTimer(challengeTimeout)
 			defer timeout.Stop()
 
 			select {

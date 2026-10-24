@@ -943,6 +943,11 @@ func patchMissingForkBlocks(cfg, defaults *params.ChainConfig, network string, m
 		patch(&cfg.TIPUpgradePenaltyBlock, defaults.TIPUpgradePenaltyBlock, "TIPUpgradePenaltyBlock")
 		patch(&cfg.Gas2500xBlock, defaults.Gas2500xBlock, "Gas2500xBlock")
 		patch(&cfg.DynamicGasLimitBlock, defaults.DynamicGasLimitBlock, "DynamicGasLimitBlock")
+		// CertiK rule blocks (#1721-#1723): without these the built-in
+		// schedule never reaches a node resolving from the embedded genesis.
+		patch(&cfg.SigningTxBoundBlock, defaults.SigningTxBoundBlock, "SigningTxBoundBlock")
+		patch(&cfg.ValidatorOrderBlock, defaults.ValidatorOrderBlock, "ValidatorOrderBlock")
+		patch(&cfg.ParoleDedupBlock, defaults.ParoleDedupBlock, "ParoleDedupBlock")
 		// V2 round configs: the embedded devnet genesis JSON carries a V2
 		// block with only the round-0 entry, so the round-50000 tier
 		// (MinimumMinerBlockPerEpoch/LimitPenaltyEpoch/MinimumSigningTx and the
