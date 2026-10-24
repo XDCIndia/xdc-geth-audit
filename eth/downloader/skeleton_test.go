@@ -1138,3 +1138,47 @@ func checkSkeletonProgress(db ethdb.KeyValueReader, unpredictable bool, peers []
 	}
 	return nil
 }
+
+// TestSkeletonEmptyResponseKeepsPeer checks that a peer answering a skeleton
+// request with no headers is kept: the response is accepted (no error on Done,
+// which would make the eth handler disconnect the peer) and the request is
+// rescheduled. On xdpos2 v101 every fresh fast/snap node lost all its peers this
+// way when its first skeleton fan-out reached peers without that range.
+func TestSkeletonEmptyResponseKeepsPeer(t *testing.T) {
+	chain := []*types.Header{{Number: big.NewInt(0)}}
+	for i := 1; i < 5000; i++ {
+		chain = append(chain, &types.Header{ParentHash: chain[i-1].Hash(), Number: big.NewInt(int64(i))})
+	}
+	db := rawdb.NewMemoryDatabase()
+	peerset := newPeerSet()
+
+	var answered atomic.Bool
+	empty := newSkeletonTestPeerWithHook("empty-once", chain, func(origin uint64) []*types.Header {
+		if answered.CompareAndSwap(false, true) {
+			return []*types.Header{} // no headers for this range
+		}
+		return nil // serve normally afterwards
+	})
+	peers := []*skeletonTestPeer{empty}
+	peers = append(peers, newSkeletonTestPeer("good", chain))
+	for _, p := range peers {
+		if err := peerset.Register(newPeerConnection(p.id, eth.ETH69, p, log.New("id", p.id))); err != nil {
+			t.Fatalf("register %s: %v", p.id, err)
+		}
+	}
+	skeleton := newSkeleton(db, peerset, func(id string) { peerset.Unregister(id) }, newHookedBackfiller(), &fakeChainReader{})
+	defer skeleton.Terminate()
+	go skeleton.Sync(chain[len(chain)-1], nil, true)
+
+	deadline := time.Now().Add(5 * time.Second)
+	for !answered.Load() && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	time.Sleep(500 * time.Millisecond)
+	if !answered.Load() {
+		t.Fatal("empty-once peer was never asked for headers")
+	}
+	if d := empty.dropped.Load(); d != 0 {
+		t.Fatalf("peer dropped after one empty skeleton response (dropped=%d)", d)
+	}
+}

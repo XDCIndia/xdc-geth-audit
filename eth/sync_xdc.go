@@ -2933,6 +2933,14 @@ func (s *xdcSyncer) buildBlocks(headers []*types.Header, bodies []eth.BlockBody)
 				body.Withdrawals = wd
 			}
 		}
+		// A body that does not belong to its header (a late reply to an earlier
+		// request, or a bad peer) must not reach InsertChain: there it fails as
+		// an invalid block, taints the peer and, off mainnet, blacklists the
+		// canonical block hash. Cut the batch here; the rest is refetched.
+		if !verifyBodyAgainstHeader(headers[i], &body) {
+			log.Debug("xdcSyncer: body does not match header", "number", headers[i].Number, "idx", i)
+			break
+		}
 		blocks = append(blocks, types.NewBlockWithHeader(headers[i]).WithBody(body))
 	}
 	return blocks

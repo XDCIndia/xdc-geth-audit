@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"math/rand"
 	"sort"
+	"sync"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -284,6 +285,7 @@ type skeleton struct {
 	// XDC fix #131: track consecutive empty-header responses per peer.
 	// Peers that repeatedly return 0 headers get dropped to unblock skeleton sync.
 	emptyResponseCount map[string]int // consecutive empty-header counts per peer ID
+	emptyMu            sync.Mutex     // guards emptyResponseCount; executeTask goroutines update it
 
 	// XDC fix #1868: track consecutive request failures per peer.
 	// Peers that fail requests are re-added to idles, but we avoid tight retry loops
@@ -779,9 +781,9 @@ func (s *skeleton) sync(head *types.Header) (*types.Header, error) {
 				s.revertRequests(peerid)
 				delete(s.idles, peerid)
 				// XDC fix #131: clear empty-response counter for departed peer
-				if s.emptyResponseCount != nil {
-					delete(s.emptyResponseCount, peerid)
-				}
+				s.emptyMu.Lock()
+				delete(s.emptyResponseCount, peerid)
+				s.emptyMu.Unlock()
 				// XDC fix #1868: clear failure counter for departed peer
 				if s.failureCount != nil {
 					delete(s.failureCount, peerid)
@@ -1211,26 +1213,35 @@ func (s *skeleton) executeTask(peer *peerConnection, req *headerRequest) {
 			// rescheduling so the peer gets another chance. On a healthier
 			// fleet (count > floor) the original drop semantics apply.
 			const maxEmptyResponses = 5
+			// This runs in the request's own goroutine: lock the counter, and
+			// size the fleet from the peer set (s.idles belongs to the sync loop).
+			s.emptyMu.Lock()
 			s.emptyResponseCount[peer.id]++
 			count := s.emptyResponseCount[peer.id]
-			totalIdles := len(s.idles)
-			peerStarved := totalIdles <= skeletonEmptyDropPeerFloor
+			if count >= maxEmptyResponses {
+				s.emptyResponseCount[peer.id] = 0
+			}
+			s.emptyMu.Unlock()
+			totalPeers := s.peers.Len()
+			peerStarved := totalPeers <= skeletonEmptyDropPeerFloor
 			if count >= maxEmptyResponses && !peerStarved {
 				peer.log.Warn("Skeleton: dropping peer after repeated empty header responses",
-					"peer", peer.id, "consecutive", count, "idles", totalIdles)
-				s.emptyResponseCount[peer.id] = 0
+					"peer", peer.id, "consecutive", count, "peers", totalPeers)
 				res.Done <- errors.New("no headers delivered")
 				s.scheduleRevertRequest(req)
 				s.drop(peer.id)
 			} else {
 				if count >= maxEmptyResponses && peerStarved {
 					peer.log.Warn("Skeleton: keeping peer despite empties (peer-starved)",
-						"peer", peer.id, "consecutive", count, "idles", totalIdles)
-					s.emptyResponseCount[peer.id] = 0 // give the peer a fresh budget
+						"peer", peer.id, "consecutive", count, "peers", totalPeers)
+					// the counter was reset above: the peer gets a fresh budget
 				} else {
 					peer.log.Debug("No headers delivered (will retry)", "consecutive", count)
 				}
-				res.Done <- errors.New("no headers delivered")
+				// Keep the peer: an error on Done makes the eth handler disconnect
+				// it on request-id (xdpos2 v101, eth/66+) responses. An empty reply
+				// is a legitimate answer here; the request is rescheduled below.
+				res.Done <- nil
 				// XDC fix #1868: mark for re-add on revert (keep-and-retry path)
 				req.keep = true
 				s.scheduleRevertRequest(req)
@@ -1249,7 +1260,7 @@ func (s *skeleton) executeTask(peer *peerConnection, req *headerRequest) {
 			// (XDPoSChain/eth/handler.go:445 MaxHeaderFetch); rejecting their
 			// 192-header replies with want=512 stalled the skeleton indefinitely.
 			peer.log.Debug("Invalid non-genesis header count", "have", len(headers), "want", batch)
-			res.Done <- errors.New("not enough non-genesis headers delivered")
+			res.Done <- nil // keep the peer, see the empty-response case above
 			// XDC fix #1868: mark for re-add on revert (XDPOS2 short-batch path)
 			req.keep = true
 			s.scheduleRevertRequest(req)
@@ -1393,9 +1404,9 @@ func (s *skeleton) processResponse(res *headerResponse) (linked bool, merged boo
 	s.idles[res.peer.id] = res.peer
 
 	// XDC fix #131: successful header delivery — reset empty-response counter
-	if s.emptyResponseCount != nil {
-		delete(s.emptyResponseCount, res.peer.id)
-	}
+	s.emptyMu.Lock()
+	delete(s.emptyResponseCount, res.peer.id)
+	s.emptyMu.Unlock()
 
 	// XDC fix #1868: reset consecutive failure counter on successful delivery
 	if s.failureCount != nil {

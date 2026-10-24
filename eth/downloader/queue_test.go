@@ -279,6 +279,10 @@ func TestEmptyBlocks(t *testing.T) {
 // scheduled, block delivery is never held back by outstanding access lists,
 // and delivered lists are validated against the header commitment.
 func TestBlockAccessLists(t *testing.T) {
+	// XDC does not advertise eth/71; exercise the retrieval machinery anyway.
+	defer func(v bool) { balRetrievable = v }(balRetrievable)
+	balRetrievable = true
+
 	// Create an access list along with its header commitment
 	list := bal.BlockAccessList{{Address: common.Address{0x01}}}
 	enc, err := rlp.EncodeToBytes(&list)
