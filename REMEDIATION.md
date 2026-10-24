@@ -2,15 +2,16 @@
 
 Report: Hacken final report, 2026-10-13. Audited commit: `45e2b6ee`.
 
-## Third hand-over (24 October 2026): revalidate `71a581f0079cd7cae87397a9a9859a00920a83f7`
+## Third hand-over (24 October 2026): revalidate `582283ef313402c9661244b4a59430db7dc223b2`
 
 ### Scope
 
 | Item | Value |
 |---|---|
 | Repository | XDCIndia/xdc-geth-audit |
-| Branch | `audit/main-uplift-11710-xdc20-r8` |
-| Commit to revalidate | **`71a581f0079cd7cae87397a9a9859a00920a83f7`** |
+| Branch | `audit/main-uplift-11710-xdc20-r9` |
+| Commit to revalidate | **`582283ef313402c9661244b4a59430db7dc223b2`** |
+| Last fix commit | `71a581f0079cd7cae87397a9a9859a00920a83f7` (the 79th fix; the head commit only removes test files) |
 | Previously revalidated commit (base) | `4bf67046816d5d2731c4f2bf78d9f327d7886618` |
 | Source | XDCIndia/go-ethereum `d0eda1964`: release v1.17.10-xdc.20 plus the sync fix for peers that cannot serve a range |
 | Upstream | go-ethereum v1.17.9 `9dffe6e976cb` (branch `1179`) and v1.17.10 `1df30b18d9ed` (branch `11710`) |
@@ -18,7 +19,7 @@ Report: Hacken final report, 2026-10-13. Audited commit: `45e2b6ee`.
 
 ### Structure: one commit per fix
 
-From the base, the branch holds **79 commits, one per source fix**, in source order:
+From the base, the branch holds **79 commits, one per source fix**, in source order, then one commit that removes the XDPoS test files:
 - Each commit has the fix's original message and author, its code (and changes to existing tests), and a `Source: XDCIndia/go-ethereum <sha>` line.
 - Commits that fix a finding name it in the subject (CertiK, F-2026-…, or an internal review ID).
 - **Upstream go-ethereum v1.17.9** enters as a real merge, `cf0dbb99f35de1df765bc6b7d8b735e388118e04` (second parent `9dffe6e976cb`, 38 upstream commits), at the point it was merged in the source.
@@ -28,7 +29,11 @@ From the base, the branch holds **79 commits, one per source fix**, in source or
   - snap.v2 auto-enable is gated off on XDPoS chains unless `--snap.v2` is set;
   - `cmd/geth/default.pgo` is upstream's.
 
-**XDC test files.** 66 XDC test files that would be new in this hand-over are not included, to keep the review diff small. Upstream tests and XDC tests already in `4bf67046816d` are kept and follow the source. The suite compiles (`go vet ./...` passes). Excluded files:
+**XDC test files.** 66 XDC test files that would be new in this hand-over are not included, to keep the review diff small. Upstream tests and XDC tests already in `4bf67046816d` are kept and follow the source. The suite compiles (`go vet ./...` passes).
+
+**XDPoS test files removed.** The head commit `582283ef3134` (`consensus/XDPoS: remove test files from audit scope`) deletes all 65 Go test files under `consensus/XDPoS` (29 in the package root, 35 in `engines/engine_v2`, 1 in `utils`) and the two JSON fixtures in `consensus/XDPoS/testvectors` that only those tests read. These test files were in `4bf67046816d`; the commit changes no non-test code, so it can be skipped when reviewing fixes.
+
+Excluded files:
 
 - `consensus/XDPoS/api_epoch_range_1756_test.go`
 - `consensus/XDPoS/api_network_info_1757_test.go`
@@ -100,11 +105,11 @@ From the base, the branch holds **79 commits, one per source fix**, in source or
 ### How to verify
 
 ```
-git log --first-parent --oneline 4bf67046816d..71a581f0079c       # 79 commits, one per fix
+git log --first-parent --oneline 4bf67046816d..582283ef3134       # 79 fix commits + 1 XDPoS test-file removal
 git log -1 --format=%P cf0dbb99f35d                                 # <previous> 9dffe6e976cb… (v1.17.9)
 git log -1 --format=%P 0076aa0ddcb4                                # <previous> 1df30b18d9ed… (v1.17.10)
-git checkout 71a581f0079c && go build ./... && go vet ./...
-go test -timeout 60m ./consensus/XDPoS/... ./core/... ./eth/...
+git checkout 582283ef3134 && go build ./... && go vet ./...
+go test -timeout 60m ./core/... ./eth/...
 # known: core/rawdb/eradb TestEreDatabase fails in the source too (upstream era fixture
 # holds Ethereum headers without the XDC header fields); being fixed in the source
 ```
