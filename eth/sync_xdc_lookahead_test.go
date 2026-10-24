@@ -29,10 +29,10 @@ import (
 // trigger. Refs #1429.
 func TestFullSyncLookaheadContiguous(t *testing.T) {
 	n := newXDCFakeNet(t, 0, 640)
-	// fetchHeadersParallel races the top xdcMaxPeerTriesPerSync peers; the
+	// SYNC-12: fetchHeadersParallel races the top xdcHeaderRacePeers peers; the
 	// remaining xdcLookaheadStreams peers serve the lookahead ranges.
 	var peers []*fakeXDCPeer
-	for i := 0; i < xdcMaxPeerTriesPerSync+xdcLookaheadStreams; i++ {
+	for i := 0; i < xdcHeaderRacePeers+xdcLookaheadStreams; i++ {
 		peers = append(peers, n.addPeer(t, byte(i+1), n.canonicalHeaders))
 	}
 	s := n.newTestXDCSyncer(t)
@@ -74,7 +74,7 @@ func TestFullSyncLookaheadContiguous(t *testing.T) {
 func TestFullSyncLookaheadGapNoRollback(t *testing.T) {
 	n := newXDCFakeNet(t, 0, 640)
 	n.bodyCap = 100
-	for i := 0; i < xdcMaxPeerTriesPerSync+xdcLookaheadStreams; i++ {
+	for i := 0; i < xdcHeaderRacePeers+xdcLookaheadStreams; i++ {
 		n.addPeer(t, byte(i+1), n.canonicalHeaders)
 	}
 	s := n.newTestXDCSyncer(t)

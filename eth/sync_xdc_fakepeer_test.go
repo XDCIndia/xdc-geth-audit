@@ -20,6 +20,7 @@ import (
 	"math/big"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/consensus"
@@ -46,7 +47,8 @@ type fakeXDCPeer struct {
 	blocks     map[common.Hash]*types.Block
 	receipts   map[common.Hash]types.Receipts // nil means "no receipts available"
 	bodyCap    int
-	corrupt    bool // if true, serve empty bodies (wrong hash) for every body request
+	corrupt    bool          // if true, serve empty bodies (wrong hash) for every body request
+	bodyDelay  time.Duration // SYNC-12: if > 0, sleep before sending body response
 
 	mu         sync.Mutex
 	headerReqs []uint64 // origins of every GetBlockHeaders received
@@ -96,6 +98,10 @@ func (f *fakeXDCPeer) serve(rw p2p.MsgReadWriter) {
 				txs, _ := rlp.EncodeToRawList(b.Transactions())
 				uncles, _ := rlp.EncodeToRawList(b.Uncles())
 				bodies = append(bodies, eth.BlockBody{Transactions: txs, Uncles: uncles})
+			}
+			// SYNC-12: simulate a slow peer by sleeping before the response.
+			if f.bodyDelay > 0 {
+				time.Sleep(f.bodyDelay)
 			}
 			select {
 			case f.XDCBodyResp <- bodies:
