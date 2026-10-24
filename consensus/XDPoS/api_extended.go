@@ -189,6 +189,17 @@ func (api *API) GetEpochNumbersBetween(begin, end *rpc.BlockNumber) ([]uint64, e
 
 	// Use V2 engine for ranges fully in V2 (both headers past the switch block).
 	if api.xdpos.IsV2Block(beginHeader) && api.xdpos.EngineV2 != nil {
+		// Reject ranges that span more than 1000 epochs to prevent a single RPC
+		// call from walking the entire chain (review R1-R02).
+		const maxEpochSpan = uint64(1000)
+		epoch := api.xdpos.config.Epoch
+		endNum := endHeader.Number.Uint64()
+		beginNum := beginHeader.Number.Uint64()
+		if endNum > beginNum && endNum-beginNum > maxEpochSpan*epoch {
+			return nil, fmt.Errorf("range spans %d blocks, exceeding the %d-epoch limit of %d blocks",
+				endNum-beginNum, maxEpochSpan, maxEpochSpan*epoch)
+		}
+
 		chainReader, ok := api.chain.(consensus.ChainReader)
 		if !ok {
 			return nil, fmt.Errorf("chain does not implement ChainReader")
@@ -257,8 +268,15 @@ func (api *API) NetworkInformation() NetworkInfo {
 		api.xdpos.config.V2.CurrentConfig.MaxMasternodes > 0 {
 		maxValidators = api.xdpos.config.V2.CurrentConfig.MaxMasternodes
 	}
+	// Use the configured chain ID (review R1-R03): Apothem (51), devnets and
+	// private networks must not report 50. Fall back to 50 only when the chain
+	// config is unavailable, which should not happen in production.
+	networkID := big.NewInt(50)
+	if cfg := api.chain.Config(); cfg != nil && cfg.ChainID != nil {
+		networkID = new(big.Int).Set(cfg.ChainID)
+	}
 	info := NetworkInfo{
-		NetworkId:     big.NewInt(50), // XDC Mainnet chain ID
+		NetworkId:     networkID,
 		XDCValidators: maxValidators,
 		Epoch:         api.xdpos.config.Epoch,
 	}
@@ -301,6 +319,15 @@ func (api *API) GetRewardByAccount(account common.Address, begin rpc.BlockNumber
 
 	epoch := api.xdpos.config.Epoch
 	accountHex := strings.ToLower(account.Hex())
+
+	// Reject ranges that span more than 1000 epochs to prevent a single RPC call
+	// from listing and decoding every reward file the node has stored (review R2-N01).
+	const maxEpochSpan = uint64(1000)
+	if endNum > beginNum && endNum-beginNum > maxEpochSpan*epoch {
+		return AccountRewardResponse{Rewards: make([]AccountEpochReward, 0)},
+			fmt.Errorf("range spans %d blocks, exceeding the %d-epoch limit of %d blocks",
+				endNum-beginNum, maxEpochSpan, maxEpochSpan*epoch)
+	}
 
 	// Read all reward files in the folder and match by block range and account
 	entries, err := os.ReadDir(common.StoreRewardFolder)

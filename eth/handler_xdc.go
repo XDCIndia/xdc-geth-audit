@@ -37,10 +37,12 @@ func (h *handler) BroadcastVote(vote *types.Vote) {
 	h.peers.lock.RUnlock()
 
 	for _, p := range peers {
-		if err := p.Peer.Send(eth.VoteMsg, vote); err != nil {
-			log.Trace("[XDC-P2P] Send vote failed", "peer", p.ID(), "err", err)
-			continue
-		}
+		p := p
+		go func() {
+			if err := p.Peer.Send(eth.VoteMsg, vote); err != nil {
+				log.Trace("[XDC-P2P] Send vote failed", "peer", p.ID(), "err", err)
+			}
+		}()
 	}
 	log.Debug("[XDC-P2P] Vote broadcast complete", "peers", len(peers), "round", vote.ProposedBlockInfo.Round)
 }
@@ -62,10 +64,12 @@ func (h *handler) BroadcastTimeout(timeout *types.Timeout) {
 	h.peers.lock.RUnlock()
 
 	for _, p := range peers {
-		if err := p.Peer.Send(eth.TimeoutMsg, timeout); err != nil {
-			log.Trace("[XDC-P2P] Send timeout failed", "peer", p.ID(), "err", err)
-			continue
-		}
+		p := p
+		go func() {
+			if err := p.Peer.Send(eth.TimeoutMsg, timeout); err != nil {
+				log.Trace("[XDC-P2P] Send timeout failed", "peer", p.ID(), "err", err)
+			}
+		}()
 	}
 	log.Debug("[XDC-P2P] Timeout broadcast complete", "peers", len(peers), "round", timeout.Round)
 }
@@ -85,10 +89,12 @@ func (h *handler) BroadcastSyncInfo(syncInfo *types.SyncInfo) {
 	h.peers.lock.RUnlock()
 
 	for _, p := range peers {
-		if err := p.Peer.Send(eth.SyncInfoMsg, syncInfo); err != nil {
-			log.Trace("[XDC-P2P] Send syncInfo failed", "peer", p.ID(), "err", err)
-			continue
-		}
+		p := p
+		go func() {
+			if err := p.Peer.Send(eth.SyncInfoMsg, syncInfo); err != nil {
+				log.Trace("[XDC-P2P] Send syncInfo failed", "peer", p.ID(), "err", err)
+			}
+		}()
 	}
 	log.Debug("[XDC-P2P] SyncInfo broadcast complete", "peers", len(peers))
 }
@@ -136,14 +142,14 @@ func (h *handler) BroadcastBlock(block *types.Block) {
 		Block: block,
 		TD:    td,
 	}
-	var sent int
 	for _, p := range peers {
-		if err := p.Peer.Send(eth.NewBlockMsg, pkt); err != nil {
-			log.Trace("[XDC-P2P] Send NewBlock failed", "peer", p.ID(), "err", err)
-			continue
-		}
-		sent++
+		p := p
+		go func() {
+			if err := p.Peer.Send(eth.NewBlockMsg, pkt); err != nil {
+				log.Trace("[XDC-P2P] Send NewBlock failed", "peer", p.ID(), "err", err)
+			}
+		}()
 	}
-	log.Debug("[XDC-P2P] Block broadcast complete",
-		"number", block.NumberU64(), "hash", block.Hash(), "peers", sent)
+	log.Debug("[XDC-P2P] Block broadcast started",
+		"number", block.NumberU64(), "hash", block.Hash(), "peers", len(peers))
 }

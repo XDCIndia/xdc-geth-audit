@@ -232,9 +232,9 @@ var eth70 = map[uint64]msgHandler{
 // adds the three XDPoS V2 consensus messages. XDC↔XDC peering goes through
 // this protocol so vote/timeout/sync-info gossip stays inside the fleet.
 var xdpos2 = map[uint64]msgHandler{
-	NewBlockHashesMsg:             handleNewBlockhashesXDC,
-	NewBlockMsg:                   handleNewBlockXDC,
-	TransactionsMsg:               handleTransactions,
+	NewBlockHashesMsg: handleNewBlockhashesXDC,
+	NewBlockMsg:       handleNewBlockXDC,
+	TransactionsMsg:   handleTransactions,
 	// A.60.3 (refs #857): msg code 0x08 is NewPooledTransactionHashesMsg on
 	// modern eth/68+ but OrderTxMsg on legacy XDPoSChain (XDC DEX order-tx
 	// broadcast). Routing inbound 0x08 from a legacy XDC peer through the
@@ -245,32 +245,68 @@ var xdpos2 = map[uint64]msgHandler{
 	// off the wire so the peer stays connected.
 	NewPooledTransactionHashesMsg: handleXDCTradingTxNoop,
 
+	GetBlockHeadersMsg: handleGetBlockHeaders,
+	BlockHeadersMsg:    handleBlockHeaders,
+	GetBlockBodiesMsg:  handleGetBlockBodies,
+	BlockBodiesMsg:     handleBlockBodies,
+	GetNodeDataMsg:     handleGetNodeData,
+	NodeDataMsg:        handleNodeData,
+	// A.60.1 (refs #857): GetReceipts on XDPOS2 carries the eth/63 bare-list
+	// wire shape `[]common.Hash`, NOT the eth/69+ {RequestId, hashes} wrapper.
+	// Routing inbound 0x0f through handleGetReceipts70 trips its decoder on
+	// the leading 32-byte hash trying to read a uint64 RequestId, fails with
+	// "rlp: input string too long for uint64", and the remote disconnects us.
+	GetReceiptsMsg: handleGetReceiptsXDPOS2,
+	// A.33: XDPOS2 ReceiptsMsg uses the bare-list wire shape (no RequestId),
+	// not eth/70's RequestId+FirstBlockReceiptIndex wrapper. Route incoming
+	// receipt responses through handleReceiptsXDPOS2 which decodes the bare
+	// shape and dispatches via stashed legacyReceiptsReqID.
+	ReceiptsMsg: handleReceiptsXDPOS2,
+	// A.60.3 (refs #857): msg code 0x09 is GetPooledTransactionsMsg on modern
+	// eth/68+ but LendingTxMsg on legacy XDPoSChain (XDC lending-protocol tx).
+	// Same routing-mismatch story as 0x08 above; drain to no-op.
+	GetPooledTransactionsMsg: handleXDCTradingTxNoop,
+	PooledTransactionsMsg:    handlePooledTransactions,
+	BlockRangeUpdateMsg:      handleBlockRangeUpdate,
+	VoteMsg:                  handleVoteMsg,
+	TimeoutMsg:               handleTimeoutMsg,
+	SyncInfoMsg:              handleSyncInfoMsg,
+}
+
+// xdpos2rid (XDPOS2RID=101) handler map. Identical to xdpos2 (100) except
+// that GetReceipts/Receipts use the eth/70 request-id shape, matching what
+// RequestReceipts sends for version > ETH69. GetBlockHeaders/BlockHeaders and
+// GetBlockBodies/BlockBodies also use the request-id path: handleGetBlockHeaders,
+// handleBlockHeaders, handleGetBlockBodies and handleBlockBodies all check
+// peer.Version() == XDPOS2 (100) — false for v101 — so they naturally fall
+// through to the standard eth/69+ dispatcher path without any code duplication.
+// Consensus messages (VoteMsg, TimeoutMsg, SyncInfoMsg) are unchanged. Refs #1861.
+var xdpos2rid = map[uint64]msgHandler{
+	NewBlockHashesMsg: handleNewBlockhashesXDC,
+	NewBlockMsg:       handleNewBlockXDC,
+	TransactionsMsg:   handleTransactions,
+	// A.60.3: same as xdpos2 — drain 0x08/0x09 to avoid legacy DEX/lending-tx
+	// decode mismatch; modern XDPOS2RID peers should not send these either.
+	NewPooledTransactionHashesMsg: handleXDCTradingTxNoop,
 	GetBlockHeadersMsg:            handleGetBlockHeaders,
 	BlockHeadersMsg:               handleBlockHeaders,
 	GetBlockBodiesMsg:             handleGetBlockBodies,
 	BlockBodiesMsg:                handleBlockBodies,
 	GetNodeDataMsg:                handleGetNodeData,
 	NodeDataMsg:                   handleNodeData,
-	// A.60.1 (refs #857): GetReceipts on XDPOS2 carries the eth/63 bare-list
-	// wire shape `[]common.Hash`, NOT the eth/69+ {RequestId, hashes} wrapper.
-	// Routing inbound 0x0f through handleGetReceipts70 trips its decoder on
-	// the leading 32-byte hash trying to read a uint64 RequestId, fails with
-	// "rlp: input string too long for uint64", and the remote disconnects us.
-	GetReceiptsMsg:                handleGetReceiptsXDPOS2,
-	// A.33: XDPOS2 ReceiptsMsg uses the bare-list wire shape (no RequestId),
-	// not eth/70's RequestId+FirstBlockReceiptIndex wrapper. Route incoming
-	// receipt responses through handleReceiptsXDPOS2 which decodes the bare
-	// shape and dispatches via stashed legacyReceiptsReqID.
-	ReceiptsMsg:                   handleReceiptsXDPOS2,
-	// A.60.3 (refs #857): msg code 0x09 is GetPooledTransactionsMsg on modern
-	// eth/68+ but LendingTxMsg on legacy XDPoSChain (XDC lending-protocol tx).
-	// Same routing-mismatch story as 0x08 above; drain to no-op.
-	GetPooledTransactionsMsg:      handleXDCTradingTxNoop,
-	PooledTransactionsMsg:         handlePooledTransactions,
-	BlockRangeUpdateMsg:           handleBlockRangeUpdate,
-	VoteMsg:                       handleVoteMsg,
-	TimeoutMsg:                    handleTimeoutMsg,
-	SyncInfoMsg:                   handleSyncInfoMsg,
+	// XDPOS2RID uses eth/70 receipt wire shape: {RequestId, FirstBlockReceiptIndex, receipts}.
+	// RequestReceipts for v101 sends GetReceiptsPacket70 (p.version > ETH69 path),
+	// so the server must decode with handleGetReceipts70 and reply via ReplyReceiptsRLP70.
+	// XDC receipt hashes are derived from receipt content, not wire framing, so the
+	// ReceiptHash in block headers is unaffected by this wire-format choice.
+	GetReceiptsMsg:           handleGetReceipts70,
+	ReceiptsMsg:              handleReceipts70,
+	GetPooledTransactionsMsg: handleXDCTradingTxNoop,
+	PooledTransactionsMsg:    handlePooledTransactions,
+	BlockRangeUpdateMsg:      handleBlockRangeUpdate,
+	VoteMsg:                  handleVoteMsg,
+	TimeoutMsg:               handleTimeoutMsg,
+	SyncInfoMsg:              handleSyncInfoMsg,
 }
 
 // handleNewBlockhashesXDC handles the legacy eth/63 NewBlockHashes message
@@ -366,6 +402,8 @@ func handleMessage(backend Backend, peer *Peer) error {
 		handlers = eth72
 	case XDPOS2:
 		handlers = xdpos2
+	case XDPOS2RID:
+		handlers = xdpos2rid
 	default:
 		return fmt.Errorf("unknown eth protocol version: %v", peer.version)
 	}

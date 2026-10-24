@@ -84,6 +84,9 @@ var (
 		Eip1559Block:        big.NewInt(98_800_200),     // XDPoSChain MainnetConstant.eip1559Block — Target 28th Jan 2026
 		CancunBlock:         big.NewInt(98_802_000),     // XDPoSChain MainnetConstant.cancunBlock — Target 28th Jan 2026
 		AmsterdamBlock:      big.NewInt(99_999_999_999), // Glamsterdam incl. EIP-7928 BAL: placeholder far-future block, not scheduled (#1644)
+		SigningTxBoundBlock: big.NewInt(99_999_999_999), // CertiK XDC-04/XDC-09: placeholder far-future block, scheduled with legacy (#1721)
+		ValidatorOrderBlock: big.NewInt(99_999_999_999), // CertiK XDC-11: placeholder far-future block, scheduled with legacy (#1722)
+		ParoleDedupBlock:    big.NewInt(99_999_999_999), // CertiK XDC-12: placeholder far-future block, scheduled with legacy (#1723)
 		XDPoS: &XDPoSConfig{
 			Period:              2,                                                                 // 2 second block time
 			Epoch:               900,                                                               // 900 blocks per epoch (~30 minutes)
@@ -1048,6 +1051,9 @@ var (
 		DynamicGasLimitBlock:   big.NewInt(83_600_000),     // XDPoSChain v2.9.3-testnet genesis/testnet.json dynamicGasLimitBlock
 		PragueBlock:            big.NewInt(84_333_000),     // XDPoSChain v3.0.0-testnet-1 genesis/testnet.json pragueBlock (#2815, moved from 87,633,000)
 		AmsterdamBlock:         big.NewInt(99_999_999_999), // Glamsterdam incl. EIP-7928 BAL: placeholder far-future block, not scheduled (#1644)
+		SigningTxBoundBlock:    big.NewInt(99_999_999_999), // CertiK XDC-04/XDC-09: placeholder far-future block, scheduled with legacy (#1721)
+		ValidatorOrderBlock:    big.NewInt(99_999_999_999), // CertiK XDC-11: placeholder far-future block, scheduled with legacy (#1722)
+		ParoleDedupBlock:       big.NewInt(99_999_999_999), // CertiK XDC-12: placeholder far-future block, scheduled with legacy (#1723)
 		XDPoS: &XDPoSConfig{
 			Period:              2,                                                                 // 2 second block time
 			Epoch:               900,                                                               // 900 blocks per epoch (~30 minutes)
@@ -2029,6 +2035,12 @@ type ChainConfig struct {
 	TIPUpgradeRewardBlock  *big.Int `json:"tipUpgradeRewardBlock,omitempty"`  // Tiered (masternode/protector/observer) reward fork; XDPoSChain v2.8.0 apothem: 83,600,000 (held disabled)
 	TIPUpgradePenaltyBlock *big.Int `json:"tipUpgradePenaltyBlock,omitempty"` // Penalty-upgrade fork; XDPoSChain v2.8.0 apothem: 83,600,000 (held disabled)
 	Gas2500xBlock          *big.Int `json:"gas2500xBlock,omitempty"`          // XDC gas price tier x2500 (base fee 625 gwei); XDPoSChain v2.9.x apothem: 83,600,000
+	// CertiK XDC-12 per-network fork-block field. nil = disabled on all networks.
+	ParoleDedupBlock *big.Int `json:"paroleDedupBlock,omitempty"` // Parole counting deduplicates (signer, signed-block-hash) pairs (CertiK XDC-12)
+	// CertiK XDC-11 per-network fork-block field. nil = disabled on all networks.
+	ValidatorOrderBlock *big.Int `json:"validatorOrderBlock,omitempty"` // Epoch-switch Validators must match calcMasternodes order exactly (CertiK XDC-11)
+	// CertiK XDC-04 / XDC-09 per-network fork-block field. nil = disabled on all networks.
+	SigningTxBoundBlock *big.Int `json:"signingTxBoundBlock,omitempty"` // ValidateBody rejects blocks with >2*MaxMasternodesV2 signing txs or size >MaxBlockSize (CertiK XDC-04, XDC-09)
 	// TIPSigningBlock is an explicit per-genesis override for the BlockSigners
 	// (0x89) contract-wipe fork block. Historically this value came ONLY from
 	// the hardcoded per-chainID table in common.CopyXDCConstants /
@@ -3321,6 +3333,40 @@ func (c *ChainConfig) IsTIPUpgradePenalty(num *big.Int) bool {
 	return isBlockForked(c.TIPUpgradePenaltyBlock, num)
 }
 
+// IsParoleDedup reports whether the parole-deduplication fork is active at num.
+// When active, HookPenalty counts each (signer, signed-block-hash) pair at most
+// once toward MinimumSigningTx, preventing a penalised candidate from satisfying
+// the threshold with duplicate signing transactions. nil = disabled on all
+// networks (CertiK XDC-12).
+func (c *ChainConfig) IsParoleDedup(num *big.Int) bool {
+	if c == nil {
+		return false
+	}
+	return isBlockForked(c.ParoleDedupBlock, num)
+}
+
+// IsValidatorOrder reports whether the validator-order enforcement fork is
+// active at num. When active, verifyHeader rejects epoch-switch headers whose
+// Validators field is not in the exact order returned by calcMasternodes.
+// nil = disabled on all networks (CertiK XDC-11).
+func (c *ChainConfig) IsValidatorOrder(num *big.Int) bool {
+	if c == nil {
+		return false
+	}
+	return isBlockForked(c.ValidatorOrderBlock, num)
+}
+
+// IsSigningTxBound reports whether the signing-tx count and block-size bounds
+// are active at num. When active, ValidateBody rejects blocks containing more
+// than 2×MaxMasternodesV2 signing transactions or whose RLP-encoded size
+// exceeds params.MaxBlockSize. nil = disabled on all networks (CertiK XDC-04, XDC-09).
+func (c *ChainConfig) IsSigningTxBound(num *big.Int) bool {
+	if c == nil {
+		return false
+	}
+	return isBlockForked(c.SigningTxBoundBlock, num)
+}
+
 // IsTIPXDCX checks if block number is past TIPXDCX fork (trading/lending enabled).
 func (c *ChainConfig) IsTIPXDCX(num *big.Int) bool {
 	return isBlockForked(xdcTIPBlock(c, func(c *ChainConfig) *big.Int { return c.TIPXDCXBlock }, common.TIPXDCX), num)
@@ -3398,11 +3444,11 @@ func (c *ChainConfig) CheckConfigForkOrder() error {
 		{name: "verkleTime", timestamp: c.VerkleTime, optional: true},
 		{name: "bpo1", timestamp: c.BPO1Time, optional: true},
 		{name: "bpo2", timestamp: c.BPO2Time, optional: true},
+		{name: "amsterdam", timestamp: c.AmsterdamTime, optional: true},
+		{name: "bogota", timestamp: c.BogotaTime, optional: true},
 		{name: "bpo3", timestamp: c.BPO3Time, optional: true},
 		{name: "bpo4", timestamp: c.BPO4Time, optional: true},
 		{name: "bpo5", timestamp: c.BPO5Time, optional: true},
-		{name: "amsterdam", timestamp: c.AmsterdamTime, optional: true},
-		{name: "bogota", timestamp: c.BogotaTime, optional: true},
 	} {
 		if lastFork.name != "" {
 			switch {
@@ -3569,6 +3615,15 @@ func (c *ChainConfig) checkCompatible(newcfg *ChainConfig, headNumber *big.Int, 
 	}
 	if isForkBlockIncompatible(c.AmsterdamBlock, newcfg.AmsterdamBlock, headNumber) {
 		return newBlockCompatError("Amsterdam fork block", c.AmsterdamBlock, newcfg.AmsterdamBlock)
+	}
+	if isForkBlockIncompatible(c.SigningTxBoundBlock, newcfg.SigningTxBoundBlock, headNumber) {
+		return newBlockCompatError("SigningTxBound fork block", c.SigningTxBoundBlock, newcfg.SigningTxBoundBlock)
+	}
+	if isForkBlockIncompatible(c.ValidatorOrderBlock, newcfg.ValidatorOrderBlock, headNumber) {
+		return newBlockCompatError("ValidatorOrder fork block", c.ValidatorOrderBlock, newcfg.ValidatorOrderBlock)
+	}
+	if isForkBlockIncompatible(c.ParoleDedupBlock, newcfg.ParoleDedupBlock, headNumber) {
+		return newBlockCompatError("ParoleDedup fork block", c.ParoleDedupBlock, newcfg.ParoleDedupBlock)
 	}
 	if isForkTimestampIncompatible(c.ShanghaiTime, newcfg.ShanghaiTime, headTimestamp) {
 		return newTimestampCompatError("Shanghai fork timestamp", c.ShanghaiTime, newcfg.ShanghaiTime)

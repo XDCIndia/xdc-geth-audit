@@ -108,7 +108,11 @@ func xdcHandshakeTD(latest *types.Header, chain interface{}) *big.Int {
 // pre-merge wire shape (StatusPacket62, no ForkID). Other versions use the
 // upstream StatusPacket shape.
 func (p *Peer) Handshake(networkID uint64, chain forkid.Blockchain, rangeMsg BlockRangeUpdatePacket) error {
-	if p.version == XDPOS2 {
+	// XDPOS2RID (101) uses the same legacy StatusPacket62 handshake as
+	// XDPOS2 (100): no ForkID, eth/63 wire shape. This keeps the handshake
+	// compatible with legacy peers and avoids splitting the capability
+	// negotiation between the two XDPOS2 versions. Refs #1861.
+	if p.version == XDPOS2 || p.version == XDPOS2RID {
 		return p.handshake62(networkID, chain)
 	}
 	var (

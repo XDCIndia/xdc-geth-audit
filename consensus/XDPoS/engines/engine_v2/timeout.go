@@ -40,11 +40,17 @@ func (x *XDPoS_v2) VerifyTimeoutMessage(chain consensus.ChainReader, timeoutMsg 
 		x.lock.Unlock()
 	}
 
+	// Snapshot currentRound under RLock.  setNewRound writes x.currentRound
+	// under x.lock.Lock(); reading it without any lock is a data race.
+	x.lock.RLock()
+	currentRound := x.currentRound
+	x.lock.RUnlock()
+
 	// Check if timeout round is current
-	if timeoutMsg.Round < x.currentRound {
+	if timeoutMsg.Round < currentRound {
 		log.Debug("[VerifyTimeoutMessage] Timeout round too old",
 			"timeoutRound", timeoutMsg.Round,
-			"currentRound", x.currentRound)
+			"currentRound", currentRound)
 		return false, nil
 	}
 
@@ -396,11 +402,17 @@ func (x *XDPoS_v2) verifyTC(chain consensus.ChainReader, timeoutCert *types.Time
 	// byte-distinct encoding of the SAME signer's timeout vote, so
 	// byte-dedup lets one masternode key inflate the counted total toward
 	// the 2/3 threshold — a BFT safety violation.
+	epochInfo, err := x.getTCEpochInfo(chain, timeoutCert)
+	if err != nil {
+		log.Error("[verifyTC] Failed to get TC epoch info", "tcRound", timeoutCert.Round, "error", err)
+		return err
+	}
+
 	signedTimeoutObj := types.TimeoutSigHash(&types.TimeoutForSign{
 		Round:     timeoutCert.Round,
 		GapNumber: timeoutCert.GapNumber,
 	})
-	signatures, duplicates, err := RecoverUniqueSigners(signedTimeoutObj, timeoutCert.Signatures)
+	signatures, duplicates, err := recoverUniqueSigners(signedTimeoutObj, timeoutCert.Signatures, epochInfo.Masternodes)
 	if err != nil {
 		log.Error("[verifyTC] Failed to recover TC signers", "tcRound", timeoutCert.Round, "error", err)
 		return err
@@ -412,11 +424,6 @@ func (x *XDPoS_v2) verifyTC(chain consensus.ChainReader, timeoutCert *types.Time
 		}
 	}
 	// Fix #64: Use TC's round epoch, not current chain head epoch.
-	epochInfo, err := x.getTCEpochInfo(chain, timeoutCert)
-	if err != nil {
-		log.Error("[verifyTC] Failed to get TC epoch info", "tcRound", timeoutCert.Round, "error", err)
-		return err
-	}
 
 	// Use per-round config for cert threshold (fix #63 benefit)
 	certThreshold := x.config.V2.Config(uint64(timeoutCert.Round)).CertThreshold
