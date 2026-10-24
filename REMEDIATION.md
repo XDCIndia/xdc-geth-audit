@@ -2,6 +2,108 @@
 
 Report: Hacken final report, 2026-10-13. Audited commit: `45e2b6ee`.
 
+## Third hand-over (24 October 2026): revalidate `5afddf3113f4458b2507c2b219f3c9caec741eae`
+
+Please revalidate the codebase at **`5afddf3113f4458b2507c2b219f3c9caec741eae`**, the head of branch **`audit/main-uplift-1179-xdc19`**. Its code commit is `e75e74047be864500d13af876880076c5b8def85`; the commit after it only adds a description at the top of AUDIT.md.
+
+- **Source:** XDCIndia/go-ethereum `24d7192e8c00`, which is release v1.17.9-xdc.19 plus later fixes.
+- **Code only, no tests.** This view excludes every `_test.go` file and every `testdata/` path (1,230 files), plus the non-code paths: docs, scripts, ops, CI and audit reports (182 paths).
+- Every remaining file is byte-identical to the source. `go build ./...` and `go vet ./...` pass on this tree.
+- **To check that no tests are included:** `git ls-tree -r --name-only 5afddf3113f4458b2507c2b219f3c9caec741eae | grep -cE '_test\.go$|(^|/)testdata/'` prints `0`.
+
+Areas we advise including, all changed since the previous revalidation commit `4bf67046816d5d2731c4f2bf78d9f327d7886618`:
+
+1. **Upstream go-ethereum v1.17.9 merge.**
+2. **CertiK findings XDC-07 to XDC-36 and P3**: QC/TC signer recovery, vote-pool caps, BFT broadcast, discovery reseed, txpool and sidechain bounds, reorg log ordering.
+3. **Consensus hardening from internal review**: signer locks, vote/timeout round locks, reward and penalty header errors, a pre-transaction state reward, epoch range limits, empty-gap-snapshot rejection, and the V1 engine path removed.
+4. **Sync** (snap/fast sync, history backfill, peer handling):
+   - **One trust change to review specifically:** under full verification, an epoch switch whose gap block lies below a snap or fast-sync pivot is accepted through the existing header fallback. No state exists locally for that gap. The leader seal, QC and signer-list checks all still run, and the gap snapshot is stored only after every check passes. All other full-verification failures remain fatal.
+   - **XDPOS2 protocol version 101**: version 100 plus request ids on the header, body and receipt messages. Legacy peers stay on 100, and consensus messages are unchanged.
+
+### Changes since `4bf67046816d` (source commits on XDCIndia/go-ethereum main, oldest first)
+
+| Source commit | Change |
+|---|---|
+| `19efdb071904` | Certik Audit |
+| `30d68b5fcdbe` | consensus/XDPoS: stop qc/tc recovery at the first non-masternode signer (CertiK P3) |
+| `ffe81e13da89` | consensus/XDPoS/utils: cap vote-pool entries to one per signer per round (CertiK XDC-07) |
+| `661a3c95d884` | consensus/XDPoS: include epoch-switch block in GetEpochSwitchInfoBetween when begin equals end (CertiK XDC-30) |
+| `f31eb0effbbe` | consensus/XDPoS: reject empty persisted v2 gap snapshots (CertiK XDC-35) |
+| `fee62fb21775` | eth: send bft broadcasts to peers without blocking on slow peers (CertiK XDC-13) |
+| `a2543b27ce00` | eth/downloader: cap nodedata responses to the requested item count (CertiK XDC-16) |
+| `9c2dbb7907bd` | p2p/discover: re-seed from bootnodes when the discovery table empties (CertiK XDC-33) |
+| `3f0f46353782` | p2p/discover: run the eip-868 test with xdc ping off |
+| `a6720ca64f0a` | core/txpool/legacypool: wait for tx events in the eviction test (CertiK XDC-31) |
+| `3c155e573e48` | core/txpool/legacypool: skip reset post-processing when pool reset fails (CertiK XDC-36) |
+| `940d3aa73e0b` | core/txpool/legacypool: decouple pool reset from txFeed subscriber delivery (CertiK XDC-15) |
+| `f48b2e4860ad` | core: nil-check GetBlock in insertSideChain pruned-ancestor loop (CertiK XDC-22) |
+| `f74525d3f3a4` | core: bound sidechain children per pruned parent (CertiK XDC-19) |
+| `5f6802d8b812` | core: emit reorg log events after the canonical indexes are written (CertiK XDC-26) |
+| `dcf0c22fc533` | consensus/XDPoS: initialise the v2 engine under the write lock in yourturn (review R1-A01) |
+| `27eab35189a3` | consensus/XDPoS: read currentround under the lock in vote and timeout verification (review R1-A02) |
+| `6c316911876d` | consensus/XDPoS: read the highest qc and tc under the lock in syncinfo verification (review R1-A03) |
+| `5b99e93d7fb8` | eth/hooks: return the reward-signers error instead of exiting (review R1-F01) |
+| `3b9612b1b329` | eth/hooks: return an error when a parent header is missing in the v2 penalty walk (review R1-F02) |
+| `9729cd6e892f` | consensus/XDPoS, miner: use pre-transaction state for v1 rewards when producing a block (review R1-F03) |
+| `8e85a272a189` | eth: require anchor on every ancestor prefetch batch, reject short responses (review R1-S02) |
+| `59f79508f397` | core/txpool/legacypool: do not lower pending nonce on expired signing-tx replacement (review R1-M01) |
+| `4d9602d0f338` | core/txpool/legacypool: restore the test file header (review R1-M02) |
+| `f0bf5bc1ff59` | consensus/XDPoS: remove unused default penalty hook functions (review R1-F04) |
+| `e96ecec7c20c` | consensus/XDPoS: move propose/discard to authenticated api and bound proposals map (review R1-R01) |
+| `0dc3f0819227` | consensus/XDPoS: reject epoch ranges spanning more than 1000 epochs (review R1-R02) |
+| `3ee3ba598c81` | consensus/XDPoS: report the configured chain id in networkinformation (review R1-R03) |
+| `e0909a30afaf` | internal/ethapi: return an error instead of panicking in proofpairlist delete (review R1-R04) |
+| `3c9a0036c66f` | eth: stop the rollback window from wrapping to zero (review R1-S01) |
+| `df62fd42d279` | eth: remove the unused snapkeepalive goroutine fan-out (review R1-S04) |
+| `d2db20d47a58` | core/vm/privacy: reject nil from deserializecompressed in ring signature (review R1-C01) |
+| `a63724e62ec1` | core/vm/privacy: fix uint32 overflow in deserializePointArray (review R2-P01) |
+| `8fd7a46ee5d3` | core/vm/privacy: guard EC global with mutex in MRPProve and MRPVerify (review R2-P02) |
+| `3af437366928` | core/vm/privacy: lower HashPoint log calls from Info to Trace (review R2-P03) |
+| `3b94fe4d7dc2` | consensus/XDPoS: read c.signer under c.lock in prepare and calcdifficulty (review R2-W01) |
+| `27aa394e4368` | consensus/XDPoS: guard forensics committed-qc state with a mutex (review R2-W02) |
+| `40c2bfb2dae6` | consensus/XDPoS: drop the unlocked signer read in the v2 calcdifficulty (review R2-W03) |
+| `6d1af01decd6` | consensus/XDPoS: bound the epoch range in getrewardbyaccount before folder scan (review R2-N01) |
+| `12f0646708a7` | node: delete unused xdc config file that holds a raw private-key field (review R2-N02) |
+| `7cf82f8c8c8d` | core/rawdb: remove unused xdc accessors and fix vote-prefix verkle overlap (review R2-N03) |
+| `be02caba3d02` | consensus/XDPoS: stop processforensics after the ancestor-qc lookup fails (review R2-W04) |
+| `2fe759f0dcf7` | eth: send minted block to peers without blocking the minter's own vote (review R2-D03) |
+| `ff429ee03f9e` | eth: match header and body responses to the xdcsyncer request (review R2-D01) |
+| `42cc47157eda` | eth: cancel delayed future-block handling on handler shutdown (review R2-D02) |
+| `53f1b74dff17` | eth: restore peer judgement for mismatched sync responses and accept partial bodies (review R2-D01) |
+| `50169c460835` | Merge origin/main into chore/merge-upstream-v1.17.9 |
+| `3ffc2cb5b81c` | core: sweep stale canonical hashes and tx-lookup entries on startup (CertiK XDC-21, XDC-27, XDC-28) |
+| `1ac91c62cb31` | params, core: add SigningTxBoundBlock fork and reject oversized/spam sign-tx blocks (CertiK XDC-04, XDC-09) |
+| `a097ef484e96` | Merge origin/main into fix/1722-validator-order |
+| `7624b1f4137d` | Merge origin/main into fix/1723-parole-dedup |
+| `65958074a752` | params, core: schedule certik rule blocks as far-future placeholders (CertiK XDC-04/09/11/12) |
+| `79f5cc0ad23a` | consensus/XDPoS: recheck switches accepted by the bulk-sync mismatch tolerance (CertiK XDC-10) |
+| `180b97317695` | params: guard certik rule blocks in checkcompatible (review R3-C01) |
+| `40d66a913837` | cmd/geth: fail start-up when the miner key cannot be unlocked (review R3-R03) |
+| `3ef042709ba5` | internal/ethapi: make GetStakerROIMasternode use its masternode argument (review R3-R04) |
+| `584db4585f8f` | node, consensus/XDPoS: remove the unwired health handler and event api (review R3-R02, R3-R05) |
+| `e6e1742ef395` | core/vm/privacy: propagate the inner-product decode error in the bulletproof verifier (review R3-P01) |
+| `a079609a377f` | eth: check the returned hash in fetchheaderbyhash (review R3-S01) |
+| `8957f64f75ae` | release: v1.17.9-xdc.19 changelog |
+| `5552a68c8647` | consensus/XDPoS: delete the unused engines/engine_v1 package (review R4-V1-01) |
+| `3cf0aaf348c4` | core/vm/privacy: guard ecpoint.neg against the point at infinity (review R4-P02) |
+| `485b4094056c` | consensus/XDPoS: write highestselfminedround under the engine lock in seal (review R4-W02) |
+| `8cefa3030bcc` | eth/protocols/eth: serve xdpos2 receipts in the consensus encoding (sync test SYNC-01) |
+| `70d9c4552a03` | eth: bound and race-proof the bulk-sync progress counters (sync test SYNC-03) |
+| `094384ea2e16` | eth: make required-block challenges work on xdpos2 and pin the apothem reset (sync test SYNC-04) |
+| `e6bf6c2b0ad6` | consensus/XDPoS: find the round-based epoch switch and clean up seeded snap info (sync test SYNC-02) |
+| `5fa29106b55e` | consensus/XDPoS, eth: verify backfilled qcs against their own epoch in fast sync (sync test SYNC-05) |
+| `62e6546a7509` | ethstats, eth: read the sync info through a backend method, not reflection |
+| `8a189c53336f` | consensus/XDPoS: bound the forensics ancestor-qc walk and guard a nil qc (review R5-F01) |
+| `545d2094bb20` | eth: allow one xdpos2 header and one body request in flight per peer (sync test SYNC-08) |
+| `7286ef6bb1b1` | eth: backfill chain history after xdc snap sync (sync test SYNC-06) |
+| `15cd80f4699b` | consensus/XDPoS, eth: skip qc verification for backfilled headers below the fast-sync anchor (sync test SYNC-09) |
+| `3e705b6df984` | core, eth: fast sync on path-scheme databases via snap state and header gap snapshots (sync test SYNC-07) |
+| `805831b498ed` | eth: read the required-block challenge timeout once per peer |
+| `c8e1ce914526` | consensus/XDPoS, eth: give snap and fast sync the gap snapshot for the first epoch switch after the pivot (sync test SYNC-11) |
+| `cec5aad61858` | eth/downloader: return a kept peer to idles after a reverted skeleton request (review R6-01) |
+| `24d7192e8c00` | eth, eth/protocols/eth: xdpos2 version 101 with request ids for header, body and receipt fetches (review SYNC-10) |
+
+
 ## Final commit
 
 **`4b6ba2d056a7a62740e6c0c6e67521e90fb34f10`**: the head code commit of the remediation branch `hacken/remediation-2026-10`. It is the first hand-over, the follow-up fixes, and the second-report fixes below. Use this commit for per-finding review.
@@ -10,7 +112,7 @@ Report: Hacken final report, 2026-10-13. Audited commit: `45e2b6ee`.
 - On top of `45e2b6ee`: the v1.17.8 audit view (upstream go-ethereum v1.17.8 base), merge `42f2db823550308bf34992bcfdd1bc77cc456340`, then one commit per finding.
 - Previous head code commit (before the second-report fixes): `37d91b8d95d7efe72b7dcd7abc8df9d9e409950e`.
 
-## Request: revalidate the codebase at `4bf67046816d5d2731c4f2bf78d9f327d7886618`
+## Previous request (second hand-over): revalidate the codebase at `4bf67046816d5d2731c4f2bf78d9f327d7886618`
 
 We ask Hacken to revalidate the codebase at **`4bf67046816d5d2731c4f2bf78d9f327d7886618`**, the head of branch `audit/main-uplift-1178-xdc15`. That commit is the current XDC client source (go-ethereum fork release v1.17.8-xdc.18 plus the fixes below) in the same code-only audit view: `git diff --name-only 4bf67046816d5d2731c4f2bf78d9f327d7886618 <source>` lists only the excluded upstream-history, ops and docs paths.
 
