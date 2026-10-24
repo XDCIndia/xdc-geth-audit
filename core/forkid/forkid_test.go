@@ -124,6 +124,7 @@ func TestCreation(t *testing.T) {
 				// XDC: Hoodi genesis hash differs from upstream due to XDC ChainConfig struct
 				// fields (AmsterdamBlock, XDPoS etc.) producing a different genesis. These
 				// values are computed from the XDC fork's actual DefaultHoodiGenesisBlock().
+				// Amsterdam is reverted on Hoodi (upstream #36001) so BPO2 is the last fork.
 				{0, 0, ID{Hash: checksumToBytes(0x8622e2af), Next: 1742999832}},            // Unsynced, last Frontier, Homestead, Tangerine, Spurious, Byzantium, Constantinople, Petersburg, Istanbul, Berlin, London, Paris, Shanghai, Cancun block
 				{123, 1742999831, ID{Hash: checksumToBytes(0x8622e2af), Next: 1742999832}}, // Last Cancun block
 				{123, 1742999832, ID{Hash: checksumToBytes(0xbe1d70f8), Next: 1761677592}}, // First Prague block
@@ -132,10 +133,8 @@ func TestCreation(t *testing.T) {
 				{123, 1762365719, ID{Hash: checksumToBytes(0xb222ce75), Next: 1762365720}}, // Last Osaka block
 				{123, 1762365720, ID{Hash: checksumToBytes(0x0c9e2f67), Next: 1762955544}}, // First BPO1 block
 				{123, 1762955543, ID{Hash: checksumToBytes(0x0c9e2f67), Next: 1762955544}}, // Last BPO1 block
-				{123, 1762955544, ID{Hash: checksumToBytes(0x425235a4), Next: 1793036568}}, // First BPO2 block
-				{123, 1793036567, ID{Hash: checksumToBytes(0x425235a4), Next: 1793036568}}, // Last BPO2 block
-				{123, 1793036568, ID{Hash: checksumToBytes(0x7b735858), Next: 0}},          // First Amsterdam block
-				{123, 2000000000, ID{Hash: checksumToBytes(0x7b735858), Next: 0}},          // Future Amsterdam block
+				{123, 1762955544, ID{Hash: checksumToBytes(0x425235a4), Next: 0}},          // First BPO2 block (last scheduled fork)
+				{123, 2000000000, ID{Hash: checksumToBytes(0x425235a4), Next: 0}},          // Future BPO2 block
 			},
 		},
 	}

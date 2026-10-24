@@ -51,6 +51,7 @@ import (
 	"github.com/ethereum/go-ethereum/metrics"
 	"github.com/ethereum/go-ethereum/p2p"
 	"github.com/ethereum/go-ethereum/p2p/enode"
+	"github.com/ethereum/go-ethereum/params"
 )
 
 const (
@@ -127,8 +128,47 @@ type handlerConfig struct {
 	Sync             ethconfig.SyncMode     // Whether to snap or full sync
 	BloomCache       uint64                 // Megabytes to alloc for snap sync bloom
 	RequiredBlocks   map[uint64]common.Hash // Hard coded map of required block hashes for sync challenges
-	SnapV2           bool                   // Whether to advertise and sync via the snap/2 protocol
+	SnapV2           *bool                  // Snap/2 state syncer: on, off, or nil for automatic
 	FetchProbability uint64                 // Full blob fetch probability for sparse blobpool (blobFetcher)
+}
+
+// snapV2AutoDelay is how long Amsterdam must have been active before the snap/2
+// state syncer is used.
+const snapV2AutoDelay = time.Hour
+
+// resolveSnapV2 decides whether the snap/2 state syncer is used. snap/2 heals
+// with block access lists, so it is only used once Amsterdam has been active
+// for snapV2AutoDelay, even if requested explicitly. Without an explicit
+// setting, snap/2 is then picked automatically unless an unfinished snap/1
+// sync is resumed.
+//
+// XDC: on XDPoS chains (config.XDPoS != nil) the automatic selection is
+// suppressed. snap/2 requires block access lists (BAL) from Amsterdam blocks;
+// the XDC fleet runs snap/1 and has not validated BAL-based healing. An
+// operator may still opt in explicitly with --snap.v2=true.
+func resolveSnapV2(explicit *bool, config *params.ChainConfig, db ethdb.Database) bool {
+	if explicit != nil && !*explicit {
+		return false
+	}
+	// XDC: suppress automatic snap/2 selection on XDPoS chains.
+	if explicit == nil && config.XDPoS != nil {
+		return false
+	}
+	if config.AmsterdamTime == nil || uint64(time.Now().Add(-snapV2AutoDelay).Unix()) < *config.AmsterdamTime {
+		if explicit != nil {
+			amsterdam := "unscheduled"
+			if config.AmsterdamTime != nil {
+				amsterdam = fmt.Sprint(*config.AmsterdamTime)
+			}
+			log.Warn("Snap/2 requested before Amsterdam, falling back to snap/1", "amsterdam", amsterdam)
+		}
+		return false
+	}
+	if explicit == nil && snap.HasLegacySyncProgress(db) {
+		log.Info("Resuming unfinished snap/1 sync, snap/2 deferred to a fresh sync")
+		return false
+	}
+	return true
 }
 
 type handler struct {
@@ -189,7 +229,11 @@ func newHandler(config *handlerConfig) (*handler, error) {
 		handlerStartCh: make(chan struct{}),
 	}
 	// Construct the downloader (long sync)
-	h.downloader = downloader.New(config.Database, config.Sync, h.chain, h.removePeer, h.enableSyncedFeatures, config.SnapV2)
+	snapV2 := resolveSnapV2(config.SnapV2, config.Chain.Config(), config.Database)
+	h.downloader = downloader.New(config.Database, config.Sync, h.chain, h.removePeer, h.enableSyncedFeatures, snapV2)
+	if h.downloader.ConfigSyncMode() == ethconfig.SnapSync {
+		log.Info("Selected snap sync state syncer", "version", h.downloader.SnapSyncVersion())
+	}
 
 	// XDC gap-pivot enumeration — Phase A.5 of #844.
 	// Inject the chain config (for gap formula) and a snapshot callback so
