@@ -113,8 +113,21 @@ const (
 	// answer. Hard timeout is still xdcBulkReqTimeout (4 s).
 	xdcBodyHedgeDelay = 800 * time.Millisecond
 
+	// SYNC-12 (#1869): if the importer has waited this long for a lookahead range
+	// (headers + bodies from one peer), or that peer returned nothing, fetch the
+	// same range from another peer and take the first complete answer. Without it
+	// one silent peer ended the round and discarded every later range.
+	xdcLookaheadHedgeDelay = 1200 * time.Millisecond
+
+	// SYNC-12 (#1869): the lookahead is a sliding window. Each imported range
+	// hands its peer the next range past the window, so xdcLookaheadStreams
+	// ranges stay in flight instead of the pipeline draining every round. One
+	// fullSyncOnce call imports at most this many lookahead ranges (~12k blocks)
+	// so the syncer loop's other duties still run between calls.
+	xdcLookaheadMaxRanges = 96
+
 	xdcMaxBackToBackRounds = 8   // A.75: max consecutive rounds per maybeSync invocation; avoids starving heartbeat
-	xdcLookaheadStreams    = 3   // A.77: extra ranges pre-fetched concurrently from other peers while range-0 body+IC runs
+	xdcLookaheadStreams    = 12  // A.77: extra ranges pre-fetched concurrently from other peers while range-0 body+IC runs. SYNC-12 (#1869): 3→12; import is ~35 ms per range, so 3 streams left the importer idle waiting on peers.
 	xdcLookaheadRangeSize  = 128 // A.77: assumed peer batch size per range (protocol cap observed in practice)
 
 	// Self-healing rollback when the local tip is stuck on a V2 BFT
@@ -2489,12 +2502,34 @@ func (s *xdcSyncer) fullSyncOnce() {
 	// assigned peer, so range N's bodies are already in flight while range N-1 imports.
 	// The collection loop uses pre-fetched bodies and skips the per-range fetchBodiesBatch
 	// call. If the goroutine times out on bodies, the collection loop returns (no retry).
-	type lookaheadResult struct {
-		peer    *eth.Peer
-		headers []*types.Header
-		bodies  []eth.BlockBody // SYNC-12: pre-fetched; nil if header or body fetch failed
-	}
 	lookaheadChs := make([]chan *lookaheadResult, 0, xdcLookaheadStreams)
+	lookaheadPeers := make([]*eth.Peer, 0, xdcLookaheadStreams)
+	busy := map[string]bool{peer.ID(): true} // peers already given a range this round
+	fetchRange := func(outCh chan *lookaheadResult, lhPeer *eth.Peer, from uint64) {
+		hdrs := s.fetchHeaderBatchTimeout(lhPeer, from, xdcLookaheadRangeSize, xdcBulkReqTimeout)
+		if len(hdrs) > 0 && hdrs[0].Number.Uint64() != from { // #1423: not the range we asked for
+			s.taintPeer(lhPeer)
+			hdrs = nil
+		}
+		// SYNC-12: pipeline — fetch bodies on the same peer immediately after
+		// headers, while range-0 body+IC runs concurrently on a different peer.
+		var bodies []eth.BlockBody
+		if len(hdrs) > 0 {
+			lhHashes := make([]common.Hash, len(hdrs))
+			for i, h := range hdrs {
+				lhHashes[i] = h.Hash()
+			}
+			bodies = s.fetchBodiesBatchTimeout(lhPeer, lhHashes, xdcBulkReqTimeout)
+		}
+		outCh <- &lookaheadResult{peer: lhPeer, headers: hdrs, bodies: bodies}
+	}
+	launch := func(p *eth.Peer, from uint64) {
+		ch := make(chan *lookaheadResult, 2) // room for the stream and one hedge
+		go fetchRange(ch, p, from)
+		busy[p.ID()] = true
+		lookaheadChs = append(lookaheadChs, ch)
+		lookaheadPeers = append(lookaheadPeers, p)
+	}
 	{
 		lhIdx := 0
 		for _, c := range candidates {
@@ -2509,26 +2544,7 @@ func (s *xdcSyncer) fullSyncOnce() {
 			// #1429: every range is xdcLookaheadRangeSize blocks, so range lhIdx+1
 			// starts right after range lhIdx ends.
 			lhFrom := fromBlock + uint64(lhIdx+1)*xdcLookaheadRangeSize
-			ch := make(chan *lookaheadResult, 1)
-			go func(outCh chan *lookaheadResult, lhPeer *eth.Peer, from uint64) {
-				hdrs := s.fetchHeaderBatchTimeout(lhPeer, from, xdcLookaheadRangeSize, xdcBulkReqTimeout)
-				if len(hdrs) > 0 && hdrs[0].Number.Uint64() != from { // #1423: not the range we asked for
-					s.taintPeer(lhPeer)
-					hdrs = nil
-				}
-				// SYNC-12: pipeline — fetch bodies on the same peer immediately after
-				// headers, while range-0 body+IC runs concurrently on a different peer.
-				var bodies []eth.BlockBody
-				if len(hdrs) > 0 {
-					lhHashes := make([]common.Hash, len(hdrs))
-					for i, h := range hdrs {
-						lhHashes[i] = h.Hash()
-					}
-					bodies = s.fetchBodiesBatchTimeout(lhPeer, lhHashes, xdcBulkReqTimeout)
-				}
-				outCh <- &lookaheadResult{peer: lhPeer, headers: hdrs, bodies: bodies}
-			}(ch, c, lhFrom)
-			lookaheadChs = append(lookaheadChs, ch)
+			launch(c, lhFrom)
 			lhIdx++
 		}
 		if len(lookaheadChs) > 0 {
@@ -2575,7 +2591,7 @@ func (s *xdcSyncer) fullSyncOnce() {
 		head.Number.Cmp(xdpos.V2.SwitchBlock) > 0 &&
 		s.handler.chain.HasBlockAndState(blocks[0].ParentHash(), head.Number.Uint64())
 	if blocks[0].ParentHash() == head.Hash() || sideParentV2 {
-		n, err = s.handler.chain.InsertChain(blocks)
+		n, err = s.insertChainResume(blocks)
 	}
 	if err != nil {
 		log.Warn("xdcSyncer: InsertChain failed",
@@ -2708,13 +2724,34 @@ func (s *xdcSyncer) fullSyncOnce() {
 	// just waits for the goroutine result and imports immediately.
 	// Wait up to 2×xdcBulkReqTimeout per range (goroutine does two serial requests).
 	// Stop at the first empty header/body batch or non-contiguous range.
-	for _, ch := range lookaheadChs {
-		var lhRes *lookaheadResult
-		select {
-		case lhRes = <-ch:
-		case <-time.After(2 * xdcBulkReqTimeout):
-			return
-		case <-s.quitCh:
+	for i := 0; i < len(lookaheadChs); i++ {
+		ch := lookaheadChs[i]
+		lhRes := s.awaitLookaheadRange(ch, func() bool {
+			// SYNC-12 hedge: the best-ranked peer not yet used this round, else
+			// any peer other than the stream's own.
+			lhFrom := fromBlock + uint64(i+1)*xdcLookaheadRangeSize
+			var alt *eth.Peer
+			for _, c := range s.bodyRankedCandidates(candidates) {
+				if c.ID() == lookaheadPeers[i].ID() || s.isPeerTainted(c.ID()) {
+					continue
+				}
+				if !busy[c.ID()] {
+					alt = c
+					break
+				}
+				if alt == nil {
+					alt = c
+				}
+			}
+			if alt == nil {
+				return false
+			}
+			busy[alt.ID()] = true
+			log.Debug("xdcSyncer: lookahead hedge", "from", lhFrom, "slow", lookaheadPeers[i].ID()[:8], "hedge", alt.ID()[:8])
+			go fetchRange(ch, alt, lhFrom)
+			return true
+		})
+		if lhRes == nil {
 			return
 		}
 		if len(lhRes.headers) == 0 {
@@ -2742,7 +2779,7 @@ func (s *xdcSyncer) fullSyncOnce() {
 		// #1423: same head-extension check as range 0.
 		lhN, lhErr := 0, consensus.ErrUnknownAncestor
 		if lhBlocks[0].ParentHash() == s.handler.chain.CurrentBlock().Hash() {
-			lhN, lhErr = s.handler.chain.InsertChain(lhBlocks)
+			lhN, lhErr = s.insertChainResume(lhBlocks)
 		}
 		if lhErr != nil {
 			log.Warn("xdcSyncer: A.77 lookahead InsertChain failed",
@@ -2758,6 +2795,13 @@ func (s *xdcSyncer) fullSyncOnce() {
 			"from", lhFrom, "count", lhN,
 			"newHead", s.handler.chain.CurrentBlock().Number.Uint64())
 
+		// SYNC-12 sliding window: the peer that delivered this full range is
+		// free, so give it the next range past the window. A short range means
+		// the peer has nothing further; the window then just drains.
+		if len(lhRes.headers) == xdcLookaheadRangeSize && len(lookaheadChs) < xdcLookaheadMaxRanges && !s.isPeerTainted(lhRes.peer.ID()) {
+			launch(lhRes.peer, fromBlock+uint64(len(lookaheadChs)+1)*xdcLookaheadRangeSize)
+		}
+
 		// Same highestQC advance for lookahead batches (canonical parity).
 		if engine, ok := s.handler.chain.Engine().(*XDPoS.XDPoS); ok {
 			go func(h *types.Header) {
@@ -2766,6 +2810,73 @@ func (s *xdcSyncer) fullSyncOnce() {
 						"block", h.Number, "hash", h.Hash(), "err", err)
 				}
 			}(lhBlocks[len(lhBlocks)-1].Header())
+		}
+	}
+}
+
+// insertChainResume imports blocks and, if the import stopped part-way with
+// ErrUnknownAncestor, imports the rest once more. In bulk sync a batch that
+// spans a V1 gap block can fail the XDPoS V1 snapshot walk-back a few blocks
+// later ("parents mismatch AND chain miss") although every parent is in the
+// batch; the same blocks import cleanly once their parents are committed. On
+// Apothem this ended a bulk-sync call every ~15 s. Validation is unchanged:
+// both attempts are full InsertChain calls. SYNC-12, refs #1869.
+func (s *xdcSyncer) insertChainResume(blocks types.Blocks) (int, error) {
+	n, err := s.handler.chain.InsertChain(blocks)
+	if err != nil && n > 0 && n < len(blocks) && errors.Is(err, consensus.ErrUnknownAncestor) {
+		m, err2 := s.handler.chain.InsertChain(blocks[n:])
+		log.Debug("xdcSyncer: resumed partial import", "from", blocks[n].NumberU64(), "inserted", m, "err", err2)
+		return n + m, err2
+	}
+	return n, err
+}
+
+// lookaheadResult is one A.77 lookahead range fetched from peer.
+type lookaheadResult struct {
+	peer    *eth.Peer
+	headers []*types.Header
+	bodies  []eth.BlockBody // SYNC-12: pre-fetched; nil if header or body fetch failed
+}
+
+// awaitLookaheadRange waits for one lookahead range on ch. If no complete
+// answer (headers and bodies) arrives within xdcLookaheadHedgeDelay, or the
+// first answer is incomplete, it calls hedge once to fetch the same range from
+// another peer, then returns the first complete answer. It returns the last
+// incomplete answer when every fetch came back incomplete, and nil on the
+// 2×xdcBulkReqTimeout deadline or shutdown. SYNC-12, refs #1869.
+func (s *xdcSyncer) awaitLookaheadRange(ch chan *lookaheadResult, hedge func() bool) *lookaheadResult {
+	hedgeTimer := time.NewTimer(xdcLookaheadHedgeDelay)
+	defer hedgeTimer.Stop()
+	deadline := time.NewTimer(2 * xdcBulkReqTimeout)
+	defer deadline.Stop()
+	pending, hedged := 1, false
+	for {
+		select {
+		case r := <-ch:
+			pending--
+			if len(r.headers) > 0 && len(r.bodies) > 0 {
+				return r
+			}
+			if !hedged {
+				hedged = true
+				if hedge() {
+					pending++
+				}
+			}
+			if pending == 0 {
+				return r
+			}
+		case <-hedgeTimer.C:
+			if !hedged {
+				hedged = true
+				if hedge() {
+					pending++
+				}
+			}
+		case <-deadline.C:
+			return nil
+		case <-s.quitCh:
+			return nil
 		}
 	}
 }

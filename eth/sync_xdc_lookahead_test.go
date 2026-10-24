@@ -28,7 +28,7 @@ import (
 // range 0's import ends, import cleanly, and never feed the fork-rollback
 // trigger. Refs #1429.
 func TestFullSyncLookaheadContiguous(t *testing.T) {
-	n := newXDCFakeNet(t, 0, 640)
+	n := newXDCFakeNet(t, 0, xdcLookaheadRangeSize*(1+xdcLookaheadStreams))
 	// SYNC-12: fetchHeadersParallel races the top xdcHeaderRacePeers peers; the
 	// remaining xdcLookaheadStreams peers serve the lookahead ranges.
 	var peers []*fakeXDCPeer
@@ -51,7 +51,8 @@ func TestFullSyncLookaheadContiguous(t *testing.T) {
 	for _, p := range peers {
 		p.mu.Lock()
 		for _, o := range p.headerReqs {
-			if o != 1 {
+			// The sliding window also asks for the range past the chain end.
+			if o != 1 && o <= want {
 				lookahead = append(lookahead, o)
 			}
 		}
@@ -64,6 +65,28 @@ func TestFullSyncLookaheadContiguous(t *testing.T) {
 	}
 	if !slices.Equal(lookahead, wantStarts) {
 		t.Errorf("lookahead range starts = %v, want %v", lookahead, wantStarts)
+	}
+}
+
+// TestFullSyncLookaheadSlidingWindow checks that the lookahead keeps refilling
+// its window: one fullSyncOnce call syncs a chain twice as long as range 0 plus
+// xdcLookaheadStreams ranges. SYNC-12, refs #1869.
+func TestFullSyncLookaheadSlidingWindow(t *testing.T) {
+	want := 2 * xdcLookaheadRangeSize * (1 + xdcLookaheadStreams)
+	n := newXDCFakeNet(t, 0, want)
+	for i := 0; i < xdcHeaderRacePeers+xdcLookaheadStreams; i++ {
+		n.addPeer(t, byte(i+1), n.canonicalHeaders)
+	}
+	s := n.newTestXDCSyncer(t)
+
+	s.fullSyncOnce()
+
+	if head := n.chain.CurrentBlock().Number.Uint64(); head != uint64(want) {
+		t.Errorf("head after one call = %d, want %d", head, want)
+	}
+	if s.stuckFrom != 0 || s.stuckFailures != 0 || core.XdcForkRecovering.Load() {
+		t.Errorf("sliding window fed the rollback trigger: stuckFrom=%d stuckFailures=%d forkRecovering=%v",
+			s.stuckFrom, s.stuckFailures, core.XdcForkRecovering.Load())
 	}
 }
 
