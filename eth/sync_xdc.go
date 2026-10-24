@@ -3760,6 +3760,18 @@ func (s *xdcSyncer) isConsensusFailedBlock(hash common.Hash) bool {
 // don't run off the batch top.
 const snapPivotBackoff uint64 = 1024
 
+// snapPeerMaxLag is how far a snap-capable peer's head may trail the reference
+// tip and still be used for the snap pivot. A modern peer that is itself still
+// syncing reports a head far behind the network; pivoting on it makes snap sync
+// a node to that old block (#1876).
+const snapPeerMaxLag uint64 = 4 * snapPivotBackoff
+
+// snapPeerCurrent reports whether a snap peer at head is close enough to the
+// reference tip ref to serve as the snap pivot source.
+func snapPeerCurrent(head, ref uint64) bool {
+	return head+snapPeerMaxLag >= ref
+}
+
 // fetchPeerHeadHeader walks connected peers, fetches each peer's FULL
 // header at their announced LatestBlockHash, then picks the LOWEST head
 // among snap-capable peers — the archive is the slowest to import (more
@@ -3799,6 +3811,21 @@ func (s *xdcSyncer) fetchPeerHeadHeader() *types.Header {
 			continue
 		}
 		heads = append(heads, peerHead{peer: p, hdr: headHdr})
+	}
+	// #1876: drop snap peers that are still syncing. The reference tip is the
+	// one fast sync uses (the best-ranked peer's announced head). Without one,
+	// keep every peer as before.
+	if ref := s.refreshOperatorPivotHead(); ref != nil {
+		kept := heads[:0]
+		for _, h := range heads {
+			if snapPeerCurrent(h.hdr.Number.Uint64(), ref.Number.Uint64()) {
+				kept = append(kept, h)
+			} else {
+				log.Debug("xdcSyncer: snap peer behind reference tip, skipped",
+					"peer", h.peer.ID()[:12], "head", h.hdr.Number.Uint64(), "ref", ref.Number.Uint64())
+			}
+		}
+		heads = kept
 	}
 	if len(heads) == 0 {
 		return nil
