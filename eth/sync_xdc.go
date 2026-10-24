@@ -2135,7 +2135,7 @@ func (s *xdcSyncer) snapEventLoop() {
 				case downloader.SyncStarted:
 					log.Info("xdcSyncer: SyncStarted observed (snap)", "mode", ev.Mode)
 				case downloader.SyncCompleted:
-					log.Info("xdcSyncer: snap-sync complete; transitioning to TIP_CATCH",
+					log.Info("xdcSyncer: snap-sync complete; seeding gap snapshots before TIP_CATCH (SYNC-11)",
 						"pivot", s.snapPivotBlock(),
 						"latest", func() string {
 							if ev.Latest == nil {
@@ -2143,6 +2143,13 @@ func (s *xdcSyncer) snapEventLoop() {
 							}
 							return ev.Latest.Number.String()
 						}())
+					// SYNC-11 (refs #1863): seed V2 masternode snapshots for every gap block
+					// at or below the state-download pivot whose state was never executed.
+					// Runs synchronously here — snapBeaconStarted stays true so concurrent
+					// sync ticks remain in SNAP_RUNNING (snapRunningCheck returns immediately)
+					// until seeding completes, preventing TIP_CATCH from importing blocks
+					// before the snapshots exist. Analogous to A.97.4 for fast sync (#1862).
+					s.seedSnapPivotGapSnapshots()
 					s.snapPhase.Store(int32(phaseTipCatch))
 					s.snapBeaconStarted.Store(false)
 					// SYNC-06: kick the post-snap history backfill as a background
@@ -4148,6 +4155,296 @@ func (s *xdcSyncer) reapplyA70Seeds() {
 	}
 	log.Info("xdcSyncer: A.70 re-seeded V2 masternode snapshots post-SyncCompleted",
 		"gap_reseeds", gapSeeds, "anchor_reseeds", anchorSeeds, "total_cached", len(s.a70SeedCache))
+}
+
+// seedSnapPivotGapSnapshots seeds V2 masternode snapshots for every XDPoS gap
+// block that is strictly below the snap state-download pivot (and therefore
+// was never executed — its state is absent). This is the snap-sync analogue of
+// the A.97.4 embedded-header fallback for fast sync (refs #1862).
+//
+// After a snap sync the skeleton delivers headers from pivotNum..peerHead but
+// NOT the historical headers below pivotNum. The epoch-switch header for the
+// epoch containing pivotNum is typically above the pivot (in the skeleton range)
+// and therefore accessible via chain.GetHeaderByNumber. The epoch-switch header
+// for the epoch immediately below the pivot is NOT in the local DB yet (it will
+// be fetched by runSnapHistoryBackfill, which runs concurrently). To eliminate
+// the race between history backfill and TIP_CATCH block import, we fetch any
+// missing epoch-switch headers from a peer here, synchronously, before TIP_CATCH
+// begins.
+//
+// Security: peer-fetched headers for gaps whose switch is also below the pivot
+// are authenticated against the local canonical pivot header via a parent-hash
+// chain proof (fetchVerifiedHeaderRange). A malicious peer that sends a forged
+// switch header (wrong Validators) cannot produce a valid chain ending at the
+// locally-trusted pivot hash, so the forged range is rejected and the next peer
+// is tried. Only the gap(s) whose switch must be peer-fetched need this full
+// verification; gaps whose switch is already in the local DB (above the pivot)
+// use the trusted local switch header directly.
+//
+// Consensus equivalence: header.Validators for a V2 epoch-switch header is the
+// canonical active-masternode list written by calcMasternodes and verified by
+// QC signatures from the previous epoch's validators. Using it here is the same
+// trust model as A.97.4 (#1862). Gap blocks at or above the pivot have state
+// available and are handled by the normal UpdateMasternodesFromHeader path.
+//
+// Called synchronously from snapEventLoop at SyncCompleted while
+// snapBeaconStarted is still true, so concurrent sync ticks remain in
+// SNAP_RUNNING and block import cannot start until seeding completes.
+// Refs #1863 SYNC-11.
+func (s *xdcSyncer) seedSnapPivotGapSnapshots() {
+	// Use the state-download pivot recorded by snapRunningCheck.
+	pivotNum := s.snapHistoryPivot.Load()
+	if pivotNum == 0 {
+		if p := rawdb.ReadLastPivotNumber(s.handler.database); p != nil {
+			pivotNum = *p
+		}
+	}
+	if pivotNum == 0 {
+		log.Debug("xdcSyncer: snap gap seed skipped — pivot not recorded")
+		return
+	}
+
+	// Trusted anchor: the local canonical pivot header authenticates all
+	// peer-fetched ranges via the parent-hash chain proof in fetchVerifiedHeaderRange.
+	pivotHeader := s.handler.chain.GetHeaderByNumber(pivotNum)
+	if pivotHeader == nil {
+		log.Warn("xdcSyncer: snap gap seed skipped — pivot header not in local DB", "pivot", pivotNum)
+		return
+	}
+
+	xdposEngine, ok := s.handler.chain.Engine().(*XDPoS.XDPoS)
+	if !ok {
+		log.Debug("xdcSyncer: snap gap seed skipped — engine is not XDPoS")
+		return
+	}
+	v2Engine, ok := xdposEngine.EngineV2.(*engine_v2.XDPoS_v2)
+	if !ok || v2Engine == nil {
+		log.Debug("xdcSyncer: snap gap seed skipped — V2 engine not initialised")
+		return
+	}
+	cfg := s.handler.chain.Config()
+	if cfg == nil || cfg.XDPoS == nil {
+		log.Debug("xdcSyncer: snap gap seed skipped — XDPoS config absent")
+		return
+	}
+	epoch := cfg.XDPoS.Epoch
+	gap := cfg.XDPoS.Gap
+	if epoch == 0 || gap == 0 || gap >= epoch {
+		log.Warn("xdcSyncer: snap gap seed skipped — invalid epoch/gap config",
+			"epoch", epoch, "gap", gap)
+		return
+	}
+	v2Switch := uint64(0)
+	if cfg.XDPoS.V2 != nil && cfg.XDPoS.V2.SwitchBlock != nil {
+		v2Switch = cfg.XDPoS.V2.SwitchBlock.Uint64()
+	}
+
+	// Enumerate gap blocks below the pivot that need seeding. This mirrors the
+	// computePivotGapNumbers logic in eth/downloader/gap_pivot_xdc.go (inlined
+	// here to keep the downloader package's unexported function private).
+	epochBase := pivotNum - pivotNum%epoch
+	var baseGap uint64
+	if epochBase >= gap {
+		baseGap = epochBase - gap
+	} else {
+		baseGap = epoch - gap // genesis-era: first gap is at epoch-gap
+	}
+
+	seeded := 0
+	for gapNum := baseGap; gapNum < pivotNum; gapNum += epoch {
+		if gapNum == 0 {
+			continue // skip genesis block
+		}
+		// SYNC-11 (#1863): V2 epoch switches happen by round, so the switch block
+		// can be anywhere in [gapNum+gap, gapNum+gap+epoch). Scan instead of using
+		// the fixed offset (gapNum+gap) which misses drifted switches.
+		scanStart := gapNum + gap
+		scanEnd := gapNum + gap + epoch
+		if scanStart <= v2Switch {
+			continue // entire switch range is pre-V2; no V2 snapshot needed
+		}
+
+		// Step 1: scan local DB in [scanStart, scanEnd). After SyncCompleted the
+		// skeleton has delivered headers from pivotNum to head, so headers above
+		// the pivot are available via GetHeaderByNumber.
+		var epochSwitchHdr *types.Header
+		for n := scanStart; n < scanEnd; n++ {
+			h := s.handler.chain.GetHeaderByNumber(n)
+			if h == nil {
+				continue
+			}
+			isSwitch, _, err := v2Engine.IsEpochSwitch(h)
+			if err != nil || !isSwitch {
+				continue
+			}
+			// Confirm the switch's own gap formula maps back to gapNum.
+			base := n - n%epoch
+			var derivedGap uint64
+			if base >= gap {
+				derivedGap = base - gap
+			}
+			if derivedGap != gapNum {
+				continue
+			}
+			epochSwitchHdr = h
+			break
+		}
+
+		gapHdr := s.handler.chain.GetHeaderByNumber(gapNum)
+
+		// Step 2: if the switch was not found locally AND part of the scan range
+		// is below the pivot (not yet delivered by the skeleton), peer-fetch that
+		// portion and scan the authenticated range.
+		if epochSwitchHdr == nil && scanStart < pivotNum {
+			fetchEnd := pivotNum
+			if scanEnd < pivotNum {
+				fetchEnd = scanEnd
+			}
+			verified := s.fetchVerifiedHeaderRange(gapNum, fetchEnd, pivotHeader)
+			if verified == nil {
+				log.Warn("xdcSyncer: snap gap seed — could not fetch/verify header range (SYNC-11)",
+					"from", gapNum, "to", fetchEnd, "pivot", pivotNum)
+				continue
+			}
+			for i, h := range verified {
+				n := gapNum + uint64(i)
+				if n < scanStart {
+					continue
+				}
+				if n >= scanEnd {
+					break
+				}
+				isSwitch, _, err := v2Engine.IsEpochSwitch(h)
+				if err != nil || !isSwitch {
+					continue
+				}
+				base := n - n%epoch
+				var derivedGap uint64
+				if base >= gap {
+					derivedGap = base - gap
+				}
+				if derivedGap != gapNum {
+					continue
+				}
+				epochSwitchHdr = h
+				break
+			}
+			if gapHdr == nil && len(verified) > 0 {
+				gapHdr = verified[0] // verified[0] is the header at gapNum
+			}
+		}
+
+		if epochSwitchHdr == nil {
+			log.Warn("xdcSyncer: snap gap seed — epoch-switch header unavailable (SYNC-11)",
+				"scanStart", scanStart, "scanEnd", scanEnd, "gap", gapNum, "pivot", pivotNum)
+			continue
+		}
+
+		masternodes := v2Engine.GetMasternodesFromEpochSwitchHeader(s.handler.chain, epochSwitchHdr)
+		if len(masternodes) == 0 {
+			log.Debug("xdcSyncer: snap gap seed — epoch-switch has no masternodes",
+				"epochSwitch", epochSwitchHdr.Number.Uint64())
+			continue
+		}
+
+		// Locate the gap header if not already found above.
+		if gapHdr == nil {
+			if verified := s.fetchVerifiedHeaderRange(gapNum, pivotNum, pivotHeader); len(verified) > 0 {
+				gapHdr = verified[0]
+			}
+		}
+		if gapHdr == nil {
+			log.Warn("xdcSyncer: snap gap seed — gap header unavailable (SYNC-11)",
+				"gap", gapNum, "pivot", pivotNum)
+			continue
+		}
+
+		epochSwitchNum := epochSwitchHdr.Number.Uint64()
+		penalties := extractAddresses(epochSwitchHdr.Penalties)
+		if err := v2Engine.UpdateMasternodesWithPenalties(s.handler.chain, gapHdr, masternodes, penalties); err != nil {
+			log.Warn("xdcSyncer: snap gap seed — UpdateMasternodesWithPenalties failed",
+				"gap", gapNum, "epochSwitch", epochSwitchNum, "err", err)
+			continue
+		}
+		seeded++
+
+		// Cache for re-apply (same as A.70) in case TIP_CATCH block-import
+		// overwrites the seed via UpdateMasternodesFromHeader.
+		s.a70SeedMu.Lock()
+		s.a70SeedCache = append(s.a70SeedCache, a70SeedRecord{
+			gapHeader:      gapHdr,
+			masternodes:    append([]common.Address(nil), masternodes...),
+			penalties:      append([]common.Address(nil), penalties...),
+			epochSwitchNum: epochSwitchNum,
+		})
+		s.a70SeedMu.Unlock()
+
+		log.Info("xdcSyncer: snap gap seed — V2 masternode snapshot seeded (SYNC-11, A.97.4)",
+			"gap", gapNum, "epochSwitch", epochSwitchNum,
+			"masternodes", len(masternodes), "penalties", len(penalties),
+			"pivot", pivotNum)
+	}
+	log.Info("xdcSyncer: snap pivot gap snapshots seed complete (SYNC-11)",
+		"pivot", pivotNum, "seeded", seeded)
+}
+
+// fetchVerifiedHeaderRange fetches headers [from, pivotNum-1] from each ranked
+// peer in turn, verifies that the returned slice forms a valid parent-hash chain
+// terminating at pivotHeader.ParentHash (the locally-trusted pivot), and returns
+// the verified slice indexed by [num-from]. Returns nil if no peer produces a
+// valid chain.
+//
+// Batches are capped at xdpos2MaxHeaderFetch to honour the legacy XDPOS2 wire
+// cap. A malicious peer that serves a forged switch header (wrong Validators)
+// changes that header's hash, breaking the parent-hash chain, and is rejected.
+func (s *xdcSyncer) fetchVerifiedHeaderRange(from, pivotNum uint64, pivotHeader *types.Header) []*types.Header {
+	count := pivotNum - from
+	if count == 0 {
+		return nil
+	}
+	for _, p := range s.rankedPeers() {
+		headers := make([]*types.Header, 0, count)
+		for start := from; start < pivotNum; {
+			batchSize := int(pivotNum - start)
+			if batchSize > xdpos2MaxHeaderFetch {
+				batchSize = xdpos2MaxHeaderFetch
+			}
+			batch := s.fetchHeaderBatch(p, start, batchSize)
+			if len(batch) == 0 {
+				break
+			}
+			headers = append(headers, batch...)
+			start += uint64(len(batch))
+		}
+		if uint64(len(headers)) != count {
+			continue // peer did not serve the full range
+		}
+		// Verify block numbers are sequential starting at from.
+		valid := true
+		for i, h := range headers {
+			if h == nil || h.Number.Uint64() != from+uint64(i) {
+				valid = false
+				break
+			}
+		}
+		if !valid {
+			continue
+		}
+		// Verify the parent-hash chain terminates at the locally-trusted pivot.
+		if headers[len(headers)-1].Hash() != pivotHeader.ParentHash {
+			continue
+		}
+		for i := len(headers) - 1; i > 0; i-- {
+			if headers[i].ParentHash != headers[i-1].Hash() {
+				valid = false
+				break
+			}
+		}
+		if valid {
+			return headers
+		}
+	}
+	return nil
 }
 
 // findOperatorPivotHeader locates the operator pivot header via the chain's
