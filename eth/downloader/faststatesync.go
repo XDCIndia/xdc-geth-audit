@@ -46,6 +46,7 @@ import (
 	"github.com/ethereum/go-ethereum/core/state"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
+	"github.com/ethereum/go-ethereum/eth/protocols/snap"
 	"github.com/ethereum/go-ethereum/ethdb"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/trie"
@@ -63,6 +64,40 @@ import (
 // bypasses fastStateSync entirely for path-scheme gap blocks and dispatches
 // snap/1 directly, so this path should not be reached.
 var errPathSchemeNodeData = errors.New("path-scheme database: gap-block state cannot be synced via NodeData; caller must use snap/1 or A.97.4 embedded-header fallback")
+
+// stalePivotNoProgressTimeout is the wall-clock duration the SYNC-15 retry loop
+// waits without observing any snap/1 state-download progress before declaring
+// the frozen pivot unserveable.  "No progress" means the snap syncer's account/
+// storage/bytecode/trienode counters have not advanced for this long while at
+// least one snap/1 peer is connected.  90s is chosen to be comfortably above the
+// typical peer-dial delay (20–60s) while well below the harness kill timeout.
+// (#1872 SYNC-16)
+const stalePivotNoProgressTimeout = 90 * time.Second
+
+// isStaleByNoProgress reports whether the snap/1 pivot state download should be
+// abandoned because no progress has been observed for long enough while snap/1
+// peers are connected.  sinceLastAdvance is the duration since the snap syncer
+// last advanced any counter (accounts/storage/bytecodes/trienodes); snapPeers is
+// the current snap/1 peer count.
+//
+// NOTE: peer BlockRange().LatestBlock must NOT be used here — on XDC that field
+// carries the handshake TD, not a block number, and is frozen at handshake time.
+// Measured live on net2040: real head 130,088 while peers report 179,941 /
+// 129,745 / 97,607 / 97,463 / 1.  Any block-number comparison against that value
+// would fire errStalePivot on every single retry. (#1872 SYNC-16)
+func isStaleByNoProgress(sinceLastAdvance time.Duration, snapPeers int) bool {
+	return sinceLastAdvance >= stalePivotNoProgressTimeout && snapPeers > 0
+}
+
+// snapProgressAdvanced reports whether any state-download counter in cur exceeds
+// the corresponding counter in prev, indicating forward progress on the pivot root.
+func snapProgressAdvanced(prev, cur snap.Progress) bool {
+	return cur.AccountSynced > prev.AccountSynced ||
+		cur.StorageSynced > prev.StorageSynced ||
+		cur.BytecodeSynced > prev.BytecodeSynced ||
+		cur.TrienodeHealSynced > prev.TrienodeHealSynced ||
+		cur.BytecodeHealSynced > prev.BytecodeHealSynced
+}
 
 // fastStatePoolLogInterval throttles the A.37 "peer pool gated" INFO log.
 // 30s is roughly twice the typical fast-sync request cycle on Apothem so the
@@ -588,29 +623,123 @@ func (s *fastStateSync) loop() (err error) {
 		if s.pivotHdr == nil {
 			return errPathSchemeNodeData
 		}
-		log.Info("Fast sync SYNC-07: path-scheme DB — downloading pivot state via snap/1 (bypassing NodeData)",
-			"root", s.root, "pivot", s.pivotHdr.Number.Uint64())
-		snapCancel := make(chan struct{})
-		snapDone := make(chan struct{})
-		go func() {
-			select {
-			case <-s.cancel:
-				close(snapCancel)
-			case <-s.d.cancelCh:
-				close(snapCancel)
-			case <-snapDone:
+		// SYNC-15 + SYNC-16: retry loop for snap/1 pivot state download on
+		// path-scheme (#1872).
+		//
+		// snap.Sync() blocks until its cancel channel is closed or the download
+		// completes.  Two failure modes require detection:
+		//
+		//   1. Spurious/transient cancel (SYNC-15): no snap/1 peer was available
+		//      at Sync() entry.  snap.Sync() may return ErrCancelled immediately
+		//      because of an internal race.  Wait with exponential backoff and retry.
+		//
+		//   2. Stale pivot (SYNC-16): snap/1 peers are connected but none serves the
+		//      frozen pivot root (chain has advanced past the snap/1 serving window,
+		//      typically ~128 blocks).  snap.Sync() blocks indefinitely: peers accept
+		//      the connection but return no data for the requested root.  Detected by
+		//      tracking the snap syncer's Progress() counters; if no account/storage/
+		//      bytecode/trienode counter advances for stalePivotNoProgressTimeout (90s)
+		//      while at least one snap/1 peer is connected, the monitoring goroutine
+		//      closes snapCancel and sets noProgressStale.
+		//
+		// IMPORTANT: peer BlockRange().LatestBlock is NOT a block number on XDC.  It
+		// carries the handshake TD (total difficulty) and is frozen at handshake time.
+		// Never use it as a block-height proxy for staleness detection.
+		const maxSnapBackoff = 10 * time.Second
+		snapBackoff := 500 * time.Millisecond
+		cancelCh := s.d.cancelCh // captured at retry-loop start; closed by d.Cancel()
+		for {
+			log.Info("Fast sync SYNC-07: path-scheme DB — downloading pivot state via snap/1 (bypassing NodeData)",
+				"root", s.root, "pivot", s.pivotHdr.Number.Uint64())
+
+			snapCancel := make(chan struct{})
+			snapDone := make(chan struct{})
+			var noProgressStale atomic.Bool
+
+			// Per-attempt progress baseline for SYNC-16 detection.
+			baseProgress := s.d.snapSyncer.Progress()
+			lastAdvanceAt := time.Now()
+
+			// Monitoring goroutine: closes snapCancel on genuine cycle abort
+			// (s.cancel / d.cancelCh) OR when snap/1 progress has stalled for
+			// stalePivotNoProgressTimeout while peers are connected (SYNC-16).
+			go func() {
+				ticker := time.NewTicker(10 * time.Second)
+				defer ticker.Stop()
+				for {
+					select {
+					case <-s.cancel:
+						close(snapCancel)
+						return
+					case <-cancelCh:
+						close(snapCancel)
+						return
+					case <-snapDone:
+						return
+					case <-ticker.C:
+						cur := s.d.snapSyncer.Progress()
+						if snapProgressAdvanced(baseProgress, cur) {
+							baseProgress = cur
+							lastAdvanceAt = time.Now()
+						} else if isStaleByNoProgress(time.Since(lastAdvanceAt), s.d.snapSyncer.PeerCount()) {
+							noProgressStale.Store(true)
+							close(snapCancel)
+							return
+						}
+					}
+				}
+			}()
+
+			snapErr := s.d.snapSyncer.Sync(s.pivotHdr, snapCancel)
+			close(snapDone)
+
+			if snapErr == nil {
+				log.Info("Fast sync SYNC-07: snap/1 pivot state download complete (path-scheme)",
+					"root", s.root)
+				return nil
 			}
-		}()
-		snapErr := s.d.snapSyncer.Sync(s.pivotHdr, snapCancel)
-		close(snapDone)
-		if snapErr != nil {
 			log.Warn("Fast sync SYNC-07: snap/1 pivot state download failed (path-scheme)",
 				"root", s.root, "err", snapErr)
-		} else {
-			log.Info("Fast sync SYNC-07: snap/1 pivot state download complete (path-scheme)",
-				"root", s.root)
+			if snapErr != snap.ErrCancelled {
+				return snapErr // protocol or I/O error — do not retry
+			}
+			// ErrCancelled: check for genuine cycle abort first.
+			select {
+			case <-s.cancel:
+				return errCancelStateFetch
+			default:
+			}
+			select {
+			case <-cancelCh:
+				return errCancelStateFetch
+			default:
+			}
+			// SYNC-16: monitoring goroutine detected no progress for 90s with
+			// snap/1 peers connected → pivot root is unserveable; re-pivot needed.
+			if noProgressStale.Load() {
+				log.Warn("Fast sync SYNC-16: pivot unserveable — no snap/1 progress for bounded time; triggering re-pivot",
+					"pivot", s.pivotHdr.Number.Uint64(),
+					"root", s.root,
+					"timeout", stalePivotNoProgressTimeout,
+					"snap_peers", s.d.snapSyncer.PeerCount())
+				return errStalePivot
+			}
+			// Spurious cancel (SYNC-15): no snap/1 peer available yet.
+			// Wait with backoff for a peer to join, then retry.
+			log.Info("Fast sync SYNC-07: waiting for snap/1 peer before retry",
+				"root", s.root, "backoff", snapBackoff, "snap_peers", s.d.snapSyncer.PeerCount())
+			timer := time.NewTimer(snapBackoff)
+			select {
+			case <-timer.C:
+				snapBackoff = min(snapBackoff*2, maxSnapBackoff)
+			case <-s.cancel:
+				timer.Stop()
+				return errCancelStateFetch
+			case <-cancelCh:
+				timer.Stop()
+				return errCancelStateFetch
+			}
 		}
-		return snapErr
 	}
 
 	// Listen for new peer events to assign tasks to them

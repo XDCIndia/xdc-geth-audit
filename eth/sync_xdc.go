@@ -137,6 +137,16 @@ const (
 	// same fork-side block. Issue #802 task 2 — geth-aligned peer rotation.
 	xdcForkTaintTTL = 60 * time.Second
 
+	// Empty-response cooldown: if a peer returns 0 headers xdcPeerEmptyStrikeMax
+	// times in a row for in-range requests it is put on a cooldown (separate from
+	// fork-taint) and excluded from rankedPeers() for xdcPeerEmptyCooldownTTL.
+	// Fixes the genesis-peer wedge (#1872): peers stuck at genesis have high
+	// handshake TD so they rank first; they always return 0 headers once fromBlock
+	// exceeds their chain height; without a cooldown they consume all K fanout
+	// slots every round and force xdcBulkReqTimeout (4s) per round indefinitely.
+	xdcPeerEmptyStrikeMax   = 3
+	xdcPeerEmptyCooldownTTL = 2 * time.Minute
+
 	// maxConsensusFailedBlocks caps the consensusFailedBlocks map to prevent
 	// unbounded growth in the pathological case where many distinct bad blocks
 	// arrive. 256 entries is far more than needed in practice. Fixes #1670.
@@ -253,6 +263,26 @@ type xdcSyncer struct {
 	// picks a different peer instead of re-importing the same fork.
 	forkTaintedMu sync.Mutex
 	forkTainted   map[string]time.Time
+
+	// Empty-response cooldown (#1872): a peer earns a strike only when it
+	// returns 0 headers in a round where another peer in the SAME round served
+	// the same fromBlock (proving the range exists). Empty replies in all-empty
+	// rounds ("nothing yet at tip") are never strikes. After xdcPeerEmptyStrikeMax
+	// strikes the peer is excluded from rankedPeers() for xdcPeerEmptyCooldownTTL.
+	// Separate from fork-taint: the peer is not on a fork, it just cannot serve.
+	emptyStrikesMu  sync.Mutex
+	emptyStrikes    map[string]int
+	emptyCooldownMu sync.Mutex
+	emptyCooldown   map[string]time.Time
+
+	// lastEmptyRoundIDs is the set of peer IDs raced in the most recent
+	// all-empty round (no winner). fetchHeadersParallel uses it to rotate
+	// the candidate window: peers NOT in this set are preferred next round,
+	// giving a healthy peer outside the initial top-K a slot to prove itself.
+	// Only accessed from the single-flight sync goroutine — no mutex required.
+	// Note: for XDC, handshake TD is a ranking metric, not a block height; an
+	// XDPOS2 peer stuck at genesis can rank first in candidates.
+	lastEmptyRoundIDs map[string]bool
 
 	// consensusFailedBlocksMu protects consensusFailedBlocks.
 	consensusFailedBlocksMu sync.Mutex
@@ -1036,7 +1066,9 @@ func (s *xdcSyncer) fastRunningCheck() {
 	var pivotPeer *eth.Peer
 	if opNumber != 0 && opHash != (common.Hash{}) {
 		opAttempts := 0
-		for _, p := range s.rankedPeers() {
+		// Use rankedPeersNoCD: pivot selection must not be blocked by the
+		// empty-response cooldown (a fullSyncOnce efficiency mechanism). (#1872)
+		for _, p := range s.rankedPeersNoCD() {
 			if opAttempts >= fastHeadFetchMaxAttempts {
 				break
 			}
@@ -1061,7 +1093,9 @@ func (s *xdcSyncer) fastRunningCheck() {
 
 	if headHdr == nil {
 		attempts := 0
-		for _, p := range s.rankedPeers() {
+		// Use rankedPeersNoCD: empty-response cooldown must not block fast-sync
+		// pivot selection; only fork-tainted peers are excluded. (#1872)
+		for _, p := range s.rankedPeersNoCD() {
 			if attempts >= fastHeadFetchMaxAttempts {
 				break
 			}
@@ -1086,6 +1120,15 @@ func (s *xdcSyncer) fastRunningCheck() {
 				// re-entry path → block-import never starts). Skip this
 				// candidate and continue scanning; if every peer-tip is
 				// below the pivot, fall through and retry next tick.
+				if h.Number.Uint64() == 0 {
+					// Genesis-stuck peer: LatestBlockHash resolves to block 0.
+					// Invoking BeaconSync with head=0 causes the skeleton to
+					// request headers near MAX_UINT64 (arithmetic underflow),
+					// returning count=0 from all peers and timing them out.
+					// Skip without counting as a failure attempt. (#1872)
+					attempts-- // don't charge an attempt for a genesis-stuck peer
+					continue
+				}
 				if opNumber != 0 && h.Number.Uint64() < opNumber {
 					log.Warn("xdcSyncer: rejecting peer-tip below operator pivot for BeaconSync head",
 						"peer", p.ID(),
@@ -1125,7 +1168,9 @@ func (s *xdcSyncer) fastRunningCheck() {
 	primeSourcePeer := pivotPeer
 	if primeSourcePeer == nil && isDynamic {
 		// Dynamic path: pick best available peer for header walk-back.
-		for _, p := range s.rankedPeers() {
+		// Use rankedPeersNoCD so pivot selection is not blocked by the
+		// empty-response cooldown (a fullSyncOnce efficiency mechanism). (#1872)
+		for _, p := range s.rankedPeersNoCD() {
 			primeSourcePeer = p
 			break
 		}
@@ -1700,7 +1745,8 @@ func (s *xdcSyncer) snapSelectOnce() {
 			//
 			// Refs #807 Phase 7+. Fetch + verify the header matches
 			// the checkpoint Hash before using it as a pivot.
-			candidates := s.rankedPeers()
+			// Use rankedPeersNoCD so cooldown never blocks pivot selection. (#1872)
+			candidates := s.rankedPeersNoCD()
 			if len(candidates) == 0 {
 				return // stay in SNAP_SELECTING; retry next tick
 			}
@@ -1776,57 +1822,61 @@ func (s *xdcSyncer) snapSelectOnce() {
 	}
 
 	// Fallback path: ADR-807 QC-verification helper.
-	candidates := s.rankedPeers()
+	//
+	// Use rankedPeersNoCD so the empty-response cooldown (a fullSyncOnce
+	// efficiency tool) never blocks pivot selection. (#1872)
+	candidates := s.rankedPeersNoCD()
 	if len(candidates) == 0 {
 		return
 	}
-	peer := candidates[0]
-	if peer.BlockRange() == nil {
-		return
-	}
 	// SYNC-02 (#1842): determine peerHead for QC-verify pivot selection.
-	// Primary: peer's live head (most accurate; avoids stale compiled checkpoints).
-	// On net2040 the highest compiled checkpoint was 11,250 while the actual chain
-	// head was 89,000 — SelectSnapPivot received 11,250 and rejected every candidate
-	// as "pre-V2 history". Fetching the live head first fixes this.
-	// Fallback: compiled TrustedSyncCheckpoints (for mainnet/Apothem where checkpoints
-	// are near-tip and the live fetch may fail). Existing A.97 short-chain guard
-	// semantics are preserved: if the live head is below xdcSnapEngageMinGap we
-	// revert to FULL_SYNC immediately (#912).
+	// Iterate all candidates, not just [0], so a genesis-stuck peer ranked
+	// first by TD does not shadow real at-tip peers.
+	//
+	// A peer returning block 0 is genesis-stuck and not a sign of a short
+	// chain — skip it without counting as a failure so we keep retrying on
+	// the next tick until real peers connect. Only a peer with head > 0 but
+	// below xdcSnapEngageMinGap indicates a genuinely short chain. (#1872)
 	var peerHead uint64
-	if rng := peer.BlockRange(); rng != nil && rng.LatestBlockHash != (common.Hash{}) {
-		if hdr := s.fetchHeaderByHash(peer, rng.LatestBlockHash); hdr != nil {
-			actualPeer := hdr.Number.Uint64()
-			// A.97 short-chain guard (refs #912).
-			if actualPeer < xdcSnapEngageMinGap {
-				log.Info("xdcSyncer: snap pivot fallback skipped — peer head below xdcSnapEngageMinGap; reverting to FULL_SYNC",
-					"peerHead", actualPeer, "minGap", xdcSnapEngageMinGap,
-					"localHead", cur.Number.Uint64())
-				s.snapSelectFailures++
-				if s.snapSelectFailures >= xdcSnapSelectMaxRetries {
-					s.snapPermanentFullFallback.Store(true)
-					log.Warn("xdcSyncer: snap pivot selection failed repeatedly — permanently falling back to full-sync (no snap-capable peers)",
-						"attempts", s.snapSelectFailures)
-				}
-				s.snapPhase.Store(int32(phaseFullSync))
-				return
-			}
-			peerHead = actualPeer
+	var snapPivotPeer *eth.Peer // peer that provided the real head
+	for _, p := range candidates {
+		rng := p.BlockRange()
+		if rng == nil || rng.LatestBlockHash == (common.Hash{}) {
+			continue
 		}
-	}
-	// Fallback: compiled checkpoints — used when live fetch fails or on
-	// mainnet/Apothem where checkpoints are near-tip. Secondary priority only.
-	if peerHead == 0 && cfg != nil {
-		for _, cp := range cfg.TrustedSyncCheckpoints {
-			if cp.Number > peerHead {
-				peerHead = cp.Number
-			}
+		hdr := s.fetchHeaderByHash(p, rng.LatestBlockHash)
+		if hdr == nil {
+			continue
 		}
+		n := hdr.Number.Uint64()
+		if n == 0 {
+			// Genesis-stuck peer — not a sign of a short chain; skip.
+			continue
+		}
+		peerHead = n
+		snapPivotPeer = p
+		break
 	}
 	if peerHead == 0 {
-		// Last resort: synthetic target so SelectSnapPivot has a search space.
-		peerHead = cur.Number.Uint64() + xdcSnapEngageMinGap
+		// No peer with a real (non-genesis) head yet. Wait for network peers
+		// to connect rather than burning failure retries. (#1872)
+		return
 	}
+	// A.97 short-chain guard (refs #912).
+	if peerHead < xdcSnapEngageMinGap {
+		log.Info("xdcSyncer: snap pivot fallback skipped — peer head below xdcSnapEngageMinGap; reverting to FULL_SYNC",
+			"peerHead", peerHead, "minGap", xdcSnapEngageMinGap,
+			"localHead", cur.Number.Uint64())
+		s.snapSelectFailures++
+		if s.snapSelectFailures >= xdcSnapSelectMaxRetries {
+			s.snapPermanentFullFallback.Store(true)
+			log.Warn("xdcSyncer: snap pivot selection failed repeatedly — permanently falling back to full-sync (no snap-capable peers)",
+				"attempts", s.snapSelectFailures)
+		}
+		s.snapPhase.Store(int32(phaseFullSync))
+		return
+	}
+	peer := snapPivotPeer
 	fetchHeader := func(n uint64) *types.Header {
 		hdrs := s.fetchHeaderBatch(peer, n, 1)
 		if len(hdrs) == 0 {
@@ -3372,6 +3422,63 @@ func (s *xdcSyncer) isPeerTainted(peerID string) bool {
 	return false
 }
 
+// incPeerEmptyStrike records that peer returned 0 headers for an in-range
+// request. After xdcPeerEmptyStrikeMax strikes the peer is put on a cooldown
+// for xdcPeerEmptyCooldownTTL and excluded from rankedPeers(). (#1872)
+func (s *xdcSyncer) incPeerEmptyStrike(peerID string) {
+	s.emptyStrikesMu.Lock()
+	if s.emptyStrikes == nil {
+		s.emptyStrikes = make(map[string]int)
+	}
+	s.emptyStrikes[peerID]++
+	n := s.emptyStrikes[peerID]
+	s.emptyStrikesMu.Unlock()
+
+	if n >= xdcPeerEmptyStrikeMax {
+		s.emptyCooldownMu.Lock()
+		if s.emptyCooldown == nil {
+			s.emptyCooldown = make(map[string]time.Time)
+		}
+		if _, alreadyCooling := s.emptyCooldown[peerID]; !alreadyCooling {
+			log.Debug("xdcSyncer: peer put on empty-response cooldown",
+				"peer", peerID, "strikes", n, "ttl", xdcPeerEmptyCooldownTTL)
+			s.emptyCooldown[peerID] = time.Now()
+		}
+		s.emptyCooldownMu.Unlock()
+	}
+}
+
+// resetPeerEmptyStrike clears the strike counter and any cooldown for a peer
+// that just served a successful header batch.
+func (s *xdcSyncer) resetPeerEmptyStrike(peerID string) {
+	s.emptyStrikesMu.Lock()
+	delete(s.emptyStrikes, peerID)
+	s.emptyStrikesMu.Unlock()
+
+	s.emptyCooldownMu.Lock()
+	delete(s.emptyCooldown, peerID)
+	s.emptyCooldownMu.Unlock()
+}
+
+// isPeerOnEmptyCooldown returns true if the peer is currently on an
+// empty-response cooldown. Prunes expired entries inline.
+func (s *xdcSyncer) isPeerOnEmptyCooldown(peerID string) bool {
+	s.emptyCooldownMu.Lock()
+	defer s.emptyCooldownMu.Unlock()
+	if s.emptyCooldown == nil {
+		return false
+	}
+	t, ok := s.emptyCooldown[peerID]
+	if !ok {
+		return false
+	}
+	if time.Since(t) > xdcPeerEmptyCooldownTTL {
+		delete(s.emptyCooldown, peerID)
+		return false
+	}
+	return true
+}
+
 // isDefinitiveInvalidBlockError reports whether err from InsertChain proves
 // that the block itself is invalid — not a local state gap, a liveness
 // failure, or a transient condition. Uses an explicit allowlist: only errors
@@ -4632,15 +4739,29 @@ func (s *xdcSyncer) fetchHeaderBatchTimeout(peer *eth.Peer, from uint64, count i
 // racedIDs is the set of peer IDs that were actually sent requests this round;
 // callers use it to avoid re-querying rate-limited peers in A.77 lookahead (A.78).
 func (s *xdcSyncer) fetchHeadersParallel(candidates []*eth.Peer, fromBlock uint64, curHash common.Hash) (*peerHeaderResult, int, int, map[string]bool) {
-	K := len(candidates)
-	if K > xdcHeaderRacePeers {
-		K = xdcHeaderRacePeers
+	// Rotation (#1872, rule 2): when the previous round was all-empty, prefer
+	// peers that were NOT in that round so they get a slot to prove the range
+	// exists. Within each group (fresh / prev-tried) relative TD order is kept.
+	// Note: for XDC, handshake TD is a ranking metric, not a block height —
+	// an XDPOS2 peer stuck at genesis can rank first in candidates.
+	fresh := candidates[:0:0]     // peers not in lastEmptyRoundIDs
+	prevTried := candidates[:0:0] // peers in lastEmptyRoundIDs
+	for _, p := range candidates {
+		if s.lastEmptyRoundIDs[p.ID()] {
+			prevTried = append(prevTried, p)
+		} else {
+			fresh = append(fresh, p)
+		}
 	}
-	raced := make([]*eth.Peer, 0, K)
-	rngs := make(map[string]*eth.BlockRangeUpdatePacket, K)
+	ordered := append(fresh, prevTried...) // fresh first; fill from prev-tried
+
+	raced := make([]*eth.Peer, 0, xdcHeaderRacePeers)
+	rngs := make(map[string]*eth.BlockRangeUpdatePacket, xdcHeaderRacePeers)
 	atTipCount := 0
-	for i := 0; i < K; i++ {
-		p := candidates[i]
+	for _, p := range ordered {
+		if len(raced) >= xdcHeaderRacePeers {
+			break
+		}
 		rng := p.BlockRange()
 		if rng == nil {
 			continue
@@ -4673,6 +4794,14 @@ func (s *xdcSyncer) fetchHeadersParallel(candidates []*eth.Peer, fromBlock uint6
 	if len(raced) == 0 {
 		return nil, atTipCount, tried, racedIDs
 	}
+
+	// emptyIDs collects peers whose goroutines return 0 headers this round.
+	// Strikes (#1872, rule 1) are applied only if a winner is found — an empty
+	// reply when nobody served the range means "nothing yet" (normal at-tip
+	// signal for XDPOS2) and must never earn a strike.
+	var emptyMu sync.Mutex
+	emptyIDs := make([]string, 0, len(raced))
+
 	out := make(chan *peerHeaderResult, len(raced))
 	var wg sync.WaitGroup
 	for _, p := range raced {
@@ -4681,6 +4810,9 @@ func (s *xdcSyncer) fetchHeadersParallel(candidates []*eth.Peer, fromBlock uint6
 			defer wg.Done()
 			hdrs := s.fetchHeaderBatchTimeout(p, fromBlock, xdcBatchSize, xdcBulkReqTimeout)
 			if len(hdrs) == 0 {
+				emptyMu.Lock()
+				emptyIDs = append(emptyIDs, p.ID())
+				emptyMu.Unlock()
 				return
 			}
 			// #1423: XDPOS2 replies carry no request id. A batch that does not
@@ -4704,20 +4836,17 @@ func (s *xdcSyncer) fetchHeadersParallel(candidates []*eth.Peer, fromBlock uint6
 				return
 			}
 			// Track the highest peer block seen (Fixes #1841).
-			if len(hdrs) > 0 {
-				// Derive from the request, not the peer's last header number,
-				// which is not checked here and could be inflated.
-				highestInBatch := fromBlock + uint64(len(hdrs)) - 1
-				for {
-					current := s.highestPeerBlockSeen.Load()
-					if highestInBatch <= current {
-						break
-					}
-					if s.highestPeerBlockSeen.CompareAndSwap(current, highestInBatch) {
-						break
-					}
+			highestInBatch := fromBlock + uint64(len(hdrs)) - 1
+			for {
+				current := s.highestPeerBlockSeen.Load()
+				if highestInBatch <= current {
+					break
+				}
+				if s.highestPeerBlockSeen.CompareAndSwap(current, highestInBatch) {
+					break
 				}
 			}
+			s.resetPeerEmptyStrike(p.ID()) // peer served: clear any cooldown
 			select {
 			case out <- &peerHeaderResult{peer: p, rng: rngs[p.ID()], headers: hdrs}:
 			default: // a winner already claimed the slot; drop silently
@@ -4729,8 +4858,29 @@ func (s *xdcSyncer) fetchHeadersParallel(candidates []*eth.Peer, fromBlock uint6
 	go func() { wg.Wait(); close(allDone) }()
 	select {
 	case first := <-out:
+		// Winner found: the range exists. Schedule strikes for peers whose
+		// goroutines returned empty this round (#1872, rule 1). The background
+		// goroutine waits for allDone so every peer has recorded its status
+		// before strikes are applied. No goroutine leak: allDone is guaranteed
+		// to close (all goroutines call wg.Done()).
+		go func() {
+			<-allDone
+			emptyMu.Lock()
+			ids := append([]string(nil), emptyIDs...)
+			emptyMu.Unlock()
+			for _, id := range ids {
+				s.incPeerEmptyStrike(id)
+			}
+		}()
+		s.lastEmptyRoundIDs = nil // winner found: reset rotation
 		return first, atTipCount, tried, racedIDs
 	case <-allDone:
+		// All-empty round: record raced peers for next-round rotation. No
+		// strikes — this is the normal "nothing yet at tip" signal.
+		s.lastEmptyRoundIDs = make(map[string]bool, len(raced))
+		for _, p := range raced {
+			s.lastEmptyRoundIDs[p.ID()] = true
+		}
 		return nil, atTipCount, tried, racedIDs
 	case <-s.quitCh:
 		return nil, atTipCount, tried, racedIDs
@@ -5383,6 +5533,13 @@ func (s *xdcSyncer) rankedPeers() []*eth.Peer {
 			skippedTainted++
 			continue
 		}
+		// Exclude peers on empty-response cooldown (#1872). These peers
+		// repeatedly returned 0 headers for in-range requests; including
+		// them blocks the fanout for xdcBulkReqTimeout per round.
+		if s.isPeerOnEmptyCooldown(p.ID()) {
+			skippedTainted++ // reuse counter — both represent "bad peer excluded"
+			continue
+		}
 		cands = append(cands, p)
 	}
 	if skippedTainted > 0 && len(cands) == 0 {
@@ -5393,6 +5550,34 @@ func (s *xdcSyncer) rankedPeers() []*eth.Peer {
 			"skipped", skippedTainted, "ttl", xdcForkTaintTTL)
 	}
 	// Insertion sort by descending LatestBlock — n is small (≤ maxPeers).
+	for i := 1; i < len(cands); i++ {
+		for j := i; j > 0 && cands[j-1].BlockRange().LatestBlock < cands[j].BlockRange().LatestBlock; j-- {
+			cands[j-1], cands[j] = cands[j], cands[j-1]
+		}
+	}
+	return cands
+}
+
+// rankedPeersNoCD is like rankedPeers but intentionally does NOT exclude peers
+// on empty-response cooldown. It is used exclusively by snap and fast-sync pivot
+// selection, where the cooldown (a fullSyncOnce efficiency tool for demoting
+// genesis-stuck peers from the header-fetch fanout) must never prevent the pivot
+// from seeing real at-tip peers. Fork-tainted peers are still excluded because
+// they proved their chain is wrong, not just slow. (#1872)
+func (s *xdcSyncer) rankedPeersNoCD() []*eth.Peer {
+	all := s.handler.peers.all()
+	cands := make([]*eth.Peer, 0, len(all))
+	for _, ep := range all {
+		p := ep.Peer
+		if p.BlockRange() == nil {
+			continue
+		}
+		if s.isPeerTainted(p.ID()) {
+			continue
+		}
+		// NOTE: isPeerOnEmptyCooldown is intentionally omitted here.
+		cands = append(cands, p)
+	}
 	for i := 1; i < len(cands); i++ {
 		for j := i; j > 0 && cands[j-1].BlockRange().LatestBlock < cands[j].BlockRange().LatestBlock; j-- {
 			cands[j-1], cands[j] = cands[j], cands[j-1]
@@ -5648,6 +5833,14 @@ func (s *xdcSyncer) runSnapHistoryBackfill() {
 	written := uint64(0)
 	skipped := uint64(0)
 
+	// historyBlind tracks peers that returned 0 headers for the current batch
+	// range — they cannot serve old history (e.g. a fast-synced peer whose own
+	// backfill is still in progress).  Blind peers are skipped within a cycle
+	// and the set is reset when every peer is blind (triggering the 5s pause).
+	// This prevents a partial peer from holding XDCHeaderReqMu for xdcReqTimeout
+	// (8s) on every batch iteration and stalling the fullSyncOnce fanout.
+	historyBlind := make(map[string]bool)
+
 	for nextTop >= 1 {
 		select {
 		case <-s.quitCh:
@@ -5663,14 +5856,29 @@ func (s *xdcSyncer) runSnapHistoryBackfill() {
 		}
 		want := int(nextTop-lo) + 1
 
-		// Fetch headers from the best available peer.
+		// Fetch headers from the best available peer.  Use xdcBulkReqTimeout (4s)
+		// rather than xdcReqTimeout (8s) so a peer that can't serve the old range
+		// releases XDCHeaderReqMu quickly, keeping it available for the concurrent
+		// fullSyncOnce fanout.  Peers returning 0 are added to historyBlind and
+		// skipped in subsequent batches until the set is reset.
 		var headers []*types.Header
 		peers := s.rankedPeers()
+		triedAny := false
 		for _, p := range peers {
-			headers = s.fetchHeaderBatch(p, lo, want)
+			if historyBlind[p.ID()] {
+				continue
+			}
+			triedAny = true
+			headers = s.fetchHeaderBatchTimeout(p, lo, want, xdcBulkReqTimeout)
 			if len(headers) > 0 {
 				break
 			}
+			// Peer can't serve this range; skip it for the remainder of this cycle.
+			historyBlind[p.ID()] = true
+		}
+		if !triedAny {
+			// All peers are blind; reset so the next iteration retries the full set.
+			historyBlind = make(map[string]bool)
 		}
 		if len(headers) == 0 {
 			log.Warn("xdcSyncer: SYNC-06 history backfill — no peer served headers; will retry",

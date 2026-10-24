@@ -85,6 +85,11 @@ var (
 	errCancelContentProcessing = errors.New("content processing canceled (requested)")
 	errCanceled                = errors.New("syncing canceled (requested)")
 	errNoPivotHeader           = errors.New("pivot header is not found")
+	// errStalePivot is returned by fastStateSync.loop() (SYNC-16) when the frozen
+	// pivot falls more than stalePivotThreshold blocks behind the best peer's head,
+	// meaning no snap/1 server will serve that root any more.  The sync cycle
+	// terminates and xdcSyncer re-engages with a fresh near-tip pivot. (#1872)
+	errStalePivot = errors.New("snap/1 pivot is stale — no peer serves that root; re-pivot needed")
 )
 
 // SyncMode defines the sync method of the downloader.
@@ -1933,7 +1938,13 @@ func (d *Downloader) processFastSyncContent() error {
 	}()
 
 	closeOnErr := func(s *fastStateSync) {
-		if err := s.Wait(); err != nil && err != errCancelStateFetch && err != errCanceled {
+		// snap.ErrCancelled is treated as a clean cancellation (no snap peers yet,
+		// or early-start snap/1 interrupted before bodies/receipts arrived). Do
+		// NOT close the queue so processFastSyncContent can survive the early
+		// snap/1 failure and restart the definitive state download when the pivot
+		// block result arrives at line ~2048. Mirrors processSnapSyncContent's
+		// closeOnErr which already excludes snap.ErrCancelled. (#1872 SYNC-14)
+		if err := s.Wait(); err != nil && err != errCancelStateFetch && err != errCanceled && err != snap.ErrCancelled {
 			d.queue.Close() // wake up Results
 		}
 	}
