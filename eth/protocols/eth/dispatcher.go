@@ -195,6 +195,19 @@ func (p *Peer) dispatchResponse(res *Response, metadata func() interface{}) erro
 		if metadata != nil {
 			res.Meta = metadata()
 		}
+		// Nil-sink requests (XDPOS2RID nil-sink callers such as fetchHeaderBatch
+		// and fetchBodiesBatch) cannot be delivered via the sink channel — sending
+		// to a nil channel blocks forever. Route to the matching XDC legacy channel
+		// instead, non-blocking, and return immediately so the peer read loop stays
+		// live. Requests with a real sink are never affected. Refs #1861.
+		// v100 (XDPOS2) already pushed this reply to the XDC channel in its
+		// handler, so only v101 delivers here; otherwise v100 gets it twice.
+		if res.Req.sink == nil {
+			if p.version == XDPOS2RID {
+				p.xdcNilSinkDelivery(res)
+			}
+			return nil
+		}
 		// Deliver the filled out response and wait until it's handled. This
 		// path is a bit funky as Go's select has no order, so if a response
 		// arrives to an already cancelled request, there's a 50-50% changes

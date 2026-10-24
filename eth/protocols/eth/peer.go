@@ -387,10 +387,13 @@ func (p *Peer) sendPooledTransactionHashes(hashes []common.Hash, types []byte, s
 	// early return must come first: p.version == XDPOS2 (100) would also
 	// satisfy p.version >= ETH72 below, so without the early return the
 	// XDPOS2 case would fall through into the upstream send path.
-	// Transactions still propagate to XDPOS2 peers via the full TransactionsMsg
-	// (0x02) gossip path, matching XDPoSChain's own tx-propagation behaviour.
-	if p.version == XDPOS2 {
-		p.knownTxs.Add(hashes...) // suppress retries; no wire send on XDPOS2
+	// XDPOS2RID (101) also shares the XDPoSChain legacy-compat constraint:
+	// 0x08 is OrderTxMsg in the legacy XDPoS wire; XDPOS2RID peers drain it
+	// via handleXDCTradingTxNoop, so sending NPTH would be wasted bandwidth.
+	// Transactions still propagate to XDPOS2/XDPOS2RID peers via the full
+	// TransactionsMsg (0x02) gossip path.
+	if p.version == XDPOS2 || p.version == XDPOS2RID {
+		p.knownTxs.Add(hashes...) // suppress retries; no wire send on XDPOS2/XDPOS2RID
 		return nil
 	}
 	var err error
@@ -719,6 +722,30 @@ func (p *Peer) RequestBodies(hashes []common.Hash, sink chan *Response) (*Reques
 	return req, nil
 }
 
+// xdcNilSinkDelivery routes a dispatcher response to the matching XDC legacy
+// channel when the original request carried a nil sink (used by XDPOS2RID
+// nil-sink callers such as fetchHeaderBatch and fetchBodiesBatch). The push is
+// non-blocking: if no reader is waiting the delivery is silently dropped and
+// the caller will time out as it always has. Refs #1861.
+func (p *Peer) xdcNilSinkDelivery(res *Response) {
+	switch res.code {
+	case BlockHeadersMsg:
+		if hdrs, ok := res.Res.(*BlockHeadersRequest); ok {
+			select {
+			case p.XDCHeaderResp <- []*types.Header(*hdrs):
+			default:
+			}
+		}
+	case BlockBodiesMsg:
+		if bodies, ok := res.Res.(*BlockBodiesResponse); ok {
+			select {
+			case p.XDCBodyResp <- []BlockBody(*bodies):
+			default:
+			}
+		}
+	}
+}
+
 // RequestReceipts fetches a batch of transaction receipts from a remote node.
 // `gasUsed` provides the total gas used per block, used to estimate the maximum
 // log byte size. `timestamps` provides the block timestamps for fork aware validation.
@@ -950,11 +977,9 @@ func (p *Peer) RequestTxs(hashes []common.Hash) error {
 	// A.60.2 (refs #857): XDPoSChain v2.7.0 uses msg code 0x09 for LendingTxMsg
 	// (XDC lending-protocol tx broadcast), NOT GetPooledTransactions. Sending
 	// our RequestId-wrapped GetPooledTransactions to an XDPOS2 peer trips its
-	// LendingTx decoder and the peer disconnects us. XDPoSChain has no
-	// pull-by-hash mechanism for pending txs — they only propagate via full
-	// TransactionsMsg gossip. No-op here keeps the peer alive; the txpool
-	// will see the full tx when it arrives via the gossip path.
-	if p.version == XDPOS2 {
+	// LendingTx decoder and the peer disconnects us. XDPOS2RID (101) peers
+	// share the same 0x09 no-op handler; no-op here keeps the peer alive.
+	if p.version == XDPOS2 || p.version == XDPOS2RID {
 		return nil
 	}
 	id := rand.Uint64()
