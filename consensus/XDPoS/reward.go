@@ -17,6 +17,7 @@
 package XDPoS
 
 import (
+	"fmt"
 	"math/big"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -90,8 +91,7 @@ func (c *XDPoS) GetRewardForCheckpoint(
 	for i := prevCheckpoint + (rCheckpoint * 2) - 1; i >= startBlockNumber; i-- {
 		h = chain.GetHeader(h.ParentHash, i)
 		if h == nil {
-			log.Error("GetRewardForCheckpoint: header not found", "number", i)
-			break
+			return nil, fmt.Errorf("GetRewardForCheckpoint: header unavailable at %d", i)
 		}
 		mapBlkHash[i] = h.Hash()
 

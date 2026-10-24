@@ -118,5 +118,89 @@ func xdcPrecompiles(rules params.Rules) []common.Address {
 	case rules.IsCancun:
 		return PrecompiledAddressesXDCCancun
 	}
+	// XDCx precompiles (0x1e, 0x28, 0x29, 0x2a) are only active before
+	// TIPXDCXMinerDisable. EIP-2929 access-list warming is first active at
+	// EIP1559 on XDC, by which point XDCx is already disabled. So there is
+	// no period where both access-list warming AND XDCx precompiles overlap,
+	// and the XDCx addresses never need to appear in this list.
 	return nil
+}
+
+// XDCx precompile addresses.
+// Active on XDC chains for blocks in [4, TIPXDCXMinerDisable).
+// Canonical XDPoSChain v2.9.3-testnet core/vm/contracts.go.
+var (
+	xdcxRingVerifierAddress = common.BytesToAddress([]byte{0x1e})
+	xdcxBulletproofAddress  = common.BytesToAddress([]byte{0x28})
+	xdcxLastPriceAddress    = common.BytesToAddress([]byte{0x29})
+	xdcxEpochPriceAddress   = common.BytesToAddress([]byte{0x2a})
+)
+
+// xdcxLastPrice is precompile 0x29 (XDCXLastPrice). Charges 1 gas and returns
+// 32 zero bytes. Canonical XDPoSChain reads last traded price from XDCx trading
+// state; on nodes without that state it also returns 32 zero bytes. This
+// stateless form matches that fallback.
+// Canonical: core/vm/contracts.go XDCXLastPrice.Run, v2.9.3-testnet.
+type xdcxLastPrice struct{}
+
+func (c *xdcxLastPrice) RequiredGas(input []byte) uint64  { return 1 }
+func (c *xdcxLastPrice) Run(input []byte) ([]byte, error) { return make([]byte, 32), nil }
+func (c *xdcxLastPrice) Name() string                     { return "XDCX_LAST_PRICE" }
+
+// xdcxEpochPrice is precompile 0x2a (XDCXEpochPrice). Same gas and return value
+// as xdcxLastPrice; reads the epoch settlement price in canonical XDPoSChain.
+// Canonical: core/vm/contracts.go XDCXEpochPrice.Run, v2.9.3-testnet.
+type xdcxEpochPrice struct{}
+
+func (c *xdcxEpochPrice) RequiredGas(input []byte) uint64  { return 1 }
+func (c *xdcxEpochPrice) Run(input []byte) ([]byte, error) { return make([]byte, 32), nil }
+func (c *xdcxEpochPrice) Name() string                     { return "XDCX_EPOCH_PRICE" }
+
+// xdcxExtras is the set of four XDCx precompile entries that augment the
+// standard sets for XDC blocks before TIPXDCXMinerDisable.
+var xdcxExtras = PrecompiledContracts{
+	xdcxRingVerifierAddress: &ringSignatureVerifier{},
+	xdcxBulletproofAddress:  &bulletproofVerifier{},
+	xdcxLastPriceAddress:    &xdcxLastPrice{},
+	xdcxEpochPriceAddress:   &xdcxEpochPrice{},
+}
+
+// XDC-specific precompile sets for the blocks before TIPXDCXMinerDisable.
+// Each is the corresponding standard set plus the four XDCx entries.
+// Keeping them as separate variables lets the precompile result cache
+// distinguish between them.
+var (
+	// PrecompiledContractsXDCByzantiumXDCx is used for XDC blocks in
+	// [0, Istanbul) that are also before TIPXDCXMinerDisable.
+	// On all current XDC chains Istanbul=0, so this set is unreachable
+	// in practice but included for completeness.
+	PrecompiledContractsXDCByzantiumXDCx PrecompiledContracts
+
+	// PrecompiledContractsXDCIstanbulXDCx is used for XDC blocks in
+	// [Istanbul, Berlin) that are also before TIPXDCXMinerDisable.
+	// On XDC mainnet Istanbul=0 and Berlin=76,321,000, so this covers
+	// blocks [0, 76,321,000).
+	PrecompiledContractsXDCIstanbulXDCx PrecompiledContracts
+
+	// PrecompiledContractsXDCBerlinXDCx is used for XDC blocks in
+	// [Berlin, TIPXDCXMinerDisable). ModExp uses pre-EIP-2565 pricing
+	// because XDC defers EIP-2565 to Eip1559Block (issue #716).
+	// On XDC mainnet this covers blocks [76,321,000, 80,370,000).
+	PrecompiledContractsXDCBerlinXDCx PrecompiledContracts
+)
+
+func init() {
+	// Build the XDCx-augmented sets by cloning the base sets and adding
+	// the four XDCx precompile entries.
+	merge := func(base PrecompiledContracts) PrecompiledContracts {
+		m := maps.Clone(base)
+		for k, v := range xdcxExtras {
+			m[k] = v
+		}
+		return m
+	}
+	PrecompiledContractsXDCByzantiumXDCx = merge(PrecompiledContractsByzantium)
+	PrecompiledContractsXDCIstanbulXDCx = merge(PrecompiledContractsIstanbul)
+	// XDCBerlin has eip2565:false; merge that, not the upstream Berlin.
+	PrecompiledContractsXDCBerlinXDCx = merge(PrecompiledContractsXDCBerlin)
 }

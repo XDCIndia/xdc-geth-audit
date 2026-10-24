@@ -110,8 +110,15 @@ type Peer struct {
 	// Bypasses the dispatcher's pending-map + tracker (which is incompatible
 	// with the legacy bare-list wire format that has no RequestId). The
 	// xdcSyncer's fetchHeaderBatch/fetchBodiesBatch read directly from these.
-	XDCHeaderResp chan []*types.Header // BlockHeaders responses on XDPOS2
-	XDCBodyResp   chan []BlockBody     // BlockBodies responses on XDPOS2
+	XDCHeaderResp  chan []*types.Header  // BlockHeaders responses on XDPOS2
+	XDCBodyResp    chan []BlockBody      // BlockBodies responses on XDPOS2
+	XDCReceiptResp chan []types.Receipts // Receipts responses on XDPOS2
+	// XDCHeaderReqMu / XDCBodyReqMu allow one XDPOS2 header and one body
+	// request in flight per peer: replies carry no request id, so two
+	// concurrent requesters would drain or consume each other's reply (#1857).
+	XDCHeaderReqMu  sync.Mutex
+	XDCBodyReqMu    sync.Mutex
+	XDCReceiptReqMu sync.Mutex
 
 	txpool      TxPool // Transaction pool used by the broadcasters for liveness checks
 	blobpool    BlobPool
@@ -152,26 +159,27 @@ func NewPeer(version uint, p *p2p.Peer, rw p2p.MsgReadWriter, txpool TxPool, blo
 	cap := p2p.Cap{Name: ProtocolName, Version: version}
 	id := p.ID().String()
 	peer := &Peer{
-		id:            id,
-		Peer:          p,
-		rw:            rw,
-		version:       version,
-		knownTxs:      newKnownCache(maxKnownTxs),
-		knownNodes:    newKnownCache(MaxKnownNodes),
-		txBroadcast:   make(chan []common.Hash),
-		txAnnounce:    make(chan []common.Hash),
-		tracker:       tracker.New(cap, id, 5*time.Minute),
-		reqDispatch:   make(chan *request),
-		reqCancel:     make(chan *cancel),
-		reqResend:     make(chan *resend),
-		resDispatch:   make(chan *response),
-		txpool:        txpool,
-		blobpool:      blobpool,
-		chainConfig:   chainConfig,
-		receiptBuffer: make(map[uint64]*receiptRequest),
-		term:          make(chan struct{}),
-		XDCHeaderResp: make(chan []*types.Header, 1),
-		XDCBodyResp:   make(chan []BlockBody, 1),
+		id:             id,
+		Peer:           p,
+		rw:             rw,
+		version:        version,
+		knownTxs:       newKnownCache(maxKnownTxs),
+		knownNodes:     newKnownCache(MaxKnownNodes),
+		txBroadcast:    make(chan []common.Hash),
+		txAnnounce:     make(chan []common.Hash),
+		tracker:        tracker.New(cap, id, 5*time.Minute),
+		reqDispatch:    make(chan *request),
+		reqCancel:      make(chan *cancel),
+		reqResend:      make(chan *resend),
+		resDispatch:    make(chan *response),
+		txpool:         txpool,
+		blobpool:       blobpool,
+		chainConfig:    chainConfig,
+		receiptBuffer:  make(map[uint64]*receiptRequest),
+		term:           make(chan struct{}),
+		XDCHeaderResp:  make(chan []*types.Header, 1),
+		XDCBodyResp:    make(chan []BlockBody, 1),
+		XDCReceiptResp: make(chan []types.Receipts, 1),
 	}
 	// Start up all the broadcasters
 	go peer.broadcastTransactions()
@@ -379,10 +387,13 @@ func (p *Peer) sendPooledTransactionHashes(hashes []common.Hash, types []byte, s
 	// early return must come first: p.version == XDPOS2 (100) would also
 	// satisfy p.version >= ETH72 below, so without the early return the
 	// XDPOS2 case would fall through into the upstream send path.
-	// Transactions still propagate to XDPOS2 peers via the full TransactionsMsg
-	// (0x02) gossip path, matching XDPoSChain's own tx-propagation behaviour.
-	if p.version == XDPOS2 {
-		p.knownTxs.Add(hashes...) // suppress retries; no wire send on XDPOS2
+	// XDPOS2RID (101) also shares the XDPoSChain legacy-compat constraint:
+	// 0x08 is OrderTxMsg in the legacy XDPoS wire; XDPOS2RID peers drain it
+	// via handleXDCTradingTxNoop, so sending NPTH would be wasted bandwidth.
+	// Transactions still propagate to XDPOS2/XDPOS2RID peers via the full
+	// TransactionsMsg (0x02) gossip path.
+	if p.version == XDPOS2 || p.version == XDPOS2RID {
+		p.knownTxs.Add(hashes...) // suppress retries; no wire send on XDPOS2/XDPOS2RID
 		return nil
 	}
 	var err error
@@ -537,7 +548,7 @@ func (p *Peer) ReplyReceiptsRLP70(id uint64, receipts rlp.RawList[*ReceiptList],
 // A.60.1 (refs #857): without this, msg code 0x10 sent to a legacy XDPOS2
 // peer trips its decoder on the leading RequestId varint, and the peer
 // disconnects us with the symmetric error to A.60's GetReceipts decode bug.
-func (p *Peer) ReplyReceiptsRLPLegacy(receipts rlp.RawList[*ReceiptList]) error {
+func (p *Peer) ReplyReceiptsRLPLegacy(receipts []rlp.RawValue) error {
 	return p2p.Send(p.rw, ReceiptsMsg, receipts)
 }
 
@@ -709,6 +720,30 @@ func (p *Peer) RequestBodies(hashes []common.Hash, sink chan *Response) (*Reques
 		return nil, err
 	}
 	return req, nil
+}
+
+// xdcNilSinkDelivery routes a dispatcher response to the matching XDC legacy
+// channel when the original request carried a nil sink (used by XDPOS2RID
+// nil-sink callers such as fetchHeaderBatch and fetchBodiesBatch). The push is
+// non-blocking: if no reader is waiting the delivery is silently dropped and
+// the caller will time out as it always has. Refs #1861.
+func (p *Peer) xdcNilSinkDelivery(res *Response) {
+	switch res.code {
+	case BlockHeadersMsg:
+		if hdrs, ok := res.Res.(*BlockHeadersRequest); ok {
+			select {
+			case p.XDCHeaderResp <- []*types.Header(*hdrs):
+			default:
+			}
+		}
+	case BlockBodiesMsg:
+		if bodies, ok := res.Res.(*BlockBodiesResponse); ok {
+			select {
+			case p.XDCBodyResp <- []BlockBody(*bodies):
+			default:
+			}
+		}
+	}
 }
 
 // RequestReceipts fetches a batch of transaction receipts from a remote node.
@@ -942,11 +977,9 @@ func (p *Peer) RequestTxs(hashes []common.Hash) error {
 	// A.60.2 (refs #857): XDPoSChain v2.7.0 uses msg code 0x09 for LendingTxMsg
 	// (XDC lending-protocol tx broadcast), NOT GetPooledTransactions. Sending
 	// our RequestId-wrapped GetPooledTransactions to an XDPOS2 peer trips its
-	// LendingTx decoder and the peer disconnects us. XDPoSChain has no
-	// pull-by-hash mechanism for pending txs — they only propagate via full
-	// TransactionsMsg gossip. No-op here keeps the peer alive; the txpool
-	// will see the full tx when it arrives via the gossip path.
-	if p.version == XDPOS2 {
+	// LendingTx decoder and the peer disconnects us. XDPOS2RID (101) peers
+	// share the same 0x09 no-op handler; no-op here keeps the peer alive.
+	if p.version == XDPOS2 || p.version == XDPOS2RID {
 		return nil
 	}
 	id := rand.Uint64()

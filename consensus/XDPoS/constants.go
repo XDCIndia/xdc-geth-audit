@@ -102,9 +102,8 @@ var MaxMasternodesV2 = 108
 
 // Global configuration variables
 var (
-	IsTestnet         bool = false
-	StoreRewardFolder string
-	MinGasPrice       int64
+	IsTestnet   bool = false
+	MinGasPrice int64
 )
 
 // updateGlobalConstants updates the global var pointers to point to network-specific values

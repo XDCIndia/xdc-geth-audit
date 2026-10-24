@@ -33,6 +33,9 @@ var (
 	// errNoValidatorSignature mirrors consensus.ErrNoValidatorSignature (legacy):
 	// a block past the first epoch carries an empty header.Validator under full verify.
 	errNoValidatorSignature = errors.New("xdpos v1: missing M2 validator signature (header.Validator empty past epoch 1)")
+	// ErrNoValidatorSignature exports errNoValidatorSignature for the block handler,
+	// which waits for the co-signed block instead of importing such a block.
+	ErrNoValidatorSignature = errNoValidatorSignature
 )
 
 // decodeMasternodesFromHeaderExtra extracts the 20-byte masternode addresses packed

@@ -610,6 +610,26 @@ func (db *Database) Recoverable(root common.Hash) bool {
 	return m.parent == root
 }
 
+// RecoverableDepth returns the number of state-history entries that a
+// Recover(root) call would truncate from the head. Returns 0 if root is not
+// recoverable (unknown, not in history, or the freezer is unavailable).
+// The value is informational (used for logging before a Recover call) and
+// may be approximate under concurrent access.
+func (db *Database) RecoverableDepth(root common.Hash) uint64 {
+	if !db.Recoverable(root) {
+		return 0
+	}
+	id := rawdb.ReadStateID(db.diskdb, root)
+	if id == nil {
+		return 0
+	}
+	dl := db.tree.bottom()
+	if dl.stateID() <= *id {
+		return 0
+	}
+	return dl.stateID() - *id
+}
+
 // Close closes the trie database and the held freezer.
 func (db *Database) Close() error {
 	db.lock.Lock()

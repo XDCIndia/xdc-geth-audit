@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"runtime"
 	"sync"
 
 	"github.com/ethereum/go-ethereum/accounts"
@@ -18,6 +19,13 @@ import (
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/log"
 )
+
+// maxPeerSigCap is the maximum number of signatures accepted in a QC or TC
+// received from a peer, checked before any ecrecover work. Comfortably above
+// MaxMasternodesV2 (108). A QC/TC with more signatures than active masternodes
+// is invalid; this pre-check rejects signature-bomb messages at the intake
+// point, before epoch info is available (CertiK P3 / #1707).
+const maxPeerSigCap = 150
 
 // secp256k1halfN is half of the secp256k1 curve order N. A signature's S
 // value must be <= secp256k1halfN to be in canonical low-S form; ECDSA
@@ -101,7 +109,26 @@ func hasLowS(signature types.Signature) bool {
 // signature recovers the same address), which would otherwise let a single
 // masternode key inflate the counted total toward the 2/3 quorum threshold.
 // Matches legacy XDPoSChain engines/engine_v2/utils.go:83 (#1074 / go-ethereum#1074).
+//
+// The implementation uses a bounded worker pool of min(GOMAXPROCS, len)
+// goroutines. Workers abort early (drain without doing work) on the first
+// error, so a bomb input of N signatures never spawns N goroutines (#1707).
 func RecoverUniqueSigners(signedHash common.Hash, signatureList []types.Signature) ([]types.Signature, []types.Signature, error) {
+	return recoverUniqueSigners(signedHash, signatureList, nil)
+}
+
+// errSignerNotMasternode is returned by recoverUniqueSigners when a signature
+// recovers to an address outside the allowed set. verifyQC and verifyTC reject
+// such a certificate anyway (each signer must be a masternode), so stopping
+// at the first one accepts exactly the same certificates while bounding the
+// work an invalid certificate can cause (CertiK P3).
+var errSignerNotMasternode = errors.New("signature from a non-masternode")
+
+// recoverUniqueSigners is RecoverUniqueSigners with an optional allowed set.
+// With a non-nil allowed set it stops at the first signer outside it. Byte-
+// identical signatures recover to the same signer, so they are counted as
+// duplicates without a second ecrecover.
+func recoverUniqueSigners(signedHash common.Hash, signatureList []types.Signature, allowed []common.Address) ([]types.Signature, []types.Signature, error) {
 	if signedHash == (common.Hash{}) {
 		return nil, nil, errors.New("signedHash cannot be empty")
 	}
@@ -109,60 +136,111 @@ func RecoverUniqueSigners(signedHash common.Hash, signatureList []types.Signatur
 		return []types.Signature{}, []types.Signature{}, nil
 	}
 
-	type Message struct {
-		pubkey common.Address
-		sig    types.Signature
+	var member map[common.Address]struct{}
+	if allowed != nil {
+		member = make(map[common.Address]struct{}, len(allowed))
+		for _, a := range allowed {
+			member[a] = struct{}{}
+		}
 	}
 
-	result := make(chan Message, len(signatureList))
-	errCh := make(chan error, len(signatureList))
+	nWorkers := runtime.GOMAXPROCS(0)
+	if nWorkers > len(signatureList) {
+		nWorkers = len(signatureList)
+	}
+
+	type recovered struct {
+		addr common.Address
+		sig  types.Signature
+	}
+
+	jobs := make(chan types.Signature, len(signatureList))
+	results := make(chan recovered, len(signatureList))
+
+	// firstErr records the first error seen by any worker; subsequent workers
+	// drain remaining jobs without performing ecrecover (early abort).
+	var firstErr error
+	var errMu sync.Mutex
+	setErr := func(e error) {
+		errMu.Lock()
+		if firstErr == nil {
+			firstErr = e
+		}
+		errMu.Unlock()
+	}
+	hasErr := func() bool {
+		errMu.Lock()
+		ok := firstErr != nil
+		errMu.Unlock()
+		return ok
+	}
+
 	var wg sync.WaitGroup
-	wg.Add(len(signatureList))
-
-	for _, signature := range signatureList {
-		go func(sig types.Signature) {
+	wg.Add(nWorkers)
+	for i := 0; i < nWorkers; i++ {
+		go func() {
 			defer wg.Done()
-			pubkey, err := crypto.Ecrecover(signedHash.Bytes(), sig)
-			if err != nil {
-				log.Error("[RecoverUniqueSigners] ecrecover error",
-					"error", err,
-					"signature", common.Bytes2Hex(sig))
-				errCh <- err
-				return
+			for sig := range jobs {
+				// Abort early: drain remaining jobs without doing ecrecover.
+				if hasErr() {
+					continue
+				}
+				pubkey, err := crypto.Ecrecover(signedHash.Bytes(), sig)
+				if err != nil {
+					log.Error("[RecoverUniqueSigners] ecrecover error",
+						"error", err,
+						"signature", common.Bytes2Hex(sig))
+					setErr(err)
+					continue
+				}
+				// Reject the entire batch if this signature is an ECDSA-malleated
+				// (high-S) counterpart. An honest signer (crypto.Sign) always
+				// produces low-S; a high-S signature over an already-recoverable
+				// hash is evidence of a malleability attack, not a genuine second
+				// vote/timeout from a distinct signer.
+				if !hasLowS(sig) {
+					log.Warn("[RecoverUniqueSigners] found evidence of malleability attack",
+						"message", signedHash.Hex())
+					setErr(utils.ErrInvalidSignature)
+					continue
+				}
+				var addr common.Address
+				copy(addr[:], crypto.Keccak256(pubkey[1:])[12:])
+				if member != nil {
+					if _, ok := member[addr]; !ok {
+						setErr(errSignerNotMasternode)
+						continue
+					}
+				}
+				results <- recovered{addr: addr, sig: sig}
 			}
-			var signerAddress common.Address
-			copy(signerAddress[:], crypto.Keccak256(pubkey[1:])[12:])
-
-			// Reject the entire batch if this signature is an ECDSA-malleated
-			// (high-S) counterpart. An honest signer (crypto.Sign) always
-			// produces low-S; a high-S signature over an already-recoverable
-			// hash is evidence of a malleability attack, not a genuine second
-			// vote/timeout from a distinct signer.
-			if !hasLowS(sig) {
-				log.Warn("[RecoverUniqueSigners] found evidence of malleability attack",
-					"signer", signerAddress,
-					"message", signedHash.Hex())
-				errCh <- utils.ErrInvalidSignature
-				return
-			}
-
-			result <- Message{pubkey: signerAddress, sig: sig}
-		}(signature)
+		}()
 	}
-	wg.Wait()
-	close(result)
-	close(errCh)
 
-	if len(errCh) > 0 {
-		return nil, nil, <-errCh
+	byteDups := make([]types.Signature, 0)
+	seenBytes := make(map[string]struct{}, len(signatureList))
+	for _, sig := range signatureList {
+		if _, ok := seenBytes[string(sig)]; ok {
+			byteDups = append(byteDups, sig)
+			continue
+		}
+		seenBytes[string(sig)] = struct{}{}
+		jobs <- sig
+	}
+	close(jobs)
+	wg.Wait()
+	close(results)
+
+	if firstErr != nil {
+		return nil, nil, firstErr
 	}
 
 	keys := make(map[string]struct{})
-	uniqueSigners := make([]types.Signature, 0, len(result))
+	uniqueSigners := make([]types.Signature, 0, len(signatureList))
 	duplicates := make([]types.Signature, 0)
 
-	for r := range result {
-		pubkeyHex := r.pubkey.Hex()
+	for r := range results {
+		pubkeyHex := r.addr.Hex()
 		if _, ok := keys[pubkeyHex]; !ok {
 			keys[pubkeyHex] = struct{}{}
 			uniqueSigners = append(uniqueSigners, r.sig)
@@ -174,7 +252,29 @@ func RecoverUniqueSigners(signedHash common.Hash, signatureList []types.Signatur
 		}
 	}
 
+	duplicates = append(duplicates, byteDups...)
 	return uniqueSigners, duplicates, nil
+}
+
+// countPoolSigners returns the number of distinct signers among the pooled
+// messages that are in masternodes. The pool keys entries by message hash,
+// which includes the signature bytes, so one signer can hold several entries;
+// the vote and timeout threshold gates must count signers, not entries (#1552).
+// Signers were recovered when each message was admitted, so no ecrecover here.
+func countPoolSigners(pooled map[common.Hash]utils.PoolObj, masternodes []common.Address) int {
+	member := make(map[common.Address]struct{}, len(masternodes))
+	for _, mn := range masternodes {
+		member[mn] = struct{}{}
+	}
+	seen := make(map[common.Address]struct{}, len(pooled))
+	for _, obj := range pooled {
+		if signer := obj.GetSigner(); signer != (common.Address{}) {
+			if _, ok := member[signer]; ok {
+				seen[signer] = struct{}{}
+			}
+		}
+	}
+	return len(seen)
 }
 
 // verifyQC verifies a quorum certificate
@@ -200,23 +300,16 @@ func (x *XDPoS_v2) inCheckpointCatchup(chain consensus.ChainReader, blockNum uin
 	if !active || anchor == 0 {
 		return false
 	}
-	// Symmetric 2x-epoch window: BeaconSync walks BACK from the pivot to
-	// download historical headers before walking forward to state. Both
-	// directions need the same QC-skip relaxation while the pre-anchor
-	// epoch-switch headers haven't been ingested yet.
+	// All blocks at or below the anchor (plus a forward window) need relaxed
+	// QC verification. BeaconSync backfills the entire pre-pivot range top-down,
+	// and those headers reference epoch-switch blocks that have not been
+	// downloaded yet. The parent-hash chain from the trusted pivot authenticates
+	// the backfill range; individual QC gap and signature checks can only run
+	// once the referenced epoch-switch headers are locally available.
 	//
-	// A.60.5 follow-up (refs #857): the original check `blockNum >= anchor`
-	// only covered the forward walk; verifyHeader was still firing on
-	// every pre-anchor block (e.g. block anchor-1 with QC referencing
-	// anchor-2). With BeaconSync's reverse-walk pattern from operator-
-	// pinned pivot, those pre-anchor blocks dominate the verification
-	// volume and the failure cancels every sync attempt.
+	// refs #1847 #1851 #1859
 	window := x.config.Epoch * 2
-	lo := uint64(0)
-	if anchor > window {
-		lo = anchor - window
-	}
-	return blockNum >= lo && blockNum <= anchor+window
+	return blockNum <= anchor+window
 }
 
 func (x *XDPoS_v2) verifyQC(chain consensus.ChainReader, quorumCert *types.QuorumCert, parentHeader *types.Header, parents []*types.Header) error {
@@ -249,7 +342,7 @@ func (x *XDPoS_v2) verifyQC(chain consensus.ChainReader, quorumCert *types.Quoru
 	// (not gated on qcRound>0) so a high-S signature is rejected even on the
 	// round-0 QC marker path; only the threshold-count comparison below stays
 	// gated on qcRound>0.
-	signatures, duplicates, err := RecoverUniqueSigners(signedVoteObj, quorumCert.Signatures)
+	signatures, duplicates, err := recoverUniqueSigners(signedVoteObj, quorumCert.Signatures, epochInfo.Masternodes)
 	if err != nil {
 		log.Error("[verifyQC] Error while recovering unique signers from QC",
 			"qcBlockNum", quorumCert.ProposedBlockInfo.Number,
@@ -395,10 +488,12 @@ func (x *XDPoS_v2) processQC(chain consensus.ChainReader, incomingQuorumCert *ty
 	// Get proposed block header
 	proposedBlockHeader := chain.GetHeaderByHash(incomingQuorumCert.ProposedBlockInfo.Hash)
 	if proposedBlockHeader == nil {
-		log.Warn("[processQC] Proposed block not yet available, skipping QC processing",
+		// Canonical XDPoSChain returns an error here (engine.go processQC);
+		// returning nil made callers treat an unprocessed QC as processed.
+		log.Warn("[processQC] Proposed block not found",
 			"hash", incomingQuorumCert.ProposedBlockInfo.Hash,
 			"number", incomingQuorumCert.ProposedBlockInfo.Number)
-		return nil
+		return fmt.Errorf("block not found, number: %v, hash: %v", incomingQuorumCert.ProposedBlockInfo.Number, incomingQuorumCert.ProposedBlockInfo.Hash)
 	}
 
 	// Update lock QC for blocks after V2 switch
@@ -575,15 +670,34 @@ func (x *XDPoS_v2) VerifyBlockInfo(chain consensus.ChainReader, blockInfo *types
 
 // VerifySyncInfoMessage verifies a sync info message
 func (x *XDPoS_v2) VerifySyncInfoMessage(chain consensus.ChainReader, syncInfo *types.SyncInfo) (bool, error) {
+	// Snapshot the local QC and TC rounds under RLock.  processQC and processTC
+	// (called from SyncInfoHandler/ProposedBlockHandler under Lock) replace
+	// x.highestQuorumCert and x.highestTimeoutCert; reading them without any
+	// lock is a data race.
+	x.lock.RLock()
+	localQCRound := x.highestQuorumCert.ProposedBlockInfo.Round
+	localTCRound := x.highestTimeoutCert.Round
+	x.lock.RUnlock()
+
 	// Check if we need to update
-	if x.highestQuorumCert.ProposedBlockInfo.Round >= syncInfo.HighestQuorumCert.ProposedBlockInfo.Round &&
-		x.highestTimeoutCert.Round >= syncInfo.HighestTimeoutCert.Round {
+	if localQCRound >= syncInfo.HighestQuorumCert.ProposedBlockInfo.Round &&
+		localTCRound >= syncInfo.HighestTimeoutCert.Round {
 		log.Debug("[VerifySyncInfoMessage] SyncInfo not newer",
-			"localQCRound", x.highestQuorumCert.ProposedBlockInfo.Round,
+			"localQCRound", localQCRound,
 			"incomingQCRound", syncInfo.HighestQuorumCert.ProposedBlockInfo.Round,
-			"localTCRound", x.highestTimeoutCert.Round,
+			"localTCRound", localTCRound,
 			"incomingTCRound", syncInfo.HighestTimeoutCert.Round)
 		return false, nil
+	}
+
+	// Peer-intake cap: reject before any ecrecover if signature count exceeds
+	// the safe upper bound for masternodes. maxPeerSigCap is comfortably above
+	// MaxMasternodesV2 (108), so a legitimate QC/TC can never hit this limit.
+	// This prevents a signature-bomb attack via SyncInfo messages (CertiK P3 / #1707).
+	if n := len(syncInfo.HighestQuorumCert.Signatures); n > maxPeerSigCap {
+		log.Warn("[VerifySyncInfoMessage] QC signature bomb rejected",
+			"signatures", n, "cap", maxPeerSigCap)
+		return false, fmt.Errorf("QC from peer has %d signatures, exceeds peer cap %d", n, maxPeerSigCap)
 	}
 
 	// Verify QC
@@ -602,6 +716,12 @@ func (x *XDPoS_v2) VerifySyncInfoMessage(chain consensus.ChainReader, syncInfo *
 			"qcRound", syncInfo.HighestQuorumCert.ProposedBlockInfo.Round,
 			"qcNumber", syncInfo.HighestQuorumCert.ProposedBlockInfo.Number)
 		return true, nil
+	}
+	// Peer-intake cap for TC signatures (mirrors QC cap above).
+	if n := len(syncInfo.HighestTimeoutCert.Signatures); n > maxPeerSigCap {
+		log.Warn("[VerifySyncInfoMessage] TC signature bomb rejected",
+			"signatures", n, "cap", maxPeerSigCap)
+		return false, fmt.Errorf("TC from peer has %d signatures, exceeds peer cap %d", n, maxPeerSigCap)
 	}
 	if err := x.verifyTC(chain, syncInfo.HighestTimeoutCert); err != nil {
 		log.Warn("[VerifySyncInfoMessage] TC verification failed",
@@ -696,26 +816,6 @@ func (x *XDPoS_v2) GetSignersFromSnapshot(chain consensus.ChainReader, header *t
 		return nil, err
 	}
 	return snap.NextEpochCandidates, nil
-}
-
-// UniqueSignatures deduplicates signatures by their byte content.
-// Returns unique signatures and any duplicates found.
-// Matches v2.6.8 engines/engine_v2/utils.go conceptually.
-func UniqueSignatures(signatureSlice []types.Signature) ([]types.Signature, []types.Signature) {
-	seen := make(map[common.Hash]bool)
-	unique := make([]types.Signature, 0, len(signatureSlice))
-	duplicates := make([]types.Signature, 0)
-
-	for _, sig := range signatureSlice {
-		sigHash := common.BytesToHash(sig)
-		if seen[sigHash] {
-			duplicates = append(duplicates, sig)
-		} else {
-			seen[sigHash] = true
-			unique = append(unique, sig)
-		}
-	}
-	return unique, duplicates
 }
 
 // CalculateMissingRounds computes which consensus rounds were missed in the current epoch.

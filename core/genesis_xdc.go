@@ -36,6 +36,9 @@ var xdcApothemGenesisJSON []byte
 //go:embed xdc_genesis/devnet.json
 var xdcDevnetGenesisJSON []byte
 
+//go:embed xdc_genesis/devnet551.json
+var xdcDevnet551GenesisJSON []byte
+
 // XDC Network contract addresses (pre-deployed at genesis)
 var (
 	// XDCValidatorAddress is the masternode validator contract
@@ -83,6 +86,19 @@ func DefaultXDCDevnetGenesisBlock() *Genesis {
 	if err := json.Unmarshal(xdcDevnetGenesisJSON, &genesis); err != nil {
 		log.Crit("Failed to unmarshal embedded devnet genesis", "err", err)
 	}
+	return &genesis
+}
+
+// DefaultXDCDevnet551GenesisBlock returns the XDC devnet (chain ID 551) genesis
+// block: XinFinOrg/XDPoSChain v2.9.3-testnet core/genesis.go:925
+// DefaultDevnetGenesisBlock (alloc, extraData, gas limit and timestamp dumped
+// from it), hash 0x50e63112ebf55bba9115ea875eedc3f6c62b42440d23786323e2678a9848b7ac.
+func DefaultXDCDevnet551GenesisBlock() *Genesis {
+	var genesis Genesis
+	if err := json.Unmarshal(xdcDevnet551GenesisJSON, &genesis); err != nil {
+		log.Crit("Failed to unmarshal embedded devnet 551 genesis", "err", err)
+	}
+	genesis.Config = params.XDCDevnet551ChainConfig
 	return &genesis
 }
 

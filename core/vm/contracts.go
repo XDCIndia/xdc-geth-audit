@@ -34,6 +34,7 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/bitutil"
 	"github.com/ethereum/go-ethereum/core/tracing"
+	"github.com/ethereum/go-ethereum/core/vm/privacy"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/crypto/blake2b"
 	"github.com/ethereum/go-ethereum/crypto/bn256"
@@ -259,12 +260,24 @@ func activePrecompiledContracts(rules params.Rules) *PrecompiledContracts {
 		// with bigModExp{eip2565: true}. Issue #716. The set is its own variable so
 		// the precompile cache never shares entries across the two MODEXP variants.
 		if rules.IsXDC && !rules.IsEIP1559 {
+			// XDCx precompiles (0x1e/0x28/0x29/0x2a) are active until
+			// TIPXDCXMinerDisable. Canonical XDPoSChain v2.9.3-testnet
+			// core/vm/contracts.go activePrecompiledContracts.
+			if !rules.IsXDCxMinerDisable {
+				return &PrecompiledContractsXDCBerlinXDCx
+			}
 			return &PrecompiledContractsXDCBerlin
 		}
 		return &PrecompiledContractsBerlin
 	case rules.IsIstanbul:
+		if rules.IsXDC && !rules.IsXDCxMinerDisable {
+			return &PrecompiledContractsXDCIstanbulXDCx
+		}
 		return &PrecompiledContractsIstanbul
 	case rules.IsByzantium:
+		if rules.IsXDC && !rules.IsXDCxMinerDisable {
+			return &PrecompiledContractsXDCByzantiumXDCx
+		}
 		return &PrecompiledContractsByzantium
 	default:
 		return &PrecompiledContractsHomestead
@@ -1689,3 +1702,51 @@ func (c *p256Verify) Cacheable() bool { return true }
 func (c *p256Verify) NormalizeInput(input []byte) ([]byte, bool) {
 	return input, len(input) == p256VerifyInputLength
 }
+
+// XDC-specific precompiles: 0x1e (ringSignatureVerifier) and 0x28 (bulletproofVerifier)
+// These are active from block 4 (Byzantium) through TIPXDCXMinerDisableBlock
+// (mainnet 80,370,000 / Apothem 61,290,000) on XDC chains. Canonical reference:
+// XDPoSChain v2.9.3-testnet core/vm/contracts.go:72-75, 90-93.
+
+// ringSignatureVerifier is precompile 0x1e. It costs 100,000 gas and verifies a
+// Linkable Ring Signature (LSAG) proof. Fails with an error on any invalid or
+// undecodable proof.
+type ringSignatureVerifier struct{}
+
+func (c *ringSignatureVerifier) RequiredGas(input []byte) uint64 {
+	return 100000
+}
+
+func (c *ringSignatureVerifier) Run(proof []byte) ([]byte, error) {
+	der, err := privacy.Deserialize(proof)
+	if err != nil {
+		return []byte{}, errors.New("fail to deserialize proof")
+	}
+	if !privacy.Verify(der, false) {
+		return []byte{}, errors.New("fail to verify ring signature")
+	}
+	return []byte{}, nil
+}
+
+func (c *ringSignatureVerifier) Name() string { return "RING_SIG_VERIFY" }
+
+// bulletproofVerifier is precompile 0x28. It costs 100,000 gas and verifies a
+// Bulletproof range proof. Fails with an error on any invalid or undecodable proof.
+type bulletproofVerifier struct{}
+
+func (c *bulletproofVerifier) RequiredGas(input []byte) uint64 {
+	return 100000
+}
+
+func (c *bulletproofVerifier) Run(proof []byte) ([]byte, error) {
+	mrp := new(privacy.MultiRangeProof)
+	if mrp.Deserialize(proof) != nil {
+		return []byte{}, errors.New("failed to deserialize bulletproofs")
+	}
+	if !privacy.MRPVerify(mrp) {
+		return []byte{}, errors.New("failed to verify bulletproof")
+	}
+	return []byte{}, nil
+}
+
+func (c *bulletproofVerifier) Name() string { return "BULLET_PROOF_VERIFY" }

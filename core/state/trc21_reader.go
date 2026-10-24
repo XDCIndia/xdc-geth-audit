@@ -17,11 +17,20 @@
 package state
 
 import (
+	"bytes"
 	"math/big"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/tracing"
 	"github.com/holiman/uint256"
+)
+
+// ABI function selectors for TRC21 token-fee transaction validation.
+// transfer(address,uint256)            = 0xa9059cbb
+// transferFrom(address,address,uint256) = 0x23b872dd
+var (
+	trc21TransferSig     = []byte{0xa9, 0x05, 0x9c, 0xbb}
+	trc21TransferFromSig = []byte{0x23, 0xb8, 0x72, 0xdd}
 )
 
 // TRC21 token-fee capacity, ported from XinFinOrg/XDPoSChain core/state/trc21_reader.go
@@ -81,6 +90,44 @@ func PayFeeWithTRC21TxFail(statedb *StateDB, from, token common.Address) {
 	issuerBalanceKey := common.BigToHash(GetLocMappingAtKey(common.BytesToHash(issuerAddr.Bytes()), slotTRC21TokenBalances))
 	issuerBalance := statedb.GetState(token, issuerBalanceKey).Big()
 	statedb.SetState(token, issuerBalanceKey, common.BigToHash(new(big.Int).Add(issuerBalance, feeUsed)))
+}
+
+// ValidateTRC21Tx checks whether from has sufficient token balance to send a
+// TRC21 token-fee transaction to token. It mirrors XDPoSChain
+// StateDB.ValidateTRC21Tx (core/state/trc21_reader.go v2.9.3-testnet):
+//
+//   - If the sender holds token balance, it must be ≥ minFee + transfer value
+//     (parsed from a transfer/transferFrom ABI call in data).
+//   - If the sender holds no token balance, the tx is accepted anyway (canonical
+//     behaviour: "we both accept tx with balance = 0 and fee = 0").
+//
+// Returns false only when data is too short to contain a selector or when the
+// sender's token balance is insufficient.
+func ValidateTRC21Tx(statedb *StateDB, from, token common.Address, data []byte) bool {
+	if statedb == nil || len(data) < 4 {
+		return false
+	}
+	balanceKey := common.BigToHash(GetLocMappingAtKey(common.BytesToHash(from.Bytes()), slotTRC21TokenBalances))
+	balanceHash := statedb.GetState(token, balanceKey)
+	if (balanceHash == common.Hash{}) {
+		// No token balance: accept, mirroring canonical "balance = 0 and fee = 0" path.
+		return true
+	}
+	balance := balanceHash.Big()
+	minFee := statedb.GetState(token, GetLocSimpleVariable(slotTRC21TokenMinFee)).Big()
+	// Parse the transfer value from standard ABI-encoded transfer / transferFrom.
+	// transfer(address,uint256): selector 0xa9059cbb, 68 bytes total, value at [36:68].
+	// transferFrom(address,address,uint256): selector 0x23b872dd, 80 bytes (canonical
+	// packs value into 12 bytes), value at [68:80] — mirrors XDPoSChain exactly.
+	value := new(big.Int)
+	switch {
+	case bytes.Equal(data[:4], trc21TransferSig) && len(data) == 68:
+		value = common.BytesToHash(data[36:]).Big()
+	case bytes.Equal(data[:4], trc21TransferFromSig) && len(data) == 80:
+		value = common.BytesToHash(data[68:]).Big()
+	}
+	required := new(big.Int).Add(minFee, value)
+	return balance.Cmp(required) >= 0
 }
 
 // UpdateTRC21Fee writes the tokens' new fee capacities back to the issuer

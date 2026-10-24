@@ -352,7 +352,7 @@ func (sim *simulator) processBlock(ctx context.Context, block *simBlock, header,
 			}
 		}
 	}
-	if sim.chainConfig.IsCancun(header.Number, header.Time) {
+	if sim.chainConfig.IsCancun(header.Number, header.Time) && !sim.chainConfig.IsXDC() {
 		var excess uint64
 		if sim.chainConfig.IsCancun(parent.Number, parent.Time) {
 			excess = eip4844.CalcExcessBlobGas(sim.chainConfig, parent, header.Time)
@@ -552,6 +552,19 @@ func (sim *simulator) sanitizeCall(call *TransactionArgs, state vm.StateDB, head
 	gasCapped := gas < uint64(*call.Gas)
 	call.Gas = (*hexutil.Uint64)(&gas)
 
+	// A set-code transaction needs the EIP-1559 fee fields, so gasPrice cannot be
+	// combined with an authorization list. CallDefaults does not check this, so
+	// without it the pair is downgraded to a legacy transaction in the returned
+	// block while the call itself applies the authorization list. The same
+	// downgrade happens when the simulated header has no base fee and
+	// CallDefaults fills a zero gasPrice. As XDPoSChain v3.0.0
+	// internal/ethapi/simulate.go.
+	if call.GasPrice != nil && call.AuthorizationList != nil {
+		return false, errors.New("both gasPrice and authorizationList specified")
+	}
+	if call.AuthorizationList != nil && header.BaseFee == nil {
+		return false, errors.New("authorizationList requires a base fee")
+	}
 	return gasCapped, call.CallDefaults(0, header.BaseFee, sim.chainConfig.ChainID)
 }
 

@@ -131,10 +131,22 @@ func (evm *EVM) Run(contract *Contract, input []byte, readOnly bool) (ret []byte
 	// cannot see table changes made by ExtraEips. The same goes for verkle, which
 	// the generator gets no lane for at all. Those configs run the table
 	// loop, as do tracing and the differential test via forceTableLoop.
-	if evm.forceTableLoop || evm.chainRules.IsEIP4762 || len(evm.Config.ExtraEips) > 0 || evm.Config.Tracer != nil {
+	if evm.useTableLoop() {
 		return evm.execTraced(scope)
 	}
 	return evm.execUntraced(scope)
+}
+
+// useTableLoop reports whether execution must walk the per-fork operation
+// table instead of the generated fast path.
+//
+// XDC: XDC chains build their own instruction sets (EIPs gated at the XDC fork
+// blocks, XDC opcode behaviour), and the generated path bakes in upstream's
+// per-fork gas and gates at generate time. XDC chains therefore always run the
+// table loop, which executes exactly the XDC jump tables as before v1.17.9.
+func (evm *EVM) useTableLoop() bool {
+	return evm.forceTableLoop || evm.chainRules.IsXDC || evm.chainRules.IsEIP4762 ||
+		len(evm.Config.ExtraEips) > 0 || evm.Config.Tracer != nil
 }
 
 // execTraced is the old table-walking interpreter loop. It dispatches every

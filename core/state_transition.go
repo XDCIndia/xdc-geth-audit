@@ -68,6 +68,18 @@ func (result *ExecutionResult) Revert() []byte {
 	return common.CopyBytes(result.ReturnData)
 }
 
+// XDCPreEIP2028Calldata reports whether an XDC chain charges the pre-EIP-2028
+// price of 68 gas per non-zero calldata byte. Canonical XDPoSChain v3.0.0 moves
+// to the EIP-2028 price at Prague. Devnet 5551 is the exception: its sealers run
+// the XDPoSChain dev-upgrade line (XDC v2.7.0-devnet), which activates Prague at
+// 50,000 but keeps 68 gas, so its history must be replayed with 68 gas.
+func XDCPreEIP2028Calldata(config *params.ChainConfig, rules params.Rules) bool {
+	if !config.IsXDC() {
+		return false
+	}
+	return !rules.IsPrague || (config.ChainID != nil && config.ChainID.Uint64() == 5551)
+}
+
 // IntrinsicGas computes the 'intrinsic gas' for a message with the given data.
 func IntrinsicGas(data []byte, accessList types.AccessList, authList []types.SetCodeAuthorization, from common.Address, to *common.Address, value *uint256.Int, rules params.Rules) (uint64, error) {
 	isContractCreation := to == nil
@@ -111,7 +123,9 @@ func IntrinsicGas(data []byte, accessList types.AccessList, authList []types.Set
 		}
 		gas += z * params.TxDataZeroGas
 
-		if isContractCreation && rules.IsShanghai {
+		// EIP-3860 word cost: IsEIP3860 is IsShanghai upstream and IsEIP1559 on
+		// XDC (canonical XDPoSChain IntrinsicGas(..., rules.IsEIP1559)), #842.
+		if isContractCreation && rules.IsEIP3860 {
 			lenWords := toWordSize(dataLen)
 			if (math.MaxUint64-gas)/params.InitCodeWordGas < lenWords {
 				return 0, ErrGasUintOverflow
@@ -677,6 +691,10 @@ func (st *stateTransition) preCheck(rules params.Rules) error {
 	if msg.AccessList != nil && !rules.IsBerlin {
 		return fmt.Errorf("%w: access list tx (sender %v)", ErrTxTypeNotSupported, msg.From)
 	}
+	// Check that the blob fee cap is only present once EIP-4844 is active
+	if msg.BlobGasFeeCap != nil && !rules.IsCancun {
+		return fmt.Errorf("%w: blob tx (sender %v)", ErrTxTypeNotSupported, msg.From)
+	}
 	// Check the blob version validity
 	if msg.BlobHashes != nil {
 		if !rules.IsCancun {
@@ -775,13 +793,14 @@ func (st *stateTransition) execute() (*ExecutionResult, error) {
 	// Calculate the intrinsic gas of this transaction and make sure the gas limit
 	// is sufficient to cover that.
 	//
-	// XDC: disable EIP-2028 transaction data pricing to match XDPoSChain v2.6.8.
-	// Canonical XDPoSChain does not implement EIP-2028 and always charges
-	// 68 gas per non-zero byte; forcing IsIstanbul=false here (on a rules copy
-	// fed only to IntrinsicGas, never to preCheck/FloorDataGas/settleGas) keeps
-	// gas accounting consensus-equivalent on XDC chains (refs #740/#742).
+	// XDC: EIP-2028 transaction data pricing starts at Prague, as in canonical
+	// XDPoSChain v3.0.0 (devnet 5551 excepted, see XDCPreEIP2028Calldata);
+	// before Prague a non-zero byte costs 68 gas. Forcing
+	// IsIstanbul=false here (on a rules copy fed only to IntrinsicGas, never to
+	// preCheck/FloorDataGas/settleGas) keeps gas accounting consensus-equivalent
+	// on XDC chains (refs #740/#742).
 	intrRules := rules
-	if st.evm.ChainConfig().IsXDC() {
+	if XDCPreEIP2028Calldata(st.evm.ChainConfig(), rules) {
 		intrRules.IsIstanbul = false
 	}
 	intrinsicGas, err := IntrinsicGas(msg.Data, msg.AccessList, msg.SetCodeAuthorizations, msg.From, msg.To, msg.Value, intrRules)
@@ -878,13 +897,14 @@ func (st *stateTransition) execute() (*ExecutionResult, error) {
 			// still accessed like in a real block.
 			effectiveTip = new(uint256.Int)
 		}
-		if st.evm.Context.BlockNumber.Cmp(common.TIPTRC21Fee) > 0 {
-			// XDC TRC21 fee routing (refs #740/#742): after TIPTRC21Fee, the full
+		if st.evm.Context.BlockNumber.Cmp(st.evm.ChainConfig().EffectiveTIPTRC21FeeBlock()) > 0 {
+			// XDC TRC21 fee routing (refs #740/#742/#1549): after TIPTRC21FeeBlock, the full
 			// gasUsed * gasPrice (no base-fee deduction) is credited to the
-			// coinbase-owner address — matches XDPoSChain v2.6.8 semantics where
+			// coinbase-owner address — matches XDPoSChain v2.9.3 semantics where
 			// the TRC21 owner receives the entire fee rather than the block miner.
+			// Strict > matches canonical XDPoSChain state_transition.go:507.
 			// With no registered owner canonical credits nothing (XDPoSChain
-			// v2.9.2 core/state_transition.go:507-510); it never falls back to
+			// v2.9.3 core/state_transition.go:507-510); it never falls back to
 			// the coinbase.
 			if st.owner != (common.Address{}) {
 				fee := new(uint256.Int).SetUint64(gasUsed)
@@ -1322,7 +1342,17 @@ func (st *stateTransition) applyAuthorizations(rules params.Rules, auths []types
 // calcRefund computes the EIP-3529 refund cap against tx_gas_used_before_refund.
 func (st *stateTransition) calcRefund(gasUsedBeforeRefund uint64) uint64 {
 	quotient := params.RefundQuotient
-	if st.evm.ChainConfig().IsLondon(st.evm.Context.BlockNumber) {
+	num := st.evm.Context.BlockNumber
+	// XDC chains activate the EIP-3529 /5 refund cap at Eip1559Block, matching
+	// canonical XDPoSChain (core/state_transition.go:594-603 v2.9.3-testnet).
+	// London fires earlier on XDC (76,321,000) than EIP-1559 (98,800,200);
+	// using IsLondon here would apply the cap 22.48M blocks too early.
+	// Non-XDC chains keep the upstream IsLondon behaviour.
+	if st.evm.ChainConfig().IsXDC() {
+		if st.evm.ChainConfig().IsEIP1559(num) {
+			quotient = params.RefundQuotientEIP3529
+		}
+	} else if st.evm.ChainConfig().IsLondon(num) {
 		quotient = params.RefundQuotientEIP3529
 	}
 	refund := gasUsedBeforeRefund / quotient

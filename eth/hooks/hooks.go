@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"sync"
 
 	"github.com/ethereum/go-ethereum/common"
 	xdc_sort "github.com/ethereum/go-ethereum/common/sort"
@@ -18,56 +19,48 @@ import (
 	"github.com/ethereum/go-ethereum/core/state"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/log"
+	"github.com/ethereum/go-ethereum/metrics"
 	"github.com/ethereum/go-ethereum/params"
+)
+
+// Counters for HookVerifyMNs skip paths so operators can observe silent bypasses
+// (Hacken F-2026-19462 residual).
+var (
+	// hookVerifyMNsApothemSkips counts checkpoints skipped on Apothem (chain 51)
+	// because canonical XDPoSChain disables full V1 verification on testnet.
+	hookVerifyMNsApothemSkips = metrics.NewRegisteredCounter("eth/hooks/verify_mns/apothem_skips", nil)
+	// hookVerifyMNsMissingStateSkips counts checkpoints skipped because the
+	// parent header or its state is not available on this node.
+	hookVerifyMNsMissingStateSkips = metrics.NewRegisteredCounter("eth/hooks/verify_mns/missing_state_skips", nil)
+
+	hookVerifyMNsApothemSkipOnce sync.Once
 )
 
 // AttachConsensusV1Hooks attaches V1 consensus hooks to XDPoS engine. (#72)
 // Mirrors v2.6.8 eth/hooks/engine_v1_hooks.go AttachConsensusV1Hooks.
-//
-// NOTE: Full M2 randomization via the 0x0090 randomize contract requires
-// a ContractBackend (IPC client). That wiring (bc.GetClient / bc.IPCEndpoint)
-// is tracked in issue #72 as a follow-up. For now we wire the hooks with a
-// best-effort implementation: direct signer encoding pre-TIPRandomize, and
-// pass-through (non-enforcing) post-TIPRandomize to unblock sync.
 func AttachConsensusV1Hooks(adaptor *XDPoS.XDPoS, bc *core.BlockChain, chainConfig *params.ChainConfig) {
 	xdposConf := chainConfig.XDPoS
 
-	// HookValidator: computes the Validators bytes for a checkpoint block header.
-	// Stored in header.Validators field; used by V1 verifySeal / M2 double-signing.
+	// HookValidator: computes the Validators bytes (M2 list) for a checkpoint
+	// block this node mints. Port of canonical XDPoSChain eth/hooks/
+	// engine_v1_hooks.go HookValidator / getValidatorsAtNumber: at every
+	// checkpoint the list is derived from the 0x90 randomize values in the
+	// parent's state, the same list HookVerifyMNs checks on import.
 	adaptor.HookValidator = func(header *types.Header, signers []common.Address) ([]byte, error) {
-		if xdposConf == nil || len(signers) == 0 {
-			return []byte{}, nil
+		parent := bc.GetHeaderByHash(header.ParentHash)
+		if parent == nil {
+			return nil, errors.New("v1 HookValidator: nil parent block to derive the validators from")
 		}
-		number := header.Number.Uint64()
-
-		// Before TIPRandomize (3,464,000): encode signers in order
-		if number < 3464000 {
-			result := make([]byte, 0, len(signers)*common.AddressLength)
-			for _, s := range signers {
-				result = append(result, s.Bytes()...)
-			}
-			header.Validators = result
-			return result, nil
+		statedb, err := bc.StateAt(parent.Root, parent.Number, parent.Time)
+		if err != nil {
+			return nil, err
 		}
-
-		// After TIPRandomize: M2 randomization is derived from the 0x0090 randomize contract.
-		// Full contract-call support requires bc.GetClient() (IPC) — see issue #72 follow-up.
-		// For now: if header.Validators is already set (synced from network), use it as-is.
-		// When mining, this hook is called to SET the field — we can't derive M2 without IPC,
-		// so we fall back to encoding signers directly (produces wrong M2 but won't crash).
-		if len(header.Validators) > 0 {
-			log.Trace("[V1 HookValidator] using existing Validators from header", "number", number)
-			return header.Validators, nil
+		validators, err := validatorsFromState(statedb, signers)
+		if err != nil {
+			return nil, err
 		}
-
-		// Fallback: direct encoding (wrong M2 order post-TIPRandomize, but non-fatal in sync mode)
-		log.Debug("[V1 HookValidator] M2 contract unavailable, direct encoding", "number", number)
-		result := make([]byte, 0, len(signers)*common.AddressLength)
-		for _, s := range signers {
-			result = append(result, s.Bytes()...)
-		}
-		header.Validators = result
-		return result, nil
+		header.Validators = validators
+		return validators, nil
 	}
 
 	// HookVerifyMNs: verifies the Validators field at epoch checkpoints against
@@ -86,18 +79,32 @@ func AttachConsensusV1Hooks(adaptor *XDPoS.XDPoS, bc *core.BlockChain, chainConf
 			chainID = chainConfig.ChainID.Uint64()
 		}
 		if chainID == params.XDCApothemChainConfig.ChainID.Uint64() || XDPoS.IsIgnoreSignerCheckBlock(chainID, number) {
+			// Canonical XDPoSChain disables full V1 verification on Apothem
+			// (chain 51) via shouldDisableFullVerify (engine_v1/engine.go).
+			// Running the check retroactively would reject valid canonical
+			// Apothem V1 blocks whose Validators bytes were never enforced.
+			// Hacken F-2026-19462: bypass is intentional; made observable here.
+			// Warn once: a replay from genesis hits this at every V1 checkpoint
+			// (~63k on Apothem). The counter records every skip.
+			hookVerifyMNsApothemSkipOnce.Do(func() {
+				log.Warn("[V1 HookVerifyMNs] skipping validator check: Apothem or ignore-listed checkpoint (logged once; see metric eth/hooks/verify_mns/apothem_skips)",
+					"number", number, "chainID", chainID)
+			})
+			hookVerifyMNsApothemSkips.Inc(1)
 			return nil
 		}
 		// Enforce only when the parent's state is here. Without it the
 		// randomize values cannot be read (e.g. a checkpoint-synced node).
 		parent := bc.GetHeaderByHash(header.ParentHash)
 		if parent == nil {
-			log.Debug("[V1 HookVerifyMNs] parent unknown, skipping", "number", number)
+			log.Warn("[V1 HookVerifyMNs] parent header unknown, skipping validator check", "number", number)
+			hookVerifyMNsMissingStateSkips.Inc(1)
 			return nil
 		}
 		statedb, err := bc.StateAt(parent.Root, parent.Number, parent.Time)
 		if err != nil {
-			log.Debug("[V1 HookVerifyMNs] parent state unavailable, skipping", "number", number, "err", err)
+			log.Warn("[V1 HookVerifyMNs] parent state unavailable, skipping validator check", "number", number, "err", err)
+			hookVerifyMNsMissingStateSkips.Inc(1)
 			return nil
 		}
 		validators, err := validatorsFromState(statedb, signers)

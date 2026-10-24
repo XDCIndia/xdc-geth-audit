@@ -31,7 +31,7 @@ func CheckMaxInitCodeSize(rules *params.Rules, size uint64) error {
 		if size > params.MaxInitCodeSizeAmsterdam {
 			return fmt.Errorf("%w: code size %v limit %v", ErrMaxInitCodeSizeExceeded, size, params.MaxInitCodeSizeAmsterdam)
 		}
-	} else if rules.IsShanghai {
+	} else if rules.IsEIP3860 { // IsShanghai upstream; IsEIP1559 on XDC, as canonical
 		if size > params.MaxInitCodeSize {
 			return fmt.Errorf("%w: code size %v limit %v", ErrMaxInitCodeSizeExceeded, size, params.MaxInitCodeSize)
 		}
