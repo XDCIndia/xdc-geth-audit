@@ -490,7 +490,7 @@ func (h *handler) runEthPeer(peer *eth.Peer, handler eth.Handler) error {
 			// bounded timeout; on timeout keep the peer — silence on legacy
 			// wire is not evidence of misbehaviour. Only an explicit hash
 			// mismatch at the requested number warrants a drop.
-			if peer.Version() == eth.XDPOS2 {
+			if eth.IsXDPOS2Family(peer.Version()) {
 				timeout := time.NewTimer(challengeTimeout)
 				defer timeout.Stop()
 				select {
