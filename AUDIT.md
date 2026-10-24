@@ -1,3 +1,11 @@
+> **This view: `audit/main-uplift-1179-xdc19`: code only, no tests.**
+> Source: XDCIndia/go-ethereum `24d7192e8c00` (v1.17.9-xdc.19 plus later fixes).
+> Every `_test.go` file and every `testdata/` path is excluded (1,230 files), together
+> with the non-code paths (docs, scripts, ops, CI, reports: 182 paths). Every remaining
+> file is byte-identical to the source. `go build ./...` and `go vet ./...` pass on
+> this tree. The tier tables and notes below describe the earlier 1178 cut and are kept
+> for history; tests listed there are not part of this view.
+
 # XDC go-ethereum fork — audit guide
 
 This repository exists to give a reviewer **one provable diff** of the entire XDC
