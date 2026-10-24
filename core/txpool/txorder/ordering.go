@@ -36,15 +36,25 @@ type txWithMinerFee struct {
 // newTxWithMinerFee creates a wrapped transaction, calculating the effective
 // miner gasTipCap if a base fee is provided.
 // Returns error in case of a negative effective miner gasTipCap.
+// Special transactions (BlockSigners 0x89, Randomize 0x90) carry gas price 0
+// and are exempt from the fee-cap check; they yield a zero miner tip so they
+// sort last in the price heap (F-2026-19727).
 func newTxWithMinerFee(tx *txpool.LazyTransaction, from common.Address, baseFee *uint256.Int) (*txWithMinerFee, error) {
 	tip := new(uint256.Int).Set(tx.GasTipCap)
 	if baseFee != nil {
 		if tx.GasFeeCap.Cmp(baseFee) < 0 {
-			return nil, types.ErrGasFeeCapTooLow
-		}
-		tip = new(uint256.Int).Sub(tx.GasFeeCap, baseFee)
-		if tip.Gt(tx.GasTipCap) {
-			tip = tx.GasTipCap
+			// Special txs at gas price 0 yield zero miner tip regardless of the
+			// block base fee, so they can follow a paid nonce from the same
+			// account in the price heap. Resolve only here: it is a pool lookup.
+			if resolved := tx.Resolve(); resolved == nil || !resolved.IsSpecialTransaction() {
+				return nil, types.ErrGasFeeCapTooLow
+			}
+			tip = new(uint256.Int)
+		} else {
+			tip = new(uint256.Int).Sub(tx.GasFeeCap, baseFee)
+			if tip.Gt(tx.GasTipCap) {
+				tip = tx.GasTipCap
+			}
 		}
 	}
 	return &txWithMinerFee{

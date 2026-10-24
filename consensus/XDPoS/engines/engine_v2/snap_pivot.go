@@ -5,6 +5,11 @@
 // ADR-807 Phase 1. It is read-only over headers and does not mutate
 // engine state. The state-machine integration that invokes this helper
 // from xdcSyncer is Phase 3b (deferred — see #807 tracker).
+//
+// SYNC-02 fix (issue #1842): fresh nodes have no locally-stored epoch-switch
+// headers, so verifyQC fails with "failed to get epoch switch info". The fix
+// fetches the epoch-switch header of the candidate's epoch from the peer and
+// seeds the engine's epochSwitches cache before calling verifyQC.
 
 package engine_v2
 
@@ -181,6 +186,30 @@ func (x *XDPoS_v2) tryPivotCandidate(
 		return nil
 	}
 
+	// SYNC-02 (#1842): on a fresh node the epochSwitches cache is empty, so
+	// verifyQC → getEpochSwitchInfoWithParents → getEpochSwitchInfo fails to
+	// walk the local DB and returns "failed to get epoch switch info". Fix:
+	// fetch the epoch-switch header for the candidate's epoch from the peer
+	// and seed the cache before the verifyQC loop. verifyQC then finds the
+	// info via fast path 1 (exact hash hit) and succeeds without touching the
+	// local chain DB. On an established node the cache is already warm and
+	// seedEpochSwitchForSnap is a no-op (early exit on cache hit).
+	verifiedAll := false
+	if _, ok := x.epochSwitches.Get(hN.Hash()); !ok {
+		if seeded := x.trySeedEpochSwitchForSnap(hN, hN1, hN2, fetchHeader); len(seeded) > 0 {
+			// The seeded info comes from the peer. Drop it unless the QCs
+			// below verify against it, so a rejected candidate cannot leave
+			// a wrong masternode set cached under real block hashes.
+			defer func() {
+				if !verifiedAll {
+					for _, h := range seeded {
+						x.epochSwitches.Remove(h)
+					}
+				}
+			}()
+		}
+	}
+
 	// Checks 2+3: 3-chain committed + supermajority QC verified.
 	// Each of hN1, hN2, hN3 must carry a QC referencing the prior
 	// block, and verifyQC must succeed against the masternode set at
@@ -205,9 +234,106 @@ func (x *XDPoS_v2) tryPivotCandidate(
 		}
 	}
 
+	verifiedAll = true
 	return &PivotResult{
 		Block: hN,
 		Root:  hN.Root,
 		Depth: depth,
 	}
+}
+
+// trySeedEpochSwitchForSnap fetches the epoch-switch header for the candidate's
+// epoch from the peer and seeds the epochSwitches cache for hN, hN1, hN2.
+//
+// verifyQC looks up epoch switch info by the proposed block's hash (fast path 1
+// in getEpochSwitchInfoWithParents). Seeding hN.Hash(), hN1.Hash(), hN2.Hash()
+// covers all three verifyQC calls for hN1, hN2, hN3 respectively.
+//
+// Trust model: the serving peer is the trust root — same as fast-sync dynamic
+// pivot. A malicious peer could serve a fabricated epoch-switch header; the QC
+// signature verification that follows provides the cryptographic check.
+//
+// Bound: at most one additional header fetch (the epoch-switch header) on top
+// of the four N..N+3 fetches already done by tryPivotCandidate.
+func (x *XDPoS_v2) trySeedEpochSwitchForSnap(
+	hN, hN1, hN2 *types.Header,
+	fetchHeader HeaderFetcher,
+) []common.Hash {
+	switchHdr := x.findEpochSwitchHeaderForSnap(hN, fetchHeader)
+	if switchHdr == nil {
+		return nil
+	}
+	masternodes := x.GetMasternodesFromEpochSwitchHeader(nil, switchHdr)
+	if len(masternodes) == 0 {
+		log.Debug("snap pivot: epoch-switch header has no masternodes; cannot seed cache",
+			"epochSwitchNum", switchHdr.Number.Uint64())
+		return nil
+	}
+
+	_, round, _ := x.getExtraFieldsNoChain(switchHdr)
+	info := &types.EpochSwitchInfo{
+		Masternodes:    masternodes,
+		MasternodesLen: len(masternodes),
+		Penalties:      extractAddressesFromBytes(switchHdr.Penalties),
+		EpochSwitchBlockInfo: &types.BlockInfo{
+			Hash:   switchHdr.Hash(),
+			Number: switchHdr.Number,
+			Round:  round,
+		},
+	}
+
+	// Seed the three hashes that getEpochSwitchInfoWithParents (fast path 1)
+	// will look up during the verifyQC calls for hN1, hN2, hN3.
+	x.epochSwitches.Add(hN.Hash(), info)
+	x.epochSwitches.Add(hN1.Hash(), info)
+	x.epochSwitches.Add(hN2.Hash(), info)
+	log.Debug("snap pivot: seeded epoch switch info from peer-fetched header (SYNC-02)",
+		"epochSwitchNum", switchHdr.Number.Uint64(),
+		"candidate", hN.Number.Uint64(),
+		"masternodes", len(masternodes))
+	return []common.Hash{hN.Hash(), hN1.Hash(), hN2.Hash()}
+}
+
+// findEpochSwitchHeaderForSnap finds the epoch-switch header of hN's epoch.
+// V2 epochs are counted in rounds, and every block advances the round by at
+// least one, so the switch block lies in [N - round%Epoch, N] and the blocks
+// of hN's epoch form a suffix of that range. Binary search on the round
+// (~log2(Epoch) fetches) and confirm with IsEpochSwitch.
+func (x *XDPoS_v2) findEpochSwitchHeaderForSnap(hN *types.Header, fetchHeader HeaderFetcher) *types.Header {
+	epoch := types.Round(x.config.Epoch)
+	_, round, err := x.getExtraFieldsNoChain(hN)
+	if err != nil || epoch == 0 {
+		return nil
+	}
+	target := round / epoch
+	n := hN.Number.Uint64()
+	lo := n - min(n, uint64(round%epoch))
+	if v2 := x.config.V2.SwitchBlock.Uint64(); lo < v2 {
+		lo = v2
+	}
+	hi, best := n, hN
+	for lo < hi {
+		mid := lo + (hi-lo)/2
+		h := fetchHeader(mid)
+		if h == nil {
+			return nil
+		}
+		if _, r, err := x.getExtraFieldsNoChain(h); err == nil && r/epoch == target {
+			hi, best = mid, h
+		} else if err != nil && mid != x.config.V2.SwitchBlock.Uint64() {
+			return nil
+		} else {
+			lo = mid + 1
+		}
+	}
+	if best.Number.Uint64() != lo {
+		if best = fetchHeader(lo); best == nil {
+			return nil
+		}
+	}
+	if ok, _, err := x.IsEpochSwitch(best); err != nil || !ok {
+		log.Debug("snap pivot: no epoch-switch header found for candidate", "candidate", n, "searched", lo)
+		return nil
+	}
+	return best
 }

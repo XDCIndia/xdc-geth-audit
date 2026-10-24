@@ -31,6 +31,7 @@ import (
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/core/vm"
 	"github.com/ethereum/go-ethereum/event"
+	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/rlp"
 	"github.com/ethereum/go-ethereum/triedb"
@@ -236,7 +237,7 @@ func (bc *BlockChain) GetCanonicalReceipt(tx *types.Transaction, blockHash commo
 		return nil, fmt.Errorf("block header is not found, %d, %x", blockNumber, blockHash)
 	}
 	var blobGasPrice *big.Int
-	if header.ExcessBlobGas != nil {
+	if header.ExcessBlobGas != nil && !bc.chainConfig.IsXDC() {
 		blobGasPrice = eip4844.CalcBlobFee(bc.chainConfig, header)
 	}
 	receipt, ctx, err := rawdb.ReadCanonicalRawReceipt(bc.db, blockHash, blockNumber, txIndex)
@@ -406,6 +407,10 @@ func (bc *BlockChain) SetCheckpointSyncNoState(enabled bool) {
 // writers of bc.checkpointSyncNoState must go through this helper to keep the
 // global from drifting. Persistence (rawdb) stays at the individual call sites.
 func (bc *BlockChain) storeCheckpointSyncNoState(v bool) {
+	if v && XdcForceFullVerify.Load() {
+		log.Warn("XDC_FORCE_FULL_VERIFY: refusing to enter checkpointSyncNoState; state validation stays on")
+		return
+	}
 	bc.checkpointSyncNoState.Store(v)
 	CheckpointSyncNoStateActive.Store(v)
 }

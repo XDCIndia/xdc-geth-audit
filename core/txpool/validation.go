@@ -32,6 +32,14 @@ import (
 	"github.com/holiman/uint256"
 )
 
+// trc21Cost computes the cost of a TRC21 token-fee transaction at the given
+// block number: TRC21GasPriceForBlock(cfg, number) * gas + value.
+func trc21Cost(cfg *params.ChainConfig, number *big.Int, tx *types.Transaction) *big.Int {
+	price := params.TRC21GasPriceForBlock(cfg, number)
+	c := new(big.Int).Mul(price, new(big.Int).SetUint64(tx.Gas()))
+	return c.Add(c, tx.Value())
+}
+
 var (
 	// blobTxMinBlobGasPrice is the big.Int version of the configured protocol
 	// parameter to avoid constructing a new big integer for every transaction.
@@ -80,11 +88,22 @@ func ValidateTransaction(tx *types.Transaction, head *types.Header, signer types
 	if !rules.IsBerlin && tx.Type() != types.LegacyTxType {
 		return fmt.Errorf("%w: type %d rejected, pool not yet in Berlin", core.ErrTxTypeNotSupported, tx.Type())
 	}
+	// XDC chains defer type-1/2 support to Eip1559Block. Canonical XDPoSChain
+	// v2.9.3-testnet core/txpool/validation.go:81-83 rejects non-legacy txs
+	// when !IsEIP1559. On XDC mainnet London=76,321,000 < EIP1559=98,800,200.
+	if rules.IsXDC && !rules.IsEIP1559 && tx.Type() != types.LegacyTxType {
+		return fmt.Errorf("%w: type %d rejected, XDC pool not yet at EIP-1559", core.ErrTxTypeNotSupported, tx.Type())
+	}
 	if !rules.IsLondon && tx.Type() == types.DynamicFeeTxType {
 		return fmt.Errorf("%w: type %d rejected, pool not yet in London", core.ErrTxTypeNotSupported, tx.Type())
 	}
 	if !rules.IsCancun && tx.Type() == types.BlobTxType {
 		return fmt.Errorf("%w: type %d rejected, pool not yet in Cancun", core.ErrTxTypeNotSupported, tx.Type())
+	}
+	// XDC has no blob transactions (canonical XDPoSChain has no type 3). The
+	// block-gated Prague signer recovers them, so reject them here.
+	if rules.IsXDC && tx.Type() == types.BlobTxType {
+		return fmt.Errorf("%w: type %d rejected, no blob transactions on XDC", core.ErrTxTypeNotSupported, tx.Type())
 	}
 	if !rules.IsPrague && tx.Type() == types.SetCodeTxType {
 		return fmt.Errorf("%w: type %d rejected, pool not yet in Prague", core.ErrTxTypeNotSupported, tx.Type())
@@ -143,13 +162,13 @@ func ValidateTransaction(tx *types.Transaction, head *types.Header, signer types
 	// Ensure the transaction has more gas than the bare minimum needed to cover
 	// the transaction metadata.
 	//
-	// XDC: disable EIP-2028 (lower per-non-zero-byte calldata gas) for XDC
-	// chains. Canonical XDPoSChain v2.6.8 keeps 68 gas per non-zero byte at all
-	// times, so enabling EIP-2028 would diverge from canonical intrinsic-gas
-	// calculation on every tx with calldata. This is fed only to IntrinsicGas
-	// below, never to FloorDataGas or the rest of validation.
+	// XDC: EIP-2028 (lower per-non-zero-byte calldata gas) starts at Prague on
+	// XDC chains, as in canonical XDPoSChain v3.0.0 (devnet 5551 excepted, see
+	// core.XDCPreEIP2028Calldata); before Prague a non-zero
+	// byte costs 68 gas. This is fed only to IntrinsicGas below, never to
+	// FloorDataGas or the rest of validation.
 	intrRules := rules
-	if opts.Config.IsXDC() {
+	if core.XDCPreEIP2028Calldata(opts.Config, rules) {
 		intrRules.IsIstanbul = false
 	}
 	intrGas, err := core.IntrinsicGas(tx.Data(), tx.AccessList(), tx.SetCodeAuthorizations(), from, tx.To(), value, intrRules)
@@ -292,6 +311,24 @@ type ValidationOptionsWithState struct {
 	// ExistingCost is a mandatory callback to retrieve an already pooled
 	// transaction's cost with the given nonce to check for overdrafts.
 	ExistingCost func(addr common.Address, nonce uint64) *big.Int
+
+	// XDC TRC21 token-fee pool admission (XDPoSChain core/txpool/validation.go).
+	// When Trc21FeeCapacity is non-nil and the tx recipient is a registered TRC21
+	// token, the sender's balance check is supplemented by that token's fee
+	// capacity: effective = balance + capacity, and the cost is recomputed at the
+	// canonical TRC21 gas price instead of the tx's own gas price.
+	// Config and CurrentNumber are required when Trc21FeeCapacity is non-nil.
+	// When both are set and Config.IsXDC() is true they also enforce the active
+	// gas-price tier floor (Gas50x or Gas2500x): a non-special transaction priced
+	// below it is rejected with ErrUnderMinGasPrice.
+
+	// Trc21FeeCapacity maps each registered TRC21 token to its XDC fee capacity.
+	Trc21FeeCapacity map[common.Address]*big.Int
+	// Config is the chain config, used to compute the TRC21 gas price tier.
+	Config *params.ChainConfig
+	// CurrentNumber returns the current head block number. Pending transactions
+	// are priced at head+1, matching XDPoSChain's pendingBlockNumber helper.
+	CurrentNumber func() *big.Int
 }
 
 // ValidateTransactionWithState is a helper method to check whether a transaction
@@ -317,12 +354,30 @@ func ValidateTransactionWithState(tx *types.Transaction, signer types.Signer, op
 			return fmt.Errorf("%w: tx nonce %v, gapped nonce %v", core.ErrNonceTooHigh, tx.Nonce(), gap)
 		}
 	}
-	// Ensure the transactor has enough funds to cover the transaction costs
+	// Ensure the transactor has enough funds to cover the transaction costs.
+	// XDC TRC21 (XDPoSChain core/txpool/validation.go ~L240-265): when the
+	// recipient is a registered TRC21 token, the issuer's fee capacity counts
+	// toward the sender's available balance, and the cost is recomputed at the
+	// canonical TRC21 gas price (not the tx's own gas price).
 	var (
-		balance = opts.State.GetBalance(from).ToBig()
-		cost    = tx.Cost()
+		balance     = opts.State.GetBalance(from).ToBig()
+		cost        = tx.Cost()
+		feeCapacity = new(big.Int)
 	)
-	if balance.Cmp(cost) < 0 {
+	if to := tx.To(); to != nil && opts.Trc21FeeCapacity != nil {
+		if cap, ok := opts.Trc21FeeCapacity[*to]; ok {
+			if !state.ValidateTRC21Tx(opts.State, from, *to, tx.Data()) {
+				return fmt.Errorf("%w: insufficient token balance for trc21 fee tx", core.ErrInsufficientFunds)
+			}
+			feeCapacity = cap
+			// Replace user gas price with the canonical TRC21 gas price for this block.
+			// Pending block is current head + 1 (mirroring XDPoSChain pendingBlockNumber).
+			pendingNum := new(big.Int).Add(opts.CurrentNumber(), big.NewInt(1))
+			cost = trc21Cost(opts.Config, pendingNum, tx)
+		}
+	}
+	effectiveBalance := new(big.Int).Add(balance, feeCapacity)
+	if effectiveBalance.Cmp(cost) < 0 {
 		return fmt.Errorf("%w: balance %v, tx cost %v, overshot %v", core.ErrInsufficientFunds, balance, cost, new(big.Int).Sub(cost, balance))
 	}
 	// Ensure the transactor has enough funds to cover for replacements or nonce
@@ -331,13 +386,13 @@ func ValidateTransactionWithState(tx *types.Transaction, signer types.Signer, op
 	if prev := opts.ExistingCost(from, tx.Nonce()); prev != nil {
 		bump := new(big.Int).Sub(cost, prev)
 		need := new(big.Int).Add(spent, bump)
-		if balance.Cmp(need) < 0 {
-			return fmt.Errorf("%w: balance %v, queued cost %v, tx bumped %v, overshot %v", core.ErrInsufficientFunds, balance, spent, bump, new(big.Int).Sub(need, balance))
+		if effectiveBalance.Cmp(need) < 0 {
+			return fmt.Errorf("%w: balance %v, queued cost %v, tx bumped %v, overshot %v", core.ErrInsufficientFunds, balance, spent, bump, new(big.Int).Sub(need, effectiveBalance))
 		}
 	} else {
 		need := new(big.Int).Add(spent, cost)
-		if balance.Cmp(need) < 0 {
-			return fmt.Errorf("%w: balance %v, queued cost %v, tx cost %v, overshot %v", core.ErrInsufficientFunds, balance, spent, cost, new(big.Int).Sub(need, balance))
+		if effectiveBalance.Cmp(need) < 0 {
+			return fmt.Errorf("%w: balance %v, queued cost %v, tx cost %v, overshot %v", core.ErrInsufficientFunds, balance, spent, cost, new(big.Int).Sub(need, effectiveBalance))
 		}
 		// Transaction takes a new nonce value out of the pool. Ensure it doesn't
 		// overflow the number of permitted transactions from a single account
@@ -346,6 +401,24 @@ func ValidateTransactionWithState(tx *types.Transaction, signer types.Signer, op
 			if used, left := opts.UsedAndLeftSlots(from); left <= 0 {
 				return fmt.Errorf("%w: pooled %d txs", ErrAccountLimitExceeded, used)
 			}
+		}
+	}
+	// XDC: enforce the active gas-price tier floor at pool admission.
+	// Canonical: XDPoSChain core/txpool/validation.go ValidateTransactionWithState,
+	// end of function — GetMinGasPrice(pendingNumber, opts.Config) with the same
+	// special-tx exemption. Without this check, txs priced below the Gas2500x
+	// floor (625 gwei) enter the pool on modern but can never be mined, and they
+	// block nonce-consecutive replacements until they are evicted.
+	if opts.Config != nil && opts.Config.IsXDC() && opts.CurrentNumber != nil && !tx.IsSpecialTransaction() {
+		pendingNum := new(big.Int).Add(opts.CurrentNumber(), common.Big1)
+		// Canonical chainDefaultGasPrice: the Gas2500x / Gas50x tier price, or
+		// the common.DefaultMinGasPrice baseline before any tier fork.
+		minGasPrice := big.NewInt(common.DefaultMinGasPrice)
+		if opts.Config.IsGas50x(pendingNum) {
+			minGasPrice = params.XDCBaseFeeForBlock(opts.Config, pendingNum)
+		}
+		if tx.GasPrice().Cmp(minGasPrice) < 0 {
+			return ErrUnderMinGasPrice
 		}
 	}
 	return nil

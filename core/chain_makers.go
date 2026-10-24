@@ -127,7 +127,9 @@ func (b *BlockGen) addTx(bc *BlockChain, vmConfig vm.Config, tx *types.Transacti
 
 	// Merge the tx-local access event into the "block-local" one, in order to collect
 	// all values, so that the witness can be built.
-	if b.statedb.Database().Type().Is(state.TypeUBT) {
+	// XDC: evm.AccessEvents is nil on UBT chains that use EnableUBTAtGenesis rather than
+	// IsEIP4762, because the EVM only initialises AccessEvents when IsEIP4762 is true.
+	if b.statedb.Database().Type().Is(state.TypeUBT) && evm.AccessEvents != nil {
 		b.statedb.AccessEvents().Merge(evm.AccessEvents)
 	}
 	b.txs = append(b.txs, tx)
@@ -167,7 +169,10 @@ func (b *BlockGen) AddTxWithChain(bc *BlockChain, tx *types.Transaction) {
 // been set, the block's coinbase is set to the zero address.
 // The evm interpreter can be customized with the provided vm config.
 func (b *BlockGen) AddTxWithVMConfig(tx *types.Transaction, config vm.Config) {
-	b.addTx(nil, config, tx)
+	// XDC: wrap chain config in an empty BlockChain so NewEVMBlockContext can
+	// call chain.Config() without a typed-nil interface panic (same pattern as AddTx).
+	bc := &BlockChain{chainConfig: b.cm.config}
+	b.addTx(bc, config, tx)
 }
 
 // GetBalance returns the balance of the given address at the generated block.
@@ -391,6 +396,8 @@ func GenerateChain(config *params.ChainConfig, parent *types.Block, engine conse
 			evm := vm.NewEVM(blockContext, statedb, cm.config, vm.Config{})
 			ProcessParentBlockHash(b.header.ParentHash, evm, b.bal)
 		}
+		// XDC: Multicall3 install once Prague is active (see ApplyMulticall3HardFork).
+		ApplyMulticall3HardFork(config, statedb, b.header.Number)
 
 		// Execute any user modifications to the block
 		if gen != nil {
@@ -453,8 +460,11 @@ func GenerateChain(config *params.ChainConfig, parent *types.Block, engine conse
 	}
 
 	// Forcibly use hash-based state scheme for retaining all nodes in disk.
+	// XDC: IsUBT is stubbed to always return false on this fork. Also check
+	// EnableUBTAtGenesis for non-XDC test chains that opted into binary-trie
+	// genesis; the !IsXDC() guard keeps this path off for all XDC chains.
 	var triedbConfig = triedb.HashDefaults
-	if config.IsUBT(config.ChainID, 0) {
+	if config.IsUBT(config.ChainID, 0) || (config.EnableUBTAtGenesis && !config.IsXDC()) {
 		triedbConfig = triedb.UBTDefaults
 	}
 	triedb := triedb.NewDatabase(db, triedbConfig)
@@ -480,7 +490,7 @@ func GenerateChain(config *params.ChainConfig, parent *types.Block, engine conse
 			txs = txs[:len(receipts)]
 		}
 		var blobGasPrice *big.Int
-		if block.ExcessBlobGas() != nil {
+		if block.ExcessBlobGas() != nil && !cm.config.IsXDC() {
 			blobGasPrice = eip4844.CalcBlobFee(cm.config, block.Header())
 		}
 		if err := receipts.DeriveFields(config, block.Hash(), block.NumberU64(), block.Time(), block.BaseFee(), blobGasPrice, txs); err != nil {
@@ -503,7 +513,12 @@ func GenerateChain(config *params.ChainConfig, parent *types.Block, engine conse
 func GenerateChainWithGenesis(genesis *Genesis, engine consensus.Engine, n int, gen func(int, *BlockGen)) (ethdb.Database, []*types.Block, []types.Receipts) {
 	db := rawdb.NewMemoryDatabase()
 	var triedbConfig *triedb.Config = triedb.HashDefaults
-	if genesis.Config != nil && genesis.Config.IsUBT(genesis.Config.ChainID, 0) {
+	// XDC: IsUBT is stubbed to always return false on this fork because XDC chains
+	// do not activate UBT. Fall back to EnableUBTAtGenesis for non-XDC test chains
+	// that explicitly request a binary-trie genesis (e.g. bintrie_witness_test.go)
+	// so they use the same UBTDefaults that NewBlockChain selects, keeping the two
+	// genesis state roots in sync. The !IsXDC() guard keeps XDC chains on MPT.
+	if genesis.Config != nil && (genesis.Config.IsUBT(genesis.Config.ChainID, 0) || (genesis.Config.EnableUBTAtGenesis && !genesis.Config.IsXDC())) {
 		triedbConfig = triedb.UBTDefaults
 	}
 	genesisTriedb := triedb.NewDatabase(db, triedbConfig)
@@ -535,7 +550,10 @@ func (cm *chainMaker) makeHeader(parent *types.Block, engine consensus.Engine) *
 			header.GasLimit = CalcGasLimit(parentGasLimit, parentGasLimit)
 		}
 	}
-	if cm.config.IsCancun(header.Number, header.Time) {
+	// XDC sets CancunBlock for EVM-level Cancun EIPs but has no BlobScheduleConfig
+	// (no blob transactions). Skip blob-gas fields here; FillAmsterdamHeader sets
+	// ExcessBlobGas=ptr(0) as the canonical placeholder for Amsterdam blocks.
+	if cm.config.IsCancun(header.Number, header.Time) && !cm.config.IsXDC() {
 		excessBlobGas := eip4844.CalcExcessBlobGas(cm.config, parentHeader, time)
 		header.ExcessBlobGas = &excessBlobGas
 		header.BlobGasUsed = new(uint64)

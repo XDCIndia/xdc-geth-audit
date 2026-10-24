@@ -532,7 +532,7 @@ func (c *Cache) selectTopTxs() []common.Hash {
 		BaseFee:      uint256.MustFromBig(baseFee),
 		PartialCells: c.needCell,
 	}
-	if head.ExcessBlobGas != nil {
+	if head.ExcessBlobGas != nil && !config.IsXDC() {
 		filter.BlobFee = uint256.MustFromBig(eip4844.CalcBlobFee(config, head))
 	}
 	if config.IsOsaka(head.Number, head.Time) {

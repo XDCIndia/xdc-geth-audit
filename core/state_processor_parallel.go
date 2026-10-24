@@ -57,8 +57,9 @@ func supportsParallelExecution(block *types.Block, config *params.ChainConfig, w
 	}
 	// XDC: the parallel processor has none of the XDPoS seams of the
 	// sequential one (0x89/0x92/0x93 special-tx dispatch, TRC21 fee owner,
-	// parentState for rewards). XDC never schedules Amsterdam, but refuse
-	// here as well so a misconfigured chain cannot silently diverge.
+	// parentState for rewards). XDC uses the sequential processor even on
+	// Amsterdam blocks; the BAL is still constructed (for the header hash),
+	// but BAL-driven parallelism is disabled here.
 	if config.IsXDC() {
 		return false
 	}
@@ -181,6 +182,10 @@ func (p *StateProcessor) processParallel(ctx context.Context, block *types.Block
 		if err := statedb.ApplyBlockAccessList(accessList); err != nil {
 			return err
 		}
+		// XDC: Multicall3 install once Prague is active (see ApplyMulticall3HardFork).
+		// Must run after ApplyBlockAccessList (access list applied to statedb)
+		// and before IntermediateRoot (so the code install is in the state root).
+		ApplyMulticall3HardFork(config, statedb, header.Number)
 		stateApply = time.Since(start)
 
 		start = time.Now()

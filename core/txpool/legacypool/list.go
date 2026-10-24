@@ -374,21 +374,37 @@ func (l *list) Forward(threshold uint64) types.Transactions {
 // post-removal maintenance. Strict-mode invalidated transactions are also
 // returned.
 //
+// trc21Issuers, when non-nil, maps TRC21 token addresses to their fee capacity.
+// A tx whose recipient is in this map is retained when balance + capacity covers
+// its TRC21 cost (trc21CostFn(tx)), mirroring XDPoSChain list.Filter behaviour.
+//
 // This method uses the cached costcap and gascap to quickly decide if there's even
 // a point in calculating all the costs or if the balance covers all. If the threshold
 // is lower than the costgas cap, the caps will be reset to a new high after removing
 // the newly invalidated transactions.
-func (l *list) Filter(costLimit *uint256.Int, gasLimit uint64) (types.Transactions, types.Transactions) {
-	// If all transactions are below the threshold, short circuit
-	if l.costcap.Cmp(costLimit) <= 0 && l.gascap <= gasLimit {
+func (l *list) Filter(costLimit *uint256.Int, gasLimit uint64, trc21Issuers map[common.Address]*big.Int, trc21CostFn func(*types.Transaction) *big.Int) (types.Transactions, types.Transactions) {
+	// If all transactions are below the threshold, short circuit (skip when TRC21
+	// issuers are present: their effective cost may differ from tx.Cost()).
+	if len(trc21Issuers) == 0 && l.costcap.Cmp(costLimit) <= 0 && l.gascap <= gasLimit {
 		return nil, nil
 	}
 	l.costcap = new(uint256.Int).Set(costLimit) // Lower the caps to the thresholds
 	l.gascap = gasLimit
 
-	// Filter out all the transactions above the account's funds
+	// Filter out all the transactions above the account's funds.
+	// XDC TRC21: for txs going to a registered TRC21 token, the token's fee
+	// capacity supplements the sender's balance and cost is at the TRC21 price.
 	removed := l.txs.Filter(func(tx *types.Transaction) bool {
-		return tx.Gas() > gasLimit || tx.Cost().Cmp(costLimit.ToBig()) > 0
+		if tx.Gas() > gasLimit {
+			return true
+		}
+		if to := tx.To(); to != nil && len(trc21Issuers) > 0 {
+			if feeCapacity, ok := trc21Issuers[*to]; ok {
+				effective := new(big.Int).Add(costLimit.ToBig(), feeCapacity)
+				return effective.Cmp(trc21CostFn(tx)) < 0
+			}
+		}
+		return tx.Cost().Cmp(costLimit.ToBig()) > 0
 	})
 
 	if len(removed) == 0 {

@@ -33,7 +33,14 @@ func NewPool() *Pool {
 }
 
 // Add adds an object to the pool
-// Returns the count of objects with the same pool key and all objects with that key
+// Returns the count of objects with the same pool key and all objects with that key.
+//
+// At most one entry is kept per (pool key, recovered signer).  Once a signer
+// address has been recovered via SetSigner/GetSigner, any later message from
+// the same signer for the same pool key is dropped regardless of whether its
+// Hash() differs (e.g. due to a re-signing or ECDSA malleation).  Objects
+// whose signer has not been set yet (zero address) bypass this check and are
+// deduplicated by Hash() only, as before (CertiK XDC-07).
 func (p *Pool) Add(obj PoolObj) (int, map[common.Hash]PoolObj) {
 	p.lock.Lock()
 	defer p.lock.Unlock()
@@ -45,7 +52,24 @@ func (p *Pool) Add(obj PoolObj) (int, map[common.Hash]PoolObj) {
 		p.pool[key] = make(map[common.Hash]PoolObj)
 	}
 
-	// Only add if not already present
+	// Signer dedup: if the incoming object has a recovered signer (non-zero),
+	// check whether this signer already occupies a slot for this pool key.
+	// Drop the duplicate rather than growing pool memory unboundedly (XDC-07).
+	incomingSigner := obj.GetSigner()
+	if incomingSigner != (common.Address{}) {
+		for _, existing := range p.pool[key] {
+			if existing.GetSigner() == incomingSigner {
+				// Already have an entry for this signer; return current state.
+				result := make(map[common.Hash]PoolObj)
+				for k, v := range p.pool[key] {
+					result[k] = v
+				}
+				return len(p.pool[key]), result
+			}
+		}
+	}
+
+	// Only add if not already present by hash
 	if _, exists := p.pool[key][hash]; !exists {
 		p.pool[key][hash] = obj
 	}
@@ -127,7 +151,6 @@ func (p *Pool) Size() int {
 	}
 	return count
 }
-
 
 // GetObjsByKey returns all objects matching the given pool key.
 func (p *Pool) GetObjsByKey(key string) map[common.Hash]PoolObj {

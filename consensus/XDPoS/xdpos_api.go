@@ -7,10 +7,12 @@ package XDPoS
 import (
 	"errors"
 	"math/big"
+	"slices"
 
 	"github.com/ethereum/go-ethereum/accounts"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/consensus"
+	"github.com/ethereum/go-ethereum/consensus/XDPoS/engines/engine_v2"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/log"
 )
@@ -105,15 +107,22 @@ func (c *XDPoS) GetValidator(creator common.Address, chain consensus.ChainHeader
 	return m[creator], nil
 }
 
-// getValidatorWithParents is GetValidator for header verification. The
-// checkpoint is this block's own ancestor, so it is resolved along the block's
-// ancestry rather than by canonical number: first among the batch's parents (a
-// batch that crosses a checkpoint holds it before it is written), then by
-// walking parent hashes through stored headers (a sidechain re-import after a
-// state rewind holds it stored but not canonical). Only if neither finds it
-// does it fall back to GetValidator. Canonical XDPoSChain gets the same result
-// by verifying batches through a reader that serves the batch's headers
-// (consensus/XDPoS/verify_chain_reader.go, core/blockchain.go:2583-2585).
+// getValidatorWithParents is GetValidator for header verification.  The
+// checkpoint at cpNo = no - no%epoch contains the M1→M2 map for this block.
+//
+// #1636 V1 FIX: PR #1579 enabled M2 co-signature checks for mainnet.  Each call
+// previously rebuilt an O(N) inBatch map from the full parents slice and then
+// walked up to cpDist hops back to the checkpoint — O(N) per call, O(N²) total
+// for a 128-header batch.  The fast path below uses GetHeaderByNumber(cpNo),
+// an O(1) DB lookup, because V1 epoch checkpoints are canonical (block-number
+// based; no competing branches at the same epoch boundary in V1 PoA consensus).
+// During replay all ancestors are committed to the DB ahead of the current batch,
+// so GetHeaderByNumber reliably returns the correct checkpoint.
+//
+// ponytail: canonical lookup; a deep V1 fork where cpNo differs between the
+// canonical chain and the sidechain being verified would get the canonical set.
+// V1 PoA does not fork past epoch boundaries in practice — add an ancestry check
+// if V1 sidechain import ever becomes a requirement.
 func (c *XDPoS) getValidatorWithParents(creator common.Address, chain consensus.ChainHeaderReader, header *types.Header, parents []*types.Header) (common.Address, error) {
 	epoch := c.config.Epoch
 	no := header.Number.Uint64()
@@ -121,6 +130,43 @@ func (c *XDPoS) getValidatorWithParents(creator common.Address, chain consensus.
 	if cpNo == 0 || no%epoch == 0 {
 		return c.GetValidator(creator, chain, header)
 	}
+	// Fast path A: checkpoint is in the current batch's parents slice.
+	// parents[0..i-1] = headers[0..i-1] from VerifyHeaders — a sequential,
+	// ancestry-correct chain.  If cpNo falls within that range, index directly
+	// (O(1), branch-safe: we follow the actual hash chain, not the canonical
+	// number index).
+	if len(parents) > 0 {
+		first := parents[0].Number.Uint64()
+		if cpNo >= first && cpNo < first+uint64(len(parents)) {
+			idx := cpNo - first
+			if cp := parents[idx]; cp != nil && cp.Number.Uint64() == cpNo {
+				m, err := getM1M2FromCheckpointHeader(cp, header, chain.Config())
+				if err != nil {
+					return common.Address{}, err
+				}
+				return m[creator], nil
+			}
+		}
+	}
+	// Fast path B: checkpoint predates the batch. The canonical lookup by number
+	// is only correct when the batch's base (the parent of its first header, or
+	// of header itself) is canonical; a sidechain import must take the slow
+	// ancestry walk instead.
+	baseHash, baseNo := header.ParentHash, no-1
+	if len(parents) > 0 {
+		baseHash, baseNo = parents[0].ParentHash, parents[0].Number.Uint64()-1
+	}
+	if base := chain.GetHeaderByNumber(baseNo); base != nil && base.Hash() == baseHash {
+		if cpHeader := chain.GetHeaderByNumber(cpNo); cpHeader != nil {
+			m, err := getM1M2FromCheckpointHeader(cpHeader, header, chain.Config())
+			if err != nil {
+				return common.Address{}, err
+			}
+			return m[creator], nil
+		}
+	}
+	// Slow path: checkpoint is not yet committed and not in the batch slice.
+	// Walk the ancestry chain using the inBatch hash map as a shortcut.
 	inBatch := make(map[common.Hash]*types.Header, len(parents))
 	for _, p := range parents {
 		if p != nil {
@@ -147,7 +193,18 @@ func (c *XDPoS) getValidatorWithParents(creator common.Address, chain consensus.
 }
 
 // IsAuthorisedAddress checks if an address is authorised to sign blocks.
+// For V2 headers every candidate of the epoch's gap snapshot qualifies, so
+// standby and penalized candidates may still send and relay signing txs
+// (canonical XDPoSChain engine_v2 IsAuthorisedAddress, NextEpochCandidates).
 func (c *XDPoS) IsAuthorisedAddress(chain consensus.ChainHeaderReader, header *types.Header, address common.Address) bool {
+	if c.IsV2Block(header) {
+		v2, ok := c.EngineV2.(*engine_v2.XDPoS_v2)
+		cr, crOk := chain.(consensus.ChainReader)
+		if ok && crOk {
+			snap, err := v2.GetSnapshot(cr, header)
+			return err == nil && snap != nil && slices.Contains(snap.CandidatePool(), address)
+		}
+	}
 	masternodes := c.GetMasternodes(chain, header)
 	for _, mn := range masternodes {
 		if mn == address {

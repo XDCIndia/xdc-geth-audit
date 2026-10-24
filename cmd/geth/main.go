@@ -94,6 +94,7 @@ var (
 		utils.ExitWhenSyncedFlag,
 		utils.GCModeFlag,
 		utils.SnapshotFlag,
+		utils.SnapV2Flag,
 		utils.TransactionHistoryFlag,
 		utils.ChainHistoryFlag,
 		utils.LogHistoryFlag,
@@ -129,6 +130,7 @@ var (
 		utils.MinerExtraDataFlag,
 		utils.MinerMaxBlobsFlag,
 		utils.MinerRecommitIntervalFlag,
+		utils.MinerBlockVoteGasCapFlag,
 		utils.MinerPendingFeeRecipientFlag,
 		utils.NATFlag,
 		utils.NoDiscoverFlag,
@@ -164,6 +166,7 @@ var (
 		utils.BeaconCheckpointFileFlag,
 		utils.LogSlowBlockFlag,
 		utils.StoreRewardFlag,
+		utils.StateSizeTrackingFlag, // deprecated (upstream)
 	}, utils.NetworkFlags, utils.DatabaseFlags)
 
 	rpcFlags = []cli.Flag{
@@ -208,25 +211,6 @@ var (
 		utils.RPCTelemetryInstanceIDFlag,
 		utils.RPCTelemetryTagsFlag,
 		utils.RPCTelemetrySampleRatioFlag,
-	}
-
-	metricsFlags = []cli.Flag{
-		utils.MetricsEnabledFlag,
-		utils.MetricsHTTPFlag,
-		utils.MetricsPortFlag,
-		utils.MetricsEnableInfluxDBFlag,
-		utils.MetricsInfluxDBEndpointFlag,
-		utils.MetricsInfluxDBDatabaseFlag,
-		utils.MetricsInfluxDBUsernameFlag,
-		utils.MetricsInfluxDBPasswordFlag,
-		utils.MetricsInfluxDBTagsFlag,
-		utils.MetricsInfluxDBIntervalFlag,
-		utils.MetricsEnableInfluxDBV2Flag,
-		utils.MetricsInfluxDBTokenFlag,
-		utils.MetricsInfluxDBBucketFlag,
-		utils.MetricsInfluxDBOrganizationFlag,
-		utils.SnapV2Flag,
-		utils.StateSizeTrackingFlag, // deprecated
 	}
 )
 
@@ -279,7 +263,7 @@ func init() {
 		rpcFlags,
 		consoleFlags,
 		debug.Flags,
-		metricsFlags,
+		utils.MetricsFlags,
 	)
 	flags.AutoEnvVars(app.Flags, "GETH")
 
@@ -355,8 +339,10 @@ func startNode(ctx *cli.Context, stack *node.Node, isConsole bool) {
 	// We re-implement the minimal unlock path here: read --password file and call
 	// ks.Unlock() directly — no HTTP exposure of the unlocked key (refs #894).
 	if ctx.Bool(utils.MiningEnabledFlag.Name) && ctx.Path(utils.PasswordFileFlag.Name) != "" {
+		// A validator that cannot sign never mints; stop instead of running
+		// on looking healthy (review R3-R03).
 		if err := utils.UnlockXDPoSMinerAccount(ctx, stack); err != nil {
-			log.Warn("XDPoS miner account unlock failed", "err", err)
+			utils.Fatalf("XDPoS miner account unlock failed: %v", err)
 		}
 	}
 

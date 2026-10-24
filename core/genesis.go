@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"maps"
 	"math/big"
 	"strings"
@@ -75,6 +76,33 @@ type Genesis struct {
 	ExcessBlobGas *uint64     `json:"excessBlobGas"` // EIP-4844
 	BlobGasUsed   *uint64     `json:"blobGasUsed"`   // EIP-4844
 	SlotNumber    *uint64     `json:"slotNumber"`    // EIP-7843
+}
+
+// DecodeGenesisJSON decodes a genesis JSON document from r, applying a strict
+// unknown-key check on the "config" object. Use this for user-supplied genesis
+// files (geth init, --genesis flag, cmd/evm). Do NOT use for rawdb or RPC paths
+// — they decode ChainConfig directly and must tolerate keys from other releases.
+// Refs #1528.
+func DecodeGenesisJSON(r io.Reader) (*Genesis, error) {
+	data, err := io.ReadAll(r)
+	if err != nil {
+		return nil, err
+	}
+	// Strict check on config keys — genesis files only. Refs #1528.
+	var top map[string]json.RawMessage
+	if err := json.Unmarshal(data, &top); err != nil {
+		return nil, err
+	}
+	if cfgData, ok := top["config"]; ok {
+		if err := params.CheckGenesisConfigUnknownKeys(cfgData); err != nil {
+			return nil, err
+		}
+	}
+	var g Genesis
+	if err := json.Unmarshal(data, &g); err != nil {
+		return nil, err
+	}
+	return &g, nil
 }
 
 // copy copies the genesis.
@@ -361,6 +389,8 @@ func SetupGenesisBlockWithOverride(db ethdb.Database, triedb *triedb.Database, g
 				patchMissingForkBlocks(genesis.Config, params.XDCApothemChainConfig, "apothem", forkPatchRegistered)
 			case 5551:
 				patchMissingForkBlocks(genesis.Config, params.XDCDevnetChainConfig, "devnet", forkPatchRegistered)
+			case 551:
+				patchMissingForkBlocks(genesis.Config, params.XDCDevnet551ChainConfig, "devnet551", forkPatchRegistered)
 			}
 		}
 
@@ -397,6 +427,8 @@ func SetupGenesisBlockWithOverride(db ethdb.Database, triedb *triedb.Database, g
 				patchMissingForkBlocks(genesis.Config, params.XDCApothemChainConfig, "apothem", forkPatchRegistered)
 			case 5551:
 				patchMissingForkBlocks(genesis.Config, params.XDCDevnetChainConfig, "devnet", forkPatchRegistered)
+			case 551:
+				patchMissingForkBlocks(genesis.Config, params.XDCDevnet551ChainConfig, "devnet551", forkPatchRegistered)
 			}
 		}
 
@@ -474,6 +506,14 @@ func SetupGenesisBlockWithOverride(db ethdb.Database, triedb *triedb.Database, g
 				AllConfigs:    params.XDCDevnetChainConfig.XDPoS.V2.AllConfigs,
 			}
 			log.Info("XDC: patched missing V2 config in SetupGenesis for devnet (chain ID 5551)", "switchBlock", newCfg.XDPoS.V2.SwitchBlock)
+		case 551:
+			newCfg.XDPoS.V2 = &params.V2{
+				SwitchBlock:   new(big.Int).Set(params.XDCDevnet551ChainConfig.XDPoS.V2.SwitchBlock),
+				SwitchEpoch:   params.XDCDevnet551ChainConfig.XDPoS.V2.SwitchEpoch,
+				CurrentConfig: params.XDCDevnet551ChainConfig.XDPoS.V2.CurrentConfig,
+				AllConfigs:    params.XDCDevnet551ChainConfig.XDPoS.V2.AllConfigs,
+			}
+			log.Info("XDC: patched missing V2 config in SetupGenesis for devnet (chain ID 551)", "switchBlock", newCfg.XDPoS.V2.SwitchBlock)
 		default:
 			newCfg.XDPoS.V2 = &params.V2{
 				SwitchBlock:   new(big.Int).Set(params.XDCDefaultPrivateChainConfig.XDPoS.V2.SwitchBlock),
@@ -489,7 +529,7 @@ func SetupGenesisBlockWithOverride(db ethdb.Database, triedb *triedb.Database, g
 	// profile while keeping the JSON-provided SwitchBlock/SwitchEpoch intact.
 	if newCfg.XDPoS != nil && newCfg.XDPoS.V2 != nil && newCfg.XDPoS.V2.AllConfigs == nil && newCfg.ChainID != nil {
 		switch newCfg.ChainID.Uint64() {
-		case 50, 51, 5551:
+		case 50, 51, 551, 5551:
 			// registered nets: V2 AllConfigs must come from their own hardcoded config.
 		default:
 			newCfg.XDPoS.V2.CurrentConfig = params.XDCDefaultPrivateChainConfig.XDPoS.V2.CurrentConfig
@@ -509,6 +549,8 @@ func SetupGenesisBlockWithOverride(db ethdb.Database, triedb *triedb.Database, g
 			patchMissingForkBlocks(newCfg, params.XDCApothemChainConfig, "apothem", forkPatchRegistered)
 		case 5551:
 			patchMissingForkBlocks(newCfg, params.XDCDevnetChainConfig, "devnet", forkPatchRegistered)
+		case 551:
+			patchMissingForkBlocks(newCfg, params.XDCDevnet551ChainConfig, "devnet551", forkPatchRegistered)
 		default:
 			if newCfg.XDPoS != nil {
 				patchMissingForkBlocks(newCfg, params.XDCDefaultPrivateChainConfig, "xdc-default", forkPatchGenesisAuthoritative)
@@ -580,6 +622,14 @@ func LoadChainConfig(db ethdb.Database, genesis *Genesis) (cfg *params.ChainConf
 						AllConfigs:    params.XDCDevnetChainConfig.XDPoS.V2.AllConfigs,
 					}
 					log.Info("XDC: patched missing V2 config in stored config for devnet (chain ID 5551)", "switchBlock", storedcfg.XDPoS.V2.SwitchBlock)
+				case 551:
+					storedcfg.XDPoS.V2 = &params.V2{
+						SwitchBlock:   new(big.Int).Set(params.XDCDevnet551ChainConfig.XDPoS.V2.SwitchBlock),
+						SwitchEpoch:   params.XDCDevnet551ChainConfig.XDPoS.V2.SwitchEpoch,
+						CurrentConfig: params.XDCDevnet551ChainConfig.XDPoS.V2.CurrentConfig,
+						AllConfigs:    params.XDCDevnet551ChainConfig.XDPoS.V2.AllConfigs,
+					}
+					log.Info("XDC: patched missing V2 config in stored config for devnet (chain ID 551)", "switchBlock", storedcfg.XDPoS.V2.SwitchBlock)
 				default:
 					storedcfg.XDPoS.V2 = &params.V2{
 						SwitchBlock:   new(big.Int).Set(params.XDCDefaultPrivateChainConfig.XDPoS.V2.SwitchBlock),
@@ -595,7 +645,7 @@ func LoadChainConfig(db ethdb.Database, genesis *Genesis) (cfg *params.ChainConf
 			// from the default profile while keeping the stored SwitchBlock/SwitchEpoch.
 			if storedcfg.XDPoS != nil && storedcfg.XDPoS.V2 != nil && storedcfg.XDPoS.V2.AllConfigs == nil && storedcfg.ChainID != nil {
 				switch storedcfg.ChainID.Uint64() {
-				case 50, 51, 5551:
+				case 50, 51, 551, 5551:
 					// registered nets: V2 AllConfigs must come from their own hardcoded config.
 				default:
 					storedcfg.XDPoS.V2.CurrentConfig = params.XDCDefaultPrivateChainConfig.XDPoS.V2.CurrentConfig
@@ -631,6 +681,8 @@ func LoadChainConfig(db ethdb.Database, genesis *Genesis) (cfg *params.ChainConf
 					patchMissingForkBlocks(storedcfg, params.XDCApothemChainConfig, "apothem", forkPatchRegistered)
 				case 5551:
 					patchMissingForkBlocks(storedcfg, params.XDCDevnetChainConfig, "devnet", forkPatchRegistered)
+				case 551:
+					patchMissingForkBlocks(storedcfg, params.XDCDevnet551ChainConfig, "devnet551", forkPatchRegistered)
 				default:
 					if storedcfg.XDPoS != nil {
 						patchMissingForkBlocks(storedcfg, params.XDCDefaultPrivateChainConfig, "xdc-default", forkPatchGenesisAuthoritative)
@@ -686,6 +738,14 @@ func LoadChainConfig(db ethdb.Database, genesis *Genesis) (cfg *params.ChainConf
 					AllConfigs:    params.XDCDevnetChainConfig.XDPoS.V2.AllConfigs,
 				}
 				log.Info("XDC: patched missing V2 config in genesis spec for devnet (chain ID 5551)", "switchBlock", genesis.Config.XDPoS.V2.SwitchBlock)
+			case 551:
+				genesis.Config.XDPoS.V2 = &params.V2{
+					SwitchBlock:   new(big.Int).Set(params.XDCDevnet551ChainConfig.XDPoS.V2.SwitchBlock),
+					SwitchEpoch:   params.XDCDevnet551ChainConfig.XDPoS.V2.SwitchEpoch,
+					CurrentConfig: params.XDCDevnet551ChainConfig.XDPoS.V2.CurrentConfig,
+					AllConfigs:    params.XDCDevnet551ChainConfig.XDPoS.V2.AllConfigs,
+				}
+				log.Info("XDC: patched missing V2 config in genesis spec for devnet (chain ID 551)", "switchBlock", genesis.Config.XDPoS.V2.SwitchBlock)
 			default:
 				genesis.Config.XDPoS.V2 = &params.V2{
 					SwitchBlock:   new(big.Int).Set(params.XDCDefaultPrivateChainConfig.XDPoS.V2.SwitchBlock),
@@ -701,7 +761,7 @@ func LoadChainConfig(db ethdb.Database, genesis *Genesis) (cfg *params.ChainConf
 		// profile while keeping the JSON-provided SwitchBlock/SwitchEpoch intact.
 		if genesis.Config != nil && genesis.Config.XDPoS != nil && genesis.Config.XDPoS.V2 != nil && genesis.Config.XDPoS.V2.AllConfigs == nil && genesis.Config.ChainID != nil {
 			switch genesis.Config.ChainID.Uint64() {
-			case 50, 51, 5551:
+			case 50, 51, 551, 5551:
 				// registered nets: V2 AllConfigs must come from their own hardcoded config.
 			default:
 				genesis.Config.XDPoS.V2.CurrentConfig = params.XDCDefaultPrivateChainConfig.XDPoS.V2.CurrentConfig
@@ -796,6 +856,8 @@ func forkLadder(cfg, defaults *params.ChainConfig) []forkLadderEntry {
 		{"tipUpgradeRewardBlock", &cfg.TIPUpgradeRewardBlock, defaults.TIPUpgradeRewardBlock, true},
 		{"tipUpgradePenaltyBlock", &cfg.TIPUpgradePenaltyBlock, defaults.TIPUpgradePenaltyBlock, true},
 		{"gas2500xBlock", &cfg.Gas2500xBlock, defaults.Gas2500xBlock, true},
+		{"osakaBlock", &cfg.OsakaBlock, defaults.OsakaBlock, true},
+		{"amsterdamBlock", &cfg.AmsterdamBlock, defaults.AmsterdamBlock, true},
 	}
 }
 
@@ -875,9 +937,34 @@ func patchMissingForkBlocks(cfg, defaults *params.ChainConfig, network string, m
 		// (devnet 5551 block 50,000: Prague/EIP-2935 history write + tiered
 		// reward/penalty bookkeeping). Refs XDCIndia/ethOne#39.
 		patch(&cfg.PragueBlock, defaults.PragueBlock, "PragueBlock")
+		patch(&cfg.OsakaBlock, defaults.OsakaBlock, "OsakaBlock")
+		patch(&cfg.AmsterdamBlock, defaults.AmsterdamBlock, "AmsterdamBlock")
 		patch(&cfg.TIPUpgradeRewardBlock, defaults.TIPUpgradeRewardBlock, "TIPUpgradeRewardBlock")
 		patch(&cfg.TIPUpgradePenaltyBlock, defaults.TIPUpgradePenaltyBlock, "TIPUpgradePenaltyBlock")
 		patch(&cfg.Gas2500xBlock, defaults.Gas2500xBlock, "Gas2500xBlock")
+		patch(&cfg.DynamicGasLimitBlock, defaults.DynamicGasLimitBlock, "DynamicGasLimitBlock")
+		// CertiK rule blocks (#1721-#1723): without these the built-in
+		// schedule never reaches a node resolving from the embedded genesis.
+		patch(&cfg.SigningTxBoundBlock, defaults.SigningTxBoundBlock, "SigningTxBoundBlock")
+		patch(&cfg.ValidatorOrderBlock, defaults.ValidatorOrderBlock, "ValidatorOrderBlock")
+		patch(&cfg.ParoleDedupBlock, defaults.ParoleDedupBlock, "ParoleDedupBlock")
+		// V2 round configs: the embedded devnet genesis JSON carries a V2
+		// block with only the round-0 entry, so the round-50000 tier
+		// (MinimumMinerBlockPerEpoch/LimitPenaltyEpoch/MinimumSigningTx and the
+		// tiered rewards) was never used and devnet 5551 block 51,813 failed
+		// "validators not legit". Fill every round the built-in profile has.
+		if cfg.XDPoS != nil && cfg.XDPoS.V2 != nil && defaults.XDPoS != nil && defaults.XDPoS.V2 != nil {
+			for round, c := range defaults.XDPoS.V2.AllConfigs {
+				if _, ok := cfg.XDPoS.V2.AllConfigs[round]; ok {
+					continue
+				}
+				if cfg.XDPoS.V2.AllConfigs == nil {
+					cfg.XDPoS.V2.AllConfigs = make(map[uint64]*params.V2Config)
+				}
+				cfg.XDPoS.V2.AllConfigs[round] = c
+				log.Info("XDC: patched missing V2 round config", "network", network, "round", round)
+			}
+		}
 		return
 	}
 
@@ -1104,6 +1191,11 @@ func (g *Genesis) Commit(db ethdb.Database, triedb *triedb.Database, tracer *tra
 	rawdb.WriteHeadFastBlockHash(batch, block.Hash())
 	rawdb.WriteHeadHeaderHash(batch, block.Hash())
 	rawdb.WriteChainConfig(batch, block.Hash(), config)
+	// XDC #1645: persist genesis TD so legacy peers (which gate sync on
+	// peerTD > ownTD) can receive the correct cumulative difficulty.
+	if config.IsXDC() {
+		rawdb.WriteTd(batch, block.Hash(), block.NumberU64(), block.Difficulty())
+	}
 	return block, batch.Write()
 }
 

@@ -266,8 +266,9 @@ func (eth *Ethereum) stateAtTransaction(ctx context.Context, block *types.Block,
 		msg, _ := core.TransactionToMessage(tx, signer, block.BaseFee())
 
 		// Not yet the searched for transaction, execute on top of the current state
+		// the way block processing does (XDC special routes, TRC21 token fees).
 		statedb.SetTxContext(tx.Hash(), idx, uint32(idx+1))
-		if _, err := core.ApplyMessage(evm, msg, nil); err != nil {
+		if _, err := core.ApplyTransactionForTrace(ctx, msg, statedb, block.Number(), block.Hash(), block.Time(), tx, evm); err != nil {
 			return nil, vm.BlockContext{}, nil, nil, fmt.Errorf("transaction %#x failed: %v", tx.Hash(), err)
 		}
 		// Ensure any modifications are committed to the state

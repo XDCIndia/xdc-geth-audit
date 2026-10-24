@@ -45,6 +45,16 @@ func MakeSigner(config *params.ChainConfig, blockNumber *big.Int, blockTime uint
 		signer = NewPragueSigner(config.ChainID)
 	case config.IsCancun(blockNumber, blockTime):
 		signer = NewCancunSigner(config.ChainID)
+	// XDC chains activate type-1/2 tx support at Eip1559Block, not at
+	// LondonBlock/BerlinBlock. Canonical XDPoSChain v2.9.3-testnet
+	// core/types/transaction_signing.go:41-55 uses IsEIP1559 for this gate.
+	// On XDC mainnet London=76,321,000 and EIP1559=98,800,200.
+	case config.IsXDC() && config.IsEIP1559(blockNumber):
+		signer = NewLondonSigner(config.ChainID)
+	case config.IsXDC() && config.IsEIP155(blockNumber):
+		signer = NewEIP155Signer(config.ChainID)
+	case config.IsXDC() && config.IsHomestead(blockNumber):
+		signer = HomesteadSigner{}
 	case config.IsLondon(blockNumber):
 		signer = NewLondonSigner(config.ChainID)
 	case config.IsBerlin(blockNumber):
@@ -70,7 +80,8 @@ func LatestSigner(config *params.ChainConfig) Signer {
 	var signer Signer
 	if config.ChainID != nil {
 		switch {
-		case config.PragueTime != nil:
+		case config.PragueTime != nil || config.PragueBlock != nil:
+			// XDC chains gate Prague by block (PragueBlock); non-XDC by timestamp (PragueTime).
 			signer = NewPragueSigner(config.ChainID)
 		case config.CancunTime != nil:
 			signer = NewCancunSigner(config.ChainID)

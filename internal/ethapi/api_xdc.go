@@ -342,6 +342,12 @@ func (s *BlockChainAPI) findFinalityOfBlock(ctx context.Context, block *types.Bl
 	if block == nil || len(masternodes) == 0 {
 		return 0, nil
 	}
+	// F-2026-19638: a V2 block that a quorum certificate has committed is
+	// final. The engine records that with SetFinalized, which the "finalized"
+	// block tag reads. Report 100 for a canonical V2 block at or below it.
+	if s.isCommittedV2Block(ctx, block) {
+		return 100, nil
+	}
 
 	signers, err := s.rpcOutputBlockSigners(block, ctx, masternodes)
 	if err != nil {
@@ -358,6 +364,21 @@ func (s *BlockChainAPI) findFinalityOfBlock(ctx context.Context, block *types.Bl
 
 	finality := uint((signerCount * 100) / masternodeCount)
 	return finality, nil
+}
+
+// isCommittedV2Block reports whether block is an XDPoS V2 block on the
+// canonical chain at or below the finalized (QC-committed) block.
+func (s *BlockChainAPI) isCommittedV2Block(ctx context.Context, block *types.Block) bool {
+	engine, ok := s.b.Engine().(*XDPoS.XDPoS)
+	if !ok || !engine.IsV2Block(block.Header()) {
+		return false
+	}
+	final, err := s.b.HeaderByNumber(ctx, rpc.FinalizedBlockNumber)
+	if err != nil || final == nil || block.NumberU64() > final.Number.Uint64() {
+		return false
+	}
+	canonical, err := s.b.HeaderByNumber(ctx, rpc.BlockNumber(block.NumberU64()))
+	return err == nil && canonical != nil && canonical.Hash() == block.Hash()
 }
 
 // RPCMarshalHeaderXDC converts a header to the RPC output with XDC fields
@@ -417,7 +438,9 @@ func (n *proofPairList) Put(key []byte, value []byte) error {
 }
 
 func (n *proofPairList) Delete(key []byte) error {
-	panic("proofPairList: Delete not supported")
+	// Return an error instead of panicking (review R1-R04): trie.Prove never
+	// calls Delete today, but returning an error is safe if that changes.
+	return errors.New("proofPairList: Delete not supported")
 }
 
 // deriveTrie builds a Merkle trie from a DerivableList (txs or receipts).
@@ -538,6 +561,17 @@ func (s *BlockChainAPI) GetCheckpointFromEpoch(ctx context.Context, epochNum rpc
 		checkpointNumber = 0
 	} else {
 		checkpointNumber = epoch * (uint64(epochNum) - 1)
+		// F-2026-19639: a V2 epoch's switch block follows rounds, not
+		// multiples of Epoch; ask the V2 engine.
+		if engine, ok := s.b.Engine().(*XDPoS.XDPoS); ok {
+			if n, isV2, err := engine.GetCheckpointByEpochNumber(s.b.BlockChain(), uint64(epochNum)); isV2 {
+				if err != nil {
+					log.Error("[GetCheckpointFromEpoch] GetBlockByEpochNumber failed", "epoch", epochNum, "err", err)
+					return 0, epochNum
+				}
+				checkpointNumber = n
+			}
+		}
 	}
 	return rpc.BlockNumber(checkpointNumber), epochNum
 }
@@ -593,11 +627,12 @@ func (s *BlockChainAPI) GetStakerROI() float64 {
 
 // GetStakerROIMasternode estimates annual ROI for stakers of a specific masternode.
 // Fix #66: Ported from v2.6.8 internal/ethapi/api.go PublicBlockChainAPI.GetStakerROIMasternode.
-func (s *BlockChainAPI) GetStakerROIMasternode(masternode common.Address) float64 {
-	// Full implementation requires XDC smart contract integration.
-	// For now, return the same as GetStakerROI() divided by masternode count.
-	roi := s.GetStakerROI()
-	return roi
+// Returns error because backend lacks voter reward data sources (GetVotersRewards, GetVotersCap, GetEpochDuration).
+func (s *BlockChainAPI) GetStakerROIMasternode(masternode common.Address) (float64, error) {
+	if masternode == (common.Address{}) {
+		return 0, errors.New("invalid masternode address")
+	}
+	return 0, errors.New("GetStakerROIMasternode: voter reward data not available in this client")
 }
 
 // GetStateHealStatus returns the current snap-heal status for diagnostic purposes.

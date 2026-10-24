@@ -23,9 +23,9 @@ import (
 	"github.com/ethereum/go-ethereum/consensus"
 	"github.com/ethereum/go-ethereum/consensus/misc/eip4844"
 	"github.com/ethereum/go-ethereum/core/tracing"
-	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/core/vm"
+	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/holiman/uint256"
 )
@@ -58,7 +58,10 @@ func NewEVMBlockContext(header *types.Header, chain ChainContext, author *common
 	if header.BaseFee != nil {
 		baseFee = new(big.Int).Set(header.BaseFee)
 	}
-	if header.ExcessBlobGas != nil {
+	// XDC carries ExcessBlobGas=0 as a canonical placeholder on Amsterdam blocks
+	// but has no blob transactions and no BlobScheduleConfig. Skip CalcBlobFee
+	// (blob base fee = 0) to avoid the unsupported-fork panic.
+	if header.ExcessBlobGas != nil && !chain.Config().IsXDC() {
 		blobBaseFee = eip4844.CalcBlobFee(chain.Config(), header)
 	}
 	// XDC Network: Use Keccak256(blockNumber) as PREVRANDAO

@@ -87,4 +87,9 @@ var (
 	// BlockSigners/RandomizeSMC) is submitted by an address that is not a
 	// current masternode signer. Mirrors XDPoSChain core/txpool/errors.go.
 	ErrSpecialTxNotFromSigner = errors.New("special transaction sender is not a signer")
+
+	// ErrUnderMinGasPrice is returned when a non-special XDC transaction's gas
+	// price is below the XDC tier minimum (Gas50x or Gas2500x). Mirrors
+	// XDPoSChain core/txpool/validation.go ErrUnderMinGasPrice.
+	ErrUnderMinGasPrice = errors.New("transaction gas price under xdc tier minimum")
 )

@@ -54,6 +54,15 @@ type Config struct {
 	// XDC A.97-M.B (Task 7): Mining enables the XDPoS V2 block-production worker
 	// when --mine is passed on the command line.  Set by cmd/utils setMiner.
 	Mining bool `toml:",omitempty"`
+
+	// BlockVoteGasCap is a soft per-block gas ceiling applied only during
+	// XDPoS V2 block production (--miner.blockvotegascap).  When non-zero
+	// and smaller than the protocol GasLimit, the miner stops filling
+	// transactions once this many gas units have been consumed, producing a
+	// smaller block that voters can re-execute faster.  The block's GasLimit
+	// header field is not changed, so the cap is invisible to consensus.
+	// A value of 0 (default) means no cap: behaviour is unchanged from before.
+	BlockVoteGasCap uint64 `toml:",omitempty"`
 }
 
 // DefaultConfig contains default settings for miner.
@@ -160,6 +169,11 @@ func (miner *Miner) getPending() *newPayloadResult {
 		withdrawal  types.Withdrawals
 		slotNum     *uint64
 	)
+	// prepareWork raises the timestamp to parent+1 when the local clock is
+	// behind the head. Do it here too, so the fork rules match the block.
+	if header.Time >= timestamp {
+		timestamp = header.Time + 1
+	}
 	if miner.chainConfig.IsShanghai(childNumber, timestamp) {
 		withdrawal = []*types.Withdrawal{}
 	}

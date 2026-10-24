@@ -60,6 +60,39 @@ func (p *StateProcessor) chainConfig() *params.ChainConfig {
 	return p.chain.Config()
 }
 
+// ApplyMulticall3HardFork installs the canonical Multicall3 runtime code at
+// params.Multicall3Address on XDC chains once Prague is active.
+//
+// XDC cannot CREATE Multicall3 at its usual address (the deployer's nonce 0 is
+// spent on XDC), so canonical XDPoSChain v2.9.3 (core/state_processor.go:101-120)
+// installs it as a state change. It runs on every Prague block after genesis
+// and installs only when the address has no code, so it normally fires once, at
+// PragueBlock. Existing balance and storage are kept; the nonce is set to 1, the
+// nonce a CREATE-deployed contract carries since EIP-161. Code that differs from
+// the canonical runtime code panics, as canonical does.
+//
+// The legacy devnet (chain ID 5551) is the exception: its sealers run the
+// XDPoSChain dev-upgrade line (XDC v2.7.0-devnet, 3bacbce5), which activates
+// Prague at 50,000 (common/constants.devnet.go:32) but has no Multicall3
+// install. Installing it there gives block 50,000 a different state root.
+func ApplyMulticall3HardFork(config *params.ChainConfig, statedb vm.StateDB, blockNumber *big.Int) {
+	if !config.IsXDC() || blockNumber.Sign() == 0 || !config.IsPragueBlock(blockNumber) {
+		return
+	}
+	if config.ChainID != nil && config.ChainID.Uint64() == 5551 {
+		return
+	}
+	if code := statedb.GetCode(params.Multicall3Address); len(code) > 0 {
+		if !bytes.Equal(code, params.Multicall3RuntimeCode) {
+			panic(fmt.Sprintf("multicall3 code mismatch: have %s want %s",
+				crypto.Keccak256Hash(code), crypto.Keccak256Hash(params.Multicall3RuntimeCode)))
+		}
+		return
+	}
+	statedb.SetCode(params.Multicall3Address, params.Multicall3RuntimeCode, tracing.CodeChangeGenesis)
+	statedb.SetNonce(params.Multicall3Address, 1, tracing.NonceChangeUnspecified)
+}
+
 // getCoinbaseOwner resolves the TRC21 fee recipient for the block. After
 // TIPTRC21Fee (Apothem 23,779,191; mainnet 38,383,838), the masternode's
 // owner — looked up from the validator contract (0x88) via GetCandidateOwner —
@@ -116,32 +149,7 @@ func (p *StateProcessor) Process(ctx context.Context, block *types.Block, stated
 		misc.ApplyDAOHardFork(tracingStateDB)
 	}
 
-	// XDC: at the TIPSigning fork block (mainnet 3,000,000; Apothem
-	// 23,779,191), canonical XDPoSChain wipes the BlockSigners contract
-	// (0x89). After this block, signing transactions are handled by
-	// ApplySigningTransaction without invoking the contract's EVM code,
-	// so the on-chain code+storage at 0x89 is no longer needed and
-	// removing it shrinks the state trie. We MUST match the canonical
-	// behaviour exactly or the state root diverges at the fork block.
-	//
-	// Implementation note: the IntermediateRoot(false) call BEFORE
-	// SelfDestruct is required for pathdb correctness. Modern geth's
-	// pathdb commits mutations against the trie that was opened during
-	// the previous IntermediateRoot. Without first opening the trie here
-	// (against the pre-deletion originalRoot), the subsequent
-	// SelfDestruct + Finalise + IntermediateRoot path leaves the trie in
-	// a state where the deletion is recorded in mutations but does not
-	// produce the canonical post-deletion root.
-	//
-	// This must run in exactly this order, and before the parent-header
-	// lookup below has any chance to matter: IntermediateRoot(false) →
-	// SelfDestruct → Finalise(true) → IntermediateRoot(true).
-	if common.TIPSigning.Cmp(block.Number()) == 0 {
-		_ = statedb.IntermediateRoot(params.Rules{})
-		statedb.SelfDestruct(common.BlockSignersBinary)
-		statedb.Finalise(params.Rules{IsEIP158: true})
-		_ = statedb.IntermediateRoot(params.Rules{IsEIP158: true})
-	}
+	ApplyTIPSigningHardFork(config, statedb, blockNumber)
 
 	parent := p.chain.GetHeader(block.ParentHash(), block.NumberU64()-1)
 	if parent == nil {
@@ -290,6 +298,35 @@ func (p *StateProcessor) Process(ctx context.Context, block *types.Block, stated
 	}, nil
 }
 
+// ApplyTIPSigningHardFork wipes the BlockSigners contract (0x89) at the
+// TIPSigning fork block (mainnet 3,000,000; Apothem 23,779,191), as canonical
+// XDPoSChain does on import and in its miner (core.ApplyTIPSigningHardFork,
+// miner/worker.go:889). After this block, signing transactions are handled by
+// ApplySigningTransaction without invoking the contract's EVM code, so the
+// on-chain code+storage at 0x89 is no longer needed and removing it shrinks
+// the state trie. We MUST match the canonical behaviour exactly or the state
+// root diverges at the fork block. Process and the XDPoS mint env both call it
+// before the first transaction.
+//
+// Implementation note: the IntermediateRoot(false) call BEFORE SelfDestruct is
+// required for pathdb correctness. Modern geth's pathdb commits mutations
+// against the trie that was opened during the previous IntermediateRoot.
+// Without first opening the trie here (against the pre-deletion originalRoot),
+// the subsequent SelfDestruct + Finalise + IntermediateRoot path leaves the
+// trie in a state where the deletion is recorded in mutations but does not
+// produce the canonical post-deletion root.
+//
+// This must run in exactly this order: IntermediateRoot(false) → SelfDestruct
+// → Finalise(true) → IntermediateRoot(true).
+func ApplyTIPSigningHardFork(config *params.ChainConfig, statedb *state.StateDB, number *big.Int) {
+	if config.EffectiveTIPSigningBlock().Cmp(number) == 0 {
+		_ = statedb.IntermediateRoot(params.Rules{})
+		statedb.SelfDestruct(common.BlockSignersBinary)
+		statedb.Finalise(params.Rules{IsEIP158: true})
+		_ = statedb.IntermediateRoot(params.Rules{IsEIP158: true})
+	}
+}
+
 // PreExecution processes pre-execution state changes and system calls.
 func PreExecution(ctx context.Context, beaconRoot *common.Hash, parent *types.Header, config *params.ChainConfig, evm *vm.EVM, number *big.Int, time uint64) *bal.ConstructionBlockAccessList {
 	_, _, spanEnd := telemetry.StartSpan(ctx, "core.preExecution")
@@ -299,10 +336,14 @@ func PreExecution(ctx context.Context, beaconRoot *common.Hash, parent *types.He
 	if config.IsAmsterdam(number, time) {
 		blockAccessList = bal.NewConstructionBlockAccessList()
 	}
-	// EIP-4788
-	if beaconRoot != nil {
+	// EIP-4788: only on chains with a consensus layer. XDC has no beacon
+	// chain; Amsterdam XDC blocks carry ParentBeaconRoot=zeroHash as a
+	// mandatory RLP placeholder, but the 4788 contract must not fire.
+	if beaconRoot != nil && !config.IsXDC() {
 		ProcessBeaconBlockRoot(*beaconRoot, evm, blockAccessList)
 	}
+	// XDC: Multicall3 install at Prague, before EIP-2935 as in canonical.
+	ApplyMulticall3HardFork(config, evm.StateDB, number)
 	// EIP-2935
 	if config.IsPrague(number, time) || config.IsUBT(number, time) {
 		ProcessParentBlockHash(parent.Hash(), evm, blockAccessList)
@@ -326,8 +367,11 @@ func PostExecution(ctx context.Context, config *params.ChainConfig, number *big.
 	if rules.IsShanghai {
 		ProcessWithdrawals(withdrawals, evm, blockAccessIndex, blockAccessList)
 	}
-	// Read requests if Prague is enabled.
-	if rules.IsPrague {
+	// Read requests if Prague is enabled. XDC has no consensus layer: canonical
+	// XDPoSChain runs no EIP-6110/7002/7251/8282 system calls, its headers carry
+	// no requestsHash, and the queue contracts are never deployed. Requests stay
+	// nil so ValidateState accepts the header without a requestsHash.
+	if rules.IsPrague && !rules.IsXDC {
 		requests = [][]byte{}
 		// EIP-6110
 		if err := ParseDepositLogs(&requests, allLogs, config); err != nil {
@@ -343,7 +387,7 @@ func PostExecution(ctx context.Context, config *params.ChainConfig, number *big.
 		}
 	}
 
-	if rules.IsAmsterdam {
+	if rules.IsAmsterdam && !rules.IsXDC {
 		// EIP-8282
 		if err := ProcessBuilderDepositQueue(&requests, rules, evm, blockAccessIndex, blockAccessList); err != nil {
 			return nil, nil, fmt.Errorf("failed to process builder deposit queue: %w", err)
@@ -420,7 +464,9 @@ func applyTransactionWithEVM(ctx context.Context, msg *Message, gp *GasPool, sta
 	}
 	// Merge the tx-local access event into the "block-local" one, in order to collect
 	// all values, so that the witness can be built.
-	if statedb.Database().Type().Is(state.TypeUBT) {
+	// XDC: evm.AccessEvents is nil on UBT chains because the EVM only initialises it
+	// when IsEIP4762 is true; UBT uses UBTTime, not IsEIP4762. Guard both sides.
+	if statedb.Database().Type().Is(state.TypeUBT) && evm.AccessEvents != nil {
 		statedb.AccessEvents().Merge(evm.AccessEvents)
 	}
 	receipt = makeReceipt(evm, result, statedb, blockNumber, blockHash, blockTime, tx, gp.CumulativeUsed(), root)
@@ -529,7 +575,9 @@ func ProcessBeaconBlockRoot(beaconRoot common.Hash, evm *vm.EVM, blockAccessList
 
 	// Unchecked system call (EIP-4788), failures are ignored as spec
 	_, _, _ = evm.Call(msg.From, *msg.To, msg.Data, gasBudget, common.U2560)
-	if evm.StateDB.AccessEvents() != nil {
+	// XDC: evm.AccessEvents is nil on UBT chains because the EVM only initialises it
+	// when IsEIP4762 is true; UBT uses UBTTime, not IsEIP4762. Guard both sides.
+	if evm.StateDB.AccessEvents() != nil && evm.AccessEvents != nil {
 		evm.StateDB.AccessEvents().Merge(evm.AccessEvents)
 	}
 	accessList := evm.StateDB.Finalise(evm.GetRules())
@@ -610,7 +658,7 @@ func ProcessParentBlockHash(prevHash common.Hash, evm *vm.EVM, blockAccessList *
 
 	// Unchecked system call (EIP-2935), failures are ignored as spec
 	_, _, _ = evm.Call(msg.From, *msg.To, msg.Data, gasBudget, common.U2560)
-	if evm.StateDB.AccessEvents() != nil {
+	if evm.StateDB.AccessEvents() != nil && evm.AccessEvents != nil {
 		evm.StateDB.AccessEvents().Merge(evm.AccessEvents)
 	}
 	accessList := evm.StateDB.Finalise(evm.GetRules())
@@ -676,7 +724,7 @@ func processRequestsSystemCall(requests *[][]byte, rules params.Rules, evm *vm.E
 	evm.StateDB.SetTxContext(common.Hash{}, 0, blockAccessIndex)
 	evm.StateDB.AddAddressToAccessList(addr)
 	ret, _, err := evm.Call(msg.From, *msg.To, msg.Data, gasBudget, common.U2560)
-	if evm.StateDB.AccessEvents() != nil {
+	if evm.StateDB.AccessEvents() != nil && evm.AccessEvents != nil {
 		evm.StateDB.AccessEvents().Merge(evm.AccessEvents)
 	}
 	bal := evm.StateDB.Finalise(evm.GetRules())
@@ -726,6 +774,40 @@ func onSystemCallStart(tracer *tracing.Hooks, ctx *tracing.VMContext) {
 	}
 }
 
+// FillAmsterdamHeader fills the mandatory Amsterdam optional header fields
+// (canonical-empty placeholder hashes) and sets BlockAccessListHash from the
+// accumulated BAL. Returns the encoded access list for attaching to the block
+// via types.Block.WithAccessListUnsafe. Mutates header in place.
+//
+// Called by both AssembleBlock and the XDPoS sealing path
+// (miner/xdpos_worker.go) so the two cannot diverge.
+//
+// gen_header_rlp.go note: the cascading null-placeholder encoder writes 0x80
+// for a nil *common.Hash when a later optional field is non-nil; the struct
+// decoder cannot decode 0x80 as a 32-byte hash, so every optional field that
+// precedes BlockAccessListHash must be non-nil after Amsterdam.
+func FillAmsterdamHeader(header *types.Header, blockAccessList *bal.ConstructionBlockAccessList) *bal.BlockAccessList {
+	blobZero := uint64(0)
+	zeroHash := common.Hash{}
+	if header.BlobGasUsed == nil {
+		header.BlobGasUsed = &blobZero
+	}
+	if header.ExcessBlobGas == nil {
+		header.ExcessBlobGas = &blobZero
+	}
+	if header.ParentBeaconRoot == nil {
+		// Zero hash, not nil. EIP-4788 is gated out for XDC in PreExecution.
+		header.ParentBeaconRoot = &zeroHash
+	}
+	if header.RequestsHash == nil {
+		header.RequestsHash = &types.EmptyRequestsHash
+	}
+	blal := blockAccessList.ToEncodingObj()
+	balHash := blal.Hash()
+	header.BlockAccessListHash = &balHash
+	return blal
+}
+
 // AssembleBlock finalizes the state and assembles the block with provided
 // body and receipts.
 func AssembleBlock(chain consensus.ChainHeaderReader, header *types.Header, state *state.StateDB, body *types.Body, receipts []*types.Receipt, blockAccessList *bal.ConstructionBlockAccessList) *types.Block {
@@ -736,11 +818,19 @@ func AssembleBlock(chain consensus.ChainHeaderReader, header *types.Header, stat
 	if !rules.IsAmsterdam {
 		return types.NewBlock(header, body, receipts, trie.NewStackTrie(nil))
 	}
-	// Assign the BlockAccessListHash if Amsterdam has been enabled
-	bal := blockAccessList.ToEncodingObj()
-	balHash := bal.Hash()
-	header.BlockAccessListHash = &balHash
-	return types.NewBlock(header, body, receipts, trie.NewStackTrie(nil)).WithAccessListUnsafe(bal)
+	blal := FillAmsterdamHeader(header, blockAccessList)
+	// WithdrawalsHash: types.NewBlock overrides it from body.Withdrawals
+	// (nil → nil header). Pass an empty non-nil slice so NewBlock sets
+	// WithdrawalsHash = &EmptyWithdrawalsHash.
+	assemblyBody := body
+	if body.Withdrawals == nil {
+		assemblyBody = &types.Body{
+			Transactions: body.Transactions,
+			Uncles:       body.Uncles,
+			Withdrawals:  types.Withdrawals{},
+		}
+	}
+	return types.NewBlock(header, assemblyBody, receipts, trie.NewStackTrie(nil)).WithAccessListUnsafe(blal)
 }
 
 // TxRoute says which handler a transaction goes through while a block is
@@ -820,9 +910,13 @@ func ApplySigningTransaction(config *params.ChainConfig, statedb *state.StateDB,
 	}
 	statedb.AddLog(sigLog)
 
-	// Build receipt — gasUsed=0, cumulativeGasUsed unchanged.
+	// Build receipt — gasUsed=0, cumulativeGasUsed unchanged. Canonical
+	// XDPoSChain builds it with types.NewReceipt, which is always a legacy
+	// receipt whatever the tx type (core/state_processor.go:505,
+	// core/types/receipt.go:123-128); the type decides the receipt-trie
+	// encoding, so a typed sign tx must still get a legacy receipt.
 	receipt := &types.Receipt{
-		Type:              tx.Type(),
+		Type:              types.LegacyTxType,
 		PostState:         root,
 		Status:            types.ReceiptStatusSuccessful,
 		CumulativeGasUsed: cumulativeGasUsed,
@@ -862,8 +956,10 @@ func ApplyEmptyTransaction(config *params.ChainConfig, statedb *state.StateDB, b
 	}
 	statedb.AddLog(emptyLog)
 
+	// Legacy receipt whatever the tx type, as canonical types.NewReceipt
+	// (core/state_processor.go:529); see ApplySigningTransaction.
 	receipt := &types.Receipt{
-		Type:              tx.Type(),
+		Type:              types.LegacyTxType,
 		PostState:         root,
 		Status:            types.ReceiptStatusSuccessful,
 		CumulativeGasUsed: cumulativeGasUsed,
@@ -909,4 +1005,52 @@ func SettleTRC21TokenFee(config *params.ChainConfig, statedb *state.StateDB, msg
 	tokensFee[token] = new(big.Int).Sub(tokensFee[token], fee)
 	balanceUpdated[token] = tokensFee[token]
 	totalFeeUsed.Add(totalFeeUsed, fee)
+}
+
+// ApplyTransactionForTrace applies a transaction of a block the way Process
+// does, for tracing and state regeneration (eth/tracers, eth/state_accessor):
+// signing (0x89) and XDCx empty (0x91-0x94) txs take their non-EVM routes, a
+// tx to a TRC21 token pays its fee from the token's capacity, and the fee goes
+// to the coinbase owner. Replaying a block with plain ApplyMessage instead
+// bumps the nonce on the empty route and charges TRC21 fees to the sender, so
+// a later tx of the block fails ("nonce too low", "insufficient funds") where
+// canonical XDPoSChain replays it (eth/state_accessor.go, core
+// ApplyTransactionForReplay). A non-EVM tx is reported to the tracer as one
+// top-level call that uses no gas, like XDPoSChain's call tracer does (#1626).
+func ApplyTransactionForTrace(ctx context.Context, msg *Message, statedb *state.StateDB, blockNumber *big.Int, blockHash common.Hash, blockTime uint64, tx *types.Transaction, evm *vm.EVM) (*types.Receipt, error) {
+	config := evm.ChainConfig()
+	route := RouteTransaction(config, blockNumber, tx)
+	if route == TxRouteEVM {
+		capacity := state.GetTRC21FeeCapacityFromState(statedb)
+		tokenFee := ApplyTRC21TokenFee(config, msg, capacity, tx, blockNumber)
+		owner := state.GetCandidateOwner(statedb, evm.Context.Coinbase)
+		receipt, _, err := ApplyTransactionWithEVM(ctx, msg, NewGasPool(msg.GasLimit), statedb, blockNumber, blockHash, blockTime, tx, evm, owner)
+		if err == nil && tokenFee && receipt.Status == types.ReceiptStatusFailed {
+			state.PayFeeWithTRC21TxFail(statedb, msg.From, *tx.To())
+		}
+		return receipt, err
+	}
+	hooks := evm.Config.Tracer
+	if hooks != nil && hooks.OnTxStart != nil {
+		hooks.OnTxStart(evm.GetVMContext(), tx, msg.From)
+	}
+	if hooks != nil && hooks.OnEnter != nil {
+		hooks.OnEnter(0, byte(vm.CALL), msg.From, *tx.To(), tx.Data(), tx.Gas(), tx.Value())
+	}
+	var (
+		receipt *types.Receipt
+		err     error
+	)
+	if route == TxRouteSign {
+		receipt, err = ApplySigningTransaction(config, statedb, blockNumber, blockHash, tx, 0)
+	} else {
+		receipt, err = ApplyEmptyTransaction(config, statedb, blockNumber, blockHash, tx, 0)
+	}
+	if hooks != nil && hooks.OnExit != nil {
+		hooks.OnExit(0, nil, 0, err, err != nil)
+	}
+	if hooks != nil && hooks.OnTxEnd != nil {
+		hooks.OnTxEnd(receipt, err)
+	}
+	return receipt, err
 }

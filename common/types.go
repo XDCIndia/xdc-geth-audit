@@ -239,25 +239,22 @@ func CopyXDCConstants(chainID uint64) {
 		BlackListHFNumber = 38383838
 		// Canonical XDPoSChain v2.6.8 common/constants.mainnet.go: tip2019Block=1.
 		TIP2019Block = big.NewInt(1)
-	case 551: // Active devnet (XDPoSChain main)
+	case 551: // Devnet: XDPoSChain v2.9.3-testnet params/config_networks.go:471 DevnetChainConfig
 		TRC21IssuerSMC = HexToAddress("0x8c0faeb5C6bEd2129b8674F262Fd45c4e9468bee")
-		BlockNumberGas50x = big.NewInt(21600)
+		BlockNumberGas50x = big.NewInt(0)
 		TIPSigning = big.NewInt(0)
-		TIPTRC21Fee = big.NewInt(10800)
+		TIPTRC21Fee = big.NewInt(0)
 		TIPNoHalvingMNReward = big.NewInt(0)
 		TIPXDCXCancellationFee = big.NewInt(0)
 		TIPXDCX = big.NewInt(0)
 		TIPXDCXLending = big.NewInt(0)
 		TIPXDCXMinerDisable = big.NewInt(0)
-		// TIPXDCXReceiverDisable must be > TIPXDCX (0) so that IsTIPXDCXReceiver
-		// returns true for all blocks. If both are 0, isForked(0,N)=true &&
-		// !isForked(0,N)=false yields false for every block — breaking the special
-		// ApplyEmptyTransaction path for XDPoSChain system txs to 0x92.
-		// Use math.MaxInt64-like sentinel: XDPoSChain devnet never reaches block 1e17.
-		TIPXDCXReceiverDisable = big.NewInt(1e17)
+		// Canonical TIPXDCXReceiverDisableBlock = 0 = TIPXDCXBlock, so
+		// IsTIPXDCXReceiver is false on every block (no XDCx empty-tx route).
+		TIPXDCXReceiverDisable = big.NewInt(0)
 		BlackListHFNumber = 0
-		// Canonical XDPoSChain v2.6.8 common/constants.devnet.go: tip2019Block=0.
 		TIP2019Block = big.NewInt(0)
+		TIPRandomize = big.NewInt(0)
 	case 5151: // Local devnet (XDPoSChain constants.local.go — all TIPs active from genesis)
 		// canonical XDPoSChain common/constants.local.go has every tipXxx = big.NewInt(0),
 		// meaning all fork activations and special transaction paths (signing, XDCx, etc.)

@@ -604,6 +604,33 @@ func (pool *LegacyPool) ValidateTxBasics(tx *types.Transaction) error {
 	return txpool.ValidateTransaction(tx, pool.currentHead.Load(), pool.signer, opts)
 }
 
+// trc21Data returns the current TRC21 fee capacity map and a cost function for
+// the pending block, used by list.Filter and promoteExecutables to retain TRC21
+// txs that the token's issuer capacity can afford.
+func (pool *LegacyPool) trc21Data() (map[common.Address]*big.Int, func(*types.Transaction) *big.Int) {
+	if pool.currentState == nil || !pool.chainconfig.IsXDC() {
+		return nil, nil
+	}
+	issuers := state.GetTRC21FeeCapacityFromState(pool.currentState)
+	if len(issuers) == 0 {
+		return nil, nil
+	}
+	var num *big.Int
+	if head := pool.currentHead.Load(); head != nil {
+		// Pending block is one past current head.
+		num = new(big.Int).Add(head.Number, big.NewInt(1))
+	} else {
+		num = new(big.Int)
+	}
+	cfg := pool.chainconfig
+	costFn := func(tx *types.Transaction) *big.Int {
+		price := params.TRC21GasPriceForBlock(cfg, num)
+		c := new(big.Int).Mul(price, new(big.Int).SetUint64(tx.Gas()))
+		return c.Add(c, tx.Value())
+	}
+	return issuers, costFn
+}
+
 // validateTx checks whether a transaction is valid according to the consensus
 // rules and adheres to some heuristic limits of the local node (price and size).
 func (pool *LegacyPool) validateTx(tx *types.Transaction) error {
@@ -641,6 +668,19 @@ func (pool *LegacyPool) validateTx(tx *types.Transaction) error {
 				}
 			}
 			return nil
+		},
+		// XDC TRC21 pool admission: supplement balance with the token's fee
+		// capacity for txs sent to a registered TRC21 token (XDPoSChain
+		// core/txpool/legacypool/legacypool.go:622 trc21FeeCapacity). Config
+		// and the head number also drive the gas-price tier floor (Gas50x /
+		// Gas2500x).
+		Trc21FeeCapacity: state.GetTRC21FeeCapacityFromState(pool.currentState),
+		Config:           pool.chainconfig,
+		CurrentNumber: func() *big.Int {
+			if head := pool.currentHead.Load(); head != nil {
+				return head.Number
+			}
+			return new(big.Int)
 		},
 	}
 	if err := txpool.ValidateTransactionWithState(tx, pool.signer, opts); err != nil {
@@ -787,7 +827,7 @@ func (pool *LegacyPool) promoteSpecialTx(from common.Address, tx *types.Transact
 		pool.all.Add(tx)
 		pool.priced.Put(tx)
 	}
-	pool.pendingNonces.set(from, tx.Nonce()+1)
+	pool.pendingNonces.setIfHigher(from, tx.Nonce()+1)
 	pool.queueTxEvent(tx)
 	log.Trace("XDC: fast-pathed special signing tx to pending", "hash", tx.Hash(), "from", from, "to", tx.To(), "nonce", tx.Nonce())
 	return true, nil
@@ -849,6 +889,51 @@ func (pool *LegacyPool) isSigningTxExpired(tx *types.Transaction) bool {
 	return headNum > expiry
 }
 
+// specialTxSignSel is the 4-byte ABI selector for BlockSigners.sign(uint256,bytes32),
+// derived from common.HexSignMethod so it never diverges from the canonical source.
+// Canonical layout (contracts.CreateTxSign): 4-byte selector + 32-byte blockNumber + 32-byte blockHash = 68 bytes.
+var specialTxSignSel = func() (r [4]byte) { copy(r[:], common.Hex2Bytes(common.HexSignMethod)); return }()
+
+// specialTxRandSelectors are the 4-byte ABI selectors for the two RandomizeSMC methods
+// that masternodes legitimately call: setSecret (HexSetSecret) and setOpening (HexSetOpening).
+var specialTxRandSelectors = [2][4]byte{
+	func() (r [4]byte) { copy(r[:], common.Hex2Bytes(common.HexSetSecret)); return }(),
+	func() (r [4]byte) { copy(r[:], common.Hex2Bytes(common.HexSetOpening)); return }(),
+}
+
+// hasKnownSpecialCalldata reports whether tx carries calldata that matches a known
+// canonical special-tx method.  Only transactions that pass this check are eligible
+// for the IsSigner fast path; all other calldata to 0x89/0x90 must take the normal
+// pool path where tip checks and GlobalSlots caps are applied.
+//
+// For BlockSigners (0x89): exactly 68 bytes — 4-byte sign selector plus 32-byte
+// blockNumber plus 32-byte blockHash (contracts.CreateTxSign / common.HexSignMethod).
+// Mirrors the identical guard in consensus/XDPoS/reward.go:isSigningTx.
+//
+// For RandomizeSMC (0x90): at least 4 bytes with a setSecret or setOpening selector
+// (contracts.BuildTxSecretRandomize / BuildTxOpeningRandomize / common.HexSetSecret,
+// common.HexSetOpening).  Calldata length is not fixed for these methods.
+//
+// Hacken F-2026-19457 residual: the prior mitigation (cd3cd00) added the IsSigner
+// sender check but not this calldata guard, leaving any calldata from a seated
+// masternode on the fee-exempt fast path above GlobalSlots.
+func hasKnownSpecialCalldata(tx *types.Transaction) bool {
+	data := tx.Data()
+	if len(data) < 4 || tx.To() == nil {
+		return false
+	}
+	var sel [4]byte
+	copy(sel[:], data[:4])
+	switch *tx.To() {
+	case common.BlockSignersBinary:
+		// Exactly 68 bytes: selector (4) + uint256 blockNumber (32) + bytes32 blockHash (32).
+		return len(data) == 68 && sel == specialTxSignSel
+	case common.RandomizeSMCBinary:
+		return sel == specialTxRandSelectors[0] || sel == specialTxRandSelectors[1]
+	}
+	return false
+}
+
 // add validates a transaction and inserts it into the non-executable queue for later
 // pending promotion and execution. If the transaction is a replacement for an already
 // pending or queued one, it overwrites the previous transaction if its price is higher.
@@ -883,16 +968,38 @@ func (pool *LegacyPool) add(tx *types.Transaction) (replaced bool, err error) {
 	// This handles the "jammed nonce" recovery case: a stale signing tx is stuck
 	// in pending (pendingNonces advanced past it), and a fresh replacement tx
 	// cannot pass the price-bump check in list.Add (gasPrice=0 on both).
-	if tx.IsSpecialTransaction() && pool.IsSigner != nil && pool.IsSigner(from) {
+	// Hacken F-2026-19457 residual: require that the calldata matches a known
+	// special-tx method selector, not just the destination.  Any calldata that
+	// does not match takes the normal add() path below (tip checks, slot caps).
+	if tx.IsSpecialTransaction() && pool.IsSigner != nil && pool.IsSigner(from) && hasKnownSpecialCalldata(tx) {
 		pendingN := pool.pendingNonces.get(from)
 		if pendingN == tx.Nonce() {
 			// Normal case: tx nonce matches the expected next pending nonce.
-			return pool.promoteSpecialTx(from, tx)
+			// Hold the subpool reservation for new senders before inserting into
+			// pending, so the reserver invariant (each account in at most one
+			// subpool) is maintained on this fast path too.  The normal add() path
+			// below holds the reservation at line 996; the expired-replacement
+			// branch below requires pool.pending[from] != nil (already held).
+			_, hasPending := pool.pending[from]
+			_, hasQueued := pool.queue.get(from)
+			newSender := !hasPending && !hasQueued
+			if newSender {
+				if err := pool.reserver.Hold(from); err != nil {
+					return false, err
+				}
+			}
+			ok, promErr := pool.promoteSpecialTx(from, tx)
+			if promErr != nil && newSender {
+				pool.reserver.Release(from)
+			}
+			return ok, promErr
 		}
 		if pendingN > tx.Nonce() && pool.pending[from] != nil {
 			if old := pool.pending[from].txs.Get(tx.Nonce()); old != nil && pool.isSigningTxExpired(old) {
 				// Expired special tx at a lower nonce — allow replacement via
 				// promoteSpecialTx which will evict the old tx and insert the new one.
+				// pool.pending[from] != nil guarantees hasPending, so the reservation
+				// is already held from a prior add(); no Hold needed here.
 				return pool.promoteSpecialTx(from, tx)
 			}
 		}
@@ -1370,7 +1477,10 @@ func (pool *LegacyPool) scheduleReorgLoop() {
 	for {
 		// Launch next background reorg if needed
 		if curDone == nil && launchNextRun {
-			// Run the background reorg and announcements
+			// Run the background reorg and announcements.
+			// XDC-15: pool.wg tracks the goroutine so pool.Close waits for event
+			// delivery to finish even though done is signalled before txFeed.Send.
+			pool.wg.Add(1)
 			go pool.runReorg(nextDone, reset, dirtyAccounts, queuedEvents)
 
 			// Prepare everything for the next round of reorg
@@ -1427,10 +1537,10 @@ func (pool *LegacyPool) scheduleReorgLoop() {
 
 // runReorg runs reset and promoteExecutables on behalf of scheduleReorgLoop.
 func (pool *LegacyPool) runReorg(done chan struct{}, reset *txpoolResetRequest, dirtyAccounts *accountSet, events map[common.Address]*SortedMap) {
+	defer pool.wg.Done()
 	defer func(t0 time.Time) {
 		reorgDurationTimer.Update(time.Since(t0))
 	}(time.Now())
-	defer close(done)
 
 	var promoteAddrs []common.Address
 	if dirtyAccounts != nil && reset == nil {
@@ -1439,6 +1549,9 @@ func (pool *LegacyPool) runReorg(done chan struct{}, reset *txpoolResetRequest, 
 		// the flatten operation can be avoided.
 		promoteAddrs = dirtyAccounts.flatten()
 	}
+	// resetOK is set to true when pool.reset successfully loads new-head state.
+	// Head-specific post-processing is skipped when it is false (CertiK XDC-36).
+	var resetOK bool
 	pool.mu.Lock()
 	if reset != nil {
 		if reset.newHead != nil && reset.oldHead != nil {
@@ -1458,14 +1571,19 @@ func (pool *LegacyPool) runReorg(done chan struct{}, reset *txpoolResetRequest, 
 				}
 			}
 		}
-		// Reset from the old head to the new, rescheduling any reorged transactions
-		pool.reset(reset.oldHead, reset.newHead)
+		// Reset from the old head to the new, rescheduling any reorged transactions.
+		// XDC-36: capture whether reset succeeded; skip head-specific post-processing
+		// (nonce forwarding, demotion, base-fee repricing) when it did not, so we do
+		// not operate on stale currentState / pendingNonces for the requested head.
+		resetOK = pool.reset(reset.oldHead, reset.newHead)
 
-		// Nonces were reset, discard any events that became stale
-		for addr := range events {
-			events[addr].Forward(pool.pendingNonces.get(addr))
-			if events[addr].Len() == 0 {
-				delete(events, addr)
+		if resetOK {
+			// Nonces were reset, discard any events that became stale
+			for addr := range events {
+				events[addr].Forward(pool.pendingNonces.get(addr))
+				if events[addr].Len() == 0 {
+					delete(events, addr)
+				}
 			}
 		}
 		// Reset needs promote for all addresses
@@ -1477,7 +1595,7 @@ func (pool *LegacyPool) runReorg(done chan struct{}, reset *txpoolResetRequest, 
 	// If a new block appeared, validate the pool of pending transactions. This will
 	// remove any transaction that has been included in the block or was invalidated
 	// because of another transaction (e.g. higher gas price).
-	if reset != nil {
+	if reset != nil && resetOK {
 		pool.demoteUnexecutables()
 		if reset.newHead != nil {
 			if pool.chainconfig.IsLondon(new(big.Int).Add(reset.newHead.Number, big.NewInt(1))) {
@@ -1499,9 +1617,29 @@ func (pool *LegacyPool) runReorg(done chan struct{}, reset *txpoolResetRequest, 
 	pool.truncatePending()
 	pool.truncateQueue()
 
+	// XDC-31: filter out promoted txs that were evicted by truncatePending or
+	// truncateQueue so we do not announce them to peers. Evicted txs are removed
+	// from pool.all; anything still present there survived truncation.
+	{
+		n := 0
+		for _, tx := range promoted {
+			if pool.all.Get(tx.Hash()) != nil {
+				promoted[n] = tx
+				n++
+			}
+		}
+		promoted = promoted[:n]
+	}
+
 	dropBetweenReorgHistogram.Update(int64(pool.changesSinceReorg))
 	pool.changesSinceReorg = 0 // Reset change counter
 	pool.mu.Unlock()
+
+	// XDC-15: signal done before delivering events so callers of requestReset /
+	// requestPromoteExecutables are not blocked by a slow txFeed subscriber.
+	// pool.wg tracks this goroutine (see scheduleReorgLoop) so pool.Close still
+	// waits for txFeed.Send to finish, preserving clean shutdown.
+	close(done)
 
 	// Notify subsystems for newly added transactions
 	for _, tx := range promoted {
@@ -1522,9 +1660,16 @@ func (pool *LegacyPool) runReorg(done chan struct{}, reset *txpoolResetRequest, 
 
 // reset retrieves the current state of the blockchain and ensures the content
 // of the transaction pool is valid with regard to the chain state.
-func (pool *LegacyPool) reset(oldHead, newHead *types.Header) {
+// It returns true when the pool's currentState and pendingNonces were updated
+// to newHead, and false when an error prevented that update.  Callers must
+// skip head-specific post-processing (nonce forwarding, demotion, base-fee
+// repricing) when reset returns false (CertiK XDC-36).
+func (pool *LegacyPool) reset(oldHead, newHead *types.Header) bool {
 	// If we're reorging an old state, reinject all dropped transactions
 	var reinject types.Transactions
+	// included tracks txs in the newly confirmed chain (populated during reorg;
+	// used later for the XDC empty-route-tx drop).
+	var included types.Transactions
 
 	if oldHead != nil && oldHead.Hash() != newHead.ParentHash {
 		// If the reorg is too deep, avoid doing it (will happen during fast sync)
@@ -1548,7 +1693,7 @@ func (pool *LegacyPool) reset(oldHead, newHead *types.Header) {
 					// If we reorged to a same or higher number, then it's not a case of setHead
 					log.Warn("Transaction pool reset with missing old head",
 						"old", oldHead.Hash(), "oldnum", oldNum, "new", newHead.Hash(), "newnum", newNum)
-					return
+					return false
 				}
 				// If the reorg ended up on a lower number, it's indicative of setHead being the cause
 				log.Debug("Skipping transaction reset caused by setHead",
@@ -1561,33 +1706,33 @@ func (pool *LegacyPool) reset(oldHead, newHead *types.Header) {
 					// reorg caused by sync-reversion or explicit sethead back to an
 					// earlier block.
 					log.Warn("Transaction pool reset with missing new head", "number", newHead.Number, "hash", newHead.Hash())
-					return
+					return false
 				}
-				var discarded, included types.Transactions
+				var discarded types.Transactions
 				for rem.NumberU64() > add.NumberU64() {
 					discarded = append(discarded, rem.Transactions()...)
 					if rem = pool.chain.GetBlock(rem.ParentHash(), rem.NumberU64()-1); rem == nil {
 						log.Error("Unrooted old chain seen by tx pool", "block", oldHead.Number, "hash", oldHead.Hash())
-						return
+						return false
 					}
 				}
 				for add.NumberU64() > rem.NumberU64() {
 					included = append(included, add.Transactions()...)
 					if add = pool.chain.GetBlock(add.ParentHash(), add.NumberU64()-1); add == nil {
 						log.Error("Unrooted new chain seen by tx pool", "block", newHead.Number, "hash", newHead.Hash())
-						return
+						return false
 					}
 				}
 				for rem.Hash() != add.Hash() {
 					discarded = append(discarded, rem.Transactions()...)
 					if rem = pool.chain.GetBlock(rem.ParentHash(), rem.NumberU64()-1); rem == nil {
 						log.Error("Unrooted old chain seen by tx pool", "block", oldHead.Number, "hash", oldHead.Hash())
-						return
+						return false
 					}
 					included = append(included, add.Transactions()...)
 					if add = pool.chain.GetBlock(add.ParentHash(), add.NumberU64()-1); add == nil {
 						log.Error("Unrooted new chain seen by tx pool", "block", newHead.Number, "hash", newHead.Hash())
-						return
+						return false
 					}
 				}
 				lost := make([]*types.Transaction, 0, len(discarded))
@@ -1612,19 +1757,55 @@ func (pool *LegacyPool) reset(oldHead, newHead *types.Header) {
 		if core.CheckpointSyncNoStateActive.Load() {
 			log.Debug("legacypool: head state not yet available (snap-heal pending), skipping reset",
 				"block", newHead.Number, "root", newHead.Root)
-			return
+			return false
 		}
 		log.Error("Failed to reset txpool state", "err", err)
-		return
+		return false
 	}
 	pool.currentHead.Store(newHead)
 	pool.currentState = statedb
 	pool.pendingNonces = newNoncer(statedb)
 
+	// XDC: empty-route txs (0x91-0x94) do not advance the sender's nonce
+	// (ApplyEmptyTransaction is canonical). Once such a tx appears in the
+	// confirmed chain, drop it from pending so the miner does not include it
+	// again in subsequent blocks (Fixes #1702).
+	// Do this before re-injecting discarded txs: TxDifference already excludes
+	// txs in the new chain from reinject, so order does not matter for
+	// correctness, but pruning first is cleaner.
+	if pool.chainconfig.IsXDC() && newHead != nil {
+		var toCheck types.Transactions
+		if oldHead != nil && oldHead.Hash() != newHead.ParentHash {
+			// Reorg: the walk above already collected all txs added in the new chain.
+			toCheck = included
+		} else {
+			// Simple advance: inspect the single newly confirmed block.
+			if blk := pool.chain.GetBlock(newHead.Hash(), newHead.Number.Uint64()); blk != nil {
+				toCheck = blk.Transactions()
+			}
+		}
+		for _, tx := range toCheck {
+			if to := tx.To(); to != nil && isXDCEmptyRouteAddr(*to) {
+				pool.removeTx(tx.Hash(), false, true)
+			}
+		}
+	}
+
 	// Inject any transactions discarded due to reorgs
 	log.Debug("Reinjecting stale transactions", "count", len(reinject))
 	core.SenderCacher().Recover(pool.signer, reinject)
 	pool.addTxsLocked(reinject, make([]error, len(reinject)))
+	return true
+}
+
+// isXDCEmptyRouteAddr reports whether addr is one of the four XDCx contracts
+// (0x91-0x94) that ApplyEmptyTransaction handles while IsTIPXDCXReceiver is
+// active. Used to detect pending txs that will not advance the sender's nonce.
+func isXDCEmptyRouteAddr(addr common.Address) bool {
+	return addr == common.XDCXAddrBinary ||
+		addr == common.TradingStateAddrBinary ||
+		addr == common.XDCXLendingAddressBinary ||
+		addr == common.XDCXLendingFinalizedTradeAddressBinary
 }
 
 // promoteExecutables moves transactions that have become processable from the
@@ -1632,7 +1813,8 @@ func (pool *LegacyPool) reset(oldHead, newHead *types.Header) {
 // invalidated transactions (low nonce, low balance) are deleted.
 func (pool *LegacyPool) promoteExecutables(accounts []common.Address) []*types.Transaction {
 	gasLimit := pool.currentHead.Load().GasLimit
-	promotable, dropped, removedAddresses := pool.queue.promoteExecutables(accounts, gasLimit, pool.currentState, pool.pendingNonces)
+	trc21Issuers, trc21CostFn := pool.trc21Data()
+	promotable, dropped, removedAddresses := pool.queue.promoteExecutables(accounts, gasLimit, pool.currentState, pool.pendingNonces, trc21Issuers, trc21CostFn)
 
 	// promote all promotable transactions
 	promoted := make([]*types.Transaction, 0, len(promotable))
@@ -1769,6 +1951,7 @@ func (pool *LegacyPool) truncateQueue() {
 func (pool *LegacyPool) demoteUnexecutables() {
 	// Iterate over all accounts and demote any non-executable transactions
 	gasLimit := pool.currentHead.Load().GasLimit
+	trc21Issuers, trc21CostFn := pool.trc21Data()
 	for addr, list := range pool.pending {
 		nonce := pool.currentState.GetNonce(addr)
 
@@ -1779,8 +1962,9 @@ func (pool *LegacyPool) demoteUnexecutables() {
 			pool.all.Remove(hash)
 			log.Trace("Removed old pending transaction", "hash", hash)
 		}
-		// Drop all transactions that are too costly (low balance or out of gas), and queue any invalids back for later
-		drops, invalids := list.Filter(pool.currentState.GetBalance(addr), gasLimit)
+		// Drop all transactions that are too costly (low balance or out of gas), and queue any invalids back for later.
+		// XDC TRC21: pass issuer capacities so TRC21 txs affordable from fee capacity survive the reset.
+		drops, invalids := list.Filter(pool.currentState.GetBalance(addr), gasLimit, trc21Issuers, trc21CostFn)
 		for _, tx := range drops {
 			hash := tx.Hash()
 			pool.all.Remove(hash)
