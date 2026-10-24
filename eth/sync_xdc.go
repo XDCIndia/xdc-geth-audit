@@ -31,6 +31,7 @@ import (
 	"github.com/ethereum/go-ethereum/ethdb"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/params"
+	"github.com/ethereum/go-ethereum/rlp"
 	"github.com/ethereum/go-ethereum/trie"
 )
 
@@ -542,7 +543,7 @@ func (s *xdcSyncer) loop() {
 					// it as a block number makes peerAtTip always false on XDPoS
 					// V2 networks (TD ≫ head height), so skip them here and rely
 					// solely on headFresh for the at-tip signal.
-					if p.Version() == eth.XDPOS2 {
+					if eth.IsXDPOS2Family(p.Version()) {
 						continue
 					}
 					rng := p.BlockRange()
@@ -4616,7 +4617,7 @@ func (s *xdcSyncer) fetchHeadersParallel(candidates []*eth.Peer, fromBlock uint6
 		// indefinitely even though the peer has since advanced. For XDPOS2
 		// peers, rely solely on an empty header response as the at-tip signal.
 		// Refs #1654.
-		if p.Version() != eth.XDPOS2 &&
+		if !eth.IsXDPOS2Family(p.Version()) &&
 			rng.LatestBlockHash != (common.Hash{}) && rng.LatestBlockHash == curHash {
 			atTipCount++
 			continue
@@ -4754,6 +4755,36 @@ func (s *xdcSyncer) fetchReceiptsBatch(peer *eth.Peer, headers []*types.Header) 
 	if len(headers) == 0 {
 		return nil
 	}
+	// XDPOS2RID (101): handleReceipts70 routes through the request-ID dispatcher,
+	// not XDCReceiptResp, so the nil-sink path below stalls. Use the dedicated
+	// request-ID fetcher and decode the storage-encoded bytes. Refs #1861.
+	if peerHasRequestID(peer) {
+		rrRLP, _ := s.fetchReceiptsRequestID(peer, headers)
+		if len(rrRLP) == 0 {
+			return nil
+		}
+		result := make([]types.Receipts, 0, len(rrRLP))
+		for _, raw := range rrRLP {
+			// dispatchReceipts re-encodes via ReceiptList.EncodeForStorage, which
+			// produces storage-format RLP (3 fields: postState, gasUsed, logs —
+			// TxType stripped). Decode into ReceiptForStorage; cast to Receipt.
+			// ponytail: TxType is lost (stays 0) so DeriveSha fails for typed txs
+			// in this fallback path. v101 peers normally use backfillBodyReceiptChunkModern
+			// (modern path) and never reach here. Fix: bridge network-format types.Receipts
+			// from handleReceipts70 to XDCReceiptResp if the fallback path becomes hot.
+			var stored []*types.ReceiptForStorage
+			if err := rlp.DecodeBytes(raw, &stored); err != nil {
+				log.Debug("xdcSyncer.fetchReceiptsBatch: v101 decode error", "err", err)
+				break
+			}
+			rcpts := make(types.Receipts, len(stored))
+			for i, sr := range stored {
+				rcpts[i] = (*types.Receipt)(sr)
+			}
+			result = append(result, rcpts)
+		}
+		return result
+	}
 	hashes := make([]common.Hash, len(headers))
 	gasUsed := make([]uint64, len(headers))
 	timestamps := make([]uint64, len(headers))
@@ -4789,6 +4820,197 @@ func (s *xdcSyncer) fetchReceiptsBatch(peer *eth.Peer, headers []*types.Header) 
 	case <-s.quitCh:
 		return nil
 	}
+}
+
+// peerHasRequestID reports whether p uses a request-ID-capable eth protocol
+// (eth/69 or eth/70). XDPOS2 (100) and eth/63 peers share a per-peer mutex
+// instead; modern peers support several concurrent in-flight requests.
+func peerHasRequestID(p *eth.Peer) bool {
+	v := p.Version()
+	return v >= eth.ETH69 && v != eth.XDPOS2
+}
+
+// fetchBodiesRequestID fetches block bodies for hashes via the request-ID
+// dispatcher path (eth/69+). The caller must NOT hold XDCBodyReqMu; each
+// request carries a unique RequestId so concurrent calls on the same peer
+// are safe. Falls back with nil on error or timeout (caller falls back to
+// the XDPOS2 path). Refs #1861 (SYNC-10).
+func (s *xdcSyncer) fetchBodiesRequestID(peer *eth.Peer, hashes []common.Hash) []eth.BlockBody {
+	sink := make(chan *eth.Response, 1)
+	req, err := peer.RequestBodies(hashes, sink)
+	if err != nil {
+		log.Debug("xdcSyncer.fetchBodiesRequestID: request failed", "count", len(hashes), "err", err)
+		return nil
+	}
+	defer req.Close()
+	select {
+	case res := <-sink:
+		res.Done <- nil
+		br, ok := res.Res.(*eth.BlockBodiesResponse)
+		if !ok || br == nil {
+			return nil
+		}
+		return []eth.BlockBody(*br)
+	case <-time.After(xdcBulkReqTimeout):
+		log.Debug("xdcSyncer.fetchBodiesRequestID: timed out", "count", len(hashes))
+		return nil
+	case <-s.quitCh:
+		return nil
+	}
+}
+
+// fetchReceiptsRequestID fetches receipts via the request-ID dispatcher path
+// (eth/69+). It returns the raw storage bytes per block together with the receipt
+// hash per block (derived by the dispatcher via ReceiptList.Derivable, which
+// computes the bloom from logs so the hash matches the block header). The raw
+// bytes can be written directly via rawdb.WriteRawReceipts; the hashes are used
+// for verification. Returns (nil, nil) on error or timeout. Refs #1861 (SYNC-10).
+func (s *xdcSyncer) fetchReceiptsRequestID(peer *eth.Peer, headers []*types.Header) (eth.ReceiptsRLPResponse, []common.Hash) {
+	if len(headers) == 0 {
+		return nil, nil
+	}
+	hashes := make([]common.Hash, len(headers))
+	gasUsed := make([]uint64, len(headers))
+	timestamps := make([]uint64, len(headers))
+	for i, h := range headers {
+		hashes[i] = h.Hash()
+		gasUsed[i] = h.GasUsed
+		timestamps[i] = h.Time
+	}
+	sink := make(chan *eth.Response, 1)
+	req, err := peer.RequestReceipts(hashes, gasUsed, timestamps, sink)
+	if err != nil {
+		log.Debug("xdcSyncer.fetchReceiptsRequestID: request failed", "count", len(hashes), "err", err)
+		return nil, nil
+	}
+	defer req.Close()
+	select {
+	case res := <-sink:
+		res.Done <- nil
+		rr, ok := res.Res.(*eth.ReceiptsRLPResponse)
+		if !ok || rr == nil {
+			return nil, nil
+		}
+		rcpHashes, _ := res.Meta.([]common.Hash)
+		return *rr, rcpHashes
+	case <-time.After(xdcBulkReqTimeout):
+		log.Debug("xdcSyncer.fetchReceiptsRequestID: timed out", "count", len(hashes))
+		return nil, nil
+	case <-s.quitCh:
+		return nil, nil
+	}
+}
+
+// backfillBodyReceiptChunkModern fetches and persists bodies and receipts for
+// headers using the request-ID (eth/69+) transport. Bodies are fetched in one
+// batch; all verified bodies' receipts are fetched in a single follow-on
+// RequestReceipts call. Short receipt replies are written up to the last
+// verified entry and the remainder stays in bodyPending for the next attempt.
+// Returns tainted=true when the peer sends data that fails body or receipt hash
+// verification; the caller taints the peer in that case.
+//
+// Safe to call concurrently for different peers / non-overlapping header slices;
+// each invocation owns its own sink channels and DB batch. Refs #1861 (SYNC-10).
+func (s *xdcSyncer) backfillBodyReceiptChunkModern(peer *eth.Peer, headers []*types.Header, db ethdb.Database) (tainted bool) {
+	if len(headers) == 0 {
+		return false
+	}
+	hashes := make([]common.Hash, len(headers))
+	for i, h := range headers {
+		hashes[i] = h.Hash()
+	}
+
+	rawBodies := s.fetchBodiesRequestID(peer, hashes)
+	if len(rawBodies) == 0 {
+		return false // peer returned nothing; not tainted, try again later
+	}
+
+	pairCount := min(len(rawBodies), len(headers))
+	batch := db.NewBatch()
+
+	// Phase 1: verify and write bodies. Collect headers that still need receipts
+	// (only for blocks whose body was just verified in this pass).
+	var rcptHeaders []*types.Header
+	needsBodySet := make(map[common.Hash]bool, pairCount)
+	for i := 0; i < pairCount; i++ {
+		rb := rawBodies[i]
+		h := headers[i]
+		hash := h.Hash()
+		num := h.Number.Uint64()
+
+		txs, err := rb.Transactions.Items()
+		if err != nil {
+			log.Warn("xdcSyncer: SYNC-10 history backfill — body decode error; tainting peer",
+				"block", num, "peer", peer.ID(), "err", err)
+			_ = batch.Write()
+			return true
+		}
+		uncles, err := rb.Uncles.Items()
+		if err != nil {
+			log.Warn("xdcSyncer: SYNC-10 history backfill — body decode error; tainting peer",
+				"block", num, "peer", peer.ID(), "err", err)
+			_ = batch.Write()
+			return true
+		}
+		body := &types.Body{Transactions: txs, Uncles: uncles}
+		if rb.Withdrawals != nil {
+			if wd, err2 := rb.Withdrawals.Items(); err2 == nil {
+				body.Withdrawals = wd
+			}
+		}
+		if !verifyBodyAgainstHeader(h, body) {
+			log.Warn("xdcSyncer: SYNC-10 history backfill — body hash mismatch; tainting peer",
+				"block", num, "peer", peer.ID())
+			_ = batch.Write()
+			return true
+		}
+
+		needsBody := !rawdb.HasBody(db, hash, num)
+		if !needsBody {
+			if ex := rawdb.ReadBody(db, hash, num); ex != nil && len(ex.Transactions) == 0 {
+				needsBody = true
+			}
+		}
+		if needsBody {
+			rawdb.WriteBody(batch, hash, num, body)
+			needsBodySet[hash] = true
+		}
+		rawdb.WriteTxLookupEntriesByBlock(batch, types.NewBlockWithHeader(h).WithBody(*body))
+
+		// Queue receipt if missing or body was just re-written.
+		if !rawdb.HasReceipts(db, hash, num) || needsBodySet[hash] {
+			rcptHeaders = append(rcptHeaders, h)
+		}
+	}
+
+	// Phase 2: one batch RequestReceipts for all verified blocks that need receipts.
+	// The dispatcher derives rcpHashes[i] via ReceiptList.Derivable (bloom from logs),
+	// so rcpHashes[i] == h.ReceiptHash for correctly served blocks.
+	// Short replies are handled by writing verified entries and leaving the rest
+	// in bodyPending (via snapBlockComplete) for the next attempt.
+	if len(rcptHeaders) > 0 {
+		rrRLP, rcpHashes := s.fetchReceiptsRequestID(peer, rcptHeaders)
+		nGot := min(len(rrRLP), len(rcptHeaders))
+		for i := 0; i < nGot; i++ {
+			h := rcptHeaders[i]
+			hash := h.Hash()
+			num := h.Number.Uint64()
+			if i >= len(rcpHashes) || rcpHashes[i] != h.ReceiptHash {
+				log.Warn("xdcSyncer: SYNC-10 history backfill — receipt hash mismatch; tainting peer",
+					"block", num, "peer", peer.ID())
+				_ = batch.Write()
+				return true
+			}
+			rawdb.WriteRawReceipts(batch, hash, num, rrRLP[i])
+		}
+		// If nGot < len(rcptHeaders), the remaining blocks keep their missing-receipt
+		// status; snapBlockComplete re-enqueues them for the next attempt.
+	}
+
+	if err := batch.Write(); err != nil {
+		log.Warn("xdcSyncer: SYNC-10 history backfill — batch write failed", "err", err)
+	}
+	return false
 }
 
 // prefetchAncestorBodiesAndReceipts pre-fetches block bodies + receipts for
@@ -5175,8 +5397,9 @@ func (s *xdcSyncer) triggerReinitBFT(gapNum uint64) {
 //
 // Refs #1848 (SYNC-06).
 const (
-	snapHistoryBatchSize    = 128 // matches observed XDPOS2 body-response cap
-	snapHistoryMaxBodyRetry = 10  // max body-fetch attempts per batch before giving up
+	snapHistoryBatchSize      = 128 // matches observed XDPOS2 body-response cap
+	snapHistoryMaxBodyRetry   = 10  // max body-fetch attempts per batch before giving up
+	snapHistoryMaxModernPeers = 4   // max concurrent eth/69+ peers for body+receipt fan-out (SYNC-10)
 )
 
 func (s *xdcSyncer) runSnapHistoryBackfill() {
@@ -5382,8 +5605,63 @@ func (s *xdcSyncer) runSnapHistoryBackfill() {
 			default:
 			}
 
+			peers = s.rankedPeers()
+
+			// SYNC-10: modern (request-ID) peer path.  Fan out body+receipt requests
+			// to up to snapHistoryMaxModernPeers peers concurrently; each peer owns a
+			// non-overlapping chunk so several requests are in flight simultaneously.
+			// Falls through to the XDPOS2 legacy path when no modern peers are available
+			// or when modern peers deliver no new data this round.
+			var modern []*eth.Peer
+			for _, p := range peers {
+				if peerHasRequestID(p) {
+					modern = append(modern, p)
+				}
+			}
+			if len(modern) > 0 {
+				n := min(len(modern), snapHistoryMaxModernPeers)
+				chunkSize := max(1, min(reqSize, (len(bodyPending)+n-1)/n))
+				prevPending := len(bodyPending)
+				var wg sync.WaitGroup
+				offset := 0
+				for i := 0; i < n && offset < len(bodyPending); i++ {
+					end := min(offset+chunkSize, len(bodyPending))
+					chunk := bodyPending[offset:end]
+					p := modern[i]
+					wg.Add(1)
+					go func(peer *eth.Peer, headers []*types.Header) {
+						defer wg.Done()
+						if s.backfillBodyReceiptChunkModern(peer, headers, db) {
+							s.taintPeer(peer)
+						}
+					}(p, chunk)
+					offset = end
+				}
+				wg.Wait()
+				var stillPending []*types.Header
+				for _, h := range bodyPending {
+					if !snapBlockComplete(db, h.Hash(), h.Number.Uint64(), h.TxHash) {
+						stillPending = append(stillPending, h)
+					}
+				}
+				bodyPending = stillPending
+				if len(bodyPending) < prevPending {
+					// Made progress; brief backoff then next attempt.
+					if len(bodyPending) > 0 {
+						select {
+						case <-time.After(time.Second):
+						case <-s.quitCh:
+							return
+						}
+					}
+					continue
+				}
+				// No progress from modern peers; fall through to XDPOS2 legacy path.
+			}
+
+			// XDPOS2 legacy path (pre-SYNC-10).
 			var activePeer *eth.Peer
-			if peers = s.rankedPeers(); len(peers) > 0 {
+			if len(peers) > 0 {
 				activePeer = peers[0]
 			}
 			if activePeer == nil {
@@ -5476,7 +5754,7 @@ func (s *xdcSyncer) runSnapHistoryBackfill() {
 				// and will be retried on the next attempt.
 				rcpSlice := s.fetchReceiptsBatch(activePeer, []*types.Header{h})
 				if len(rcpSlice) == 1 && rcpSlice[0] != nil {
-					rcpHash := types.DeriveSha(types.Receipts(rcpSlice[0]), trie.NewStackTrie(nil))
+					rcpHash := types.DeriveSha(rcpSlice[0], trie.NewStackTrie(nil))
 					if rcpHash != h.ReceiptHash {
 						log.Warn("xdcSyncer: SYNC-06 history backfill — receipt hash mismatch; tainting peer",
 							"block", num, "peer", activePeer.ID())
