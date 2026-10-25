@@ -4736,6 +4736,12 @@ func (s *xdcSyncer) repairSeededGapPools() {
 		// The switch header may be above the head block (header-synced, block not
 		// yet imported): that is exactly a SYNC-11 seed about to be consumed.
 		for n := gapNum + 1; n <= gapNum+2*epoch && n <= hdrNum; n++ {
+			// Up to 4*2*epoch header reads: stop() must not outwait us on slow disks.
+			select {
+			case <-s.quitCh:
+				return
+			default:
+			}
 			if h := chain.GetHeaderByNumber(n); h != nil {
 				if isSwitch, _, err := v2.IsEpochSwitch(h); err == nil && isSwitch {
 					sw = h
