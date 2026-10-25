@@ -3842,11 +3842,43 @@ var xdcForkGuards = map[uint64]struct {
 	51: {84_000_000, common.HexToHash("0x6c715a4644acbda91545108bec722921164941d08e58173bf78095570b195782")},
 }
 
+// xdcTipExtendMaxBatches bounds extendToPeerTip (192 headers per batch).
+const xdcTipExtendMaxBatches = 64
+
+// extendToPeerTip walks forward from h on the peer that served it, following
+// parent links, and returns the newest header it has. A peer's announced head
+// is the one from its handshake unless it sends block-range updates, which
+// xdpos2 v100 peers do not; an hour after connecting it is ~1,800 blocks old.
+// A snap pivot taken from it names a root that peers have already pruned, so
+// every attempt downloaded nothing (#1884). Stops at the first short or
+// non-linking batch.
+func (s *xdcSyncer) extendToPeerTip(p *eth.Peer, h *types.Header) *types.Header {
+	for i := 0; i < xdcTipExtendMaxBatches; i++ {
+		next := s.fetchHeaderBatchTimeout(p, h.Number.Uint64()+1, xdpos2MaxHeaderFetch, xdcBulkReqTimeout)
+		n := 0
+		for _, nh := range next {
+			if nh.ParentHash != h.Hash() || nh.Number.Uint64() != h.Number.Uint64()+1 {
+				break
+			}
+			h = nh
+			n++
+		}
+		if n < xdpos2MaxHeaderFetch {
+			break
+		}
+	}
+	return h
+}
+
 // fetchPeerTip fetches a peer's announced head header for use as a sync tip,
 // or nil if the peer does not serve it or is on an abandoned branch.
 func (s *xdcSyncer) fetchPeerTip(p *eth.Peer, hash common.Hash) *types.Header {
 	h := s.fetchHeaderByHash(p, hash)
 	if h == nil || !s.onCanonicalBranch(p, h) {
+		return nil
+	}
+	// The walk may cross the fork guard from a head below it: check again.
+	if h = s.extendToPeerTip(p, h); !s.onCanonicalBranch(p, h) {
 		return nil
 	}
 	n := h.Number.Uint64()
