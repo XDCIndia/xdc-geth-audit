@@ -863,8 +863,13 @@ func handleReceipts70(backend Backend, msg Decoder, peer *Peer) error {
 // over `types.Receipts` then produces the receipt-trie root the block
 // header expects.
 func handleReceiptsXDPOS2(backend Backend, msg Decoder, peer *Peer) error {
-	var raw []types.Receipts
-	if err := msg.Decode(&raw); err != nil {
+	var enc rlp.RawValue
+	if err := msg.Decode(&enc); err != nil {
+		return err
+	}
+	// Accept both the consensus and the eth/69 receipt shapes (#1889).
+	raw, err := decodeReceiptsXDPOS2(enc)
+	if err != nil {
 		log.Info("XDPOS2 Receipts decode failed", "peer", peer.ID()[:8], "err", err)
 		return err
 	}
