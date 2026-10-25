@@ -786,6 +786,22 @@ func LoadChainConfig(db ethdb.Database, genesis *Genesis) (cfg *params.ChainConf
 				log.Info("XDC: patched missing TrustedSyncCheckpoints in genesis spec for devnet", "count", len(genesis.Config.TrustedSyncCheckpoints))
 			}
 		}
+		// XDC: patch missing fork blocks here too, as SetupGenesisBlock and the
+		// stored-config branch do. On a fresh datadir this config feeds the
+		// consensus hooks and engine (eth/backend.go); unpatched, Apothem paid
+		// flat rewards past TIPUpgradeRewardBlock until the first restart.
+		if genesis.Config != nil && genesis.Config.ChainID != nil {
+			switch genesis.Config.ChainID.Uint64() {
+			case 50:
+				patchMissingForkBlocks(genesis.Config, params.XDCMainnetChainConfig, "mainnet", forkPatchRegistered)
+			case 51:
+				patchMissingForkBlocks(genesis.Config, params.XDCApothemChainConfig, "apothem", forkPatchRegistered)
+			case 5551:
+				patchMissingForkBlocks(genesis.Config, params.XDCDevnetChainConfig, "devnet", forkPatchRegistered)
+			case 551:
+				patchMissingForkBlocks(genesis.Config, params.XDCDevnet551ChainConfig, "devnet551", forkPatchRegistered)
+			}
+		}
 		return genesis.Config, ghash, nil
 	}
 	// There is no stored chain config and no new config provided,
