@@ -22,8 +22,13 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/ethereum/go-ethereum/accounts"
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/consensus/XDPoS"
+	"github.com/ethereum/go-ethereum/consensus/ethash"
 	"github.com/ethereum/go-ethereum/contracts"
+	"github.com/ethereum/go-ethereum/core"
+	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/params"
 )
@@ -340,5 +345,96 @@ func TestBroadcastSigningTx_FreshnessGate_XDPoS_FreshBlock(t *testing.T) {
 	pool.mu.Unlock()
 	if n != 0 {
 		t.Errorf("pool.Add called %d times; want 0 (manager nil)", n)
+	}
+}
+
+// ─── imported-block sign tx: V1 vs V2 (#1456) ────────────────────────────────
+
+// newV1SignTestWorker returns a worker on a 20-block chain whose genesis (the V1
+// epoch-0 checkpoint) lists signer as the only masternode, plus a counter of
+// sign txs emitted per block number.
+func newV1SignTestWorker(t *testing.T, signer common.Address) (*XdcWorker, *core.BlockChain, map[uint64]int) {
+	t.Helper()
+	extra := make([]byte, 32+common.AddressLength+65)
+	copy(extra[32:], signer.Bytes())
+	gspec := &core.Genesis{Config: params.AllEthashProtocolChanges, ExtraData: extra}
+	_, blocks, _ := core.GenerateChainWithGenesis(gspec, ethash.NewFaker(), 20, nil)
+	bc, err := core.NewBlockChain(rawdb.NewMemoryDatabase(), gspec, ethash.NewFaker(), &core.BlockChainConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(bc.Stop)
+	if _, err := bc.InsertChain(blocks); err != nil {
+		t.Fatal(err)
+	}
+	signed := make(map[uint64]int)
+	orig := createTransactionSign
+	createTransactionSign = func(_ *params.ChainConfig, _ contracts.TxPoolAdder, _ *accounts.Manager, b *types.Block, _ common.Address, _ contracts.StateNonceReader) error {
+		signed[b.NumberU64()]++
+		return nil
+	}
+	t.Cleanup(func() { createTransactionSign = orig })
+
+	engine := XDPoS.New(&params.XDPoSConfig{
+		Epoch: 900,
+		V2:    &params.V2{SwitchBlock: big.NewInt(1800)},
+	}, rawdb.NewMemoryDatabase())
+	w := &XdcWorker{
+		engine:         engine,
+		coinbase:       signer,
+		accountManager: &accounts.Manager{},
+		txPool:         &stubWorkerPool{},
+		miner:          &Miner{chain: bc, chainConfig: bc.Config()},
+	}
+	return w, bc, signed
+}
+
+// TestImportedSignTx_V1Signer: a V1 masternode signs imported blocks at
+// MergeSignRange (XDPoSChain eth/backend.go:372). On origin/main this path
+// required a V2 snapshot and never signed in V1.
+func TestImportedSignTx_V1Signer(t *testing.T) {
+	signer := common.HexToAddress("0x1456")
+	w, bc, signed := newV1SignTestWorker(t, signer)
+	for n := uint64(1); n <= 16; n++ {
+		w.maybeBroadcastImportedSignTx(bc.GetBlockByNumber(n))
+	}
+	if len(signed) != 1 || signed[15] != 1 {
+		t.Fatalf("signed blocks = %v, want only block 15", signed)
+	}
+}
+
+// TestImportedSignTx_V1PreTIP2019: before TIP2019 every block is signed.
+func TestImportedSignTx_V1PreTIP2019(t *testing.T) {
+	orig := common.TIP2019Block
+	common.TIP2019Block = big.NewInt(100)
+	t.Cleanup(func() { common.TIP2019Block = orig })
+
+	signer := common.HexToAddress("0x1456")
+	w, bc, signed := newV1SignTestWorker(t, signer)
+	w.maybeBroadcastImportedSignTx(bc.GetBlockByNumber(7))
+	if signed[7] != 1 {
+		t.Fatalf("pre-TIP2019 block 7 not signed: %v", signed)
+	}
+}
+
+// TestImportedSignTx_V1NonSigner: a coinbase outside the V1 set never signs.
+func TestImportedSignTx_V1NonSigner(t *testing.T) {
+	w, bc, signed := newV1SignTestWorker(t, common.HexToAddress("0x1456"))
+	w.coinbase = common.HexToAddress("0xdead")
+	w.maybeBroadcastImportedSignTx(bc.GetBlockByNumber(15))
+	if len(signed) != 0 {
+		t.Fatalf("non-signer signed %v", signed)
+	}
+}
+
+// TestImportedSignTx_V2NoSnapshot: V2 blocks keep the CandidatePool gate; with
+// no V2 engine wired nothing is signed (and the V1 set is not consulted).
+func TestImportedSignTx_V2NoSnapshot(t *testing.T) {
+	signer := common.HexToAddress("0x1456")
+	w, _, signed := newV1SignTestWorker(t, signer)
+	v2Block := types.NewBlockWithHeader(&types.Header{Number: big.NewInt(1815)})
+	w.maybeBroadcastImportedSignTx(v2Block)
+	if len(signed) != 0 {
+		t.Fatalf("V2 block signed without a V2 snapshot: %v", signed)
 	}
 }

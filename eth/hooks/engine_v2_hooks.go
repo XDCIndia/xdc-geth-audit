@@ -7,12 +7,14 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"slices"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
 	commonmath "github.com/ethereum/go-ethereum/common/math"
 	"github.com/ethereum/go-ethereum/consensus"
 	"github.com/ethereum/go-ethereum/consensus/XDPoS"
+	"github.com/ethereum/go-ethereum/consensus/XDPoS/utils"
 	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/core/state"
@@ -101,7 +103,7 @@ func AttachConsensusV2Hooks(adaptor *XDPoS.XDPoS, bc *core.BlockChain, chainConf
 				epochNum := chainConfig.XDPoS.V2.SwitchEpoch + uint64(round)/chainConfig.XDPoS.Epoch
 
 				// Get per-tier signers + burned fees for the rewarded epoch.
-				tierSigners, burnedInOneEpoch, terr := GetSigningTxCountTiered(adaptor, bc, header, chainConfig, currentConfig)
+				tierSigners, burnedInOneEpoch, terr := GetSigningTxCountTiered(adaptor, bc, header, chainConfig, currentConfig, parentState)
 				if terr != nil {
 					log.Error("[HookReward] Fail to get tiered signers count", "error", terr)
 					return nil, terr
@@ -249,7 +251,10 @@ func AttachConsensusV2Hooks(adaptor *XDPoS.XDPoS, bc *core.BlockChain, chainConf
 
 			log.Debug("Time Get Signers", "block", header.Number.Uint64(), "mode", map[bool]string{true: "v2", false: "v1"}[isV2], "time", common.PrettyDuration(time.Since(start)))
 			if err != nil {
-				log.Crit("Fail to get signers for reward checkpoint", "error", err)
+				// Reject the block instead of exiting: a missing header in the
+				// reward window is a local data gap, and the import can retry.
+				log.Error("Fail to get signers for reward checkpoint", "number", header.Number, "error", err)
+				return nil, err
 			}
 			rewards["signers"] = signers
 
@@ -329,7 +334,7 @@ func AttachConsensusV2Hooks(adaptor *XDPoS.XDPoS, bc *core.BlockChain, chainConf
 			for {
 				parentHeader := chain.GetHeader(parentHash, parentNumber)
 				if parentHeader == nil {
-					break
+					return []common.Address{}, fmt.Errorf("hook penalty fail to get parent header at number: %v, hash: %v", parentNumber, parentHash)
 				}
 				isEpochSwitch, _, err := adaptor.EngineV2.IsEpochSwitch(parentHeader)
 				if err != nil {
@@ -462,8 +467,14 @@ func AttachConsensusV2Hooks(adaptor *XDPoS.XDPoS, bc *core.BlockChain, chainConf
 						}
 					}
 					// Count signing txs per signer over the current epoch's blocks.
+					// CertiK XDC-12 / ParoleDedupBlock: each (signer, signed-block-hash)
+					// pair counts at most once, so submitting MinimumSigningTx copies of
+					// the same signing tx for one block cannot satisfy the parole threshold.
 					mapBlockHash := map[common.Hash]bool{}
 					txSignerMap := map[common.Address]int{}
+					// seenPairs deduplicates (signer, target-block-hash) pairs when active.
+					seenPairs := map[common.Address]map[common.Hash]struct{}{}
+					dedupActive := chainConfig.IsParoleDedup(number)
 					startRange := int(chainConfig.XDPoS.Epoch) - 1
 					if startRange >= len(listBlockHash) {
 						startRange = len(listBlockHash) - 1
@@ -492,6 +503,15 @@ func AttachConsensusV2Hooks(adaptor *XDPoS.XDPoS, bc *core.BlockChain, chainConf
 								continue
 							}
 							if mapBlockHash[blkHash] {
+								if dedupActive {
+									if _, ok := seenPairs[from]; !ok {
+										seenPairs[from] = map[common.Hash]struct{}{}
+									}
+									if _, seen := seenPairs[from][blkHash]; seen {
+										continue // duplicate (signer, block-hash) pair
+									}
+									seenPairs[from][blkHash] = struct{}{}
+								}
 								txSignerMap[from]++
 							}
 						}
@@ -871,7 +891,7 @@ func GetSigningTxCount(c *XDPoS.XDPoS, chain *core.BlockChain, header *types.Hea
 //
 // Live from TIPUpgradeReward (apothem TIPUpgradeRewardBlock = 83,600,000;
 // mainnet unscheduled).
-func GetSigningTxCountTiered(c *XDPoS.XDPoS, chain *core.BlockChain, header *types.Header, chainConfig *params.ChainConfig, currentConfig *params.V2Config) (map[Beneficiary]map[common.Address]*XDPoS.RewardLog, *big.Int, error) {
+func GetSigningTxCountTiered(c *XDPoS.XDPoS, chain *core.BlockChain, header *types.Header, chainConfig *params.ChainConfig, currentConfig *params.V2Config, parentState *state.StateDB) (map[Beneficiary]map[common.Address]*XDPoS.RewardLog, *big.Int, error) {
 	number := header.Number.Uint64()
 	rewardEpochCount := 2
 	signEpochCount := 1
@@ -932,7 +952,12 @@ func GetSigningTxCountTiered(c *XDPoS.XDPoS, chain *core.BlockChain, header *typ
 				// that of the rewarded epoch, read from h's own historical epoch
 				// snapshot (stake-sorted, already filtered of h's masternodes and
 				// penalties) - not from the candidates of the current parent state.
-				standbyPool := c.GetStandbynodes(chain, h)
+				var standbyPool []common.Address
+				if chainConfig.ChainID != nil && chainConfig.ChainID.Uint64() == 5551 {
+					standbyPool = legacyStandbyPool(parentState, h, nodesToKeep[MasterNodeBeneficiary])
+				} else {
+					standbyPool = c.GetStandbynodes(chain, h)
+				}
 				protectorEnd := min(currentConfig.MaxProtectorNodes, len(standbyPool))
 				observerEnd := min(protectorEnd+currentConfig.MaxObserverNodes, len(standbyPool))
 				nodesToKeep[ProtectorNodeBeneficiary] = standbyPool[:protectorEnd]
@@ -1010,4 +1035,35 @@ func GetSigningTxCountTiered(c *XDPoS.XDPoS, chain *core.BlockChain, header *typ
 
 	log.Info("Calculate tiered reward at checkpoint", "startBlock", startBlockNumber, "endBlock", endBlockNumber)
 	return signers, burnedInOneEpoch, nil
+}
+
+// legacyStandbyPool is the protector/observer pool of the legacy devnet 5551.
+// Its sealers (XDC v2.7.0-devnet, XinFinOrg/XDPoSChain 3bacbce5,
+// eth/hooks/engine_v2_hooks.go:464-500) predate XinFinOrg/XDPoSChain#2612 and
+// rank the candidates of the parent state of the reward block by stake,
+// dropping h's penalties and masternodes. #2612 reads h's epoch snapshot
+// instead, which differs once candidates join during the rewarded epoch
+// (devnet 5551 block 196,664).
+func legacyStandbyPool(parentState *state.StateDB, h *types.Header, masternodes []common.Address) []common.Address {
+	var ms []utils.Masternode
+	for _, cand := range state.GetCandidates(parentState) {
+		if cand != (common.Address{}) {
+			ms = append(ms, utils.Masternode{Address: cand, Stake: state.GetCandidateCap(parentState, cand)})
+		}
+	}
+	slices.SortStableFunc(ms, func(a, b utils.Masternode) int { return b.Stake.Cmp(a.Stake) })
+	skip := make(map[common.Address]struct{})
+	for _, a := range common.ExtractAddressFromBytes(h.Penalties) {
+		skip[a] = struct{}{}
+	}
+	for _, a := range masternodes {
+		skip[a] = struct{}{}
+	}
+	var pool []common.Address
+	for _, n := range ms {
+		if _, ok := skip[n.Address]; !ok {
+			pool = append(pool, n.Address)
+		}
+	}
+	return pool
 }

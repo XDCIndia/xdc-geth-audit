@@ -22,6 +22,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"math/big"
+
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/lru"
 	"github.com/ethereum/go-ethereum/consensus"
@@ -272,6 +274,16 @@ func (hc *HeaderChain) WriteHeaders(headers []*types.Header) (int, error) {
 		parentKnown = true             // Set to true to force hc.HasHeader check the first iteration
 		batch       = hc.chainDb.NewBatch()
 	)
+
+	// XDC: seed running TD from the first header's parent so we can persist
+	// cumulative TD for each header-only import (#1645). If parent TD is absent
+	// the background backfill goroutine will fill in the gap.
+	var xdcRunTD *big.Int
+	if hc.config.IsXDC() && len(headers) > 0 {
+		first := headers[0]
+		xdcRunTD = rawdb.ReadTd(hc.chainDb, first.ParentHash, first.Number.Uint64()-1)
+	}
+
 	for i, header := range headers {
 		var hash common.Hash
 		// The headers have already been validated at this point, so we already
@@ -292,6 +304,12 @@ func (hc *HeaderChain) WriteHeaders(headers []*types.Header) (int, error) {
 			inserted = append(inserted, rawdb.NumberHash{Number: number, Hash: hash})
 			hc.headerCache.Add(hash, header)
 			hc.numberCache.Add(hash, number)
+		}
+		// XDC: write cumulative TD regardless of alreadyKnown (a re-org may
+		// have introduced a new canonical header at this number).
+		if xdcRunTD != nil {
+			xdcRunTD = new(big.Int).Add(xdcRunTD, header.Difficulty)
+			rawdb.WriteTd(batch, hash, number, xdcRunTD)
 		}
 		parentKnown = alreadyKnown
 	}

@@ -2,28 +2,21 @@
 // A.97.5 — pure geth-aligned fast-sync: header-derived QC verification
 //
 // Tests verify:
-//   1. The A.89 inCheckpointCatchup QC-skip branch is GONE from verifyHeader.go.
-//      inCheckpointCatchup now only fires in GetMasternodesWithParents and the
-//      commit-rule skip — NOT in the header verification path.
-//   2. GetMasternodesFromEpochSwitchHeader extracts masternodes from header.Validators
+//   1. GetMasternodesFromEpochSwitchHeader extracts masternodes from header.Validators
 //      matching the canonical XDPoSChain bit-for-bit (XDPoSChain engine.go:998-1008).
-//   3. getEpochSwitchInfoWithParents resolves the epoch-switch header from:
+//   2. getEpochSwitchInfoWithParents resolves the epoch-switch header from:
 //      (a) the verifying header itself (round-0 / cache path)
 //      (b) the parents slice (in-batch path)
 //      (c) DB entries seeded into the cache (cross-batch path)
 //      In all three cases Masternodes/MasternodesLen must equal a fixture
 //      computed the canonical way (from the same header.Validators).
-//   4. inCheckpointCatchup returns false when no anchor is installed (clean path).
+//   3. inCheckpointCatchup returns false when no anchor is installed (clean path).
+//   4. When an anchor IS installed, inCheckpointCatchup covers all blocks from 0
+//      up to anchor+2*epoch (the full BeaconSync backfill range).
 //
-// Canonical-parity argument (I1-I5):
-//   Canonical XDPoSChain verifyQC (engine.go:803) → getEpochSwitchInfo →
-//   getExtraFields → GetMasternodesFromEpochSwitchHeader(epochSwitchHeader) reads
-//   epochSwitchHeader.Validators unconditionally (engine.go:998-1008).  Our
-//   GetMasternodesFromEpochSwitchHeader (engine.go:1154-1196) reads the same field
-//   via the same byte-slice copy loop.  Since we no longer skip verifyQC for any
-//   header, I1 is satisfied.  I2 is satisfied by the byte-level equality assert in
-//   TestA975_GetMasternodesFromEpochSwitchHeader.  I3-I5 are structural (gap math,
-//   RLP, signature recovery) and are unchanged by this PR.
+// Note: the QC-skip branch in verifyHeader.go was removed in A.97.5 (#894) and
+// re-added in #1859 to handle BeaconSync backfill below the sync pivot.  The
+// clean-path invariant (anchor=nil → inCheckpointCatchup=false) is unchanged.
 //
 // Run: go test ./consensus/XDPoS/engines/engine_v2/... -run TestA975 -count=1
 
@@ -125,9 +118,10 @@ func canonicalMasternodes(header *types.Header) []common.Address {
 // --- A.97.5 tests -----------------------------------------------------------
 
 // TestA975_NoQCSkipBranchOnCleanPath asserts that inCheckpointCatchup with
-// no anchor installed always returns false, confirming the removed QC-skip
-// branch in verifyHeader.go was already dead on the clean path.
-// Post-removal: verifyQC is called unconditionally.
+// no anchor installed always returns false, so verifyQC is called unconditionally
+// on the clean fast-sync path (no operator pivot, no dynamic anchor yet).
+// (#1859 re-added the inCheckpointCatchup gate in verifyHeader.go, but the
+// clean-path invariant holds: nil chain → not ckptAware → gate never fires.)
 // A chain that does NOT implement ckptAware (GetTrustedCheckpointAnchor) → false.
 func TestA975_NoQCSkipBranchOnCleanPath(t *testing.T) {
 	eng := newA975Engine(900, 900, 450)
@@ -374,15 +368,15 @@ func TestA975_InCheckpointCatchup_DegradedLayerIntact(t *testing.T) {
 	// Only the GetTrustedCheckpointAnchor method matters for inCheckpointCatchup.
 	mcc := &mockAnchorChainForTest{anchor: cc.anchor, active: cc.active}
 
-	// Blocks within 2*epoch of anchor=1800 should be in the catchup window.
-	// epoch=900, window=[1800-1800, 1800+1800] = [0, 3600].
+	// All blocks at or below anchor+2*epoch should be in the catchup window.
+	// epoch=900, window=3600. Any block <= 3600 returns true (refs #1859).
 	for _, tc := range []struct {
 		block uint64
 		want  bool
 	}{
-		{0, true},      // 0 >= 0 && 0 <= 3600
+		{0, true},      // well below anchor, still in range (full backfill)
 		{1800, true},   // anchor itself
-		{3600, true},   // anchor + 2*epoch
+		{3600, true},   // anchor + 2*epoch (upper boundary)
 		{3601, false},  // just outside window
 		{50000, false}, // well outside
 	} {
@@ -418,20 +412,17 @@ func (m *mockAnchorChainForTest) GetHeaderByHash(h common.Hash) *types.Header   
 func (m *mockAnchorChainForTest) GetTd(h common.Hash, n uint64) *big.Int          { return nil }
 func (m *mockAnchorChainForTest) GetBlock(h common.Hash, n uint64) *types.Block   { return nil }
 
-// TestA975_QCSkipRemoved_Structural verifies the structural invariant that
-// the package compiles with the QC-skip branch removed from verifyHeader.go.
-// The presence of this test file in the package IS the structural proof:
-// if verifyHeader.go still had the inCheckpointCatchup call, compiling this
-// package would require inCheckpointCatchup to be used in both places.
-// We confirm inCheckpointCatchup still exists (dormant for the clean path).
-func TestA975_QCSkipRemoved_Structural(t *testing.T) {
+// TestA975_QCSkipBranchStructural verifies that inCheckpointCatchup exists and
+// that with nil chain (no anchor) it always returns false, so the QC-skip gate
+// in verifyHeader.go is a no-op on the clean fast-sync path.
+// (#1859 re-added the inCheckpointCatchup gate in verifyHeader.go; this test
+// confirms the clean-path invariant is preserved: no anchor → gate never fires.)
+func TestA975_QCSkipBranchStructural(t *testing.T) {
 	eng := newA975Engine(900, 900, 450)
-	// inCheckpointCatchup must still exist (used in GetMasternodesWithParents
-	// and processQC commit-rule skip — degraded-recovery layer).
-	// It is NOT called from verifyHeader.go (the QC-skip branch is gone).
+	// nil chain → not ckptAware → inCheckpointCatchup returns false for all blocks.
 	result := eng.inCheckpointCatchup(nil, 1800)
 	if result {
 		t.Error("inCheckpointCatchup(nil chain, 1800) should be false (nil chain → not ckptAware → false)")
 	}
-	t.Log("PASS structural: package compiles; inCheckpointCatchup exists for degraded-recovery layer but is NOT called from verifyHeader.go (QC-skip removed)")
+	t.Log("PASS structural: inCheckpointCatchup returns false with no anchor (clean path QC-skip gate is dormant)")
 }

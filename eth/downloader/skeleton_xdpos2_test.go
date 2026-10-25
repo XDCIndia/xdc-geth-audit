@@ -391,3 +391,45 @@ func TestSkeletonPureETHKeepsLegacyBatchSize(t *testing.T) {
 			got, requestHeaders)
 	}
 }
+
+// TestSkeletonXDPOS2JoinSkipsLargeBatchCycle: a cycle started with no XDPOS2
+// peer uses the 512 batch. An XDPOS2 peer joining mid-cycle caps replies at
+// 192 and must not be assigned tasks; an eth/66+ peer joining must be.
+// Regression for #1868.
+func TestSkeletonXDPOS2JoinSkipsLargeBatchCycle(t *testing.T) {
+	chainLen := requestHeaders*2 + 50
+	chain := []*types.Header{{Number: big.NewInt(0)}}
+	for i := 1; i < chainLen; i++ {
+		chain = append(chain, &types.Header{ParentHash: chain[i-1].Hash(), Number: big.NewInt(int64(i))})
+	}
+	db := rawdb.NewMemoryDatabase()
+	rawdb.WriteBlock(db, types.NewBlockWithHeader(chain[0]))
+	rawdb.WriteReceipts(db, chain[0].Hash(), chain[0].Number.Uint64(), types.Receipts{})
+
+	peerset := newPeerSet()
+	skeleton := newSkeleton(db, peerset, func(id string) { peerset.Unregister(id) }, newHookedBackfiller(), &fakeChainReader{})
+	defer skeleton.Terminate()
+	skeleton.Sync(chain[len(chain)-1], nil, true)
+	time.Sleep(200 * time.Millisecond) // let the empty-fleet cycle start
+
+	xdc := &xdpos2BatchRecordingPeer{skeletonTestPeer: newSkeletonTestPeer("xdc", chain)}
+	if err := peerset.Register(newPeerConnection("xdc", eth.XDPOS2, xdc, log.New("id", "xdc"))); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(500 * time.Millisecond)
+	if n := xdc.calls.Load(); n != 0 {
+		t.Fatalf("XDPOS2 peer got %d requests in a 512-batch cycle", n)
+	}
+
+	modern := &xdpos2BatchRecordingPeer{skeletonTestPeer: newSkeletonTestPeer("eth", chain)}
+	if err := peerset.Register(newPeerConnection("eth", eth.ETH69, modern, log.New("id", "eth"))); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for modern.calls.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if modern.calls.Load() == 0 {
+		t.Fatal("eth/66+ peer was never assigned a task")
+	}
+}

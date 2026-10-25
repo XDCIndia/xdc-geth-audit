@@ -24,6 +24,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -340,6 +341,12 @@ func (q *queue) SetBALCutoff(cutoff uint64) {
 	q.balCutoff = cutoff
 }
 
+// balRetrievable reports whether block access lists can be fetched at all. Only
+// eth/71+ peers serve them, and a peer negotiates eth/71+ only if we advertise
+// it. XDC does not (see eth.ProtocolVersions), so no peer can ever answer, and
+// a queued access-list task would wait for a peer that never comes.
+var balRetrievable = slices.Contains(eth.ProtocolVersions, eth.ETH71)
+
 // balEligible reports whether the access list of the given block should be
 // scheduled for retrieval. Only post-Amsterdam blocks within the recency
 // window below the network head are attempted, and known-empty access lists
@@ -347,6 +354,9 @@ func (q *queue) SetBALCutoff(cutoff uint64) {
 //
 // Note, this method expects the queue lock to be already held.
 func (q *queue) balEligible(header *types.Header) bool {
+	if !balRetrievable {
+		return false
+	}
 	if header.BlockAccessListHash == nil || *header.BlockAccessListHash == types.EmptyBlockAccessListHash {
 		return false
 	}

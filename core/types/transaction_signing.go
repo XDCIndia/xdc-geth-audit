@@ -45,6 +45,16 @@ func MakeSigner(config *params.ChainConfig, blockNumber *big.Int, blockTime uint
 		signer = NewPragueSigner(config.ChainID)
 	case config.IsCancun(blockNumber, blockTime):
 		signer = NewCancunSigner(config.ChainID)
+	// XDC chains activate type-1/2 tx support at Eip1559Block, not at
+	// LondonBlock/BerlinBlock. Canonical XDPoSChain v2.9.3-testnet
+	// core/types/transaction_signing.go:41-55 uses IsEIP1559 for this gate.
+	// On XDC mainnet London=76,321,000 and EIP1559=98,800,200.
+	case config.IsXDC() && config.IsEIP1559(blockNumber):
+		signer = NewLondonSigner(config.ChainID)
+	case config.IsXDC() && config.IsEIP155(blockNumber):
+		signer = NewEIP155Signer(config.ChainID)
+	case config.IsXDC() && config.IsHomestead(blockNumber):
+		signer = HomesteadSigner{}
 	case config.IsLondon(blockNumber):
 		signer = NewLondonSigner(config.ChainID)
 	case config.IsBerlin(blockNumber):
@@ -70,7 +80,8 @@ func LatestSigner(config *params.ChainConfig) Signer {
 	var signer Signer
 	if config.ChainID != nil {
 		switch {
-		case config.PragueTime != nil:
+		case config.PragueTime != nil || config.PragueBlock != nil:
+			// XDC chains gate Prague by block (PragueBlock); non-XDC by timestamp (PragueTime).
 			signer = NewPragueSigner(config.ChainID)
 		case config.CancunTime != nil:
 			signer = NewCancunSigner(config.ChainID)
@@ -260,7 +271,7 @@ func (s *modernSigner) Sender(tx *Transaction) (common.Address, error) {
 		return s.legacy.Sender(tx)
 	}
 	if tx.ChainId().Cmp(s.chainID) != 0 {
-		return common.Address{}, fmt.Errorf("%w: have %d want %d", ErrInvalidChainId, tx.ChainId(), s.chainID)
+		return common.Address{}, errInvalidChainID(tx.ChainId(), s.chainID)
 	}
 	// 'modern' txs are defined to use 0 and 1 as their recovery
 	// id, add 27 to become equivalent to unprotected Homestead signatures.
@@ -280,7 +291,7 @@ func (s *modernSigner) SignatureValues(tx *Transaction, sig []byte) (R, S, V *bi
 	// Check that chain ID of tx matches the signer. We also accept ID zero here,
 	// because it indicates that the chain ID was not specified in the tx.
 	if tx.inner.chainID().Sign() != 0 && tx.inner.chainID().Cmp(s.chainID) != 0 {
-		return nil, nil, nil, fmt.Errorf("%w: have %d want %d", ErrInvalidChainId, tx.inner.chainID(), s.chainID)
+		return nil, nil, nil, errInvalidChainID(tx.inner.chainID(), s.chainID)
 	}
 	R, S, _, err = decodeSignature(sig)
 	if err != nil {
@@ -361,7 +372,7 @@ func (s EIP155Signer) Sender(tx *Transaction) (common.Address, error) {
 		return HomesteadSigner{}.Sender(tx)
 	}
 	if tx.ChainId().Cmp(s.chainId) != 0 {
-		return common.Address{}, fmt.Errorf("%w: have %d want %d", ErrInvalidChainId, tx.ChainId(), s.chainId)
+		return common.Address{}, errInvalidChainID(tx.ChainId(), s.chainId)
 	}
 	V, R, S := tx.RawSignatureValues()
 	V = new(big.Int).Sub(V, s.chainId)
@@ -501,6 +512,13 @@ func recoverPlain(sighash common.Hash, R, S, Vb *big.Int, homestead bool) (commo
 	var addr common.Address
 	copy(addr[:], crypto.Keccak256(pub[1:])[12:])
 	return addr, nil
+}
+
+func errInvalidChainID(have, want *big.Int) error {
+	if have.BitLen() > 256 {
+		return fmt.Errorf("%w: have %d-bit value want %d", ErrInvalidChainId, have.BitLen(), want)
+	}
+	return fmt.Errorf("%w: have %d want %d", ErrInvalidChainId, have, want)
 }
 
 // deriveChainId derives the chain id from the given v parameter

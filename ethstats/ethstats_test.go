@@ -17,6 +17,7 @@
 package ethstats
 
 import (
+	"encoding/json"
 	"strconv"
 	"strings"
 	"testing"
@@ -110,5 +111,127 @@ func TestCoinbaseAndRole(t *testing.T) {
 		if gotCoinbase != c.wantCoinbase || gotRole != c.wantRole {
 			t.Errorf("%s: got (%q, %q), want (%q, %q)", c.name, gotCoinbase, gotRole, c.wantCoinbase, c.wantRole)
 		}
+	}
+}
+
+func TestNodeInfoJSON(t *testing.T) {
+	// Test that nodeInfo correctly serializes the sync mode, gc mode, and state scheme fields
+	cases := []struct {
+		name       string
+		info       nodeInfo
+		wantKeys   []string
+		wantValues map[string]string
+	}{
+		{
+			name: "snap-sync-full-gc-path-scheme",
+			info: nodeInfo{
+				Name:        "test-node",
+				Node:        "geth/v1.0",
+				Port:        30303,
+				Network:     "1",
+				Protocol:    "eth/68",
+				API:         "No",
+				Os:          "linux",
+				OsVer:       "amd64",
+				Client:      "0.1.1",
+				History:     true,
+				Coinbase:    "0x1234567890123456789012345678901234567890",
+				Role:        "follower",
+				SyncMode:    "snap",
+				GcMode:      "full",
+				StateScheme: "path",
+			},
+			wantKeys: []string{"name", "node", "port", "net", "protocol", "api", "os", "os_v", "client", "canUpdateHistory", "coinbase", "role", "syncMode", "gcMode", "stateScheme"},
+			wantValues: map[string]string{
+				"syncMode":    "snap",
+				"gcMode":      "full",
+				"stateScheme": "path",
+			},
+		},
+		{
+			name: "full-sync-archive-gc-hash-scheme",
+			info: nodeInfo{
+				Name:        "test-node",
+				Node:        "geth/v1.0",
+				Port:        30303,
+				Network:     "1",
+				Protocol:    "eth/68",
+				API:         "No",
+				Os:          "linux",
+				OsVer:       "amd64",
+				Client:      "0.1.1",
+				History:     true,
+				Coinbase:    "0x0000000000000000000000000000000000000000",
+				Role:        "validator",
+				SyncMode:    "full",
+				GcMode:      "archive",
+				StateScheme: "hash",
+			},
+			wantKeys: []string{"name", "node", "port", "net", "protocol", "api", "os", "os_v", "client", "canUpdateHistory", "coinbase", "role", "syncMode", "gcMode", "stateScheme"},
+			wantValues: map[string]string{
+				"syncMode":    "full",
+				"gcMode":      "archive",
+				"stateScheme": "hash",
+			},
+		},
+		{
+			name: "fast-sync-empty-values",
+			info: nodeInfo{
+				Name:        "test-node",
+				Node:        "geth/v1.0",
+				Port:        30303,
+				Network:     "1",
+				Protocol:    "eth/68",
+				API:         "No",
+				Os:          "linux",
+				OsVer:       "amd64",
+				Client:      "0.1.1",
+				History:     true,
+				Coinbase:    "0x0000000000000000000000000000000000000000",
+				Role:        "follower",
+				SyncMode:    "fast",
+				GcMode:      "",
+				StateScheme: "",
+			},
+			wantKeys: []string{"name", "node", "port", "net", "protocol", "api", "os", "os_v", "client", "canUpdateHistory", "coinbase", "role", "syncMode", "gcMode", "stateScheme"},
+			wantValues: map[string]string{
+				"syncMode": "fast",
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// Marshal nodeInfo to JSON
+			data, err := json.Marshal(tc.info)
+			if err != nil {
+				t.Fatalf("Failed to marshal nodeInfo: %v", err)
+			}
+
+			// Unmarshal back to check fields
+			var result map[string]interface{}
+			if err := json.Unmarshal(data, &result); err != nil {
+				t.Fatalf("Failed to unmarshal JSON: %v", err)
+			}
+
+			// Check that all expected keys are present
+			for _, key := range tc.wantKeys {
+				if _, ok := result[key]; !ok {
+					t.Errorf("Missing expected key: %s", key)
+				}
+			}
+
+			// Check specific values
+			for key, wantVal := range tc.wantValues {
+				gotVal, ok := result[key]
+				if !ok {
+					t.Errorf("Key %s not found in JSON", key)
+					continue
+				}
+				if gotStr := gotVal.(string); gotStr != wantVal {
+					t.Errorf("Key %s: got %q, want %q", key, gotStr, wantVal)
+				}
+			}
+		})
 	}
 }

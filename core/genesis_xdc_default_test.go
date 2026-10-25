@@ -618,6 +618,7 @@ func TestRegisteredNetsForkResolutionUnchanged(t *testing.T) {
 			check("PragueBlock", cfg.PragueBlock, tc.defaults.PragueBlock)
 			check("TIPUpgradeRewardBlock", cfg.TIPUpgradeRewardBlock, tc.defaults.TIPUpgradeRewardBlock)
 			check("TIPUpgradePenaltyBlock", cfg.TIPUpgradePenaltyBlock, tc.defaults.TIPUpgradePenaltyBlock)
+			check("DynamicGasLimitBlock", cfg.DynamicGasLimitBlock, tc.defaults.DynamicGasLimitBlock)
 
 			if err := cfg.CheckConfigForkOrder(); err != nil {
 				t.Errorf("CheckConfigForkOrder failed: %v", err)

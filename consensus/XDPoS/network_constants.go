@@ -170,9 +170,9 @@ var privateConstants = &NetworkConstants{
 	MaxMasternodesV2:       108,
 }
 
-// Active devnet constants (chainId 551) — mirrors XinFinOrg/XDPoSChain main:
-// common/constants.devnet.go. V2 from genesis, fast-cycle fork schedule for
-// upgrade rehearsal: eip1559Block=32400, cancunBlock=43200, etc.
+// Devnet constants (chainId 551) — XinFinOrg/XDPoSChain v2.9.3-testnet
+// params/config_networks.go:471 DevnetChainConfig. Canonical nil
+// TIPEpochHalvingBlock is the 9999999999 "never" sentinel, as for mainnet.
 var devnet551Constants = &NetworkConstants{
 	TIP2019Block:           big.NewInt(0),
 	TIPSigning:             big.NewInt(0),
@@ -181,23 +181,23 @@ var devnet551Constants = &NetworkConstants{
 	TIPXDCX:                big.NewInt(0),
 	TIPXDCXLending:         big.NewInt(0),
 	TIPXDCXCancellationFee: big.NewInt(0),
-	TIPTRC21Fee:            big.NewInt(10800),
+	TIPTRC21Fee:            big.NewInt(0),
 	TIPIncreaseMasternodes: big.NewInt(0),
 	TIPBerlinBlock:         big.NewInt(0),
 	TIPLondonBlock:         big.NewInt(0),
 	TIPMergeBlock:          big.NewInt(0),
 	TIPShanghaiBlock:       big.NewInt(0),
-	BlockNumberGas50x:      big.NewInt(21600),
-	TIPV2SwitchBlock:       big.NewInt(0),
+	BlockNumberGas50x:      big.NewInt(0),
+	TIPV2SwitchBlock:       big.NewInt(2700),
 	TIPXDCXMinerDisable:    big.NewInt(0),
 	TIPXDCXReceiverDisable: big.NewInt(0),
-	TIPEIP1559Block:        big.NewInt(32400),
-	TIPCancunBlock:         big.NewInt(43200),
-	TIPUpgradeReward:       big.NewInt(243000),
-	TIPUpgradePenalty:      big.NewInt(9999999999),
+	TIPEIP1559Block:        big.NewInt(25000),
+	TIPCancunBlock:         big.NewInt(25000),
+	TIPUpgradeReward:       big.NewInt(50000),
+	TIPUpgradePenalty:      big.NewInt(50000),
 	TIPEpochHalving:        big.NewInt(9999999999),
 	BlackListHFNumber:      0,
-	MaxMasternodesV2:       108,
+	MaxMasternodesV2:       18,
 }
 
 // defaultXDCConstants applies to any unregistered XDPoS chain ID (i.e. any

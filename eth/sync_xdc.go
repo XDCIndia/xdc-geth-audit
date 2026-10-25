@@ -21,15 +21,19 @@ import (
 	"github.com/ethereum/go-ethereum/consensus"
 	"github.com/ethereum/go-ethereum/consensus/XDPoS"
 	"github.com/ethereum/go-ethereum/consensus/XDPoS/engines/engine_v2"
+	xdcutils "github.com/ethereum/go-ethereum/consensus/XDPoS/utils"
 	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/core/rawdb"
+	"github.com/ethereum/go-ethereum/core/state"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/eth/downloader"
 	"github.com/ethereum/go-ethereum/eth/ethconfig"
 	"github.com/ethereum/go-ethereum/eth/protocols/eth"
+	"github.com/ethereum/go-ethereum/ethdb"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/rlp"
+	"github.com/ethereum/go-ethereum/trie"
 )
 
 // snapsyncExperimentalEnv is the double-opt-in env var. Even with
@@ -94,16 +98,38 @@ func isSnapHealTrustedChain(chainID uint64) bool {
 // eth.Peer.Request* primitives we already adapted for XDPOS2 legacy).
 
 const (
-	xdcForceSyncCycle      = 500 * time.Millisecond // dropped from 2s — bulk sync was bottlenecked by tick cadence
-	xdcHeartbeat           = 30 * time.Second       // periodic head/peer log
-	xdcBatchSize           = 4096                   // headers/bodies per round (XDC bulk-sync default)
-	xdpos2MaxHeaderFetch   = 192                    // #971: legacy XDPOS2 peers cap GetBlockHeaders at MaxHeaderFetch; requesting more returns an empty reply (count=0). Clamp header requests to this.
-	xdcReqTimeout          = 8 * time.Second        // kept for non-bulk callers: anchor repair, snap pivot, head probe
-	xdcBulkReqTimeout      = 4 * time.Second        // A.75: tighter per-peer budget in parallel fan-out; fully-synced peers respond <1s
-	xdcMaxPeerTriesPerSync = 8                      // A.96: raised 3→8 to compensate for ~3% XDPOS2 GetBlockHeaders serve rate on mainnet (1726 count=0 vs 55 count=192 in 2h); fan-out=3 gave 9% per-round hit rate, fan-out=8 gives ~26%. Was A.79: 4→3 to free a peer for lookahead.
-	xdcMaxBackToBackRounds = 8                      // A.75: max consecutive rounds per maybeSync invocation; avoids starving heartbeat
-	xdcLookaheadStreams    = 3                      // A.77: extra ranges pre-fetched concurrently from other peers while range-0 body+IC runs
-	xdcLookaheadRangeSize  = 128                    // A.77: assumed peer batch size per range (protocol cap observed in practice)
+	xdcForceSyncCycle    = 500 * time.Millisecond // dropped from 2s — bulk sync was bottlenecked by tick cadence
+	xdcHeartbeat         = 30 * time.Second       // periodic head/peer log
+	xdcBatchSize         = 4096                   // headers/bodies per round (XDC bulk-sync default)
+	xdpos2MaxHeaderFetch = 192                    // #971: legacy XDPOS2 peers cap GetBlockHeaders at MaxHeaderFetch; requesting more returns an empty reply (count=0). Clamp header requests to this.
+	xdcReqTimeout        = 8 * time.Second        // kept for non-bulk callers: anchor repair, snap pivot, head probe
+	xdcBulkReqTimeout    = 4 * time.Second        // A.75: tighter per-peer budget in parallel fan-out; fully-synced peers respond <1s
+	// SYNC-12 (#1869): hedging covers slow peers; 2 frees the rest for lookahead and body hedging.
+	// A.96 argument (~26% hit-rate with 8) still satisfied — hedging gives a fast fallback
+	// regardless of which peer wins the header race.
+	xdcHeaderRacePeers = 2 // SYNC-12: cap same-anchor parallel header race (was 8)
+
+	// SYNC-12 (#1869): if the primary body-response peer has not replied within this
+	// delay, issue the same request to the next-best idle peer and take the first valid
+	// answer. Hard timeout is still xdcBulkReqTimeout (4 s).
+	xdcBodyHedgeDelay = 800 * time.Millisecond
+
+	// SYNC-12 (#1869): if the importer has waited this long for a lookahead range
+	// (headers + bodies from one peer), or that peer returned nothing, fetch the
+	// same range from another peer and take the first complete answer. Without it
+	// one silent peer ended the round and discarded every later range.
+	xdcLookaheadHedgeDelay = 1200 * time.Millisecond
+
+	// SYNC-12 (#1869): the lookahead is a sliding window. Each imported range
+	// hands its peer the next range past the window, so xdcLookaheadStreams
+	// ranges stay in flight instead of the pipeline draining every round. One
+	// fullSyncOnce call imports at most this many lookahead ranges (~12k blocks)
+	// so the syncer loop's other duties still run between calls.
+	xdcLookaheadMaxRanges = 96
+
+	xdcMaxBackToBackRounds = 8   // A.75: max consecutive rounds per maybeSync invocation; avoids starving heartbeat
+	xdcLookaheadStreams    = 12  // A.77: extra ranges pre-fetched concurrently from other peers while range-0 body+IC runs. SYNC-12 (#1869): 3→12; import is ~35 ms per range, so 3 streams left the importer idle waiting on peers.
+	xdcLookaheadRangeSize  = 128 // A.77: assumed peer batch size per range (protocol cap observed in practice)
 
 	// Self-healing rollback when the local tip is stuck on a V2 BFT
 	// competing-slot fork. See issue #801. The xdc-network downloader has
@@ -124,6 +150,21 @@ const (
 	// that put us on the fork, post-rollback sync immediately re-imports the
 	// same fork-side block. Issue #802 task 2 — geth-aligned peer rotation.
 	xdcForkTaintTTL = 60 * time.Second
+
+	// Empty-response cooldown: if a peer returns 0 headers xdcPeerEmptyStrikeMax
+	// times in a row for in-range requests it is put on a cooldown (separate from
+	// fork-taint) and excluded from rankedPeers() for xdcPeerEmptyCooldownTTL.
+	// Fixes the genesis-peer wedge (#1872): peers stuck at genesis have high
+	// handshake TD so they rank first; they always return 0 headers once fromBlock
+	// exceeds their chain height; without a cooldown they consume all K fanout
+	// slots every round and force xdcBulkReqTimeout (4s) per round indefinitely.
+	xdcPeerEmptyStrikeMax   = 3
+	xdcPeerEmptyCooldownTTL = 2 * time.Minute
+
+	// maxConsensusFailedBlocks caps the consensusFailedBlocks map to prevent
+	// unbounded growth in the pathological case where many distinct bad blocks
+	// arrive. 256 entries is far more than needed in practice. Fixes #1670.
+	maxConsensusFailedBlocks = 256
 
 	// Snap-sync state machine thresholds (refs #807 Phase 3b).
 	//
@@ -214,23 +255,68 @@ func (p xdcSnapPhase) String() string {
 }
 
 type xdcSyncer struct {
+	forkGuardVerdicts sync.Map // peer ID -> bool: head on the canonical branch past xdcForkGuards (#1876)
+
 	handler *handler
 	syncing atomic.Bool
 	quitCh  chan struct{}
+
+	// bgMu/bgStopped/bg track every background goroutine that touches the
+	// chain database so stop() can wait for them before the database is
+	// closed (pebble panics on Close with live iterators). Refs #1877.
+	bgMu      sync.Mutex
+	bgStopped bool
+	bg        sync.WaitGroup
 
 	// Self-healing state. When InsertChain returns consensus.ErrUnknownAncestor
 	// for the same fromBlock xdcUnknownAncestorThreshold times in a row, we
 	// infer the local tip is on a non-canonical competing-slot block and
 	// roll back. Tracked here so syncOnce stays stateless except for failures.
-	stuckFrom       uint64 // fromBlock that's been failing
-	stuckFailures   int    // consecutive InsertChain failures at stuckFrom
-	stuckRolledBack uint64 // cumulative rollback in current stuck-period
+	stuckFrom             uint64 // fromBlock that's been failing
+	stuckFailures         int    // consecutive InsertChain failures at stuckFrom
+	stuckRolledBack       uint64 // cumulative rollback in current stuck-period
+	stuckLastRollbackHead uint64 // head height at last rollback; resets window when chain advances past it
+	// singlePeerForkHead is the head hash at which only the triggering peer
+	// disagreed and no other peer was conclusive. The rollback is deferred once;
+	// a second such episode at the same head confirms the fork.
+	singlePeerForkHead common.Hash
 
 	// Fork-tainted peers: those that delivered the block leading to a rollback.
 	// Excluded from rankedPeers() for xdcForkTaintTTL so post-rollback bulk-sync
 	// picks a different peer instead of re-importing the same fork.
 	forkTaintedMu sync.Mutex
 	forkTainted   map[string]time.Time
+
+	// Empty-response cooldown (#1872): a peer earns a strike only when it
+	// returns 0 headers in a round where another peer in the SAME round served
+	// the same fromBlock (proving the range exists). Empty replies in all-empty
+	// rounds ("nothing yet at tip") are never strikes. After xdcPeerEmptyStrikeMax
+	// strikes the peer is excluded from rankedPeers() for xdcPeerEmptyCooldownTTL.
+	// Separate from fork-taint: the peer is not on a fork, it just cannot serve.
+	emptyStrikesMu  sync.Mutex
+	emptyStrikes    map[string]int
+	emptyCooldownMu sync.Mutex
+	emptyCooldown   map[string]time.Time
+
+	// lastEmptyRoundIDs is the set of peer IDs raced in the most recent
+	// all-empty round (no winner). fetchHeadersParallel uses it to rotate
+	// the candidate window: peers NOT in this set are preferred next round,
+	// giving a healthy peer outside the initial top-K a slot to prove itself.
+	// Only accessed from the single-flight sync goroutine — no mutex required.
+	// Note: for XDC, handshake TD is a ranking metric, not a block height; an
+	// XDPOS2 peer stuck at genesis can rank first in candidates.
+	lastEmptyRoundIDs map[string]bool
+
+	// consensusFailedBlocksMu protects consensusFailedBlocks.
+	consensusFailedBlocksMu sync.Mutex
+	// consensusFailedBlocks is the set of block hashes that failed InsertChain
+	// with a definitive consensus error (not ErrUnknownAncestor, not ErrFutureBlock).
+	// Peers whose header batch starts with one of these hashes are on a fork with
+	// an invalid block; they must not be treated as "ahead of us". Checked in
+	// fetchHeadersParallel to discard such batches before they reach InsertChain.
+	// Bounded to maxConsensusFailedBlocks to prevent unbounded growth.
+	// Fixes #1670.
+	consensusFailedBlocks map[common.Hash]struct{}
 
 	// Snap-sync phase state (refs #807 Phase 3b). Default phaseFullSync;
 	// transitions only when ConfigSyncMode == SnapSync AND a sizeable
@@ -263,6 +349,11 @@ type xdcSyncer struct {
 	// respond empty, the downloader logs "Peer rejected account range",
 	// and snap.Syncer.Progress().AccountSynced stays at 0).
 	snapBeaconStartedAt atomic.Int64
+
+	// Snap state-download progress seen by snapRunningCheck (#1884); only that
+	// check reads or writes them.
+	snapLastProgressBytes float64
+	snapLastProgressAt    time.Time
 
 	// Fast-sync peer-wait bookkeeping (refs #844 A.11).
 	// fastWaitStartedAt is the time we first noticed insufficient peers
@@ -354,6 +445,42 @@ type xdcSyncer struct {
 	// set but XDC_EXPERIMENTAL_SNAPSYNC=1 is not. Prevents log spam at the
 	// 500ms tick cadence.
 	snapExpWarnOnce atomic.Bool
+
+	// Highest peer block number seen during FULL_SYNC phase. Atomic so eth_syncing
+	// can read safely without locking. Updated when fetchPeerHeadHeader or
+	// bulk sync learns real peer head numbers. Fixes #1841.
+	highestPeerBlockSeen atomic.Uint64
+
+	// networkTipSeen is the best verified peer tip (fetchPeerTip results);
+	// highestPeerBlockSeen only reaches the top of the last header batch.
+	// tipRefreshAt (unix nanos) throttles the bulk-sync refresh. Fixes #1887.
+	networkTipSeen atomic.Uint64
+	tipRefreshAt   atomic.Int64
+
+	// bulkSyncStartBlock records the local head when bulk sync starts, once per
+	// catch-up cycle. Used to report progress in eth_syncing while behind peers.
+	bulkSyncStartBlock atomic.Uint64
+
+	// SYNC-06 snap history backfill (refs #1848).
+	//
+	// snapHistoryPivot is the downloader state-download pivot (= head −
+	// fsMinFullBlocks at BeaconSync time). Set in snapRunningCheck when the
+	// terminate floor is installed; read by runSnapHistoryBackfill after
+	// SyncCompleted to know where the history gap starts.
+	snapHistoryPivot atomic.Uint64
+
+	// snapHistoryBackfillDone is a one-shot guard so the backfill goroutine
+	// runs at most once per snap-sync invocation.
+	snapHistoryBackfillDone atomic.Bool
+
+	// SYNC-12 (#1869): per-peer body request statistics for hedge peer ranking.
+	// bodyStatsMu guards bodyLatency and bodyTimeouts.
+	// bodyLatency is an EWMA of successful response times (α=0.25).
+	// bodyTimeouts counts consecutive body-request timeouts per peer.
+	// Both maps are lazily initialised in recordBodyStat.
+	bodyStatsMu  sync.Mutex
+	bodyLatency  map[string]time.Duration
+	bodyTimeouts map[string]int
 }
 
 // a70SeedRecord captures one V2 masternode-snapshot seed:
@@ -388,18 +515,97 @@ func newXDCSyncer(h *handler) *xdcSyncer {
 	}
 }
 
+// atTipFreshnessWindow returns the maximum age (in seconds) a local head may
+// have while the node still considers itself at the chain tip.
+//
+// On XDPoS V2 chains a leader-gap rotation can leave the head stale by up to
+// TimeoutPeriod×TimeoutSyncThreshold+MinePeriod seconds — ≈182 s on mainnet
+// (60 s × 3 + 2 s). A node that restarted mid-gap has a head that old but IS
+// genuinely at tip. The floor of 30 s preserves the original behaviour for V1
+// chains and for any V2 chain whose config is not yet available. Refs #1674.
+func atTipFreshnessWindow(cfg *params.ChainConfig) int64 {
+	const floor = int64(30)
+	if cfg == nil || cfg.XDPoS == nil || cfg.XDPoS.V2 == nil {
+		return floor
+	}
+	v2cfg := cfg.XDPoS.V2.CurrentConfig
+	if v2cfg == nil || v2cfg.TimeoutPeriod <= 0 {
+		return floor
+	}
+	tst := v2cfg.TimeoutSyncThreshold
+	if tst <= 0 {
+		tst = 1
+	}
+	budget := int64(v2cfg.TimeoutPeriod)*int64(tst) + int64(v2cfg.MinePeriod)
+	if budget < floor {
+		return floor
+	}
+	return budget
+}
+
 func (s *xdcSyncer) start() {
 	// XDC: enable bulk-sync optimization for the duration of initial sync.
 	// When true: signing-tx ECDSA recovery skipped, larger TriesInMemory
 	// (4096 vs 128), chainHeadEvent throttled, sender cache skipped.
 	core.XdcBulkSyncMode.Store(true)
-	go s.loop()
-	go s.snapEventLoop() // refs #807 Phase 3b.3
+	s.spawn(s.loop)
+	s.spawn(s.snapEventLoop) // refs #807 Phase 3b.3
+	// A gap snapshot seeded from a header by older code carries the 108
+	// header validators instead of the contract pool; fix it now that state
+	// is on disk (refs #1884).
+	s.spawn(s.repairSeededGapPools)
+	// SYNC-06: after a restart a node whose snap sync already finished runs as
+	// a full node and never re-enters the snap event loop, so resume an
+	// unfinished history backfill here. Gated on the head having passed the
+	// stored pivot, so it never overlaps a running state download.
+	if p := rawdb.ReadLastPivotNumber(s.handler.database); p != nil && *p > 1 {
+		if cur := s.handler.chain.CurrentBlock(); cur != nil && cur.Number.Uint64() >= *p {
+			s.spawn(s.runSnapHistoryBackfill)
+		}
+	}
 }
 
+// xdcStopWaitTimeout bounds how long stop() waits for background goroutines.
+const xdcStopWaitTimeout = 15 * time.Second
+
+// spawn runs f as a tracked background goroutine. After stop() has begun it
+// is a no-op, so nothing can start touching the database during shutdown.
+func (s *xdcSyncer) spawn(f func()) {
+	s.bgMu.Lock()
+	defer s.bgMu.Unlock()
+	if s.bgStopped {
+		return
+	}
+	s.bg.Add(1)
+	go func() {
+		defer s.bg.Done()
+		f()
+	}()
+}
+
+// stop signals every background goroutine to quit and waits for them, so the
+// caller may close the chain database afterwards. Refs #1877.
 func (s *xdcSyncer) stop() {
 	core.XdcBulkSyncMode.Store(false)
+	s.bgMu.Lock()
+	s.bgStopped = true
+	s.bgMu.Unlock()
 	close(s.quitCh)
+
+	done := make(chan struct{})
+	go func() { s.bg.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(xdcStopWaitTimeout):
+		log.Warn("xdcSyncer: background goroutines still running at shutdown", "timeout", xdcStopWaitTimeout)
+	}
+}
+
+// SyncProgress returns the highest peer block seen and the starting block
+// for this bulk-sync cycle. Used by eth_syncing to report progress while
+// catching up. Returns (0, 0) if no peer head data is available. Fixes #1841.
+func (s *xdcSyncer) SyncProgress() (highestPeerBlock, startBlock uint64) {
+	return max(s.networkTipSeen.Load(), s.highestPeerBlockSeen.Load()), s.bulkSyncStartBlock.Load()
 }
 
 func (s *xdcSyncer) loop() {
@@ -447,7 +653,16 @@ func (s *xdcSyncer) loop() {
 			phase := xdcSnapPhase(s.snapPhase.Load())
 			if phase == phaseTipCatch || phase == phaseFullSync {
 				maxPeerHead := uint64(0)
-				for _, p := range s.handler.peers.peers {
+				for _, p := range s.handler.peers.all() {
+					// #1674: XDPOS2 peers (version==100) never receive
+					// BlockRangeUpdate — their BlockRange().LatestBlock holds
+					// the handshake Total Difficulty, not a block number. Using
+					// it as a block number makes peerAtTip always false on XDPoS
+					// V2 networks (TD ≫ head height), so skip them here and rely
+					// solely on headFresh for the at-tip signal.
+					if eth.IsXDPOS2Family(p.Version()) {
+						continue
+					}
 					rng := p.BlockRange()
 					if rng != nil && rng.LatestBlock > maxPeerHead {
 						maxPeerHead = rng.LatestBlock
@@ -466,16 +681,23 @@ func (s *xdcSyncer) loop() {
 				// Legacy XDPoSChain peers speak xpos2/100 and do NOT send the
 				// eth/69 BlockRangeUpdate, so maxPeerHead is 0 when all peers are
 				// legacy V1 nodes — peerAtTip can never fire. But if the local head
-				// block's timestamp is within headFreshnessSecs of now, we ARE
+				// block's timestamp is within the freshness window of now, we ARE
 				// importing current blocks (at tip); during genuine bulk historical
 				// sync the head timestamp is hours/days old, so this cannot
 				// false-trigger. This is what lets a modern producer peering only
 				// with legacy nodes release bulk-mode and seal.
-				const headFreshnessSecs = 30
+				//
+				// #1674: fixed 30 s is too small for XDPoS V2 chains with 60 s
+				// timeout periods. A node at tip during a leader-gap rotation can
+				// have a head that is TimeoutPeriod×TimeoutSyncThreshold+MinePeriod
+				// seconds old (≈182 s on mainnet) and still be genuinely at tip.
+				// Use the V2 timeout budget as the freshness window (floor 30 s so
+				// V1-only and unconfigured chains keep the original behaviour).
+				freshnessSecs := atTipFreshnessWindow(s.handler.chain.Config())
 				headFresh := false
 				if head := s.handler.chain.CurrentBlock(); head != nil {
 					age := time.Now().Unix() - int64(head.Time)
-					headFresh = age >= 0 && age <= headFreshnessSecs
+					headFresh = age >= 0 && age <= freshnessSecs
 				}
 
 				atTip := peerAtTip || headFresh
@@ -540,7 +762,7 @@ func (s *xdcSyncer) loop() {
 				if cur == 0 {
 					genesis := s.handler.chain.Genesis().Hash()
 					stallable = true
-					for _, p := range s.handler.peers.peers {
+					for _, p := range s.handler.peers.all() {
 						if rng := p.BlockRange(); rng == nil || rng.LatestBlockHash != genesis {
 							stallable = false
 							break
@@ -577,7 +799,7 @@ func (s *xdcSyncer) maybeSync() {
 	if !s.syncing.CompareAndSwap(false, true) {
 		return
 	}
-	go func() {
+	s.spawn(func() {
 		defer s.syncing.Store(false)
 		defer func() {
 			if r := recover(); r != nil {
@@ -585,7 +807,7 @@ func (s *xdcSyncer) maybeSync() {
 			}
 		}()
 		s.syncOnce()
-	}()
+	})
 }
 
 // syncOnce dispatches to the phase-specific action. Default is
@@ -734,7 +956,7 @@ func (s *xdcSyncer) maybeEngageSnap() {
 	// If the fetch fails (peer not ready / XDPOS2 wire doesn't carry block
 	// number), fall back to checking whether any peer is connected at all.
 	var bestPeer *eth.Peer
-	for _, p := range s.handler.peers.peers {
+	for _, p := range s.handler.peers.all() {
 		rng := p.BlockRange()
 		if rng != nil && rng.LatestBlockHash != (common.Hash{}) {
 			bestPeer = p.Peer
@@ -750,7 +972,7 @@ func (s *xdcSyncer) maybeEngageSnap() {
 	// disconnected), proceed without the guard — snap will fall back to
 	// FULL_SYNC via SelectSnapPivot returning nil anyway.
 	var actualPeerHead uint64
-	for _, p := range s.handler.peers.peers {
+	for _, p := range s.handler.peers.all() {
 		rng := p.BlockRange()
 		if rng == nil || rng.LatestBlockHash == (common.Hash{}) {
 			continue
@@ -913,7 +1135,9 @@ func (s *xdcSyncer) fastRunningCheck() {
 	var pivotPeer *eth.Peer
 	if opNumber != 0 && opHash != (common.Hash{}) {
 		opAttempts := 0
-		for _, p := range s.rankedPeers() {
+		// Use rankedPeersNoCD: pivot selection must not be blocked by the
+		// empty-response cooldown (a fullSyncOnce efficiency mechanism). (#1872)
+		for _, p := range s.rankedPeersNoCD() {
 			if opAttempts >= fastHeadFetchMaxAttempts {
 				break
 			}
@@ -938,7 +1162,9 @@ func (s *xdcSyncer) fastRunningCheck() {
 
 	if headHdr == nil {
 		attempts := 0
-		for _, p := range s.rankedPeers() {
+		// Use rankedPeersNoCD: empty-response cooldown must not block fast-sync
+		// pivot selection; only fork-tainted peers are excluded. (#1872)
+		for _, p := range s.rankedPeersNoCD() {
 			if attempts >= fastHeadFetchMaxAttempts {
 				break
 			}
@@ -947,7 +1173,7 @@ func (s *xdcSyncer) fastRunningCheck() {
 				continue
 			}
 			attempts++
-			if h := s.fetchHeaderByHash(p, rng.LatestBlockHash); h != nil {
+			if h := s.fetchPeerTip(p, rng.LatestBlockHash); h != nil {
 				// A.71 (refs #844 #859): when the operator pinned a fast-sync
 				// pivot, refuse to engage BeaconSync with a peer-tip below
 				// the pivot. The peer is either misreporting its head (some
@@ -963,6 +1189,15 @@ func (s *xdcSyncer) fastRunningCheck() {
 				// re-entry path → block-import never starts). Skip this
 				// candidate and continue scanning; if every peer-tip is
 				// below the pivot, fall through and retry next tick.
+				if h.Number.Uint64() == 0 {
+					// Genesis-stuck peer: LatestBlockHash resolves to block 0.
+					// Invoking BeaconSync with head=0 causes the skeleton to
+					// request headers near MAX_UINT64 (arithmetic underflow),
+					// returning count=0 from all peers and timing them out.
+					// Skip without counting as a failure attempt. (#1872)
+					attempts-- // don't charge an attempt for a genesis-stuck peer
+					continue
+				}
 				if opNumber != 0 && h.Number.Uint64() < opNumber {
 					log.Warn("xdcSyncer: rejecting peer-tip below operator pivot for BeaconSync head",
 						"peer", p.ID(),
@@ -1002,7 +1237,9 @@ func (s *xdcSyncer) fastRunningCheck() {
 	primeSourcePeer := pivotPeer
 	if primeSourcePeer == nil && isDynamic {
 		// Dynamic path: pick best available peer for header walk-back.
-		for _, p := range s.rankedPeers() {
+		// Use rankedPeersNoCD so pivot selection is not blocked by the
+		// empty-response cooldown (a fullSyncOnce efficiency mechanism). (#1872)
+		for _, p := range s.rankedPeersNoCD() {
 			primeSourcePeer = p
 			break
 		}
@@ -1066,7 +1303,7 @@ func (s *xdcSyncer) fastRunningCheck() {
 		"head", headHdr.Number.Uint64(),
 		"head_hash", headHdr.Hash().Hex(),
 		"head_root", headHdr.Root.Hex())
-	go func() {
+	s.spawn(func() {
 		// BeaconSync(head, final=nil): final=nil means no trusted finalized
 		// point — the downloader will use its pivot heuristic (head-64).
 		// For fast sync we rely on processFastSyncContent + NodeData for
@@ -1159,7 +1396,7 @@ func (s *xdcSyncer) fastRunningCheck() {
 				return
 			}
 		}
-	}()
+	})
 }
 
 // refreshOperatorPivotHead re-queries the best-ranked peer for its current
@@ -1182,7 +1419,7 @@ func (s *xdcSyncer) refreshOperatorPivotHead() *types.Header {
 			continue
 		}
 		attempts++
-		if h := s.fetchHeaderByHash(p, rng.LatestBlockHash); h != nil {
+		if h := s.fetchPeerTip(p, rng.LatestBlockHash); h != nil {
 			return h
 		}
 	}
@@ -1296,7 +1533,7 @@ func (s *xdcSyncer) maybeStartSnapHeal() {
 		return
 	}
 
-	go func() {
+	s.spawn(func() {
 		now := time.Now()
 		s.healStatusMu.Lock()
 		s.healStatus = xdcHealStatus{
@@ -1451,7 +1688,24 @@ func (s *xdcSyncer) maybeStartSnapHeal() {
 		s.healStatus.InProgress = false
 		s.healStatus.LastError = ""
 		s.healStatusMu.Unlock()
-	}()
+	})
+}
+
+// peersConfirmAtTip reports whether the local head is at the network tip: some
+// peer's advertised head hash equals ours AND we are within one epoch of the
+// best known tip (max of peer-advertised heads and the verified networkTip).
+// A lagging or frozen peer sitting at our height must not, on its own, make a
+// node millions of blocks behind believe it is at tip. Refs #1884.
+func peersConfirmAtTip(cur *types.Header, ranges []*eth.BlockRangeUpdatePacket, networkTip, epoch uint64) bool {
+	best, match := networkTip, false
+	for _, rng := range ranges {
+		if rng == nil {
+			continue
+		}
+		best = max(best, rng.LatestBlock)
+		match = match || rng.LatestBlockHash == cur.Hash()
+	}
+	return match && cur.Number.Uint64()+epoch >= best
 }
 
 // maybeTransitionToAtTip advances phaseTipCatch → phaseAtTip when the
@@ -1472,39 +1726,41 @@ func (s *xdcSyncer) maybeTransitionToAtTip() {
 	if cur == nil {
 		return
 	}
+	var ranges []*eth.BlockRangeUpdatePacket
+	for _, p := range s.handler.peers.all() {
+		ranges = append(ranges, p.BlockRange())
+	}
+	var epoch uint64 = 900
+	if x := s.handler.chain.Config().XDPoS; x != nil && x.Epoch > 0 {
+		epoch = x.Epoch
+	}
 	localHash := cur.Hash()
-	for _, p := range s.handler.peers.peers {
-		rng := p.BlockRange()
-		if rng == nil {
-			continue
-		}
-		if rng.LatestBlockHash == localHash {
-			log.Info("xdcSyncer: TIP_CATCH complete; transitioning to AT_TIP",
-				"head", cur.Number.Uint64(),
-				"hash", localHash.Hex())
-			s.snapPhase.Store(int32(phaseAtTip))
-			// A.73 (refs #844 #859): re-apply A.70 seeds one final time before
-			// flipping to strict mode. During TIP_CATCH, block-import of each
-			// post-pivot gap block calls UpdateMasternodesFromHeader (reads
-			// contract state, sorts candidates by stake) and can overwrite the
-			// SyncCompleted-time seed. Re-seeding here restores authoritative
-			// header.Validators as the active set so the first fullVerify=true
-			// epoch-switch verify after this flip sees the canonical 108-of-N
-			// truncation rather than the contract-state-sorted divergent one.
-			s.reapplyA70Seeds()
-			// A.97.2: flip bulk-mode first (gate B must run with bulk=false),
-			// THEN start the heal goroutine. Ordering is critical: gate B
-			// checks that XdcBulkSyncMode is false so A.94 cannot fire and
-			// any mismatch surfaces as a real error. Refs #894.
-			core.XdcBulkSyncMode.Store(false)
-			s.maybeStartSnapHeal()
-			// Authoritative at-tip transition: re-enable state validation now that
-			// bulk-sync is over, so the miner opens the real head state instead of
-			// EmptyRootHash. No-op unless the flag is set, and refuses (loudly) if the
-			// head state is missing — that DB needs a resync, not a flag flip.
-			s.handler.chain.ClearCheckpointSyncNoState()
-			return
-		}
+	if peersConfirmAtTip(cur, ranges, s.networkTipSeen.Load(), epoch) {
+		log.Info("xdcSyncer: TIP_CATCH complete; transitioning to AT_TIP",
+			"head", cur.Number.Uint64(),
+			"hash", localHash.Hex())
+		s.snapPhase.Store(int32(phaseAtTip))
+		// A.73 (refs #844 #859): re-apply A.70 seeds one final time before
+		// flipping to strict mode. During TIP_CATCH, block-import of each
+		// post-pivot gap block calls UpdateMasternodesFromHeader (reads
+		// contract state, sorts candidates by stake) and can overwrite the
+		// SyncCompleted-time seed. Re-seeding here restores authoritative
+		// header.Validators as the active set so the first fullVerify=true
+		// epoch-switch verify after this flip sees the canonical 108-of-N
+		// truncation rather than the contract-state-sorted divergent one.
+		s.reapplyA70Seeds()
+		// A.97.2: flip bulk-mode first (gate B must run with bulk=false),
+		// THEN start the heal goroutine. Ordering is critical: gate B
+		// checks that XdcBulkSyncMode is false so A.94 cannot fire and
+		// any mismatch surfaces as a real error. Refs #894.
+		core.XdcBulkSyncMode.Store(false)
+		s.maybeStartSnapHeal()
+		// Authoritative at-tip transition: re-enable state validation now that
+		// bulk-sync is over, so the miner opens the real head state instead of
+		// EmptyRootHash. No-op unless the flag is set, and refuses (loudly) if the
+		// head state is missing — that DB needs a resync, not a flag flip.
+		s.handler.chain.ClearCheckpointSyncNoState()
+		return
 	}
 }
 
@@ -1577,7 +1833,8 @@ func (s *xdcSyncer) snapSelectOnce() {
 			//
 			// Refs #807 Phase 7+. Fetch + verify the header matches
 			// the checkpoint Hash before using it as a pivot.
-			candidates := s.rankedPeers()
+			// Use rankedPeersNoCD so cooldown never blocks pivot selection. (#1872)
+			candidates := s.rankedPeersNoCD()
 			if len(candidates) == 0 {
 				return // stay in SNAP_SELECTING; retry next tick
 			}
@@ -1653,59 +1910,61 @@ func (s *xdcSyncer) snapSelectOnce() {
 	}
 
 	// Fallback path: ADR-807 QC-verification helper.
-	candidates := s.rankedPeers()
+	//
+	// Use rankedPeersNoCD so the empty-response cooldown (a fullSyncOnce
+	// efficiency tool) never blocks pivot selection. (#1872)
+	candidates := s.rankedPeersNoCD()
 	if len(candidates) == 0 {
 		return
 	}
-	peer := candidates[0]
-	if peer.BlockRange() == nil {
-		return
-	}
+	// SYNC-02 (#1842): determine peerHead for QC-verify pivot selection.
+	// Iterate all candidates, not just [0], so a genesis-stuck peer ranked
+	// first by TD does not shadow real at-tip peers.
+	//
+	// A peer returning block 0 is genesis-stuck and not a sign of a short
+	// chain — skip it without counting as a failure so we keep retrying on
+	// the next tick until real peers connect. Only a peer with head > 0 but
+	// below xdcSnapEngageMinGap indicates a genuinely short chain. (#1872)
 	var peerHead uint64
-	if cfg != nil {
-		for _, cp := range cfg.TrustedSyncCheckpoints {
-			if cp.Number > peerHead {
-				peerHead = cp.Number
-			}
+	var snapPivotPeer *eth.Peer // peer that provided the real head
+	for _, p := range candidates {
+		rng := p.BlockRange()
+		if rng == nil || rng.LatestBlockHash == (common.Hash{}) {
+			continue
 		}
+		hdr := s.fetchPeerTip(p, rng.LatestBlockHash)
+		if hdr == nil {
+			continue
+		}
+		n := hdr.Number.Uint64()
+		if n == 0 {
+			// Genesis-stuck peer — not a sign of a short chain; skip.
+			continue
+		}
+		peerHead = n
+		snapPivotPeer = p
+		break
 	}
 	if peerHead == 0 {
-		// A.97 short-chain guard (refs #912): clamp the synthetic peerHead to the
-		// peer's actual head block number. On short chains (devnet < 5000 blocks)
-		// the synthetic localHead+5000 target doesn't exist, SelectSnapPivot
-		// returns nil, and we fall back to FULL_SYNC — but maybeEngageSnap
-		// re-engages on the next tick, creating a loop.
-		//
-		// Fetch the peer's real head block number. If it is below
-		// xdcSnapEngageMinGap, fall back to FULL_SYNC immediately rather than
-		// passing an unreachable target to SelectSnapPivot. Production chains
-		// (mainnet > 73M, Apothem > 50M) are never affected by this guard.
-		rng := peer.BlockRange()
-		if rng != nil && rng.LatestBlockHash != (common.Hash{}) {
-			if hdr := s.fetchHeaderByHash(peer, rng.LatestBlockHash); hdr != nil {
-				actualPeer := hdr.Number.Uint64()
-				if actualPeer < xdcSnapEngageMinGap {
-					log.Info("xdcSyncer: snap pivot fallback skipped — peer head below xdcSnapEngageMinGap; reverting to FULL_SYNC",
-						"peerHead", actualPeer, "minGap", xdcSnapEngageMinGap,
-						"localHead", cur.Number.Uint64())
-					s.snapSelectFailures++
-					if s.snapSelectFailures >= xdcSnapSelectMaxRetries {
-						s.snapPermanentFullFallback.Store(true)
-						log.Warn("xdcSyncer: snap pivot selection failed repeatedly — permanently falling back to full-sync (no snap-capable peers)",
-							"attempts", s.snapSelectFailures)
-					}
-					s.snapPhase.Store(int32(phaseFullSync))
-					return
-				}
-				peerHead = actualPeer
-			}
-		}
-		if peerHead == 0 {
-			// Could not fetch real head; use synthetic but cap at xdcSnapEngageMinGap
-			// minimum so SelectSnapPivot always has a meaningful search space.
-			peerHead = cur.Number.Uint64() + xdcSnapEngageMinGap
-		}
+		// No peer with a real (non-genesis) head yet. Wait for network peers
+		// to connect rather than burning failure retries. (#1872)
+		return
 	}
+	// A.97 short-chain guard (refs #912).
+	if peerHead < xdcSnapEngageMinGap {
+		log.Info("xdcSyncer: snap pivot fallback skipped — peer head below xdcSnapEngageMinGap; reverting to FULL_SYNC",
+			"peerHead", peerHead, "minGap", xdcSnapEngageMinGap,
+			"localHead", cur.Number.Uint64())
+		s.snapSelectFailures++
+		if s.snapSelectFailures >= xdcSnapSelectMaxRetries {
+			s.snapPermanentFullFallback.Store(true)
+			log.Warn("xdcSyncer: snap pivot selection failed repeatedly — permanently falling back to full-sync (no snap-capable peers)",
+				"attempts", s.snapSelectFailures)
+		}
+		s.snapPhase.Store(int32(phaseFullSync))
+		return
+	}
+	peer := snapPivotPeer
 	fetchHeader := func(n uint64) *types.Header {
 		hdrs := s.fetchHeaderBatch(peer, n, 1)
 		if len(hdrs) == 0 {
@@ -1801,14 +2060,30 @@ func (s *xdcSyncer) snapRunningCheck() {
 		// SnapshotCache>0; handlers.go serves from TrieDB iterators), so an
 		// empty AccountSynced after the B1 fix most likely means state download
 		// was reached but the requested pivot root has no serving peer / drifted.
-		const snapStallGrace = 10 * time.Minute
+		//
+		// #1884: judge progress, not elapsed time. The pivot is frozen, and a
+		// serving peer keeps state for its recent blocks only, so after a few
+		// minutes it answers the old root with empty ranges. A fixed 10-minute
+		// "AccountSynced still 0" check never fired once progress was kept, yet
+		// a node could sit stalled for the whole window. Restart (and re-pivot,
+		// keeping the downloaded state) after snapStallGrace without new bytes.
+		const snapStallGrace = 3 * time.Minute
 		startNS := s.snapBeaconStartedAt.Load()
-		if startNS > 0 && time.Since(time.Unix(0, startNS)) > snapStallGrace {
-			progress := s.handler.downloader.SnapSyncer.Progress()
-			if progress.AccountSynced == 0 {
-				log.Warn("xdcSyncer: snap-sync stalled — no AccountSynced after grace; falling back to FULL_SYNC",
-					"grace", snapStallGrace,
-					"hint", "state download not reached or peer served empty AccountRange (refs #810/#836)")
+		if startNS > 0 {
+			p := s.handler.downloader.SnapSyncer.Progress()
+			done := float64(p.AccountBytes + p.BytecodeBytes + p.StorageBytes + p.TrienodeHealBytes + p.BytecodeHealBytes)
+			now := time.Now()
+			if done > s.snapLastProgressBytes {
+				s.snapLastProgressBytes, s.snapLastProgressAt = done, now
+			}
+			since := s.snapLastProgressAt
+			if since.UnixNano() < startNS {
+				since = time.Unix(0, startNS)
+			}
+			if now.Sub(since) > snapStallGrace {
+				log.Warn("xdcSyncer: snap-sync stalled — no state progress; restarting with a fresh pivot",
+					"for", now.Sub(since).Round(time.Second), "downloaded", common.StorageSize(done),
+					"hint", "pivot root no longer served (refs #810/#836/#1884)")
 				s.snapPhase.Store(int32(phaseFullSync))
 				s.snapBeaconStarted.Store(false)
 				s.snapBeaconStartedAt.Store(0)
@@ -1846,6 +2121,7 @@ func (s *xdcSyncer) snapRunningCheck() {
 	// → worst-case 15s before falling back to FULL_SYNC.
 	const headFetchMaxAttempts = 3
 	var headHdr *types.Header
+	var headPeer *eth.Peer // served headHdr, so it has its ancestors
 	attempts := 0
 	for _, p := range s.rankedPeers() {
 		if attempts >= headFetchMaxAttempts {
@@ -1856,8 +2132,8 @@ func (s *xdcSyncer) snapRunningCheck() {
 			continue
 		}
 		attempts++
-		if h := s.fetchHeaderByHash(p, rng.LatestBlockHash); h != nil {
-			headHdr = h
+		if h := s.fetchPeerTip(p, rng.LatestBlockHash); h != nil {
+			headHdr, headPeer = h, p
 			break
 		}
 	}
@@ -1880,8 +2156,12 @@ func (s *xdcSyncer) snapRunningCheck() {
 	// invalidation logic depends on the offset matching.
 	const downloaderFsMinFullBlocks = 64
 	newDownloaderPivot := headHdr.Number.Uint64() - downloaderFsMinFullBlocks
-	if lastPivot := rawdb.ReadLastPivotNumber(s.handler.database); lastPivot != nil && *lastPivot != newDownloaderPivot {
-		log.Warn("xdcSyncer: invalidating stale snap-sync state (pivot changed)",
+	// #1884: only when the pivot moves back. A forward move is the normal
+	// re-pivot after a stall: snap ranges are hash ranges and healing reconciles
+	// them to the new root (fast sync relies on this), so wiping them made every
+	// re-pivot start from zero and Apothem snap never finished.
+	if lastPivot := rawdb.ReadLastPivotNumber(s.handler.database); lastPivot != nil && *lastPivot > newDownloaderPivot {
+		log.Warn("xdcSyncer: invalidating stale snap-sync state (pivot moved back)",
 			"old_pivot", *lastPivot, "new_pivot", newDownloaderPivot)
 		// Write garbage that fails JSON decode → snap.Syncer.loadSyncStatus
 		// logs a decode error and falls through to fresh init.
@@ -1934,6 +2214,10 @@ func (s *xdcSyncer) snapRunningCheck() {
 	if headHdr.Number.Uint64() > pivotDist {
 		pivotNum := headHdr.Number.Uint64() - pivotDist
 		dl.SetSnapTerminateFloor(pivotNum)
+		// SYNC-06: record pivot for the post-sync history backfill goroutine.
+		// Persist to rawdb so a restart can resume the backfill without re-running snap sync.
+		s.snapHistoryPivot.Store(pivotNum)
+		rawdb.WriteLastPivotNumber(s.handler.database, pivotNum)
 		log.Info("xdcSyncer: snap skeleton terminate-floor set — skeleton stops at pivot, no genesis walk",
 			"floor", pivotNum, "downloader_pivot", pivotNum, "head", headHdr.Number.Uint64())
 
@@ -1941,11 +2225,10 @@ func (s *xdcSyncer) snapRunningCheck() {
 		// Walk back from headHdr one parent at a time via a peer (XDPOS2 wire serves
 		// single headers by hash). primeHeadersNeeded = pivotDist+1 ascending headers.
 		primeHeadersNeeded := int(pivotDist) + 1
-		var primeSourcePeer *eth.Peer
-		for _, p := range s.rankedPeers() {
-			primeSourcePeer = p
-			break
-		}
+		// Walk back on the peer that served the head: it holds the head's
+		// ancestors. The best-ranked peer may be a legacy or lagging peer
+		// without them, and then every tick failed the same way (#1884).
+		primeSourcePeer := headPeer
 		if primeSourcePeer != nil {
 			primeHeaders := make([]*types.Header, 0, primeHeadersNeeded)
 			primeHeaders = append(primeHeaders, headHdr)
@@ -1993,7 +2276,7 @@ func (s *xdcSyncer) snapRunningCheck() {
 	// channel and returns); the actual state download runs in the
 	// downloader's worker goroutines. We listen for the completion
 	// event via the subscription created in start().
-	go func() {
+	s.spawn(func() {
 		if err := s.handler.downloader.BeaconSync(headHdr, pivot.Block); err != nil {
 			log.Error("xdcSyncer: BeaconSync failed; falling back to FULL_SYNC",
 				"err", err, "pivot", pivot.Block.Number.Uint64())
@@ -2004,34 +2287,7 @@ func (s *xdcSyncer) snapRunningCheck() {
 		}
 		log.Info("xdcSyncer: BeaconSync kicked off; awaiting completion via SyncEvent",
 			"pivot", pivot.Block.Number.Uint64())
-	}()
-}
-
-// snapKeepAlive issues a lightweight header request to each connected
-// peer using the xdcSyncer-style fetchHeaderBatch path. Phase 5 bench
-// found peers respond to that request format with 512-header batches,
-// while the downloader's skeleton-sync request format times out after
-// 60s. The keep-alive pings keep the eth subprotocol busy on a known-
-// working request format so peers don't time out the downloader's
-// own (slower / differently-formatted) requests.
-//
-// Refs #807 Phase 7. Fire-and-forget; we don't care about the
-// response, the request itself counts as activity.
-func (s *xdcSyncer) snapKeepAlive() {
-	pivot := s.snapPivotBlock()
-	if pivot == 0 {
-		return
-	}
-	// Request 1 header starting at pivot from each peer. Returns
-	// quickly; goroutine isolates each peer so a slow peer doesn't
-	// stall the tick.
-	for _, p := range s.handler.peers.peers {
-		ethP := p.Peer
-		go func() {
-			defer func() { _ = recover() }()
-			s.fetchHeaderBatch(ethP, pivot, 1)
-		}()
-	}
+	})
 }
 
 // snapEventLoop listens for downloader SyncEvents and transitions the
@@ -2056,7 +2312,7 @@ func (s *xdcSyncer) snapEventLoop() {
 				case downloader.SyncStarted:
 					log.Info("xdcSyncer: SyncStarted observed (snap)", "mode", ev.Mode)
 				case downloader.SyncCompleted:
-					log.Info("xdcSyncer: snap-sync complete; transitioning to TIP_CATCH",
+					log.Info("xdcSyncer: snap-sync complete; seeding gap snapshots before TIP_CATCH (SYNC-11)",
 						"pivot", s.snapPivotBlock(),
 						"latest", func() string {
 							if ev.Latest == nil {
@@ -2064,8 +2320,19 @@ func (s *xdcSyncer) snapEventLoop() {
 							}
 							return ev.Latest.Number.String()
 						}())
+					// SYNC-11 (refs #1863): seed V2 masternode snapshots for every gap block
+					// at or below the state-download pivot whose state was never executed.
+					// Runs synchronously here — snapBeaconStarted stays true so concurrent
+					// sync ticks remain in SNAP_RUNNING (snapRunningCheck returns immediately)
+					// until seeding completes, preventing TIP_CATCH from importing blocks
+					// before the snapshots exist. Analogous to A.97.4 for fast sync (#1862).
+					s.seedSnapPivotGapSnapshots()
 					s.snapPhase.Store(int32(phaseTipCatch))
 					s.snapBeaconStarted.Store(false)
+					// SYNC-06: kick the post-snap history backfill as a background
+					// goroutine so head-following (TIP_CATCH fullSyncOnce) is not blocked.
+					// runSnapHistoryBackfill carries its own one-shot CAS guard.
+					s.spawn(s.runSnapHistoryBackfill)
 				case downloader.SyncFailed:
 					log.Warn("xdcSyncer: snap-sync failed; falling back to FULL_SYNC",
 						"pivot", s.snapPivotBlock(), "err", ev.Err)
@@ -2091,6 +2358,18 @@ func (s *xdcSyncer) snapEventLoop() {
 					s.snapPhase.Store(int32(phaseTipCatch))
 					s.fastEngagementResolved.Store(true)
 					s.fastBeaconStarted.Store(false)
+					// SYNC-06 (fast-sync): kick the post-fast-sync history backfill
+					// as a background goroutine so TIP_CATCH head-following is not
+					// blocked. The downloader writes rawdb.WriteLastPivotNumber
+					// during fast sync, so runSnapHistoryBackfill will find the
+					// pivot from rawdb even though snapHistoryPivot was never set
+					// in-memory. The one-shot CAS guard prevents double-execution.
+					// This backfills headers/bodies/receipts for [1, pivot−1] that
+					// the skeleton skipped (skeleton stopped at the terminate floor
+					// set by SetFastSyncPivot), making eth_getBlockByNumber(1) and
+					// old receipts available on the fully-synced node.
+					// Refs: #1848 (SYNC-06), #1850.
+					s.spawn(s.runSnapHistoryBackfill)
 					// A.70 (refs #844 #859): re-apply cached V2 masternode-snapshot
 					// seeds. Fast-sync block-import's UpdateMasternodesFromHeader
 					// at gap blocks runs BEFORE this point and overwrites our
@@ -2204,9 +2483,20 @@ func (s *xdcSyncer) fullSyncOnce() {
 	localHead := cur.Number.Uint64()
 	fromBlock := localHead + 1
 
-	candidates := s.rankedPeers()
+	candidates := s.dropAbandonedPeers(s.rankedPeers(), fromBlock)
 	if len(candidates) == 0 {
 		return
+	}
+
+	// Record the starting block once per catch-up cycle (Fixes #1841).
+	// This is used to report progress in eth_syncing while behind peers.
+	s.bulkSyncStartBlock.CompareAndSwap(0, localHead)
+
+	// Fixes #1887: learn the real network tip (at most one fetch per 30s) so
+	// eth_syncing does not stop at the top of the last header batch.
+	if now := time.Now().UnixNano(); now-s.tipRefreshAt.Load() > int64(30*time.Second) {
+		s.tipRefreshAt.Store(now)
+		s.refreshOperatorPivotHead()
 	}
 
 	// A.75: parallel fan-out to top xdcMaxPeerTriesPerSync candidates.
@@ -2298,37 +2588,65 @@ func (s *xdcSyncer) fullSyncOnce() {
 	peer := res.peer
 	r := res.rng
 	headers := res.headers
-
-	// A.77+A.78: kick off lookahead header fetches for ranges 1..xdcLookaheadStreams
-	// from FRESH candidates — peers not queried in the fan-out round — concurrently
-	// with range-0 body fetch + InsertChain. Skipping raced peers prevents sending
-	// a second request to peers that already returned count=0 this round.
-	type lookaheadResult struct {
-		peer    *eth.Peer
-		headers []*types.Header
+	// #1429: XDPOS2 peers serve up to 192 headers but only 128 bodies per request,
+	// so range 0 can import at most xdcLookaheadRangeSize blocks. Cap it here so
+	// the lookahead ranges below start exactly where range 0's import ends.
+	if len(headers) > xdcLookaheadRangeSize {
+		headers = headers[:xdcLookaheadRangeSize]
 	}
+
+	// A.77+A.78+SYNC-12: kick off lookahead goroutines for ranges 1..xdcLookaheadStreams
+	// from FRESH candidates — peers not queried in the fan-out round — concurrently
+	// with range-0 body fetch + InsertChain. Skipping raced peers prevents sending a
+	// second request to peers that already returned count=0 this round.
+	//
+	// SYNC-12 pipeline: each goroutine now fetches BOTH headers and bodies on its
+	// assigned peer, so range N's bodies are already in flight while range N-1 imports.
+	// The collection loop uses pre-fetched bodies and skips the per-range fetchBodiesBatch
+	// call. If the goroutine times out on bodies, the collection loop returns (no retry).
 	lookaheadChs := make([]chan *lookaheadResult, 0, xdcLookaheadStreams)
+	lookaheadPeers := make([]*eth.Peer, 0, xdcLookaheadStreams)
+	busy := map[string]bool{peer.ID(): true} // peers already given a range this round
+	fetchRange := func(outCh chan *lookaheadResult, lhPeer *eth.Peer, from uint64) {
+		hdrs := s.fetchHeaderBatchTimeout(lhPeer, from, xdcLookaheadRangeSize, xdcBulkReqTimeout)
+		if len(hdrs) > 0 && hdrs[0].Number.Uint64() != from { // #1423: not the range we asked for
+			s.taintPeer(lhPeer)
+			hdrs = nil
+		}
+		// SYNC-12: pipeline — fetch bodies on the same peer immediately after
+		// headers, while range-0 body+IC runs concurrently on a different peer.
+		var bodies []eth.BlockBody
+		if len(hdrs) > 0 {
+			lhHashes := make([]common.Hash, len(hdrs))
+			for i, h := range hdrs {
+				lhHashes[i] = h.Hash()
+			}
+			bodies = s.fetchBodiesBatchTimeout(lhPeer, lhHashes, xdcBulkReqTimeout)
+		}
+		outCh <- &lookaheadResult{peer: lhPeer, headers: hdrs, bodies: bodies}
+	}
+	launch := func(p *eth.Peer, from uint64) {
+		ch := make(chan *lookaheadResult, 2) // room for the stream and one hedge
+		go fetchRange(ch, p, from)
+		busy[p.ID()] = true
+		lookaheadChs = append(lookaheadChs, ch)
+		lookaheadPeers = append(lookaheadPeers, p)
+	}
 	{
 		lhIdx := 0
 		for _, c := range candidates {
-			if lhIdx >= xdcLookaheadStreams {
+			// #1429: a short range 0 means the peer has nothing further to serve.
+			if lhIdx >= xdcLookaheadStreams || len(headers) < xdcLookaheadRangeSize {
 				break
 			}
 			// Skip the range-0 winner and any peer already raced this round.
 			if c.ID() == peer.ID() || racedIDs[c.ID()] {
 				continue
 			}
-			lhFrom := fromBlock + uint64(len(headers)) + uint64(lhIdx)*xdcLookaheadRangeSize
-			ch := make(chan *lookaheadResult, 1)
-			go func(outCh chan *lookaheadResult, lhPeer *eth.Peer, from uint64) {
-				hdrs := s.fetchHeaderBatchTimeout(lhPeer, from, xdcBatchSize, xdcBulkReqTimeout)
-				if len(hdrs) > 0 && hdrs[0].Number.Uint64() != from { // #1423: not the range we asked for
-					s.taintPeer(lhPeer)
-					hdrs = nil
-				}
-				outCh <- &lookaheadResult{peer: lhPeer, headers: hdrs}
-			}(ch, c, lhFrom)
-			lookaheadChs = append(lookaheadChs, ch)
+			// #1429: every range is xdcLookaheadRangeSize blocks, so range lhIdx+1
+			// starts right after range lhIdx ends.
+			lhFrom := fromBlock + uint64(lhIdx+1)*xdcLookaheadRangeSize
+			launch(c, lhFrom)
 			lhIdx++
 		}
 		if len(lookaheadChs) > 0 {
@@ -2338,11 +2656,15 @@ func (s *xdcSyncer) fullSyncOnce() {
 	}
 
 	// Fetch bodies for range 0 (concurrent with lookahead goroutines above).
+	// SYNC-12: use fetchBodiesHedged — if primary does not respond within
+	// xdcBodyHedgeDelay (800ms), issue the same request to the next-best candidate.
+	// Hard timeout is xdcBulkReqTimeout (4s). Verification is the same TxHash/UncleHash
+	// check in buildBlocks; the hedge peer must pass it or its blocks are dropped.
 	hashes := make([]common.Hash, len(headers))
 	for i, h := range headers {
 		hashes[i] = h.Hash()
 	}
-	bodies := s.fetchBodiesBatch(peer, hashes)
+	bodies := s.fetchBodiesHedged(peer, candidates, hashes)
 	if len(bodies) == 0 {
 		log.Debug("xdcSyncer: empty body batch", "headers", len(headers))
 		return
@@ -2353,39 +2675,91 @@ func (s *xdcSyncer) fullSyncOnce() {
 		log.Debug("xdcSyncer: no valid blocks to import")
 		return
 	}
+	if blocks = s.dropAwaitingM2(blocks); len(blocks) == 0 {
+		log.Debug("xdcSyncer: next block waits for its M2 co-signature", "from", fromBlock)
+		return
+	}
 
 	// Insert + execute range 0. #1423: only if the batch extends our head;
 	// InsertChain would otherwise reorg onto any known parent. A batch that
 	// doesn't is handled like an unknown ancestor, so the fork-heal below
-	// (co-signed sibling adoption, then rollback) decides what to do.
+	// (co-signed sibling adoption, then rollback) decides what to do. A V2
+	// batch whose parent is a stored side sibling of our head (a timeout
+	// re-proposal that won its QC) is imported too: it is higher than the head,
+	// so fork choice moves the head onto it as canonical XDPoSChain does.
 	n, err := 0, consensus.ErrUnknownAncestor
-	if blocks[0].ParentHash() == s.handler.chain.CurrentBlock().Hash() {
-		n, err = s.handler.chain.InsertChain(blocks)
+	head, xdpos := s.handler.chain.CurrentBlock(), s.handler.chain.Config().XDPoS
+	sideParentV2 := xdpos != nil && xdpos.V2 != nil && xdpos.V2.SwitchBlock != nil &&
+		head.Number.Cmp(xdpos.V2.SwitchBlock) > 0 &&
+		s.handler.chain.HasBlockAndState(blocks[0].ParentHash(), head.Number.Uint64())
+	if blocks[0].ParentHash() == head.Hash() || sideParentV2 {
+		n, err = s.insertChainResume(blocks)
 	}
 	if err != nil {
 		log.Warn("xdcSyncer: InsertChain failed",
 			"from", fromBlock, "attempted", len(blocks), "inserted", n, "err", err)
-		// #952 Option B: if the advertised NEXT block (at/just above our head) is
-		// persistently INVALID — a consensus-validation error, NOT a missing parent
-		// (ErrUnknownAncestor) — then the network is feeding bad blocks above our
-		// canonical tip and WE are at the valid tip. The at-tip XdcBulkSyncMode clear
-		// (#190) requires 3 consecutive at-tip heartbeats and never accumulates them
-		// under peer churn / a stale head when the chain is halted, so the miner stays
-		// gated forever. Clear XdcBulkSyncMode here so the producer can seal the valid
-		// successor and unwedge the chain (e.g. apothem halted at 83,088,791 by an
-		// out-of-bound 420M gas limit above our 419,589,845 head — #952). NON-MAINNET
-		// only: mainnet must never relax on a validation error. Guard on the peer being
-		// at the tip: fromBlock is always head+1, so it cannot tell "at tip" from "far
-		// behind" (#1427). A short header batch can: the peer has nothing past it, so
-		// the invalid block really sits at the network tip.
-		if !errors.Is(err, consensus.ErrUnknownAncestor) &&
-			s.handler.chain.Config().ChainID != nil &&
-			s.handler.chain.Config().ChainID.Uint64() != 50 {
-			if cur := s.handler.chain.CurrentBlock(); cur != nil && len(res.headers) < xdpos2MaxHeaderFetch {
-				if core.XdcBulkSyncMode.Load() {
-					log.Warn("xdcSyncer: #952 next block invalid at tip — clearing XdcBulkSyncMode so miner can seal the valid successor",
-						"from", fromBlock, "head", cur.Number.Uint64(), "err", err)
-					core.XdcBulkSyncMode.Store(false)
+		// #1670 / #952: if the delivering peer's block fails with a definitive
+		// consensus error (not ErrUnknownAncestor — missing parent; not
+		// ErrFutureBlock — early; not a transient local error such as a missing
+		// trie node or an already-known block), taint the peer to break the
+		// chainmu starvation loop.
+		//
+		// Root cause of #1670: the bad peer was never tainted, so rankedPeers()
+		// kept selecting it. Each selection held blockchain.chainmu for the
+		// duration of block execution (proportional to gas used in the block).
+		// The miner's commitMinedBlock→InsertChain calls TryLock — not Lock —
+		// and returned errChainStopped every time, so no valid successor block
+		// was ever produced. Tainting the peer lets rankedPeers() exclude it;
+		// subsequent cycles find no peer above us and the miner's TryLock wins.
+		//
+		// ONLY trigger on definitively invalid blocks (isDefinitiveInvalidBlockError).
+		// A missing trie node or an already-known block are OUR problem, not the
+		// peer's; tainting an honest peer for our own state gap silently forks us.
+		// ErrUnknownAncestor, ErrFutureBlock, ErrKnownBlock, MissingNodeError,
+		// errChainStopped, context errors, and I/O errors are all absent from the
+		// allowlist and return false — no taint, no bulk-mode change.
+		if isDefinitiveInvalidBlockError(err) {
+			// Taint on any chain: the chainmu-starvation problem is not specific
+			// to mainnet. Taint expires after xdcForkTaintTTL (60 s).
+			s.taintPeer(peer)
+
+			isMainnet := s.handler.chain.Config().ChainID != nil &&
+				s.handler.chain.Config().ChainID.Uint64() == 50
+			if !isMainnet {
+				// Hash blacklist: record the first failing block so
+				// fetchHeadersParallel can discard it even after the taint
+				// expires. NOT applied on mainnet — a local parity bug must not
+				// permanently blacklist a canonical block and split the node off.
+				if n < len(blocks) {
+					s.markConsensusFailedBlock(blocks[n].Hash())
+				}
+				// #952: clear XdcBulkSyncMode so the miner can seal the valid
+				// successor. "Mainnet must never relax on a validation error"
+				// (#952) — guard preserved.
+				// Two at-tip signals (#952 / #1427 / Hacken F-2026-19724):
+				//   (a) headFresh: the local head's timestamp is within the
+				//       atTipFreshnessWindow. This is local state — a peer
+				//       cannot influence it. A node far behind has a stale
+				//       head (hours old) and cannot pass this check regardless
+				//       of the peer's batch length. Replaces the old short-
+				//       batch check (len < 192), which was peer-controlled:
+				//       a malicious peer could return one invalid block and
+				//       clear bulk mode on a far-behind non-mainnet node.
+				//   (b) allNonTaintedPeersKnownBad: every remaining non-tainted
+				//       peer's head hash is in consensusFailedBlocks — handles
+				//       the multi-peer long-fork case where headFresh is false
+				//       but all valid-looking peers have bad heads.
+				if cur := s.handler.chain.CurrentBlock(); cur != nil {
+					freshnessSecs := atTipFreshnessWindow(s.handler.chain.Config())
+					age := time.Now().Unix() - int64(cur.Time)
+					headFresh := age >= 0 && age <= freshnessSecs
+					atTip := headFresh || s.allNonTaintedPeersKnownBad()
+					if atTip && core.XdcBulkSyncMode.Load() {
+						log.Warn("xdcSyncer: #1670 block invalid at peer head — tainting peer and clearing XdcBulkSyncMode so miner can seal the valid successor",
+							"peer", peer.ID(), "from", fromBlock,
+							"batch", len(res.headers), "err", err)
+						core.XdcBulkSyncMode.Store(false)
+					}
 				}
 			}
 		}
@@ -2425,26 +2799,78 @@ func (s *xdcSyncer) fullSyncOnce() {
 		}(blocks[len(blocks)-1].Header())
 	}
 
-	// A.77: collect and import lookahead ranges in order.
-	// Wait up to xdcBulkReqTimeout for each range; stop at first failure or gap.
-	for _, ch := range lookaheadChs {
-		var lhRes *lookaheadResult
-		select {
-		case lhRes = <-ch:
-		case <-time.After(xdcBulkReqTimeout):
-			return
-		case <-s.quitCh:
+	// CertiK XDC-10: re-verify any epoch-switch headers that were accepted during
+	// bulk sync without local masternode computation (calcMasternodes failed because
+	// the gap snapshot was absent). Now that InsertChain committed the batch, the
+	// snapshot should be available and calcMasternodes should succeed for those blocks.
+	// Steady-state fullVerify already accepts every canonical switch block, so reusing
+	// that exact check is the safety argument: if a canonical header fails here it was
+	// forged, not locally divergent.
+	if xdposE, ok := s.handler.chain.Engine().(*XDPoS.XDPoS); ok {
+		if v2E, ok2 := xdposE.EngineV2.(*engine_v2.XDPoS_v2); ok2 && v2E != nil {
+			if bad, recheckErr := v2E.RecheckDeferredSwitches(s.handler.chain); bad != nil {
+				log.Error("xdcSyncer: XDC-10 recheck: forged epoch-switch header detected, rolling back",
+					"block", bad.Number.Uint64(), "hash", bad.Hash(), "err", recheckErr)
+				if setHeadErr := s.handler.chain.SetHead(bad.Number.Uint64() - 1); setHeadErr != nil {
+					log.Error("xdcSyncer: XDC-10 SetHead failed after forged header",
+						"target", bad.Number.Uint64()-1, "err", setHeadErr)
+				}
+				s.taintPeer(peer)
+				return
+			}
+		}
+	}
+
+	// A.77 + SYNC-12: collect and import lookahead ranges in order.
+	// Each goroutine pre-fetched both headers and bodies, so the collection loop
+	// just waits for the goroutine result and imports immediately.
+	// Wait up to 2×xdcBulkReqTimeout per range (goroutine does two serial requests).
+	// Stop at the first empty header/body batch or non-contiguous range.
+	for i := 0; i < len(lookaheadChs); i++ {
+		ch := lookaheadChs[i]
+		lhRes := s.awaitLookaheadRange(ch, func() bool {
+			// SYNC-12 hedge: the best-ranked peer not yet used this round, else
+			// any peer other than the stream's own.
+			lhFrom := fromBlock + uint64(i+1)*xdcLookaheadRangeSize
+			var alt *eth.Peer
+			for _, c := range s.bodyRankedCandidates(candidates) {
+				if c.ID() == lookaheadPeers[i].ID() || s.isPeerTainted(c.ID()) {
+					continue
+				}
+				if !busy[c.ID()] {
+					alt = c
+					break
+				}
+				if alt == nil {
+					alt = c
+				}
+			}
+			if alt == nil {
+				return false
+			}
+			busy[alt.ID()] = true
+			log.Debug("xdcSyncer: lookahead hedge", "from", lhFrom, "slow", lookaheadPeers[i].ID()[:8], "hedge", alt.ID()[:8])
+			go fetchRange(ch, alt, lhFrom)
+			return true
+		})
+		if lhRes == nil {
 			return
 		}
 		if len(lhRes.headers) == 0 {
 			log.Info("xdcSyncer: A.77 lookahead empty", "peer", lhRes.peer.ID()[:8])
 			return
 		}
-		lhHashes := make([]common.Hash, len(lhRes.headers))
-		for i, h := range lhRes.headers {
-			lhHashes[i] = h.Hash()
+		// #1429: an earlier range imported fewer blocks than its size, so this one
+		// does not extend our head. That gap is local, not a fork: stop here and
+		// keep it away from the rollback trigger.
+		lhFrom := lhRes.headers[0].Number.Uint64()
+		if head := s.handler.chain.CurrentBlock().Number.Uint64(); lhFrom != head+1 {
+			log.Debug("xdcSyncer: A.77 lookahead range not contiguous with head",
+				"from", lhFrom, "head", head)
+			return
 		}
-		lhBodies := s.fetchBodiesBatch(lhRes.peer, lhHashes)
+		// SYNC-12: use bodies pre-fetched by the goroutine; stop if unavailable.
+		lhBodies := lhRes.bodies
 		if len(lhBodies) == 0 {
 			return
 		}
@@ -2452,11 +2878,10 @@ func (s *xdcSyncer) fullSyncOnce() {
 		if len(lhBlocks) == 0 {
 			return
 		}
-		lhFrom := lhRes.headers[0].Number.Uint64()
 		// #1423: same head-extension check as range 0.
 		lhN, lhErr := 0, consensus.ErrUnknownAncestor
 		if lhBlocks[0].ParentHash() == s.handler.chain.CurrentBlock().Hash() {
-			lhN, lhErr = s.handler.chain.InsertChain(lhBlocks)
+			lhN, lhErr = s.insertChainResume(lhBlocks)
 		}
 		if lhErr != nil {
 			log.Warn("xdcSyncer: A.77 lookahead InsertChain failed",
@@ -2472,6 +2897,13 @@ func (s *xdcSyncer) fullSyncOnce() {
 			"from", lhFrom, "count", lhN,
 			"newHead", s.handler.chain.CurrentBlock().Number.Uint64())
 
+		// SYNC-12 sliding window: the peer that delivered this full range is
+		// free, so give it the next range past the window. A short range means
+		// the peer has nothing further; the window then just drains.
+		if len(lhRes.headers) == xdcLookaheadRangeSize && len(lookaheadChs) < xdcLookaheadMaxRanges && !s.isPeerTainted(lhRes.peer.ID()) {
+			launch(lhRes.peer, fromBlock+uint64(len(lookaheadChs)+1)*xdcLookaheadRangeSize)
+		}
+
 		// Same highestQC advance for lookahead batches (canonical parity).
 		if engine, ok := s.handler.chain.Engine().(*XDPoS.XDPoS); ok {
 			go func(h *types.Header) {
@@ -2484,8 +2916,102 @@ func (s *xdcSyncer) fullSyncOnce() {
 	}
 }
 
+// insertChainResume imports blocks and, if the import stopped part-way with
+// ErrUnknownAncestor, imports the rest once more. In bulk sync a batch that
+// spans a V1 gap block can fail the XDPoS V1 snapshot walk-back a few blocks
+// later ("parents mismatch AND chain miss") although every parent is in the
+// batch; the same blocks import cleanly once their parents are committed. On
+// Apothem this ended a bulk-sync call every ~15 s. Validation is unchanged:
+// both attempts are full InsertChain calls. SYNC-12, refs #1869.
+func (s *xdcSyncer) insertChainResume(blocks types.Blocks) (int, error) {
+	n, err := s.handler.chain.InsertChain(blocks)
+	if err != nil && n > 0 && n < len(blocks) && errors.Is(err, consensus.ErrUnknownAncestor) {
+		m, err2 := s.handler.chain.InsertChain(blocks[n:])
+		log.Debug("xdcSyncer: resumed partial import", "from", blocks[n].NumberU64(), "inserted", m, "err", err2)
+		return n + m, err2
+	}
+	return n, err
+}
+
+// lookaheadResult is one A.77 lookahead range fetched from peer.
+type lookaheadResult struct {
+	peer    *eth.Peer
+	headers []*types.Header
+	bodies  []eth.BlockBody // SYNC-12: pre-fetched; nil if header or body fetch failed
+}
+
+// awaitLookaheadRange waits for one lookahead range on ch. If no complete
+// answer (headers and bodies) arrives within xdcLookaheadHedgeDelay, or the
+// first answer is incomplete, it calls hedge once to fetch the same range from
+// another peer, then returns the first complete answer. It returns the last
+// incomplete answer when every fetch came back incomplete, and nil on the
+// 2×xdcBulkReqTimeout deadline or shutdown. SYNC-12, refs #1869.
+func (s *xdcSyncer) awaitLookaheadRange(ch chan *lookaheadResult, hedge func() bool) *lookaheadResult {
+	hedgeTimer := time.NewTimer(xdcLookaheadHedgeDelay)
+	defer hedgeTimer.Stop()
+	deadline := time.NewTimer(2 * xdcBulkReqTimeout)
+	defer deadline.Stop()
+	pending, hedged := 1, false
+	for {
+		select {
+		case r := <-ch:
+			pending--
+			if len(r.headers) > 0 && len(r.bodies) > 0 {
+				return r
+			}
+			if !hedged {
+				hedged = true
+				if hedge() {
+					pending++
+				}
+			}
+			if pending == 0 {
+				return r
+			}
+		case <-hedgeTimer.C:
+			if !hedged {
+				hedged = true
+				if hedge() {
+					pending++
+				}
+			}
+		case <-deadline.C:
+			return nil
+		case <-s.quitCh:
+			return nil
+		}
+	}
+}
+
 // buildBlocks pairs headers with bodies into types.Blocks. Stops at the first
 // malformed body. Used by fullSyncOnce for both range-0 and A.77 lookahead ranges.
+// dropAwaitingM2 cuts the batch before the first V1 block that still waits for
+// its assigned M2's co-signature. A legacy V1 creator serves its own block from
+// its head until the co-signed block replaces it, so a peer at the tip can answer
+// a header request with it. Importing it only fails verification with
+// ErrNoValidatorSignature and reports a BAD BLOCK. Canonical XDPoSChain does not
+// insert such a block (eth/fetcher/block_fetcher.go:734-756); the co-signed block
+// is fetched on a later tick. Acceptance is unchanged: the block is refused either way.
+func (s *xdcSyncer) dropAwaitingM2(blocks types.Blocks) types.Blocks {
+	// Only the tip block can wait for its co-signature; a co-signed V1 block and
+	// every V2 block carry a non-empty Validator.
+	if len(blocks[len(blocks)-1].Header().Validator) != 0 {
+		return blocks
+	}
+	headers := make([]*types.Header, len(blocks))
+	for i, b := range blocks {
+		headers[i] = b.Header()
+	}
+	abort, results := s.handler.chain.Engine().VerifyHeaders(s.handler.chain, headers)
+	defer close(abort)
+	for i, h := range headers {
+		if err := <-results; len(h.Validator) == 0 && errors.Is(err, XDPoS.ErrNoValidatorSignature) {
+			return blocks[:i]
+		}
+	}
+	return blocks
+}
+
 func (s *xdcSyncer) buildBlocks(headers []*types.Header, bodies []eth.BlockBody) types.Blocks {
 	pairCount := len(bodies)
 	if pairCount > len(headers) {
@@ -2508,6 +3034,14 @@ func (s *xdcSyncer) buildBlocks(headers []*types.Header, bodies []eth.BlockBody)
 			if wd, err := bodies[i].Withdrawals.Items(); err == nil {
 				body.Withdrawals = wd
 			}
+		}
+		// A body that does not belong to its header (a late reply to an earlier
+		// request, or a bad peer) must not reach InsertChain: there it fails as
+		// an invalid block, taints the peer and, off mainnet, blacklists the
+		// canonical block hash. Cut the batch here; the rest is refetched.
+		if !verifyBodyAgainstHeader(headers[i], &body) {
+			log.Debug("xdcSyncer: body does not match header", "number", headers[i].Number, "idx", i)
+			break
 		}
 		blocks = append(blocks, types.NewBlockWithHeader(headers[i]).WithBody(body))
 	}
@@ -2537,12 +3071,23 @@ func (s *xdcSyncer) buildBlocks(headers []*types.Header, bodies []eth.BlockBody)
 // window that re-stamps the miner cooldown and churns the head), so the head stays
 // fresh, XdcBulkSyncMode flips false at-tip, and the miner ungates.
 //
+// The co-signed sibling may already be stored locally as a non-canonical side-chain
+// block (e.g. it was once inserted as a same-height sibling via NewBlock gossip but
+// never won the fork choice because equal-TD blocks keep the existing canonical head).
+// In that case HasBlock returns true but GetCanonicalHash returns the unsigned twin's
+// hash. This function detects that sub-case and adopts the stored sibling directly
+// (no network fetch needed) by calling InsertChain — the ErrKnownBlock path triggers
+// writeKnownBlock → bc.reorg, swapping canonical from the unsigned to the co-signed
+// twin in one step. This was the live failure mode on net2002: co-signed-2488 was in
+// the sealer's DB as a side chain, so the old HasBlock guard returned false prematurely
+// and the node looped in maybeRollbackOnUnknownAncestor forever.
+//
 // V1-only and gated strictly above Epoch (V2 uses QC-chain fork choice, not the
 // single-signature header.Validator). Uses only existing primitives — no wire, rawdb,
 // core, or consensus change, and zero change to block bytes (we adopt the legacy
-// canonical co-signed block verbatim). Returns true iff the sibling was fetched,
-// inserted, and the batch re-imported successfully; any miss returns false so the
-// caller falls back to maybeRollbackOnUnknownAncestor. Refs #951.
+// canonical co-signed block verbatim). Returns true iff the sibling was adopted and
+// the batch re-imported successfully; any miss returns false so the caller falls back
+// to maybeRollbackOnUnknownAncestor. Refs #951.
 func (s *xdcSyncer) adoptCoSignedSibling(blocks types.Blocks, peer *eth.Peer) bool {
 	if len(blocks) == 0 || peer == nil {
 		return false
@@ -2563,11 +3108,46 @@ func (s *xdcSyncer) adoptCoSignedSibling(blocks types.Blocks, peer *eth.Peer) bo
 		return false
 	}
 	parentHash := first.ParentHash()
-	// If we already have the batch's parent, the failure is not the empty/co-signed
-	// sibling case — let the normal rollback path handle it.
+
+	// Check if the co-signed sibling is already in our local block database.
 	if s.handler.chain.HasBlock(parentHash, parentNum) {
-		return false
+		// Two cases:
+		//   (a) Already CANONICAL: blocks[0].ParentHash() == CurrentBlock().Hash() should
+		//       be true, so the #1496 guard would have let InsertChain run. If it ran and
+		//       failed with ErrUnknownAncestor, the cause is a deeper missing ancestor —
+		//       not an unsigned/co-signed split. Let rollback handle it.
+		//   (b) NON-CANONICAL (side chain): the co-signed twin was stored as a side-chain
+		//       block (e.g. equal-TD NewBlock sibling insertion) but never became the
+		//       canonical head. Adopt it directly: InsertChain on a known block triggers
+		//       the ErrKnownBlock → writeKnownBlock → bc.reorg path, swapping canonical
+		//       from the unsigned twin to the co-signed twin in one step.
+		if s.handler.chain.GetCanonicalHash(parentNum) == parentHash {
+			// Case (a): already canonical; the failure has a different cause.
+			return false
+		}
+		// Case (b): known but non-canonical — reorg to it directly from local DB.
+		sib := s.handler.chain.GetBlock(parentHash, parentNum)
+		if sib == nil {
+			return false
+		}
+		if _, err := s.handler.chain.InsertChain(types.Blocks{sib}); err != nil {
+			log.Debug("xdcSyncer: adopt co-signed sibling — known-sibling reorg failed",
+				"number", parentNum, "hash", parentHash, "err", err)
+			return false
+		}
+		if _, err := s.handler.chain.InsertChain(blocks); err != nil {
+			log.Warn("xdcSyncer: adopt co-signed sibling — batch re-insert after known-sibling reorg failed",
+				"from", first.NumberU64(), "err", err)
+			return false
+		}
+		log.Info("xdcSyncer: adopted co-signed sibling (known non-canonical, Defect 1c Part B-ext)",
+			"siblingNum", parentNum, "siblingHash", parentHash,
+			"newHead", s.handler.chain.CurrentBlock().Number.Uint64())
+		core.XdcForkRecovering.Store(false)
+		return true
 	}
+
+	// Sibling not in DB — fetch from the peer that served the batch.
 	// Fetch the co-signed sibling (the batch's missing parent) by hash from the same
 	// peer that served the batch — a by-hash request returns exactly that block.
 	hdr := s.fetchHeaderByHash(peer, parentHash)
@@ -2750,6 +3330,20 @@ func (s *xdcSyncer) repairAnchorGapBodies(peer *eth.Peer) {
 	s.anchorGapRepaired.Store(true)
 }
 
+// rollbackWindow returns the exponential rollback window for a given cumulative
+// rolled-back count. The shift is capped so the result never exceeds
+// xdcRollbackWindowMax and never wraps to zero via uint64 overflow.
+// (For stuckRolledBack in 7296..8191 the shift would be 57..63, making
+// 128*(1<<shift) overflow to 0 in uint64 — issue #1762.)
+func rollbackWindow(rolledBack uint64) uint64 {
+	const maxShift = 6 // 128 << 6 == 8192 == xdcRollbackWindowMax
+	shift := rolledBack / xdcRollbackWindowInit
+	if shift > maxShift {
+		shift = maxShift
+	}
+	return uint64(xdcRollbackWindowInit) * (1 << shift)
+}
+
 // maybeRollbackOnUnknownAncestor implements geth-aligned self-healing for
 // the V2 BFT competing-slot fork issue (issue #801). When our local tip
 // lands on a non-canonical block produced in the same slot as canonical,
@@ -2791,18 +3385,46 @@ func (s *xdcSyncer) maybeRollbackOnUnknownAncestor(fromBlock uint64, peer *eth.P
 		return
 	}
 	if fromBlock != s.stuckFrom {
+		// A failure at a new height means the head moved since the last one, so
+		// we are not stuck on a fork: drop any pause raised for the old height.
+		// The flag was otherwise cleared only by a successful syncer batch, and a
+		// live validator gets most blocks by propagation, so it could stay set
+		// and silently skip every turn (Apothem 0x11C3 minted 4 blocks in an
+		// epoch and was penalised).
 		s.stuckFrom = fromBlock
 		s.stuckFailures = 1
+		core.XdcForkRecovering.Store(false)
 		return
 	}
 	s.stuckFailures++
-	// #951: signal the miner to pause sealing while we're fork-side. Set as soon
-	// as failures begin accumulating (before the rollback threshold) so a
-	// producer doesn't keep minting on the orphaned tip and recreate the fork.
-	core.XdcForkRecovering.Store(true)
+	// #951: signal the miner to pause sealing while we're fork-side, before the
+	// rollback threshold, so a producer doesn't keep minting on the orphaned tip
+	// and recreate the fork. Wait for half the threshold at the same height: a
+	// live validator sees 1-3 transient failures at most heights (propagation
+	// races), and pausing on the second one made it skip its turns. A real fork
+	// still repeats every ~0.5 s and reaches this within ~2 s.
+	if s.stuckFailures >= xdcUnknownAncestorThreshold/2 {
+		core.XdcForkRecovering.Store(true)
+	}
 	if s.stuckFailures < xdcUnknownAncestorThreshold {
 		return
 	}
+	cur := s.handler.chain.CurrentBlock()
+	if cur == nil {
+		return
+	}
+
+	// Reset window escalation once the chain has advanced past the head we had
+	// when we last rolled back — the previous stuck episode resolved, so the
+	// doubling counter should start fresh.  Must happen before computing window
+	// so the reset takes effect for the current trigger (refs #1667 accounting fix).
+	if s.stuckLastRollbackHead > 0 && cur.Number.Uint64() > s.stuckLastRollbackHead {
+		log.Debug("xdcSyncer: chain advanced past last rollback head — resetting rollback window",
+			"lastRollbackHead", s.stuckLastRollbackHead, "curHead", cur.Number.Uint64())
+		s.stuckRolledBack = 0
+		s.stuckLastRollbackHead = 0
+	}
+
 	if s.stuckRolledBack >= xdcRollbackWindowMax {
 		log.Error("xdcSyncer: stuck on fork past rollback cap — manual intervention required",
 			"from", fromBlock, "rolledBack", s.stuckRolledBack,
@@ -2810,24 +3432,161 @@ func (s *xdcSyncer) maybeRollbackOnUnknownAncestor(fromBlock uint64, peer *eth.P
 		return
 	}
 	// Window doubles each consecutive trigger so we escape quickly from deep forks.
-	window := uint64(xdcRollbackWindowInit) * (1 << (s.stuckRolledBack / xdcRollbackWindowInit))
+	// rollbackWindow caps the shift to prevent uint64 overflow when stuckRolledBack
+	// is in the range 7296..8191 (shift 57..63 would wrap 128*(1<<shift) to 0).
+	window := rollbackWindow(s.stuckRolledBack)
 	if window+s.stuckRolledBack > xdcRollbackWindowMax {
 		window = xdcRollbackWindowMax - s.stuckRolledBack
 	}
-	cur := s.handler.chain.CurrentBlock()
-	if cur == nil || cur.Number.Uint64() <= window {
+	if window == 0 {
+		// Budget exhausted: treat as cap-path so no SetHead or cooldown stamp occurs.
+		log.Error("xdcSyncer: stuck on fork past rollback cap — manual intervention required",
+			"from", fromBlock, "rolledBack", s.stuckRolledBack,
+			"cap", xdcRollbackWindowMax)
 		return
 	}
+	if cur.Number.Uint64() <= window {
+		return
+	}
+
 	target := cur.Number.Uint64() - window
+
+	// Items 2+3 (#1667): Positive fork evidence — only roll back when at least
+	// one peer reports a different canonical hash at our head height.
+	//
+	// Strategy:
+	//   1. Ask the triggering peer.  If it agrees on our head hash the failures
+	//      were transient (out-of-order delivery under 2K TPS load) — clear and
+	//      return.  If it disagrees, fork is confirmed.
+	//   2. If the triggering peer times out or is behind our head (inconclusive),
+	//      poll ranked peers in turn.  First conclusive answer wins: agree →
+	//      clear+return, disagree → confirmed.
+	//   3. If no peer gives a conclusive answer, skip the rollback entirely and
+	//      log at Debug — the inconclusive path under load must not trigger
+	//      spurious SetHead calls (refs #1667 network-load fix).
+	clearAndReturn := func(reason, peerID string) {
+		log.Debug("xdcSyncer: "+reason,
+			"head", cur.Number.Uint64(), "hash", cur.Hash(), "peer", peerID)
+		s.stuckFrom = 0
+		s.stuckFailures = 0
+		core.XdcForkRecovering.Store(false)
+	}
+
+	forkConfirmed := false
+	triggerDisagrees := false
+	if peer != nil {
+		peerAtHead := s.fetchHeaderBatchTimeout(peer, cur.Number.Uint64(), 1, xdcBulkReqTimeout)
+		if len(peerAtHead) > 0 && peerAtHead[0].Number.Uint64() == cur.Number.Uint64() {
+			if peerAtHead[0].Hash() == cur.Hash() {
+				clearAndReturn("peer agrees on head — ErrUnknownAncestor was transient (refs #1667)", peer.ID())
+				return
+			}
+			triggerDisagrees = true // triggering peer sees a different block at our height
+		}
+		// else: inconclusive — peer timed out or is behind our head
+	}
+
+	if !forkConfirmed {
+		// Consult ranked peers: when the triggering peer was nil or inconclusive,
+		// or when it disagrees with our head. A single peer on another branch (a
+		// stale pre-fork chain, a non-canonical third-party client) must not roll
+		// back a node that the rest of the network agrees with: on Apothem one such
+		// peer forced a rollback plus a 60 s mint cooldown every ~23 blocks, and the
+		// validator missed its turn each time. If another peer agrees with our head,
+		// taint the triggering peer and keep the head.
+		for _, altPeer := range s.rankedPeers() {
+			if altPeer == peer || s.isPeerTainted(altPeer.ID()) {
+				continue
+			}
+			altHdrs := s.fetchHeaderBatchTimeout(altPeer, cur.Number.Uint64(), 1, xdcBulkReqTimeout)
+			if len(altHdrs) == 0 || altHdrs[0].Number.Uint64() != cur.Number.Uint64() {
+				continue // inconclusive
+			}
+			if altHdrs[0].Hash() == cur.Hash() {
+				if triggerDisagrees {
+					s.taintPeer(peer)
+					log.Warn("xdcSyncer: triggering peer is on another branch but an alt peer agrees on our head — tainting peer, no rollback",
+						"head", cur.Number.Uint64(), "hash", cur.Hash(), "peer", peer.ID(), "altPeer", altPeer.ID())
+				}
+				clearAndReturn("alt peer agrees on head — ErrUnknownAncestor was transient (refs #1667)", altPeer.ID())
+				return
+			}
+			forkConfirmed = true
+			break
+		}
+		// No other peer was conclusive. Right after a new head, alt peers often
+		// do not have it yet, so a single peer on a side branch rolled back a
+		// canonical head every few minutes on Apothem (60 s mint cooldown each).
+		// Defer once and re-check at the next episode; if the head has not moved
+		// and still only the triggering peer is conclusive, trust it (e.g. a node
+		// with a single peer).
+		if !forkConfirmed && triggerDisagrees {
+			if s.singlePeerForkHead == cur.Hash() {
+				forkConfirmed = true
+			} else {
+				s.singlePeerForkHead = cur.Hash()
+				clearAndReturn("only the triggering peer disagrees and no other peer is conclusive — deferring rollback to the next episode", peer.ID())
+				return
+			}
+		}
+	}
+
+	if !forkConfirmed {
+		log.Debug("xdcSyncer: no peer gave conclusive fork evidence — skipping rollback (inconclusive under load) (refs #1667)",
+			"head", cur.Number.Uint64(), "hash", cur.Hash(), "failedFrom", fromBlock)
+		s.stuckFrom = 0
+		s.stuckFailures = 0
+		core.XdcForkRecovering.Store(false)
+		return
+	}
+
+	// Item 1 (#1667, revised): Finality clamp — clamp the rollback target to
+	// the last committed (QC-finalized) block rather than skipping the rollback.
+	//
+	// On XDPoS V2 the committed tip trails head by only ~3 rounds, far less than
+	// the 128-block window, so a plain "skip if target ≤ finalized" would
+	// disable #801/#802/#951 fork recovery on every V2 trigger.  A real BFT fork
+	// can only exist above the committed tip; clamping is both safe and sufficient.
+	// When CurrentFinalBlock is nil (V1 era / no commits yet) keep existing
+	// unclamped behaviour.
+	if finalized := s.handler.chain.CurrentFinalBlock(); finalized != nil {
+		finalN := finalized.Number.Uint64()
+		if target < finalN {
+			log.Debug("xdcSyncer: clamping rollback target to finalized block (refs #1667)",
+				"unclamped", target, "finalized", finalN,
+				"localHead", cur.Number.Uint64(), "window", window)
+			target = finalN
+		}
+		// After clamping, if target is at or above the current head there is
+		// nothing to roll back.  Clear stuck state and miner gate instead.
+		if target >= cur.Number.Uint64() {
+			log.Warn("xdcSyncer: rollback target at or above head after finality clamp — clearing stuck state (refs #1667)",
+				"target", target, "localHead", cur.Number.Uint64())
+			core.XdcForkRecovering.Store(false)
+			s.stuckFrom = 0
+			s.stuckFailures = 0
+			return
+		}
+	}
+
+	// Real competing-slot fork confirmed.  Proceed with taint + rollback.
 	// Mark this peer as fork-tainted so rankedPeers() skips them for xdcForkTaintTTL.
 	// This is the geth-aligned peer rotation that prevents post-rollback bulk-sync
 	// from re-importing the same fork via the same peer (issue #802 task 2).
-	s.taintPeer(peer)
+	// Guard nil: when forkConfirmed came from an alt-peer and the triggering peer
+	// disconnected mid-check, peer may be nil.
+	taintedPeerID := ""
+	if peer != nil {
+		s.taintPeer(peer)
+		taintedPeerID = peer.ID()
+	}
+	actual := cur.Number.Uint64() - target // actual distance moved, not the intended window
 	log.Warn("xdcSyncer: fork detected — rolling back to escape competing-slot block (refs #801)",
 		"localHead", cur.Number.Uint64(), "localHash", cur.Hash(),
 		"failedFrom", fromBlock, "consecutiveFailures", s.stuckFailures,
-		"rollbackTo", target, "window", window, "cumulative", s.stuckRolledBack+window,
-		"taintedPeer", peer.ID(),
+		"rollbackTo", target, "window", window, "actual", actual,
+		"cumulative", s.stuckRolledBack+actual,
+		"taintedPeer", taintedPeerID,
 		"trigger", err.Error())
 	if err := s.handler.chain.SetHead(target); err != nil {
 		log.Error("xdcSyncer: SetHead failed during rollback", "target", target, "err", err)
@@ -2838,7 +3597,13 @@ func (s *xdcSyncer) maybeRollbackOnUnknownAncestor(fromBlock uint64, peer *eth.P
 	// this, the miner re-mints its superseded in-turn block the instant it re-reaches
 	// the contested height, recreating the fork (head bounced 143↔784, never past 785).
 	core.XdcLastForkRollbackUnix.Store(time.Now().Unix())
-	s.stuckRolledBack += window
+	// Accounting fix (#1667): add the ACTUAL blocks rolled back (cur − target), not
+	// the intended window.  Under V2 finality clamp the actual distance is typically
+	// only 3-4 blocks while the window is 128+; using window caused stuckRolledBack
+	// to hit xdcRollbackWindowMax after a handful of tiny rollbacks, permanently
+	// stalling an otherwise-healthy node.
+	s.stuckRolledBack += actual
+	s.stuckLastRollbackHead = cur.Number.Uint64()
 	s.stuckFrom = 0
 	s.stuckFailures = 0
 }
@@ -2878,6 +3643,352 @@ func (s *xdcSyncer) isPeerTainted(peerID string) bool {
 	return false
 }
 
+// incPeerEmptyStrike records that peer returned 0 headers for an in-range
+// request. After xdcPeerEmptyStrikeMax strikes the peer is put on a cooldown
+// for xdcPeerEmptyCooldownTTL and excluded from rankedPeers(). (#1872)
+func (s *xdcSyncer) incPeerEmptyStrike(peerID string) {
+	s.emptyStrikesMu.Lock()
+	if s.emptyStrikes == nil {
+		s.emptyStrikes = make(map[string]int)
+	}
+	s.emptyStrikes[peerID]++
+	n := s.emptyStrikes[peerID]
+	s.emptyStrikesMu.Unlock()
+
+	if n >= xdcPeerEmptyStrikeMax {
+		s.emptyCooldownMu.Lock()
+		if s.emptyCooldown == nil {
+			s.emptyCooldown = make(map[string]time.Time)
+		}
+		if _, alreadyCooling := s.emptyCooldown[peerID]; !alreadyCooling {
+			log.Debug("xdcSyncer: peer put on empty-response cooldown",
+				"peer", peerID, "strikes", n, "ttl", xdcPeerEmptyCooldownTTL)
+			s.emptyCooldown[peerID] = time.Now()
+		}
+		s.emptyCooldownMu.Unlock()
+	}
+}
+
+// resetPeerEmptyStrike clears the strike counter and any cooldown for a peer
+// that just served a successful header batch.
+func (s *xdcSyncer) resetPeerEmptyStrike(peerID string) {
+	s.emptyStrikesMu.Lock()
+	delete(s.emptyStrikes, peerID)
+	s.emptyStrikesMu.Unlock()
+
+	s.emptyCooldownMu.Lock()
+	delete(s.emptyCooldown, peerID)
+	s.emptyCooldownMu.Unlock()
+}
+
+// isPeerOnEmptyCooldown returns true if the peer is currently on an
+// empty-response cooldown. Prunes expired entries inline.
+func (s *xdcSyncer) isPeerOnEmptyCooldown(peerID string) bool {
+	s.emptyCooldownMu.Lock()
+	defer s.emptyCooldownMu.Unlock()
+	if s.emptyCooldown == nil {
+		return false
+	}
+	t, ok := s.emptyCooldown[peerID]
+	if !ok {
+		return false
+	}
+	if time.Since(t) > xdcPeerEmptyCooldownTTL {
+		delete(s.emptyCooldown, peerID)
+		return false
+	}
+	return true
+}
+
+// isDefinitiveInvalidBlockError reports whether err from InsertChain proves
+// that the block itself is invalid — not a local state gap, a liveness
+// failure, or a transient condition. Uses an explicit allowlist: only errors
+// known to originate from VerifyHeader, VerifyBody, or ValidateState checks
+// are considered definitive. Everything else (ErrUnknownAncestor,
+// ErrFutureBlock, ErrKnownBlock, MissingNodeError, errChainStopped,
+// errInsertionInterrupted, context errors, I/O errors) returns false — the
+// peer is not tainted for our own failures.
+//
+// Call sites use errors.Is where the sentinel is exported. Unexported
+// engine_v1 sentinels are matched by their fixed Error() strings; format
+// errors from block_validator.go (no sentinel) are matched by string prefix,
+// annotated with the source file:line.
+func isDefinitiveInvalidBlockError(err error) bool {
+	if err == nil {
+		return false
+	}
+	// A missing trie node means our own state is incomplete, not that the block
+	// is invalid. block_validator.go:251 wraps statedb.Error() (which may be a
+	// MissingNodeError) inside "invalid merkle root" via %w — check first so
+	// the merkle-root prefix match below is not reached for that case.
+	var missing *trie.MissingNodeError
+	if errors.As(err, &missing) {
+		return false
+	}
+
+	// Typed sentinels (errors.Is unwraps chains).
+
+	// consensus/errors.go
+	if errors.Is(err, consensus.ErrInvalidNumber) ||
+		errors.Is(err, consensus.ErrInvalidTerminalBlock) {
+		return true
+	}
+	// consensus/XDPoS/xdpos.go
+	if errors.Is(err, XDPoS.ErrInvalidTimestamp) ||
+		errors.Is(err, XDPoS.ErrInvalidCheckpointValidators) {
+		return true
+	}
+	// consensus/XDPoS/utils/errors.go — V2 errors
+	if errors.Is(err, xdcutils.ErrInvalidQC) ||
+		errors.Is(err, xdcutils.ErrInvalidQCSignatures) ||
+		errors.Is(err, xdcutils.ErrInvalidTC) ||
+		errors.Is(err, xdcutils.ErrInvalidTCSignatures) ||
+		errors.Is(err, xdcutils.ErrInvalidVote) ||
+		errors.Is(err, xdcutils.ErrInvalidTimeout) ||
+		errors.Is(err, xdcutils.ErrInvalidUncleHash) ||
+		errors.Is(err, xdcutils.ErrInvalidDifficulty) ||
+		errors.Is(err, xdcutils.ErrInvalidV2Extra) ||
+		errors.Is(err, xdcutils.ErrInvalidQuorumCert) ||
+		errors.Is(err, xdcutils.ErrInvalidTimestamp) ||
+		errors.Is(err, xdcutils.ErrRoundInvalid) ||
+		errors.Is(err, xdcutils.ErrInvalidCheckpointVote) ||
+		errors.Is(err, xdcutils.ErrEmptyEpochSwitchValidators) ||
+		errors.Is(err, xdcutils.ErrInvalidMixDigest) ||
+		errors.Is(err, xdcutils.ErrInvalidSignature) ||
+		errors.Is(err, xdcutils.ErrNoValidatorSignatureV2) {
+		return true
+	}
+	// consensus/XDPoS/utils/errors.go — V1 engine errors (exported there even
+	// though engine_v1/engine.go may carry private copies with identical strings)
+	if errors.Is(err, xdcutils.ErrInvalidCheckpointBeneficiary) ||
+		errors.Is(err, xdcutils.ErrMissingVanity) ||
+		errors.Is(err, xdcutils.ErrMissingSignature) ||
+		errors.Is(err, xdcutils.ErrExtraSigners) ||
+		errors.Is(err, xdcutils.ErrInvalidCheckpointPenalties) ||
+		errors.Is(err, xdcutils.ErrInvalidVotingChain) ||
+		errors.Is(err, xdcutils.ErrUnauthorized) ||
+		errors.Is(err, xdcutils.ErrInvalidCheckpointSigners) ||
+		errors.Is(err, xdcutils.ErrFailedDoubleValidation) {
+		return true
+	}
+
+	// String-matched errors: fmt.Errorf format strings without exported
+	// sentinels, and engine_v1 private sentinel strings that cannot be reached
+	// via errors.Is from outside the package.
+	msg := err.Error()
+
+	// engine_v1/engine.go private ErrUnauthorized — identical string to
+	// xdcutils.ErrUnauthorized but a separate errors.New instance; the
+	// errors.Is check above catches the utils copy, this catches the private one.
+	if msg == "unauthorized" {
+		return true
+	}
+
+	// fmt.Errorf format errors from consensus engines (no exported sentinel):
+	//   ethash/consensus.go: "invalid difficulty: have %v, want %v"
+	//   engine_v1/engine.go: "invalid difficulty" (same prefix, private sentinel)
+	//   engine_v1/engine.go: "invalid timestamp" (same prefix as utils sentinel)
+	return strings.HasPrefix(msg, "invalid difficulty") || // ethash + engine_v1
+		strings.HasPrefix(msg, "invalid timestamp") || // engine_v1 (also utils via errors.Is above)
+		// core/block_validator.go ValidateState (no sentinel):
+		strings.HasPrefix(msg, "invalid merkle root") || // block_validator.go:251 (%w, MissingNode excluded above)
+		strings.HasPrefix(msg, "invalid gas used") || // block_validator.go:203
+		strings.HasPrefix(msg, "invalid bloom") || // block_validator.go:210
+		strings.HasPrefix(msg, "invalid receipt root hash") || // block_validator.go:220
+		// core/block_validator.go ValidateBody (no sentinel):
+		strings.HasPrefix(msg, "uncle root hash mismatch") || // block_validator.go:69
+		strings.HasPrefix(msg, "transaction root hash mismatch") // block_validator.go:72
+}
+
+// allNonTaintedPeersKnownBad returns true if every non-tainted peer's
+// advertised head hash is in consensusFailedBlocks. When true, no valid peer
+// is advertising a head above ours that we should sync to — the bad peer we
+// just tainted was the last one with a valid-looking head. Used to clear
+// XdcBulkSyncMode in the multi-peer long-fork case (len ≥ 192) where the
+// short-batch #1427 guard alone is insufficient.
+//
+// Returns false when there are no non-tainted peers, to avoid the degenerate
+// case where all peers are tainted for unrelated reasons (we might genuinely
+// be far behind).
+func (s *xdcSyncer) allNonTaintedPeersKnownBad() bool {
+	peers := s.rankedPeers() // excludes tainted peers
+	if len(peers) == 0 {
+		return false // all peers tainted — can't conclude we're at canonical tip
+	}
+	for _, p := range peers {
+		rng := p.BlockRange()
+		if rng == nil || rng.LatestBlockHash == (common.Hash{}) {
+			return false // unknown head hash — conservatively treat as valid
+		}
+		if !s.isConsensusFailedBlock(rng.LatestBlockHash) {
+			return false // this peer's head is not known-bad
+		}
+	}
+	return true
+}
+
+// markConsensusFailedBlock records hash as a block that failed InsertChain with
+// a definitive consensus error. Capped at maxConsensusFailedBlocks to bound memory.
+// Fixes #1670.
+func (s *xdcSyncer) markConsensusFailedBlock(hash common.Hash) {
+	s.consensusFailedBlocksMu.Lock()
+	defer s.consensusFailedBlocksMu.Unlock()
+	if s.consensusFailedBlocks == nil {
+		s.consensusFailedBlocks = make(map[common.Hash]struct{})
+	}
+	if len(s.consensusFailedBlocks) < maxConsensusFailedBlocks {
+		s.consensusFailedBlocks[hash] = struct{}{}
+	}
+}
+
+// isConsensusFailedBlock returns true if hash was recorded by markConsensusFailedBlock.
+func (s *xdcSyncer) isConsensusFailedBlock(hash common.Hash) bool {
+	s.consensusFailedBlocksMu.Lock()
+	defer s.consensusFailedBlocksMu.Unlock()
+	if s.consensusFailedBlocks == nil {
+		return false
+	}
+	_, ok := s.consensusFailedBlocks[hash]
+	return ok
+}
+
+// xdcForkGuards pins one canonical block per chain after a chain rewind. A
+// peer still following the abandoned branch announces a head above the real
+// tip, and the sync tip is taken from peers' announced heads, so such a peer
+// could steer fast or snap sync onto the dead branch (#1876). A head above the
+// pinned height is used as a sync tip only if the same peer serves the pinned
+// block. Apothem rewound to 83,599,999 for the v2.9 rules; 84,000,000 is past it
+// (hash checked against two local nodes and three public Apothem RPCs).
+var xdcForkGuards = map[uint64]struct {
+	Number uint64
+	Hash   common.Hash
+}{
+	51: {84_000_000, common.HexToHash("0x6c715a4644acbda91545108bec722921164941d08e58173bf78095570b195782")},
+}
+
+// xdcTipExtendMaxBatches bounds extendToPeerTip (192 headers per batch).
+const xdcTipExtendMaxBatches = 64
+
+// extendToPeerTip walks forward from h on the peer that served it, following
+// parent links, and returns the newest header it has. A peer's announced head
+// is the one from its handshake unless it sends block-range updates, which
+// xdpos2 v100 peers do not; an hour after connecting it is ~1,800 blocks old.
+// A snap pivot taken from it names a root that peers have already pruned, so
+// every attempt downloaded nothing (#1884). Stops at the first short or
+// non-linking batch.
+func (s *xdcSyncer) extendToPeerTip(p *eth.Peer, h *types.Header) *types.Header {
+	for i := 0; i < xdcTipExtendMaxBatches; i++ {
+		next := s.fetchHeaderBatchTimeout(p, h.Number.Uint64()+1, xdpos2MaxHeaderFetch, xdcBulkReqTimeout)
+		n := 0
+		for _, nh := range next {
+			if nh.ParentHash != h.Hash() || nh.Number.Uint64() != h.Number.Uint64()+1 {
+				break
+			}
+			h = nh
+			n++
+		}
+		if n < xdpos2MaxHeaderFetch {
+			break
+		}
+	}
+	return h
+}
+
+// fetchPeerTip fetches a peer's announced head header for use as a sync tip,
+// or nil if the peer does not serve it or is on an abandoned branch.
+func (s *xdcSyncer) fetchPeerTip(p *eth.Peer, hash common.Hash) *types.Header {
+	h := s.fetchHeaderByHash(p, hash)
+	if h == nil || !s.onCanonicalBranch(p, h) {
+		return nil
+	}
+	// The walk may cross the fork guard from a head below it: check again.
+	if h = s.extendToPeerTip(p, h); !s.onCanonicalBranch(p, h) {
+		return nil
+	}
+	n := h.Number.Uint64()
+	for cur := s.networkTipSeen.Load(); n > cur && !s.networkTipSeen.CompareAndSwap(cur, n); cur = s.networkTipSeen.Load() {
+	}
+	return h
+}
+
+// onCanonicalBranch reports whether head, announced by p, is past this chain's
+// fork guard on the canonical branch. Heads below the guard and chains without
+// one always pass. The verdict is cached per peer until it disconnects
+// (handler.unregisterPeer), so a peer that resyncs is checked again.
+func (s *xdcSyncer) onCanonicalBranch(p *eth.Peer, head *types.Header) bool {
+	cid := s.handler.chain.Config().ChainID
+	if cid == nil {
+		return true
+	}
+	g, ok := xdcForkGuards[cid.Uint64()]
+	if !ok || head.Number.Uint64() < g.Number {
+		return true
+	}
+	if head.Number.Uint64() == g.Number {
+		return head.Hash() == g.Hash
+	}
+	canonical, known := s.guardCheck(p, g.Number, g.Hash)
+	return known && canonical // no answer: not cached, the peer may answer next time
+}
+
+// guardCheck asks p for the fork-guard block and caches whether p is on the
+// canonical branch; known is false when p did not answer (nothing cached).
+func (s *xdcSyncer) guardCheck(p *eth.Peer, num uint64, want common.Hash) (canonical, known bool) {
+	if v, ok := s.forkGuardVerdicts.Load(p.ID()); ok {
+		return v.(bool), true
+	}
+	hdrs := s.fetchHeaderBatchTimeout(p, num, 1, xdcBulkReqTimeout)
+	if len(hdrs) == 0 {
+		return false, false
+	}
+	canonical = hdrs[0].Hash() == want
+	s.forkGuardVerdicts.Store(p.ID(), canonical)
+	if !canonical {
+		log.Warn("xdcSyncer: peer is on an abandoned branch; excluded from sync",
+			"peer", p.ID()[:12], "guard", num, "have", hdrs[0].Hash(), "want", want)
+	}
+	return canonical, true
+}
+
+// onAbandonedBranch reports whether p is known to follow a branch abandoned
+// at a chain rewind (see xdcForkGuards).
+func (s *xdcSyncer) onAbandonedBranch(id string) bool {
+	v, ok := s.forkGuardVerdicts.Load(id)
+	return ok && !v.(bool)
+}
+
+// dropAbandonedPeers removes peers on an abandoned branch from candidates when
+// syncing above this chain's fork guard. Unchecked peers are asked for the
+// guard block once (concurrently, cached per connection); a peer that does not
+// answer is kept. Bulk sync fetches by number, so a peer on the abandoned
+// branch serves its own blocks at our height and every batch from it fails as
+// an unknown ancestor (#1884: a snap-synced Apothem node stuck at 84,524,595).
+func (s *xdcSyncer) dropAbandonedPeers(candidates []*eth.Peer, from uint64) []*eth.Peer {
+	cid := s.handler.chain.Config().ChainID
+	if cid == nil {
+		return candidates
+	}
+	g, ok := xdcForkGuards[cid.Uint64()]
+	if !ok || from <= g.Number {
+		return candidates
+	}
+	var wg sync.WaitGroup
+	for _, p := range candidates {
+		if _, ok := s.forkGuardVerdicts.Load(p.ID()); !ok {
+			wg.Add(1)
+			go func(p *eth.Peer) { defer wg.Done(); s.guardCheck(p, g.Number, g.Hash) }(p)
+		}
+	}
+	wg.Wait()
+	kept := candidates[:0:0]
+	for _, p := range candidates {
+		if !s.onAbandonedBranch(p.ID()) {
+			kept = append(kept, p)
+		}
+	}
+	return kept
+}
+
 // snapPivotBackoff is the number of blocks to step BACK from peer's
 // current head when selecting a snap pivot (#807 Phase 11). Peers'
 // XDPOS2 BlockHeaders responses come from a batch cache that lags
@@ -2887,6 +3998,18 @@ func (s *xdcSyncer) isPeerTainted(peerID string) bool {
 // deep inside the served range so subsequent skeleton walks backward
 // don't run off the batch top.
 const snapPivotBackoff uint64 = 1024
+
+// snapPeerMaxLag is how far a snap-capable peer's head may trail the reference
+// tip and still be used for the snap pivot. A modern peer that is itself still
+// syncing reports a head far behind the network; pivoting on it makes snap sync
+// a node to that old block (#1876).
+const snapPeerMaxLag uint64 = 4 * snapPivotBackoff
+
+// snapPeerCurrent reports whether a snap peer at head is close enough to the
+// reference tip ref to serve as the snap pivot source.
+func snapPeerCurrent(head, ref uint64) bool {
+	return head+snapPeerMaxLag >= ref
+}
 
 // fetchPeerHeadHeader walks connected peers, fetches each peer's FULL
 // header at their announced LatestBlockHash, then picks the LOWEST head
@@ -2910,7 +4033,7 @@ func (s *xdcSyncer) fetchPeerHeadHeader() *types.Header {
 		hdr  *types.Header
 	}
 	var heads []peerHead
-	for _, ep := range s.handler.peers.peers {
+	for _, ep := range s.handler.peers.all() {
 		p := ep.Peer
 		rng := p.BlockRange()
 		if rng == nil || rng.LatestBlockHash == (common.Hash{}) {
@@ -2922,11 +4045,26 @@ func (s *xdcSyncer) fetchPeerHeadHeader() *types.Header {
 		if ep.snapExt == nil {
 			continue
 		}
-		headHdr := s.fetchHeaderByHash(p, rng.LatestBlockHash)
+		headHdr := s.fetchPeerTip(p, rng.LatestBlockHash)
 		if headHdr == nil {
 			continue
 		}
 		heads = append(heads, peerHead{peer: p, hdr: headHdr})
+	}
+	// #1876: drop snap peers that are still syncing. The reference tip is the
+	// one fast sync uses (the best-ranked peer's announced head). Without one,
+	// keep every peer as before.
+	if ref := s.refreshOperatorPivotHead(); ref != nil {
+		kept := heads[:0]
+		for _, h := range heads {
+			if snapPeerCurrent(h.hdr.Number.Uint64(), ref.Number.Uint64()) {
+				kept = append(kept, h)
+			} else {
+				log.Debug("xdcSyncer: snap peer behind reference tip, skipped",
+					"peer", h.peer.ID()[:12], "head", h.hdr.Number.Uint64(), "ref", ref.Number.Uint64())
+			}
+		}
+		heads = kept
 	}
 	if len(heads) == 0 {
 		return nil
@@ -2963,6 +4101,8 @@ func (s *xdcSyncer) fetchPeerHeadHeader() *types.Header {
 // same as fetchHeaderBatch — XDPOS2 wire has no RequestId so the
 // standard response sink can't route the response).
 func (s *xdcSyncer) fetchHeaderByHash(peer *eth.Peer, hash common.Hash) *types.Header {
+	peer.XDCHeaderReqMu.Lock()
+	defer peer.XDCHeaderReqMu.Unlock()
 	select {
 	case <-peer.XDCHeaderResp:
 	default:
@@ -2975,6 +4115,10 @@ func (s *xdcSyncer) fetchHeaderByHash(peer *eth.Peer, hash common.Hash) *types.H
 	select {
 	case headers := <-peer.XDCHeaderResp:
 		if len(headers) == 0 {
+			return nil
+		}
+		if headers[0].Hash() != hash {
+			log.Debug("xdcSyncer.fetchHeaderByHash: hash mismatch", "peer", peer.ID(), "wanted", hash, "got", headers[0].Hash())
 			return nil
 		}
 		return headers[0]
@@ -3063,13 +4207,24 @@ func (s *xdcSyncer) prefetchAncestorEpochs(peer *eth.Peer, primeBase *types.Head
 			s.seedMasternodeSnapshotsFromPrefetch(allHeaders, lo, originalHi, nil, primeBase)
 			return
 		}
-		// Verify the last header's hash matches the expected parent of the
-		// next-higher block (primeBase.ParentHash for the first batch).
+		// Require the batch to reach hi. A short response leaves the batch
+		// unanchored: the caller controls headers[0].ParentHash of the next
+		// batch, so a malicious peer could inject fabricated epoch-switch
+		// headers. Taint and stop on any short response.
 		last := headers[len(headers)-1]
-		if last.Number.Uint64() == hi && last.Hash() != expectedParent {
+		if last.Number.Uint64() != hi {
+			log.Warn("xdcSyncer: A.68.2 ancestor pre-fetch — short batch from peer, stopping",
+				"want_top", hi, "got_top", last.Number.Uint64(), "batchStart", batchStart)
+			s.taintPeer(peer)
+			s.seedMasternodeSnapshotsFromPrefetch(allHeaders, lo, originalHi, nil, primeBase)
+			return
+		}
+		// Always verify the anchor: top header must hash to expectedParent.
+		if last.Hash() != expectedParent {
 			log.Warn("xdcSyncer: A.68.2 ancestor pre-fetch — top header doesn't link to prime base",
 				"expected_parent_hash", expectedParent.Hex(),
 				"got_hash", last.Hash().Hex(), "stopping")
+			s.taintPeer(peer)
 			s.seedMasternodeSnapshotsFromPrefetch(allHeaders, lo, originalHi, nil, primeBase)
 			return
 		}
@@ -3497,6 +4652,7 @@ func (s *xdcSyncer) seedMasternodeSnapshotsFromPrefetch(allHeaders []*types.Head
 //
 // Refs #844 #859 A.70.
 func (s *xdcSyncer) reapplyA70Seeds() {
+	defer s.repairSeededGapPools()
 	s.a70SeedMu.Lock()
 	defer s.a70SeedMu.Unlock()
 	if len(s.a70SeedCache) == 0 {
@@ -3531,6 +4687,368 @@ func (s *xdcSyncer) reapplyA70Seeds() {
 	}
 	log.Info("xdcSyncer: A.70 re-seeded V2 masternode snapshots post-SyncCompleted",
 		"gap_reseeds", gapSeeds, "anchor_reseeds", anchorSeeds, "total_cached", len(s.a70SeedCache))
+}
+
+// repairSeededGapPools replaces header-seeded gap snapshots (NextEpochCandidates
+// == epoch-switch header Validators, written during fast/snap sync) of the most
+// recent epochs with the real 0x88 candidate pool, so HookPenalty computes the
+// same penalties as on a fully-synced node. State used: the gap block's own if
+// present, else the head's, else the last snap pivot's (residual risk: a
+// candidate that resigned or joined between the gap and that state). Safe to
+// call repeatedly. Refs #1884.
+func (s *xdcSyncer) repairSeededGapPools() {
+	chain := s.handler.chain
+	cfg := chain.Config()
+	xdposEngine, ok := chain.Engine().(*XDPoS.XDPoS)
+	if !ok || cfg.XDPoS == nil || cfg.XDPoS.Epoch == 0 {
+		return
+	}
+	v2, ok := xdposEngine.EngineV2.(*engine_v2.XDPoS_v2)
+	if !ok || v2 == nil {
+		return
+	}
+	head := chain.CurrentBlock()
+	if head == nil {
+		return
+	}
+	epoch, gap := cfg.XDPoS.Epoch, cfg.XDPoS.Gap
+	// Fallback state: head, then the stored snap pivot.
+	var fallback *state.StateDB
+	if st, err := chain.StateAt(head.Root, head.Number, head.Time); err == nil {
+		fallback = st
+	} else if p := rawdb.ReadLastPivotNumber(s.handler.database); p != nil {
+		if ph := chain.GetHeaderByNumber(*p); ph != nil {
+			if st, err := chain.StateAt(ph.Root, ph.Number, ph.Time); err == nil {
+				fallback = st
+			}
+		}
+	}
+	headNum := head.Number.Uint64()
+	hdrNum := max(headNum, chain.CurrentHeader().Number.Uint64())
+	next := headNum - headNum%epoch + epoch
+	for cp := next; cp > next-4*epoch && cp > gap; cp -= epoch {
+		gapNum := cp - gap
+		gapHeader := chain.GetHeaderByNumber(gapNum)
+		if gapHeader == nil || gapNum > headNum {
+			continue
+		}
+		var sw *types.Header
+		// The switch header may be above the head block (header-synced, block not
+		// yet imported): that is exactly a SYNC-11 seed about to be consumed.
+		for n := gapNum + 1; n <= gapNum+2*epoch && n <= hdrNum; n++ {
+			if h := chain.GetHeaderByNumber(n); h != nil {
+				if isSwitch, _, err := v2.IsEpochSwitch(h); err == nil && isSwitch {
+					sw = h
+					break
+				}
+			}
+		}
+		if sw == nil {
+			continue
+		}
+		statedb := fallback
+		if chain.HasState(gapHeader.Root) {
+			if st, err := chain.StateAt(gapHeader.Root, gapHeader.Number, gapHeader.Time); err == nil {
+				statedb = st
+			}
+		}
+		if statedb == nil {
+			continue
+		}
+		if _, err := v2.RepairSeededCandidatePool(gapHeader, v2.GetMasternodesFromEpochSwitchHeader(chain, sw), statedb.Copy()); err != nil {
+			log.Warn("xdcSyncer: repair seeded gap pool failed", "gap", gapNum, "err", err)
+		}
+	}
+}
+
+// seedSnapPivotGapSnapshots seeds V2 masternode snapshots for every XDPoS gap
+// block that is strictly below the snap state-download pivot (and therefore
+// was never executed — its state is absent). This is the snap-sync analogue of
+// the A.97.4 embedded-header fallback for fast sync (refs #1862).
+//
+// After a snap sync the skeleton delivers headers from pivotNum..peerHead but
+// NOT the historical headers below pivotNum. The epoch-switch header for the
+// epoch containing pivotNum is typically above the pivot (in the skeleton range)
+// and therefore accessible via chain.GetHeaderByNumber. The epoch-switch header
+// for the epoch immediately below the pivot is NOT in the local DB yet (it will
+// be fetched by runSnapHistoryBackfill, which runs concurrently). To eliminate
+// the race between history backfill and TIP_CATCH block import, we fetch any
+// missing epoch-switch headers from a peer here, synchronously, before TIP_CATCH
+// begins.
+//
+// Security: peer-fetched headers for gaps whose switch is also below the pivot
+// are authenticated against the local canonical pivot header via a parent-hash
+// chain proof (fetchVerifiedHeaderRange). A malicious peer that sends a forged
+// switch header (wrong Validators) cannot produce a valid chain ending at the
+// locally-trusted pivot hash, so the forged range is rejected and the next peer
+// is tried. Only the gap(s) whose switch must be peer-fetched need this full
+// verification; gaps whose switch is already in the local DB (above the pivot)
+// use the trusted local switch header directly.
+//
+// Consensus equivalence: header.Validators for a V2 epoch-switch header is the
+// canonical active-masternode list written by calcMasternodes and verified by
+// QC signatures from the previous epoch's validators. Using it here is the same
+// trust model as A.97.4 (#1862). Gap blocks at or above the pivot have state
+// available and are handled by the normal UpdateMasternodesFromHeader path.
+//
+// Called synchronously from snapEventLoop at SyncCompleted while
+// snapBeaconStarted is still true, so concurrent sync ticks remain in
+// SNAP_RUNNING and block import cannot start until seeding completes.
+// Refs #1863 SYNC-11.
+func (s *xdcSyncer) seedSnapPivotGapSnapshots() {
+	// Use the state-download pivot recorded by snapRunningCheck.
+	pivotNum := s.snapHistoryPivot.Load()
+	if pivotNum == 0 {
+		if p := rawdb.ReadLastPivotNumber(s.handler.database); p != nil {
+			pivotNum = *p
+		}
+	}
+	if pivotNum == 0 {
+		log.Debug("xdcSyncer: snap gap seed skipped — pivot not recorded")
+		return
+	}
+
+	// Trusted anchor: the local canonical pivot header authenticates all
+	// peer-fetched ranges via the parent-hash chain proof in fetchVerifiedHeaderRange.
+	pivotHeader := s.handler.chain.GetHeaderByNumber(pivotNum)
+	if pivotHeader == nil {
+		log.Warn("xdcSyncer: snap gap seed skipped — pivot header not in local DB", "pivot", pivotNum)
+		return
+	}
+
+	xdposEngine, ok := s.handler.chain.Engine().(*XDPoS.XDPoS)
+	if !ok {
+		log.Debug("xdcSyncer: snap gap seed skipped — engine is not XDPoS")
+		return
+	}
+	v2Engine, ok := xdposEngine.EngineV2.(*engine_v2.XDPoS_v2)
+	if !ok || v2Engine == nil {
+		log.Debug("xdcSyncer: snap gap seed skipped — V2 engine not initialised")
+		return
+	}
+	cfg := s.handler.chain.Config()
+	if cfg == nil || cfg.XDPoS == nil {
+		log.Debug("xdcSyncer: snap gap seed skipped — XDPoS config absent")
+		return
+	}
+	epoch := cfg.XDPoS.Epoch
+	gap := cfg.XDPoS.Gap
+	if epoch == 0 || gap == 0 || gap >= epoch {
+		log.Warn("xdcSyncer: snap gap seed skipped — invalid epoch/gap config",
+			"epoch", epoch, "gap", gap)
+		return
+	}
+	v2Switch := uint64(0)
+	if cfg.XDPoS.V2 != nil && cfg.XDPoS.V2.SwitchBlock != nil {
+		v2Switch = cfg.XDPoS.V2.SwitchBlock.Uint64()
+	}
+
+	// Enumerate gap blocks below the pivot that need seeding. This mirrors the
+	// computePivotGapNumbers logic in eth/downloader/gap_pivot_xdc.go (inlined
+	// here to keep the downloader package's unexported function private).
+	epochBase := pivotNum - pivotNum%epoch
+	var baseGap uint64
+	if epochBase >= gap {
+		baseGap = epochBase - gap
+	} else {
+		baseGap = epoch - gap // genesis-era: first gap is at epoch-gap
+	}
+
+	seeded := 0
+	for gapNum := baseGap; gapNum < pivotNum; gapNum += epoch {
+		if gapNum == 0 {
+			continue // skip genesis block
+		}
+		// SYNC-11 (#1863): V2 epoch switches happen by round, so the switch block
+		// can be anywhere in [gapNum+gap, gapNum+gap+epoch). Scan instead of using
+		// the fixed offset (gapNum+gap) which misses drifted switches.
+		scanStart := gapNum + gap
+		scanEnd := gapNum + gap + epoch
+		if scanStart <= v2Switch {
+			continue // entire switch range is pre-V2; no V2 snapshot needed
+		}
+
+		// Step 1: scan local DB in [scanStart, scanEnd). After SyncCompleted the
+		// skeleton has delivered headers from pivotNum to head, so headers above
+		// the pivot are available via GetHeaderByNumber.
+		var epochSwitchHdr *types.Header
+		for n := scanStart; n < scanEnd; n++ {
+			h := s.handler.chain.GetHeaderByNumber(n)
+			if h == nil {
+				continue
+			}
+			isSwitch, _, err := v2Engine.IsEpochSwitch(h)
+			if err != nil || !isSwitch {
+				continue
+			}
+			// Confirm the switch's own gap formula maps back to gapNum.
+			base := n - n%epoch
+			var derivedGap uint64
+			if base >= gap {
+				derivedGap = base - gap
+			}
+			if derivedGap != gapNum {
+				continue
+			}
+			epochSwitchHdr = h
+			break
+		}
+
+		gapHdr := s.handler.chain.GetHeaderByNumber(gapNum)
+
+		// Step 2: if the switch was not found locally AND part of the scan range
+		// is below the pivot (not yet delivered by the skeleton), peer-fetch that
+		// portion and scan the authenticated range.
+		if epochSwitchHdr == nil && scanStart < pivotNum {
+			fetchEnd := pivotNum
+			if scanEnd < pivotNum {
+				fetchEnd = scanEnd
+			}
+			verified := s.fetchVerifiedHeaderRange(gapNum, fetchEnd, pivotHeader)
+			if verified == nil {
+				log.Warn("xdcSyncer: snap gap seed — could not fetch/verify header range (SYNC-11)",
+					"from", gapNum, "to", fetchEnd, "pivot", pivotNum)
+				continue
+			}
+			for i, h := range verified {
+				n := gapNum + uint64(i)
+				if n < scanStart {
+					continue
+				}
+				if n >= scanEnd {
+					break
+				}
+				isSwitch, _, err := v2Engine.IsEpochSwitch(h)
+				if err != nil || !isSwitch {
+					continue
+				}
+				base := n - n%epoch
+				var derivedGap uint64
+				if base >= gap {
+					derivedGap = base - gap
+				}
+				if derivedGap != gapNum {
+					continue
+				}
+				epochSwitchHdr = h
+				break
+			}
+			if gapHdr == nil && len(verified) > 0 {
+				gapHdr = verified[0] // verified[0] is the header at gapNum
+			}
+		}
+
+		if epochSwitchHdr == nil {
+			log.Warn("xdcSyncer: snap gap seed — epoch-switch header unavailable (SYNC-11)",
+				"scanStart", scanStart, "scanEnd", scanEnd, "gap", gapNum, "pivot", pivotNum)
+			continue
+		}
+
+		masternodes := v2Engine.GetMasternodesFromEpochSwitchHeader(s.handler.chain, epochSwitchHdr)
+		if len(masternodes) == 0 {
+			log.Debug("xdcSyncer: snap gap seed — epoch-switch has no masternodes",
+				"epochSwitch", epochSwitchHdr.Number.Uint64())
+			continue
+		}
+
+		// Locate the gap header if not already found above.
+		if gapHdr == nil {
+			if verified := s.fetchVerifiedHeaderRange(gapNum, pivotNum, pivotHeader); len(verified) > 0 {
+				gapHdr = verified[0]
+			}
+		}
+		if gapHdr == nil {
+			log.Warn("xdcSyncer: snap gap seed — gap header unavailable (SYNC-11)",
+				"gap", gapNum, "pivot", pivotNum)
+			continue
+		}
+
+		epochSwitchNum := epochSwitchHdr.Number.Uint64()
+		penalties := extractAddresses(epochSwitchHdr.Penalties)
+		if err := v2Engine.UpdateMasternodesWithPenalties(s.handler.chain, gapHdr, masternodes, penalties); err != nil {
+			log.Warn("xdcSyncer: snap gap seed — UpdateMasternodesWithPenalties failed",
+				"gap", gapNum, "epochSwitch", epochSwitchNum, "err", err)
+			continue
+		}
+		seeded++
+
+		// Cache for re-apply (same as A.70) in case TIP_CATCH block-import
+		// overwrites the seed via UpdateMasternodesFromHeader.
+		s.a70SeedMu.Lock()
+		s.a70SeedCache = append(s.a70SeedCache, a70SeedRecord{
+			gapHeader:      gapHdr,
+			masternodes:    append([]common.Address(nil), masternodes...),
+			penalties:      append([]common.Address(nil), penalties...),
+			epochSwitchNum: epochSwitchNum,
+		})
+		s.a70SeedMu.Unlock()
+
+		log.Info("xdcSyncer: snap gap seed — V2 masternode snapshot seeded (SYNC-11, A.97.4)",
+			"gap", gapNum, "epochSwitch", epochSwitchNum,
+			"masternodes", len(masternodes), "penalties", len(penalties),
+			"pivot", pivotNum)
+	}
+	log.Info("xdcSyncer: snap pivot gap snapshots seed complete (SYNC-11)",
+		"pivot", pivotNum, "seeded", seeded)
+}
+
+// fetchVerifiedHeaderRange fetches headers [from, pivotNum-1] from each ranked
+// peer in turn, verifies that the returned slice forms a valid parent-hash chain
+// terminating at pivotHeader.ParentHash (the locally-trusted pivot), and returns
+// the verified slice indexed by [num-from]. Returns nil if no peer produces a
+// valid chain.
+//
+// Batches are capped at xdpos2MaxHeaderFetch to honour the legacy XDPOS2 wire
+// cap. A malicious peer that serves a forged switch header (wrong Validators)
+// changes that header's hash, breaking the parent-hash chain, and is rejected.
+func (s *xdcSyncer) fetchVerifiedHeaderRange(from, pivotNum uint64, pivotHeader *types.Header) []*types.Header {
+	count := pivotNum - from
+	if count == 0 {
+		return nil
+	}
+	for _, p := range s.rankedPeers() {
+		headers := make([]*types.Header, 0, count)
+		for start := from; start < pivotNum; {
+			batchSize := int(pivotNum - start)
+			if batchSize > xdpos2MaxHeaderFetch {
+				batchSize = xdpos2MaxHeaderFetch
+			}
+			batch := s.fetchHeaderBatch(p, start, batchSize)
+			if len(batch) == 0 {
+				break
+			}
+			headers = append(headers, batch...)
+			start += uint64(len(batch))
+		}
+		if uint64(len(headers)) != count {
+			continue // peer did not serve the full range
+		}
+		// Verify block numbers are sequential starting at from.
+		valid := true
+		for i, h := range headers {
+			if h == nil || h.Number.Uint64() != from+uint64(i) {
+				valid = false
+				break
+			}
+		}
+		if !valid {
+			continue
+		}
+		// Verify the parent-hash chain terminates at the locally-trusted pivot.
+		if headers[len(headers)-1].Hash() != pivotHeader.ParentHash {
+			continue
+		}
+		for i := len(headers) - 1; i > 0; i-- {
+			if headers[i].ParentHash != headers[i-1].Hash() {
+				valid = false
+				break
+			}
+		}
+		if valid {
+			return headers
+		}
+	}
+	return nil
 }
 
 // findOperatorPivotHeader locates the operator pivot header via the chain's
@@ -3569,6 +5087,8 @@ func extractAddresses(buf []byte) []common.Address {
 // Reads from peer.XDCHeaderResp directly (bypasses dispatcher — XDPOS2 wire
 // has no RequestId so the dispatcher's pending-map can't route responses).
 func (s *xdcSyncer) fetchHeaderBatch(peer *eth.Peer, from uint64, count int) []*types.Header {
+	peer.XDCHeaderReqMu.Lock()
+	defer peer.XDCHeaderReqMu.Unlock()
 	// Drain any stale response in the channel before sending.
 	select {
 	case <-peer.XDCHeaderResp:
@@ -3585,14 +5105,31 @@ func (s *xdcSyncer) fetchHeaderBatch(peer *eth.Peer, from uint64, count int) []*
 	}
 	defer req.Close()
 
-	select {
-	case headers := <-peer.XDCHeaderResp:
-		return headers
-	case <-time.After(xdcReqTimeout):
-		log.Debug("xdcSyncer.fetchHeaderBatch: timed out", "from", from)
-		return nil
-	case <-s.quitCh:
-		return nil
+	deadline := time.NewTimer(xdcReqTimeout)
+	defer deadline.Stop()
+	// lastMismatch keeps the last response that did not match this request.
+	// If nothing matching arrives before the deadline it is returned, as
+	// before response matching, so the caller can judge (and taint) the peer.
+	var lastMismatch []*types.Header
+	for {
+		select {
+		case headers := <-peer.XDCHeaderResp:
+			// Validate: first header must be the one we asked for, and count
+			// must not exceed the request. Accept fewer headers (e.g. peer at
+			// tip). Drop unsolicited batches and keep waiting.
+			if len(headers) == 0 || headers[0].Number.Uint64() != from || len(headers) > count {
+				log.Debug("xdcSyncer.fetchHeaderBatch: response mismatch, waiting",
+					"from", from, "got", len(headers))
+				lastMismatch = headers
+				continue
+			}
+			return headers
+		case <-deadline.C:
+			log.Debug("xdcSyncer.fetchHeaderBatch: timed out", "from", from)
+			return lastMismatch
+		case <-s.quitCh:
+			return nil
+		}
 	}
 }
 
@@ -3607,6 +5144,8 @@ type peerHeaderResult struct {
 // Used by the A.75 parallel-fan-out path so that bulk-sync rounds use
 // xdcBulkReqTimeout (4s) while non-bulk callers keep xdcReqTimeout (8s).
 func (s *xdcSyncer) fetchHeaderBatchTimeout(peer *eth.Peer, from uint64, count int, timeout time.Duration) []*types.Header {
+	peer.XDCHeaderReqMu.Lock()
+	defer peer.XDCHeaderReqMu.Unlock()
 	select {
 	case <-peer.XDCHeaderResp:
 	default:
@@ -3620,44 +5159,84 @@ func (s *xdcSyncer) fetchHeaderBatchTimeout(peer *eth.Peer, from uint64, count i
 		return nil
 	}
 	defer req.Close()
-	select {
-	case headers := <-peer.XDCHeaderResp:
-		return headers
-	case <-time.After(timeout):
-		log.Debug("xdcSyncer.fetchHeaderBatchTimeout: timed out", "from", from)
-		return nil
-	case <-s.quitCh:
-		return nil
+	deadline := time.NewTimer(timeout)
+	defer deadline.Stop()
+	// lastMismatch keeps the last response that did not match this request.
+	// If nothing matching arrives before the deadline it is returned, as
+	// before response matching, so the caller can judge (and taint) the peer.
+	var lastMismatch []*types.Header
+	for {
+		select {
+		case headers := <-peer.XDCHeaderResp:
+			if len(headers) == 0 || headers[0].Number.Uint64() != from || len(headers) > count {
+				log.Debug("xdcSyncer.fetchHeaderBatchTimeout: response mismatch, waiting",
+					"from", from, "got", len(headers))
+				lastMismatch = headers
+				continue
+			}
+			return headers
+		case <-deadline.C:
+			log.Debug("xdcSyncer.fetchHeaderBatchTimeout: timed out", "from", from)
+			return lastMismatch
+		case <-s.quitCh:
+			return nil
+		}
 	}
 }
 
-// fetchHeadersParallel fans out header requests to the top xdcMaxPeerTriesPerSync
+// fetchHeadersParallel fans out header requests to the top xdcHeaderRacePeers
 // candidates concurrently and returns the first non-empty result (A.75).
 // atTipPeers counts candidates whose LatestBlockHash == curHash (skipped from
 // the race). tried is the number of candidates evaluated (atTip + raced).
 //
-// Goroutines that lose the race complete within xdcBulkReqTimeout; the buffered
-// out channel absorbs their sends so they never block. No goroutine leak.
-// fetchHeadersParallel fans out header requests to the top xdcMaxPeerTriesPerSync
-// candidates concurrently and returns the first non-empty result (A.75).
+// SYNC-12: race capped at xdcHeaderRacePeers (2) instead of 8; body hedging
+// (fetchBodiesHedged) and pipeline (A.77 goroutines pre-fetch bodies) cover
+// slow peers without needing a large header fan-out. Goroutines that lose the
+// race complete within xdcBulkReqTimeout; the buffered out channel absorbs their
+// sends so they never block. No goroutine leak.
 // racedIDs is the set of peer IDs that were actually sent requests this round;
 // callers use it to avoid re-querying rate-limited peers in A.77 lookahead (A.78).
 func (s *xdcSyncer) fetchHeadersParallel(candidates []*eth.Peer, fromBlock uint64, curHash common.Hash) (*peerHeaderResult, int, int, map[string]bool) {
-	K := len(candidates)
-	if K > xdcMaxPeerTriesPerSync {
-		K = xdcMaxPeerTriesPerSync
+	// Rotation (#1872, rule 2): when the previous round was all-empty, prefer
+	// peers that were NOT in that round so they get a slot to prove the range
+	// exists. Within each group (fresh / prev-tried) relative TD order is kept.
+	// Note: for XDC, handshake TD is a ranking metric, not a block height —
+	// an XDPOS2 peer stuck at genesis can rank first in candidates.
+	fresh := candidates[:0:0]     // peers not in lastEmptyRoundIDs
+	prevTried := candidates[:0:0] // peers in lastEmptyRoundIDs
+	for _, p := range candidates {
+		if s.lastEmptyRoundIDs[p.ID()] {
+			prevTried = append(prevTried, p)
+		} else {
+			fresh = append(fresh, p)
+		}
 	}
-	raced := make([]*eth.Peer, 0, K)
-	rngs := make(map[string]*eth.BlockRangeUpdatePacket, K)
+	ordered := append(fresh, prevTried...) // fresh first; fill from prev-tried
+
+	raced := make([]*eth.Peer, 0, xdcHeaderRacePeers)
+	rngs := make(map[string]*eth.BlockRangeUpdatePacket, xdcHeaderRacePeers)
 	atTipCount := 0
-	for i := 0; i < K; i++ {
-		p := candidates[i]
+	for _, p := range ordered {
+		if len(raced) >= xdcHeaderRacePeers {
+			break
+		}
 		rng := p.BlockRange()
 		if rng == nil {
 			continue
 		}
-		// XDC: LatestBlock is TD, not block number. Use hash equality.
-		if rng.LatestBlockHash != (common.Hash{}) && rng.LatestBlockHash == curHash {
+		// XDC: LatestBlock is TD, not block number. Use hash equality to detect
+		// at-tip, but only for non-XDPOS2 peers. XDPOS2 peers (p.Version()==
+		// eth.XDPOS2) do not receive BlockRangeUpdate messages — their
+		// LatestBlockHash is frozen at handshake time and never updated. If a
+		// peer connects while it is at our current head (common after a
+		// coordinated restart), rng.LatestBlockHash == curHash becomes a
+		// permanent false-positive: every fetchHeadersParallel call counts
+		// the peer as at-tip and skips the header request, stalling sync
+		// indefinitely even though the peer has since advanced. For XDPOS2
+		// peers, rely solely on an empty header response as the at-tip signal.
+		// Refs #1654.
+		if !eth.IsXDPOS2Family(p.Version()) &&
+			rng.LatestBlockHash != (common.Hash{}) && rng.LatestBlockHash == curHash {
 			atTipCount++
 			continue
 		}
@@ -3673,6 +5252,14 @@ func (s *xdcSyncer) fetchHeadersParallel(candidates []*eth.Peer, fromBlock uint6
 	if len(raced) == 0 {
 		return nil, atTipCount, tried, racedIDs
 	}
+
+	// emptyIDs collects peers whose goroutines return 0 headers this round.
+	// Strikes (#1872, rule 1) are applied only if a winner is found — an empty
+	// reply when nobody served the range means "nothing yet" (normal at-tip
+	// signal for XDPOS2) and must never earn a strike.
+	var emptyMu sync.Mutex
+	emptyIDs := make([]string, 0, len(raced))
+
 	out := make(chan *peerHeaderResult, len(raced))
 	var wg sync.WaitGroup
 	for _, p := range raced {
@@ -3681,6 +5268,9 @@ func (s *xdcSyncer) fetchHeadersParallel(candidates []*eth.Peer, fromBlock uint6
 			defer wg.Done()
 			hdrs := s.fetchHeaderBatchTimeout(p, fromBlock, xdcBatchSize, xdcBulkReqTimeout)
 			if len(hdrs) == 0 {
+				emptyMu.Lock()
+				emptyIDs = append(emptyIDs, p.ID())
+				emptyMu.Unlock()
 				return
 			}
 			// #1423: XDPOS2 replies carry no request id. A batch that does not
@@ -3692,6 +5282,29 @@ func (s *xdcSyncer) fetchHeadersParallel(candidates []*eth.Peer, fromBlock uint6
 				s.taintPeer(p)
 				return
 			}
+			// #1670: if the first block in the batch is a known consensus-failed
+			// block, this peer is on a fork with an invalid block at our target
+			// height. Taint it and discard the batch so we do not acquire chainmu
+			// for 40s on a block we know will fail, allowing the miner's TryLock
+			// to succeed and seal the valid successor.
+			if s.isConsensusFailedBlock(hdrs[0].Hash()) {
+				log.Debug("xdcSyncer: header batch starts with a known consensus-failed block — discarding",
+					"peer", p.ID(), "block", hdrs[0].Number, "hash", hdrs[0].Hash())
+				s.taintPeer(p)
+				return
+			}
+			// Track the highest peer block seen (Fixes #1841).
+			highestInBatch := fromBlock + uint64(len(hdrs)) - 1
+			for {
+				current := s.highestPeerBlockSeen.Load()
+				if highestInBatch <= current {
+					break
+				}
+				if s.highestPeerBlockSeen.CompareAndSwap(current, highestInBatch) {
+					break
+				}
+			}
+			s.resetPeerEmptyStrike(p.ID()) // peer served: clear any cooldown
 			select {
 			case out <- &peerHeaderResult{peer: p, rng: rngs[p.ID()], headers: hdrs}:
 			default: // a winner already claimed the slot; drop silently
@@ -3703,8 +5316,29 @@ func (s *xdcSyncer) fetchHeadersParallel(candidates []*eth.Peer, fromBlock uint6
 	go func() { wg.Wait(); close(allDone) }()
 	select {
 	case first := <-out:
+		// Winner found: the range exists. Schedule strikes for peers whose
+		// goroutines returned empty this round (#1872, rule 1). The background
+		// goroutine waits for allDone so every peer has recorded its status
+		// before strikes are applied. No goroutine leak: allDone is guaranteed
+		// to close (all goroutines call wg.Done()).
+		go func() {
+			<-allDone
+			emptyMu.Lock()
+			ids := append([]string(nil), emptyIDs...)
+			emptyMu.Unlock()
+			for _, id := range ids {
+				s.incPeerEmptyStrike(id)
+			}
+		}()
+		s.lastEmptyRoundIDs = nil // winner found: reset rotation
 		return first, atTipCount, tried, racedIDs
 	case <-allDone:
+		// All-empty round: record raced peers for next-round rotation. No
+		// strikes — this is the normal "nothing yet at tip" signal.
+		s.lastEmptyRoundIDs = make(map[string]bool, len(raced))
+		for _, p := range raced {
+			s.lastEmptyRoundIDs[p.ID()] = true
+		}
 		return nil, atTipCount, tried, racedIDs
 	case <-s.quitCh:
 		return nil, atTipCount, tried, racedIDs
@@ -3713,7 +5347,19 @@ func (s *xdcSyncer) fetchHeadersParallel(candidates []*eth.Peer, fromBlock uint6
 
 // fetchBodiesBatch requests bodies for the given hashes from peer.
 // Reads from peer.XDCBodyResp directly (bypasses dispatcher).
+// Uses xdcReqTimeout for non-bulk callers (anchor repair, snap backfill).
+// Bulk-sync paths use fetchBodiesBatchTimeout with xdcBulkReqTimeout directly.
 func (s *xdcSyncer) fetchBodiesBatch(peer *eth.Peer, hashes []common.Hash) []eth.BlockBody {
+	return s.fetchBodiesBatchTimeout(peer, hashes, xdcReqTimeout)
+}
+
+// fetchBodiesBatchTimeout is fetchBodiesBatch with a caller-supplied deadline.
+// SYNC-12: the bulk body-fetch paths use xdcBulkReqTimeout so slow peers release
+// XDCBodyReqMu within the 4 s budget, leaving the mutex available for hedging and
+// lookahead goroutines sooner.
+func (s *xdcSyncer) fetchBodiesBatchTimeout(peer *eth.Peer, hashes []common.Hash, timeout time.Duration) []eth.BlockBody {
+	peer.XDCBodyReqMu.Lock()
+	defer peer.XDCBodyReqMu.Unlock()
 	// Drain any stale response.
 	select {
 	case <-peer.XDCBodyResp:
@@ -3721,19 +5367,168 @@ func (s *xdcSyncer) fetchBodiesBatch(peer *eth.Peer, hashes []common.Hash) []eth
 	}
 	req, err := peer.RequestBodies(hashes, nil)
 	if err != nil {
-		log.Debug("xdcSyncer.fetchBodiesBatch: request failed", "count", len(hashes), "err", err)
+		log.Debug("xdcSyncer.fetchBodiesBatchTimeout: request failed", "count", len(hashes), "err", err)
 		return nil
 	}
 	defer req.Close()
 
-	select {
-	case bodies := <-peer.XDCBodyResp:
-		return bodies
-	case <-time.After(xdcReqTimeout):
-		log.Debug("xdcSyncer.fetchBodiesBatch: timed out", "count", len(hashes))
-		return nil
-	case <-s.quitCh:
-		return nil
+	deadline := time.NewTimer(timeout)
+	defer deadline.Stop()
+	// lastMismatch keeps the last response that did not match this request.
+	// If nothing matching arrives before the deadline it is returned, as
+	// before response matching, so the caller can judge the peer.
+	var lastMismatch []eth.BlockBody
+	for {
+		select {
+		case bodies := <-peer.XDCBodyResp:
+			// Validate: peers may return fewer bodies than requested (size
+			// limits), but more than requested cannot answer this request.
+			if len(bodies) > len(hashes) {
+				log.Debug("xdcSyncer.fetchBodiesBatchTimeout: response mismatch, waiting",
+					"want", len(hashes), "got", len(bodies))
+				lastMismatch = bodies
+				continue
+			}
+			return bodies
+		case <-deadline.C:
+			log.Debug("xdcSyncer.fetchBodiesBatchTimeout: timed out", "count", len(hashes))
+			return lastMismatch
+		case <-s.quitCh:
+			return nil
+		}
+	}
+}
+
+// recordBodyStat updates per-peer body request statistics used by
+// bodyRankedCandidates to order hedge candidates. On timeout, the consecutive
+// timeout count is incremented. On success, it is reset and the EWMA latency
+// is updated (α=0.25: new = 0.25*lat + 0.75*prev). SYNC-12 refs #1869.
+func (s *xdcSyncer) recordBodyStat(peerID string, lat time.Duration, timedOut bool) {
+	s.bodyStatsMu.Lock()
+	defer s.bodyStatsMu.Unlock()
+	if s.bodyTimeouts == nil {
+		s.bodyTimeouts = make(map[string]int)
+		s.bodyLatency = make(map[string]time.Duration)
+	}
+	if timedOut {
+		s.bodyTimeouts[peerID]++
+		return
+	}
+	s.bodyTimeouts[peerID] = 0
+	prev := s.bodyLatency[peerID]
+	if prev == 0 {
+		s.bodyLatency[peerID] = lat
+	} else {
+		s.bodyLatency[peerID] = (lat + 3*prev) / 4 // α=0.25 EWMA
+	}
+}
+
+// bodyRankedCandidates returns a copy of candidates sorted by body performance:
+// fewest consecutive timeouts first, then lowest EWMA latency.
+// Preserves the original slice; always returns all candidates. SYNC-12 refs #1869.
+func (s *xdcSyncer) bodyRankedCandidates(candidates []*eth.Peer) []*eth.Peer {
+	out := make([]*eth.Peer, len(candidates))
+	copy(out, candidates)
+	s.bodyStatsMu.Lock()
+	// Snapshot stats under the lock; insertion sort outside.
+	timeouts := make(map[string]int, len(out))
+	latency := make(map[string]time.Duration, len(out))
+	for _, p := range out {
+		timeouts[p.ID()] = s.bodyTimeouts[p.ID()]
+		latency[p.ID()] = s.bodyLatency[p.ID()]
+	}
+	s.bodyStatsMu.Unlock()
+	// Insertion sort: fewer timeouts first; equal timeouts → lower latency first.
+	// ponytail: O(n²) fine — n ≤ maxPeers (~50); a heap gains nothing here.
+	for i := 1; i < len(out); i++ {
+		for j := i; j > 0; j-- {
+			ai, aj := out[j-1].ID(), out[j].ID()
+			ti, tj := timeouts[ai], timeouts[aj]
+			li, lj := latency[ai], latency[aj]
+			if ti > tj || (ti == tj && li > lj && lj > 0) {
+				out[j-1], out[j] = out[j], out[j-1]
+			} else {
+				break
+			}
+		}
+	}
+	return out
+}
+
+// fetchBodiesHedged fetches bodies for hashes from primary, hedging to the best
+// idle candidate after xdcBodyHedgeDelay if primary has not responded.
+// Hard deadline is xdcBulkReqTimeout. Updates per-peer body statistics.
+// Respects XDCBodyReqMu serialisation per peer (SYNC-12 refs #1869, #1858).
+func (s *xdcSyncer) fetchBodiesHedged(primary *eth.Peer, candidates []*eth.Peer, hashes []common.Hash) []eth.BlockBody {
+	type bodyResult struct {
+		bodies   []eth.BlockBody
+		peerID   string
+		lat      time.Duration
+		timedOut bool
+	}
+	// Buffered so losing goroutines never block when we've already returned.
+	ch := make(chan bodyResult, 2)
+
+	fetchOne := func(p *eth.Peer) {
+		t0 := time.Now()
+		bodies := s.fetchBodiesBatchTimeout(p, hashes, xdcBulkReqTimeout)
+		lat := time.Since(t0)
+		ch <- bodyResult{bodies: bodies, peerID: p.ID(), lat: lat, timedOut: len(bodies) == 0}
+	}
+	go fetchOne(primary)
+
+	hedge := time.NewTimer(xdcBodyHedgeDelay)
+	defer hedge.Stop()
+	deadline := time.NewTimer(xdcBulkReqTimeout)
+	defer deadline.Stop()
+
+	hedgeStarted := false
+	startHedge := func() {
+		if hedgeStarted {
+			return
+		}
+		hedgeStarted = true
+		ranked := s.bodyRankedCandidates(candidates)
+		for _, c := range ranked {
+			if c.ID() != primary.ID() {
+				log.Debug("xdcSyncer.fetchBodiesHedged: launching hedge", "primary", primary.ID()[:8], "hedge", c.ID()[:8])
+				go fetchOne(c)
+				return
+			}
+		}
+		// No alternative candidate — hedge is a no-op.
+	}
+
+	for {
+		select {
+		case res := <-ch:
+			s.recordBodyStat(res.peerID, res.lat, res.timedOut)
+			if len(res.bodies) > 0 {
+				return res.bodies
+			}
+			// Primary returned early with no bodies — start hedge immediately.
+			startHedge()
+			if hedgeStarted {
+				// Wait for hedge result within remaining budget.
+				select {
+				case res2 := <-ch:
+					s.recordBodyStat(res2.peerID, res2.lat, res2.timedOut)
+					return res2.bodies // may be nil
+				case <-deadline.C:
+					return nil
+				case <-s.quitCh:
+					return nil
+				}
+			}
+			return nil
+		case <-hedge.C:
+			startHedge()
+		case <-deadline.C:
+			s.recordBodyStat(primary.ID(), xdcBulkReqTimeout, true)
+			return nil
+		case <-s.quitCh:
+			return nil
+		}
 	}
 }
 
@@ -3750,6 +5545,120 @@ func (s *xdcSyncer) fetchReceiptsBatch(peer *eth.Peer, headers []*types.Header) 
 	if len(headers) == 0 {
 		return nil
 	}
+	// XDPOS2RID (101): handleReceipts70 routes through the request-ID dispatcher,
+	// not XDCReceiptResp, so the nil-sink path below stalls. Use the dedicated
+	// request-ID fetcher and decode the storage-encoded bytes. Refs #1861.
+	if peerHasRequestID(peer) {
+		rrRLP, _ := s.fetchReceiptsRequestID(peer, headers)
+		if len(rrRLP) == 0 {
+			return nil
+		}
+		result := make([]types.Receipts, 0, len(rrRLP))
+		for _, raw := range rrRLP {
+			// dispatchReceipts re-encodes via ReceiptList.EncodeForStorage, which
+			// produces storage-format RLP (3 fields: postState, gasUsed, logs —
+			// TxType stripped). Decode into ReceiptForStorage; cast to Receipt.
+			// ponytail: TxType is lost (stays 0) so DeriveSha fails for typed txs
+			// in this fallback path. v101 peers normally use backfillBodyReceiptChunkModern
+			// (modern path) and never reach here. Fix: bridge network-format types.Receipts
+			// from handleReceipts70 to XDCReceiptResp if the fallback path becomes hot.
+			var stored []*types.ReceiptForStorage
+			if err := rlp.DecodeBytes(raw, &stored); err != nil {
+				log.Debug("xdcSyncer.fetchReceiptsBatch: v101 decode error", "err", err)
+				break
+			}
+			rcpts := make(types.Receipts, len(stored))
+			for i, sr := range stored {
+				rcpts[i] = (*types.Receipt)(sr)
+			}
+			result = append(result, rcpts)
+		}
+		return result
+	}
+	hashes := make([]common.Hash, len(headers))
+	gasUsed := make([]uint64, len(headers))
+	timestamps := make([]uint64, len(headers))
+	for i, h := range headers {
+		hashes[i] = h.Hash()
+		gasUsed[i] = h.GasUsed
+		timestamps[i] = h.Time
+	}
+	// Serialise receipt requests on this peer the same way body requests are
+	// serialised: XDPOS2 carries no RequestId so two concurrent requesters
+	// would consume each other's reply.
+	peer.XDCReceiptReqMu.Lock()
+	defer peer.XDCReceiptReqMu.Unlock()
+	// Drain any stale response left by a previous timed-out call.
+	select {
+	case <-peer.XDCReceiptResp:
+	default:
+	}
+	// Send the request; nil sink — the response arrives via XDCReceiptResp.
+	req, err := peer.RequestReceipts(hashes, gasUsed, timestamps, nil)
+	if err != nil {
+		log.Debug("xdcSyncer.fetchReceiptsBatch: request failed", "count", len(hashes), "err", err)
+		return nil
+	}
+	defer req.Close()
+
+	select {
+	case rcpts := <-peer.XDCReceiptResp:
+		return rcpts
+	case <-time.After(xdcReqTimeout):
+		log.Debug("xdcSyncer.fetchReceiptsBatch: timed out", "count", len(hashes))
+		return nil
+	case <-s.quitCh:
+		return nil
+	}
+}
+
+// peerHasRequestID reports whether p uses a request-ID-capable eth protocol
+// (eth/69 or eth/70). XDPOS2 (100) and eth/63 peers share a per-peer mutex
+// instead; modern peers support several concurrent in-flight requests.
+func peerHasRequestID(p *eth.Peer) bool {
+	v := p.Version()
+	return v >= eth.ETH69 && v != eth.XDPOS2
+}
+
+// fetchBodiesRequestID fetches block bodies for hashes via the request-ID
+// dispatcher path (eth/69+). The caller must NOT hold XDCBodyReqMu; each
+// request carries a unique RequestId so concurrent calls on the same peer
+// are safe. Falls back with nil on error or timeout (caller falls back to
+// the XDPOS2 path). Refs #1861 (SYNC-10).
+func (s *xdcSyncer) fetchBodiesRequestID(peer *eth.Peer, hashes []common.Hash) []eth.BlockBody {
+	sink := make(chan *eth.Response, 1)
+	req, err := peer.RequestBodies(hashes, sink)
+	if err != nil {
+		log.Debug("xdcSyncer.fetchBodiesRequestID: request failed", "count", len(hashes), "err", err)
+		return nil
+	}
+	defer req.Close()
+	select {
+	case res := <-sink:
+		res.Done <- nil
+		br, ok := res.Res.(*eth.BlockBodiesResponse)
+		if !ok || br == nil {
+			return nil
+		}
+		return []eth.BlockBody(*br)
+	case <-time.After(xdcBulkReqTimeout):
+		log.Debug("xdcSyncer.fetchBodiesRequestID: timed out", "count", len(hashes))
+		return nil
+	case <-s.quitCh:
+		return nil
+	}
+}
+
+// fetchReceiptsRequestID fetches receipts via the request-ID dispatcher path
+// (eth/69+). It returns the raw storage bytes per block together with the receipt
+// hash per block (derived by the dispatcher via ReceiptList.Derivable, which
+// computes the bloom from logs so the hash matches the block header). The raw
+// bytes can be written directly via rawdb.WriteRawReceipts; the hashes are used
+// for verification. Returns (nil, nil) on error or timeout. Refs #1861 (SYNC-10).
+func (s *xdcSyncer) fetchReceiptsRequestID(peer *eth.Peer, headers []*types.Header) (eth.ReceiptsRLPResponse, []common.Hash) {
+	if len(headers) == 0 {
+		return nil, nil
+	}
 	hashes := make([]common.Hash, len(headers))
 	gasUsed := make([]uint64, len(headers))
 	timestamps := make([]uint64, len(headers))
@@ -3761,40 +5670,137 @@ func (s *xdcSyncer) fetchReceiptsBatch(peer *eth.Peer, headers []*types.Header) 
 	sink := make(chan *eth.Response, 1)
 	req, err := peer.RequestReceipts(hashes, gasUsed, timestamps, sink)
 	if err != nil {
-		log.Debug("xdcSyncer.fetchReceiptsBatch: request failed", "count", len(hashes), "err", err)
-		return nil
+		log.Debug("xdcSyncer.fetchReceiptsRequestID: request failed", "count", len(hashes), "err", err)
+		return nil, nil
 	}
 	defer req.Close()
-
 	select {
-	case resp := <-sink:
-		if resp == nil || resp.Res == nil {
-			log.Debug("xdcSyncer.fetchReceiptsBatch: nil response", "count", len(hashes))
-			return nil
+	case res := <-sink:
+		res.Done <- nil
+		rr, ok := res.Res.(*eth.ReceiptsRLPResponse)
+		if !ok || rr == nil {
+			return nil, nil
 		}
-		raw, ok := resp.Res.(*eth.ReceiptsRLPResponse)
-		if !ok || raw == nil {
-			log.Debug("xdcSyncer.fetchReceiptsBatch: unexpected response type", "type", "non-ReceiptsRLPResponse")
-			return nil
-		}
-		out := make([]types.Receipts, 0, len(*raw))
-		for _, enc := range *raw {
-			var rcpts types.Receipts
-			if err := rlp.DecodeBytes(enc, &rcpts); err != nil {
-				log.Debug("xdcSyncer.fetchReceiptsBatch: receipt list decode failed", "err", err)
-				return nil
-			}
-			out = append(out, rcpts)
-		}
-		// Signal acceptance (dispatcher requires Done() to release in-flight slot).
-		resp.Done <- nil
-		return out
-	case <-time.After(xdcReqTimeout):
-		log.Debug("xdcSyncer.fetchReceiptsBatch: timed out", "count", len(hashes))
-		return nil
+		rcpHashes, _ := res.Meta.([]common.Hash)
+		return *rr, rcpHashes
+	case <-time.After(xdcBulkReqTimeout):
+		log.Debug("xdcSyncer.fetchReceiptsRequestID: timed out", "count", len(hashes))
+		return nil, nil
 	case <-s.quitCh:
-		return nil
+		return nil, nil
 	}
+}
+
+// backfillBodyReceiptChunkModern fetches and persists bodies and receipts for
+// headers using the request-ID (eth/69+) transport. Bodies are fetched in one
+// batch; all verified bodies' receipts are fetched in a single follow-on
+// RequestReceipts call. Short receipt replies are written up to the last
+// verified entry and the remainder stays in bodyPending for the next attempt.
+// Returns tainted=true when the peer sends data that fails body or receipt hash
+// verification; the caller taints the peer in that case.
+//
+// Safe to call concurrently for different peers / non-overlapping header slices;
+// each invocation owns its own sink channels and DB batch. Refs #1861 (SYNC-10).
+func (s *xdcSyncer) backfillBodyReceiptChunkModern(peer *eth.Peer, headers []*types.Header, db ethdb.Database) (tainted bool) {
+	if len(headers) == 0 {
+		return false
+	}
+	hashes := make([]common.Hash, len(headers))
+	for i, h := range headers {
+		hashes[i] = h.Hash()
+	}
+
+	rawBodies := s.fetchBodiesRequestID(peer, hashes)
+	if len(rawBodies) == 0 {
+		return false // peer returned nothing; not tainted, try again later
+	}
+
+	pairCount := min(len(rawBodies), len(headers))
+	batch := db.NewBatch()
+
+	// Phase 1: verify and write bodies. Collect headers that still need receipts
+	// (only for blocks whose body was just verified in this pass).
+	var rcptHeaders []*types.Header
+	needsBodySet := make(map[common.Hash]bool, pairCount)
+	for i := 0; i < pairCount; i++ {
+		rb := rawBodies[i]
+		h := headers[i]
+		hash := h.Hash()
+		num := h.Number.Uint64()
+
+		txs, err := rb.Transactions.Items()
+		if err != nil {
+			log.Warn("xdcSyncer: SYNC-10 history backfill — body decode error; tainting peer",
+				"block", num, "peer", peer.ID(), "err", err)
+			_ = batch.Write()
+			return true
+		}
+		uncles, err := rb.Uncles.Items()
+		if err != nil {
+			log.Warn("xdcSyncer: SYNC-10 history backfill — body decode error; tainting peer",
+				"block", num, "peer", peer.ID(), "err", err)
+			_ = batch.Write()
+			return true
+		}
+		body := &types.Body{Transactions: txs, Uncles: uncles}
+		if rb.Withdrawals != nil {
+			if wd, err2 := rb.Withdrawals.Items(); err2 == nil {
+				body.Withdrawals = wd
+			}
+		}
+		if !verifyBodyAgainstHeader(h, body) {
+			log.Warn("xdcSyncer: SYNC-10 history backfill — body hash mismatch; tainting peer",
+				"block", num, "peer", peer.ID())
+			_ = batch.Write()
+			return true
+		}
+
+		needsBody := !rawdb.HasBody(db, hash, num)
+		if !needsBody {
+			if ex := rawdb.ReadBody(db, hash, num); ex != nil && len(ex.Transactions) == 0 {
+				needsBody = true
+			}
+		}
+		if needsBody {
+			rawdb.WriteBody(batch, hash, num, body)
+			needsBodySet[hash] = true
+		}
+		rawdb.WriteTxLookupEntriesByBlock(batch, types.NewBlockWithHeader(h).WithBody(*body))
+
+		// Queue receipt if missing or body was just re-written.
+		if !rawdb.HasReceipts(db, hash, num) || needsBodySet[hash] {
+			rcptHeaders = append(rcptHeaders, h)
+		}
+	}
+
+	// Phase 2: one batch RequestReceipts for all verified blocks that need receipts.
+	// The dispatcher derives rcpHashes[i] via ReceiptList.Derivable (bloom from logs),
+	// so rcpHashes[i] == h.ReceiptHash for correctly served blocks.
+	// Short replies are handled by writing verified entries and leaving the rest
+	// in bodyPending (via snapBlockComplete) for the next attempt.
+	if len(rcptHeaders) > 0 {
+		rrRLP, rcpHashes := s.fetchReceiptsRequestID(peer, rcptHeaders)
+		nGot := min(len(rrRLP), len(rcptHeaders))
+		for i := 0; i < nGot; i++ {
+			h := rcptHeaders[i]
+			hash := h.Hash()
+			num := h.Number.Uint64()
+			if i >= len(rcpHashes) || rcpHashes[i] != h.ReceiptHash {
+				log.Warn("xdcSyncer: SYNC-10 history backfill — receipt hash mismatch; tainting peer",
+					"block", num, "peer", peer.ID())
+				_ = batch.Write()
+				return true
+			}
+			rawdb.WriteRawReceipts(batch, hash, num, rrRLP[i])
+		}
+		// If nGot < len(rcptHeaders), the remaining blocks keep their missing-receipt
+		// status; snapBlockComplete re-enqueues them for the next attempt.
+	}
+
+	if err := batch.Write(); err != nil {
+		log.Warn("xdcSyncer: SYNC-10 history backfill — batch write failed", "err", err)
+	}
+	return false
 }
 
 // prefetchAncestorBodiesAndReceipts pre-fetches block bodies + receipts for
@@ -3981,8 +5987,15 @@ func (s *xdcSyncer) rankedPeers() []*eth.Peer {
 		// xdcForkTaintTTL, this peer delivered the block that put us on a
 		// non-canonical fork; without exclusion bestPeer keeps re-picking
 		// them and post-rollback sync immediately re-imports the same fork.
-		if s.isPeerTainted(p.ID()) {
+		if s.isPeerTainted(p.ID()) || s.onAbandonedBranch(p.ID()) {
 			skippedTainted++
+			continue
+		}
+		// Exclude peers on empty-response cooldown (#1872). These peers
+		// repeatedly returned 0 headers for in-range requests; including
+		// them blocks the fanout for xdcBulkReqTimeout per round.
+		if s.isPeerOnEmptyCooldown(p.ID()) {
+			skippedTainted++ // reuse counter — both represent "bad peer excluded"
 			continue
 		}
 		cands = append(cands, p)
@@ -4001,4 +6014,658 @@ func (s *xdcSyncer) rankedPeers() []*eth.Peer {
 		}
 	}
 	return cands
+}
+
+// rankedPeersNoCD is like rankedPeers but intentionally does NOT exclude peers
+// on empty-response cooldown. It is used exclusively by snap and fast-sync pivot
+// selection, where the cooldown (a fullSyncOnce efficiency tool for demoting
+// genesis-stuck peers from the header-fetch fanout) must never prevent the pivot
+// from seeing real at-tip peers. Fork-tainted peers are still excluded because
+// they proved their chain is wrong, not just slow. (#1872)
+func (s *xdcSyncer) rankedPeersNoCD() []*eth.Peer {
+	all := s.handler.peers.all()
+	cands := make([]*eth.Peer, 0, len(all))
+	for _, ep := range all {
+		p := ep.Peer
+		if p.BlockRange() == nil {
+			continue
+		}
+		if s.isPeerTainted(p.ID()) || s.onAbandonedBranch(p.ID()) {
+			continue
+		}
+		// NOTE: isPeerOnEmptyCooldown is intentionally omitted here.
+		cands = append(cands, p)
+	}
+	for i := 1; i < len(cands); i++ {
+		for j := i; j > 0 && cands[j-1].BlockRange().LatestBlock < cands[j].BlockRange().LatestBlock; j-- {
+			cands[j-1], cands[j] = cands[j], cands[j-1]
+		}
+	}
+	return cands
+}
+
+// snapBlockComplete reports whether block [num] at [hash] has sufficient history
+// in db for the snap backfill to consider it done.
+//
+//   - header must be present (always required).
+//   - if the block has no transactions (TxHash == EmptyTxsHash), the header is
+//     sufficient — the snap skeleton writes an empty placeholder body, and receipts
+//     are empty by definition.
+//   - otherwise, the body must be present.  Receipts are fetched and verified when
+//     available but are not required for completion, as some pre-pivot peers cannot
+//     serve them.
+//
+// emptyHistoryBody returns the empty body for a header that commits to no
+// transactions, no uncles and (if present) no withdrawals, else nil.
+func emptyHistoryBody(h *types.Header) *types.Body {
+	if h.TxHash != types.EmptyTxsHash || h.UncleHash != types.EmptyUncleHash {
+		return nil
+	}
+	body := &types.Body{}
+	if h.WithdrawalsHash != nil {
+		if *h.WithdrawalsHash != types.EmptyWithdrawalsHash {
+			return nil
+		}
+		body.Withdrawals = []*types.Withdrawal{}
+	}
+	return body
+}
+
+func snapBlockComplete(db ethdb.Reader, hash common.Hash, num uint64, txHash common.Hash) bool {
+	if !rawdb.HasHeader(db, hash, num) {
+		return false
+	}
+	if txHash == types.EmptyTxsHash {
+		// Empty blocks still need a body record: GetBlock/eth_getBlockByNumber
+		// return nil without one (the backfill writes it, see emptyHistoryBody).
+		return rawdb.HasBody(db, hash, num)
+	}
+	// History is complete only with the receipts too (eth_getTransactionReceipt,
+	// log filters); a block missing them stays pending and is retried.
+	return rawdb.HasBody(db, hash, num) && rawdb.HasReceipts(db, hash, num)
+}
+
+// verifyBodyAgainstHeader returns true iff body's transaction root, uncle hash,
+// and (when the header has one) withdrawals root all match the header's committed
+// values.  A false return means the peer sent wrong data and must be tainted.
+func verifyBodyAgainstHeader(h *types.Header, body *types.Body) bool {
+	if types.DeriveSha(types.Transactions(body.Transactions), trie.NewStackTrie(nil)) != h.TxHash {
+		return false
+	}
+	if types.CalcUncleHash(body.Uncles) != h.UncleHash {
+		return false
+	}
+	if h.WithdrawalsHash != nil {
+		if types.DeriveSha(types.Withdrawals(body.Withdrawals), trie.NewStackTrie(nil)) != *h.WithdrawalsHash {
+			return false
+		}
+	}
+	return true
+}
+
+// snapHistoryFindResumeTop finds the (nextTop, topHash) pair from which
+// runSnapHistoryBackfill should start or resume after a node restart.
+//
+//   - nextTop is the highest block number whose history is still missing.
+//   - topHash is the canonical hash of nextTop, derived from the parent hash of
+//     the lowest already-complete block above it.
+//   - Returns (0, {}) when block 1 already has complete history — nothing to do.
+//
+// A binary search over [1, pivot-1] finds the lowest already-complete block;
+// everything below that block is the work remaining.
+func (s *xdcSyncer) snapHistoryFindResumeTop(pivotNum uint64) (uint64, common.Hash) {
+	db := s.handler.database
+
+	// Fast path: block 1 already complete.
+	hash1 := rawdb.ReadCanonicalHash(db, 1)
+	if hash1 != (common.Hash{}) {
+		hdr1 := rawdb.ReadHeader(db, hash1, 1)
+		if hdr1 != nil && snapBlockComplete(db, hash1, 1, hdr1.TxHash) {
+			return 0, common.Hash{}
+		}
+	}
+
+	// Binary search for the lowest complete block in [1, pivot-1].
+	// Invariant: everything in [lo, pivot-1] may contain the first complete block;
+	// everything in [1, hi) is confirmed incomplete.
+	lo, hi := uint64(1), pivotNum-1
+	for lo < hi {
+		mid := (lo + hi) / 2
+		hash := rawdb.ReadCanonicalHash(db, mid)
+		if hash == (common.Hash{}) {
+			// No canonical hash → incomplete; search higher.
+			lo = mid + 1
+			continue
+		}
+		hdr := rawdb.ReadHeader(db, hash, mid)
+		if hdr != nil && snapBlockComplete(db, hash, mid, hdr.TxHash) {
+			hi = mid
+		} else {
+			lo = mid + 1
+		}
+	}
+
+	// lo is now the candidate for the lowest complete block.
+	loHash := rawdb.ReadCanonicalHash(db, lo)
+	if loHash == (common.Hash{}) {
+		// Nothing in [1, pivot-1] is complete; start fresh from pivot-1.
+		pivotHdr := s.handler.chain.GetHeaderByNumber(pivotNum)
+		if pivotHdr == nil {
+			return 0, common.Hash{}
+		}
+		return pivotNum - 1, pivotHdr.ParentHash
+	}
+	loHdr := rawdb.ReadHeader(db, loHash, lo)
+	if loHdr == nil || !snapBlockComplete(db, loHash, lo, loHdr.TxHash) {
+		// Even lo is incomplete; start fresh.
+		pivotHdr := s.handler.chain.GetHeaderByNumber(pivotNum)
+		if pivotHdr == nil {
+			return 0, common.Hash{}
+		}
+		return pivotNum - 1, pivotHdr.ParentHash
+	}
+	if lo == 1 {
+		// Block 1 is complete — all history is present.
+		return 0, common.Hash{}
+	}
+	// nextTop = lo-1; topHash = ParentHash of the lowest complete block.
+	return lo - 1, loHdr.ParentHash
+}
+
+// triggerReinitBFT calls EngineV2.ReinitBFT on the current chain head so the
+// XDPoS V2 engine can create its masternode snapshot from the now-available
+// V2 gap header.  Safe to call when the engine is not V2 (no-op).
+func (s *xdcSyncer) triggerReinitBFT(gapNum uint64) {
+	headNum := uint64(0)
+	if cur := s.handler.chain.CurrentBlock(); cur != nil {
+		headNum = cur.Number.Uint64()
+	}
+	xdposEngine, ok := s.handler.chain.Engine().(*XDPoS.XDPoS)
+	if !ok || xdposEngine.EngineV2 == nil {
+		return
+	}
+	headHdr := s.handler.chain.GetHeaderByNumber(headNum)
+	if headHdr == nil {
+		return
+	}
+	if err := xdposEngine.EngineV2.ReinitBFT(s.handler.chain, headHdr); err != nil {
+		log.Warn("xdcSyncer: SYNC-06 V2 engine re-init failed", "gapNum", gapNum, "head", headNum, "err", err)
+	} else {
+		log.Info("xdcSyncer: SYNC-06 V2 engine re-initialized", "gapNum", gapNum, "head", headNum)
+	}
+}
+
+// runSnapHistoryBackfill downloads and stores block headers, bodies and receipts
+// for the range [1, pivot−1] that the snap skeleton skipped (its terminate-floor
+// stopped the walk at pivot; see SetSnapTerminateFloor).  The goroutine runs
+// concurrently with TIP_CATCH head-following so normal forward sync is not
+// blocked.
+//
+// Algorithm:
+//
+//  1. Determine pivot: in-memory snapHistoryPivot (fresh snap-sync) or the
+//     rawdb-persisted LastPivotNumber (restart recovery).
+//  2. Find the resume point via snapHistoryFindResumeTop (binary search over
+//     already-complete blocks) so a restart resumes below where it stopped
+//     rather than re-downloading everything.
+//  3. Walk descending batches of snapHistoryBatchSize headers.  For each batch:
+//     a. Fetch headers from a ranked peer; verify top-hash and parent-hash chain.
+//     b. Write headers via PrimeAncestorHeaders (idempotent).
+//     c. For each non-empty-tx block: fetch bodies, verify each body against its
+//     header (TxHash + UncleHash + WithdrawalsHash); reject mismatches and
+//     taint the offending peer.  Retry until all bodies are present or
+//     snapHistoryMaxBodyRetry attempts are exhausted.
+//     d. Fetch receipts best-effort; verify ReceiptHash before writing.
+//  4. After writing the batch that covers the V2 gap header (SwitchBlock − Gap),
+//     call triggerReinitBFT so the engine can initialise its masternode snapshot.
+//     Also called on entry if the gap header is already present (restart case).
+//
+// Refs #1848 (SYNC-06).
+const (
+	snapHistoryBatchSize      = 128 // matches observed XDPOS2 body-response cap
+	snapHistoryMaxBodyRetry   = 10  // max body-fetch attempts per batch before giving up
+	snapHistoryMaxModernPeers = 4   // max concurrent eth/69+ peers for body+receipt fan-out (SYNC-10)
+)
+
+func (s *xdcSyncer) runSnapHistoryBackfill() {
+	// One-shot guard: exactly one backfill goroutine per syncer lifetime.
+	if !s.snapHistoryBackfillDone.CompareAndSwap(false, true) {
+		return
+	}
+
+	// Pivot: prefer in-memory (set during this session's snap sync), fall back
+	// to the rawdb-persisted value so a restart can resume.
+	pivotNum := s.snapHistoryPivot.Load()
+	if pivotNum == 0 {
+		if p := rawdb.ReadLastPivotNumber(s.handler.database); p != nil {
+			pivotNum = *p
+		}
+	}
+	if pivotNum == 0 {
+		log.Warn("xdcSyncer: SYNC-06 history backfill skipped — no pivot recorded")
+		return
+	}
+	if pivotNum <= 1 {
+		log.Info("xdcSyncer: SYNC-06 history backfill skipped — pivot <= 1", "pivot", pivotNum)
+		return
+	}
+
+	// Compute the V2 gap header number (SwitchBlock − Gap).
+	// lastGapNum == 0 means V1-only chain; no engine re-init needed.
+	cfg := s.handler.chain.Config()
+	lastGapNum := uint64(0)
+	if cfg != nil && cfg.XDPoS != nil && cfg.XDPoS.V2 != nil &&
+		cfg.XDPoS.V2.SwitchBlock != nil && cfg.XDPoS.Gap > 0 {
+		sw := cfg.XDPoS.V2.SwitchBlock.Uint64()
+		if sw > cfg.XDPoS.Gap {
+			lastGapNum = sw - cfg.XDPoS.Gap
+		}
+	}
+
+	dl := s.handler.downloader
+	db := s.handler.database
+
+	// Restart recovery: if the gap header was already written in a previous run,
+	// trigger ReinitBFT now so the engine doesn't wait for the backfill to reach
+	// that block a second time.
+	engineReinitDone := false
+	if lastGapNum > 0 {
+		gapHash := rawdb.ReadCanonicalHash(db, lastGapNum)
+		if gapHash != (common.Hash{}) && rawdb.HasHeader(db, gapHash, lastGapNum) {
+			s.triggerReinitBFT(lastGapNum)
+			engineReinitDone = true
+		}
+	}
+
+	// Find where to start (or resume after a restart).
+	nextTop, topHash := s.snapHistoryFindResumeTop(pivotNum)
+	if nextTop == 0 {
+		log.Info("xdcSyncer: SYNC-06 history backfill already complete", "pivot", pivotNum)
+		return
+	}
+
+	log.Info("xdcSyncer: SYNC-06 snap history backfill starting",
+		"pivot", pivotNum, "backfill_hi", nextTop, "backfill_lo", 1,
+		"v2GapHeader", lastGapNum)
+
+	written := uint64(0)
+	skipped := uint64(0)
+
+	// historyBlind tracks peers that returned 0 headers for the current batch
+	// range — they cannot serve old history (e.g. a fast-synced peer whose own
+	// backfill is still in progress).  Blind peers are skipped within a cycle
+	// and the set is reset when every peer is blind (triggering the 5s pause).
+	// This prevents a partial peer from holding XDCHeaderReqMu for xdcReqTimeout
+	// (8s) on every batch iteration and stalling the fullSyncOnce fanout.
+	historyBlind := make(map[string]bool)
+
+	for nextTop >= 1 {
+		select {
+		case <-s.quitCh:
+			log.Info("xdcSyncer: SYNC-06 history backfill aborted", "written", written, "skipped", skipped)
+			return
+		default:
+		}
+
+		// Batch: [lo, nextTop], ascending, at most snapHistoryBatchSize blocks.
+		lo := nextTop + 1 - uint64(snapHistoryBatchSize)
+		if nextTop < uint64(snapHistoryBatchSize) {
+			lo = 1
+		}
+		want := int(nextTop-lo) + 1
+
+		// Fetch headers from the best available peer.  Use xdcBulkReqTimeout (4s)
+		// rather than xdcReqTimeout (8s) so a peer that can't serve the old range
+		// releases XDCHeaderReqMu quickly, keeping it available for the concurrent
+		// fullSyncOnce fanout.  Peers returning 0 are added to historyBlind and
+		// skipped in subsequent batches until the set is reset.
+		var headers []*types.Header
+		peers := s.rankedPeers()
+		triedAny := false
+		for _, p := range peers {
+			if historyBlind[p.ID()] {
+				continue
+			}
+			triedAny = true
+			headers = s.fetchHeaderBatchTimeout(p, lo, want, xdcBulkReqTimeout)
+			if len(headers) > 0 {
+				break
+			}
+			// Peer can't serve this range; skip it for the remainder of this cycle.
+			historyBlind[p.ID()] = true
+		}
+		if !triedAny {
+			// All peers are blind; reset so the next iteration retries the full set.
+			historyBlind = make(map[string]bool)
+		}
+		if len(headers) == 0 {
+			log.Warn("xdcSyncer: SYNC-06 history backfill — no peer served headers; will retry",
+				"lo", lo, "hi", nextTop, "peers", len(peers))
+			select {
+			case <-time.After(5 * time.Second):
+			case <-s.quitCh:
+				return
+			}
+			continue
+		}
+
+		// Canonical-hash check: the highest returned header must hash to topHash.
+		gotTop := headers[len(headers)-1]
+		if gotTop.Hash() != topHash {
+			log.Warn("xdcSyncer: SYNC-06 history backfill — top-hash mismatch, retrying",
+				"want", topHash.Hex()[:10], "got", gotTop.Hash().Hex()[:10], "block", gotTop.Number.Uint64())
+			select {
+			case <-time.After(2 * time.Second):
+			case <-s.quitCh:
+				return
+			}
+			continue
+		}
+
+		// Internal parent-hash linkage check.
+		chainOK := true
+		for i := 1; i < len(headers); i++ {
+			if headers[i].ParentHash != headers[i-1].Hash() {
+				log.Warn("xdcSyncer: SYNC-06 history backfill — parent-hash mismatch in batch",
+					"at_index", i, "block", headers[i].Number.Uint64())
+				chainOK = false
+				break
+			}
+		}
+		if !chainOK {
+			select {
+			case <-time.After(2 * time.Second):
+			case <-s.quitCh:
+				return
+			}
+			continue
+		}
+
+		// Skip prefix that already has complete history (idempotent restarts).
+		toWrite := headers
+		for len(toWrite) > 0 {
+			h := toWrite[0]
+			if snapBlockComplete(db, h.Hash(), h.Number.Uint64(), h.TxHash) {
+				skipped++
+				toWrite = toWrite[1:]
+			} else {
+				break
+			}
+		}
+
+		if len(toWrite) == 0 {
+			// All blocks in this batch already complete; advance to next batch.
+			topHash = headers[0].ParentHash
+			if lo <= 1 {
+				break
+			}
+			nextTop = lo - 1
+			continue
+		}
+
+		// Write headers (idempotent: PrimeAncestorHeaders skips already-present blocks).
+		if err := dl.PrimeAncestorHeaders(toWrite); err != nil {
+			log.Warn("xdcSyncer: SYNC-06 history backfill — PrimeAncestorHeaders failed",
+				"lo", toWrite[0].Number.Uint64(), "hi", toWrite[len(toWrite)-1].Number.Uint64(), "err", err)
+			select {
+			case <-time.After(2 * time.Second):
+			case <-s.quitCh:
+				return
+			}
+			continue
+		}
+		written += uint64(len(toWrite))
+
+		// Empty blocks have nothing to fetch: store their empty body and receipts
+		// now, as the upstream downloader does, so they are served like a full
+		// node's blocks.
+		emptyBatch := db.NewBatch()
+		for _, h := range toWrite {
+			if body := emptyHistoryBody(h); body != nil && !rawdb.HasBody(db, h.Hash(), h.Number.Uint64()) {
+				rawdb.WriteBody(emptyBatch, h.Hash(), h.Number.Uint64(), body)
+				rawdb.WriteReceipts(emptyBatch, h.Hash(), h.Number.Uint64(), types.Receipts{})
+			}
+		}
+		if err := emptyBatch.Write(); err != nil {
+			log.Warn("xdcSyncer: SYNC-06 history backfill — empty body write failed", "err", err)
+		}
+
+		// Bodies: collect blocks that still need body and/or receipts. Use
+		// snapBlockComplete (not just !HasBody) so blocks whose body was already
+		// written but whose receipts are still missing stay in the retry queue.
+		bodyPending := make([]*types.Header, 0, len(toWrite))
+		for _, h := range toWrite {
+			if h.TxHash != types.EmptyTxsHash && !snapBlockComplete(db, h.Hash(), h.Number.Uint64(), h.TxHash) {
+				bodyPending = append(bodyPending, h)
+			}
+		}
+
+		// reqSize starts at the full batch and halves whenever the peer returns
+		// fewer bodies than requested.  For blocks whose body exceeds the peer's
+		// 2 MB soft response limit this drives reqSize to 1, ensuring at least one
+		// block is served per round-trip even when the body is very large.
+		reqSize := snapHistoryBatchSize
+
+		for attempt := 0; len(bodyPending) > 0 && attempt < snapHistoryMaxBodyRetry; attempt++ {
+			select {
+			case <-s.quitCh:
+				return
+			default:
+			}
+
+			peers = s.rankedPeers()
+
+			// SYNC-10: modern (request-ID) peer path.  Fan out body+receipt requests
+			// to up to snapHistoryMaxModernPeers peers concurrently; each peer owns a
+			// non-overlapping chunk so several requests are in flight simultaneously.
+			// Falls through to the XDPOS2 legacy path when no modern peers are available
+			// or when modern peers deliver no new data this round.
+			var modern []*eth.Peer
+			for _, p := range peers {
+				if peerHasRequestID(p) {
+					modern = append(modern, p)
+				}
+			}
+			if len(modern) > 0 {
+				n := min(len(modern), snapHistoryMaxModernPeers)
+				chunkSize := max(1, min(reqSize, (len(bodyPending)+n-1)/n))
+				prevPending := len(bodyPending)
+				var wg sync.WaitGroup
+				offset := 0
+				for i := 0; i < n && offset < len(bodyPending); i++ {
+					end := min(offset+chunkSize, len(bodyPending))
+					chunk := bodyPending[offset:end]
+					p := modern[i]
+					wg.Add(1)
+					go func(peer *eth.Peer, headers []*types.Header) {
+						defer wg.Done()
+						if s.backfillBodyReceiptChunkModern(peer, headers, db) {
+							s.taintPeer(peer)
+						}
+					}(p, chunk)
+					offset = end
+				}
+				wg.Wait()
+				var stillPending []*types.Header
+				for _, h := range bodyPending {
+					if !snapBlockComplete(db, h.Hash(), h.Number.Uint64(), h.TxHash) {
+						stillPending = append(stillPending, h)
+					}
+				}
+				bodyPending = stillPending
+				if len(bodyPending) < prevPending {
+					// Made progress; brief backoff then next attempt.
+					if len(bodyPending) > 0 {
+						select {
+						case <-time.After(time.Second):
+						case <-s.quitCh:
+							return
+						}
+					}
+					continue
+				}
+				// No progress from modern peers; fall through to XDPOS2 legacy path.
+			}
+
+			// XDPOS2 legacy path (pre-SYNC-10).
+			var activePeer *eth.Peer
+			if len(peers) > 0 {
+				activePeer = peers[0]
+			}
+			if activePeer == nil {
+				select {
+				case <-time.After(2 * time.Second):
+				case <-s.quitCh:
+					return
+				}
+				continue
+			}
+
+			// Request at most reqSize bodies to stay within the peer's response limit.
+			sendN := min(reqSize, len(bodyPending))
+			hashes := make([]common.Hash, sendN)
+			for i, h := range bodyPending[:sendN] {
+				hashes[i] = h.Hash()
+			}
+			rawBodies := s.fetchBodiesBatch(activePeer, hashes)
+			if len(rawBodies) == 0 {
+				// Peer returned nothing — halve the request size so the next attempt
+				// asks for fewer (possibly oversized) blocks at once.
+				if reqSize > 1 {
+					reqSize = max(1, reqSize/2)
+				}
+				select {
+				case <-time.After(time.Second):
+				case <-s.quitCh:
+					return
+				}
+				continue
+			}
+			if len(rawBodies) < sendN {
+				// Short reply: adapt down so we never over-request again.
+				reqSize = max(1, len(rawBodies))
+			}
+
+			pairCount := min(len(rawBodies), len(bodyPending))
+
+			// Write each verified body and its receipts immediately, one block at a
+			// time.  Direct rawdb writes avoid PrimeAncestorBodies's hard requirement
+			// that receipts and headers have equal lengths, which breaks silently when
+			// fetchReceiptsBatch returns an empty-but-non-nil slice for an oversized
+			// receipt response.
+			batch := db.NewBatch()
+			badPeer := false
+			for i := 0; i < pairCount && !badPeer; i++ {
+				rb := rawBodies[i]
+				h := bodyPending[i]
+				hash := h.Hash()
+				num := h.Number.Uint64()
+
+				txs, err := rb.Transactions.Items()
+				if err != nil {
+					continue
+				}
+				uncles, err := rb.Uncles.Items()
+				if err != nil {
+					continue
+				}
+				body := &types.Body{Transactions: txs, Uncles: uncles}
+				if rb.Withdrawals != nil {
+					if wd, err2 := rb.Withdrawals.Items(); err2 == nil {
+						body.Withdrawals = wd
+					}
+				}
+				if !verifyBodyAgainstHeader(h, body) {
+					log.Warn("xdcSyncer: SYNC-06 history backfill — body hash mismatch; tainting peer",
+						"block", num, "peer", activePeer.ID())
+					badPeer = true
+					break
+				}
+
+				// Write the body (overwrite any 0-tx placeholder left by snap sync).
+				needsBody := !rawdb.HasBody(db, hash, num)
+				if !needsBody {
+					if ex := rawdb.ReadBody(db, hash, num); ex != nil && len(ex.Transactions) == 0 {
+						needsBody = true
+					}
+				}
+				if needsBody {
+					rawdb.WriteBody(batch, hash, num, body)
+				}
+				// Index the transactions so eth_getTransactionByHash/Receipt find
+				// them; the tx indexer already ran before this backfill.
+				rawdb.WriteTxLookupEntriesByBlock(batch, types.NewBlockWithHeader(h).WithBody(*body))
+
+				// Fetch receipt for this one block and write immediately.  If the
+				// peer cannot serve it right now the body write still lands; the
+				// block stays in bodyPending (snapBlockComplete requires receipts)
+				// and will be retried on the next attempt.
+				rcpSlice := s.fetchReceiptsBatch(activePeer, []*types.Header{h})
+				if len(rcpSlice) == 1 && rcpSlice[0] != nil {
+					rcpHash := types.DeriveSha(rcpSlice[0], trie.NewStackTrie(nil))
+					if rcpHash != h.ReceiptHash {
+						log.Warn("xdcSyncer: SYNC-06 history backfill — receipt hash mismatch; tainting peer",
+							"block", num, "peer", activePeer.ID())
+						badPeer = true
+						break
+					}
+					if !rawdb.HasReceipts(db, hash, num) || needsBody {
+						rawdb.WriteReceipts(batch, hash, num, rcpSlice[0])
+					}
+				}
+			}
+			if err := batch.Write(); err != nil {
+				log.Warn("xdcSyncer: SYNC-06 history backfill — batch write failed", "err", err)
+			}
+			if badPeer {
+				s.taintPeer(activePeer)
+			}
+
+			// Re-check which blocks still lack body+receipts.
+			var stillPending []*types.Header
+			for _, h := range bodyPending {
+				if !snapBlockComplete(db, h.Hash(), h.Number.Uint64(), h.TxHash) {
+					stillPending = append(stillPending, h)
+				}
+			}
+			bodyPending = stillPending
+			if len(bodyPending) > 0 {
+				select {
+				case <-time.After(time.Second):
+				case <-s.quitCh:
+					return
+				}
+			}
+		}
+
+		if len(bodyPending) > 0 {
+			log.Warn("xdcSyncer: SYNC-06 history backfill — bodies still incomplete after retries; will resume later",
+				"remaining", len(bodyPending), "lo", lo, "hi", nextTop)
+			// Do NOT advance nextTop — the outer loop will revisit this batch on
+			// the next iteration (headers already present, PrimeAncestorHeaders is
+			// idempotent, and the skip check will push toWrite past the complete prefix).
+			select {
+			case <-time.After(5 * time.Second):
+			case <-s.quitCh:
+				return
+			}
+			continue
+		}
+
+		// If this batch covered the V2 gap header, trigger engine re-init.
+		if !engineReinitDone && lastGapNum > 0 && lo <= lastGapNum && lastGapNum <= nextTop {
+			s.triggerReinitBFT(lastGapNum)
+			engineReinitDone = true
+		}
+
+		// Advance to the next (lower) batch.
+		topHash = headers[0].ParentHash
+		if lo <= 1 {
+			break
+		}
+		nextTop = lo - 1
+	}
+
+	log.Info("xdcSyncer: SYNC-06 snap history backfill complete",
+		"written", written, "skipped", skipped, "pivot", pivotNum)
 }

@@ -4,9 +4,11 @@
 package miner
 
 import (
+	"math/big"
 	"testing"
 
 	"github.com/ethereum/go-ethereum/core"
+	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/params"
 )
 
@@ -70,4 +72,52 @@ func TestXdcGasCeil_ClimbsFromLowNeverDown(t *testing.T) {
 		}
 	}
 	t.Fatalf("did not reach plateau within 100000 blocks; stuck at %d", gl)
+}
+
+// A chain that sets DynamicGasLimitBlock seals like canonical XDPoSChain
+// (v2.9.3 miner/worker.go:844-848): the static ceiling before the fork, then
+// core.CalcGasLimit toward the ceiling. Values are from net2012 (fork 4500,
+// ceiling raised to 500M): block 4628 must rise to 448,821,589, not stay flat.
+func TestXdcGasLimit_DynamicGasLimitBlock(t *testing.T) {
+	gl := func(dyn *big.Int, number, parent uint64) uint64 {
+		w := &XdcWorker{miner: &Miner{
+			config:      &Config{GasCeil: 500_000_000},
+			chainConfig: &params.ChainConfig{DynamicGasLimitBlock: dyn},
+		}}
+		return w.xdcGasLimit(&types.Header{Number: new(big.Int).SetUint64(number - 1), GasLimit: parent})
+	}
+	cases := []struct {
+		name                 string
+		dyn                  *big.Int
+		number, parent, want uint64
+	}{
+		{"after fork: CalcGasLimit toward ceiling", big.NewInt(4500), 4628, 448_383_716, 448_821_589},
+		{"at fork block", big.NewInt(4500), 4500, 420_000_000, 420_410_155},
+		{"before fork: static ceiling", big.NewInt(4500), 4499, 420_000_000, 500_000_000},
+		{"no DynamicGasLimitBlock: 420M plateau rule", nil, 4628, 448_383_716, 448_383_716},
+	}
+	for _, c := range cases {
+		if got := gl(c.dyn, c.number, c.parent); got != c.want {
+			t.Errorf("%s: gas limit = %d, want %d", c.name, got, c.want)
+		}
+	}
+}
+
+// Apothem seals like canonical XDPoSChain v2.9.3-testnet, whose
+// genesis/testnet.json sets dynamicGasLimitBlock 83,600,000 with the v2.9
+// reset: the static ceiling before it, then core.CalcGasLimit (#1539).
+func TestXdcGasLimit_ApothemDynamicGasLimitBlock(t *testing.T) {
+	w := &XdcWorker{miner: &Miner{
+		config:      &Config{GasCeil: 500_000_000},
+		chainConfig: params.XDCApothemChainConfig,
+	}}
+	gl := func(number, parent uint64) uint64 {
+		return w.xdcGasLimit(&types.Header{Number: new(big.Int).SetUint64(number - 1), GasLimit: parent})
+	}
+	if got, want := gl(83_599_999, 420_000_000), uint64(500_000_000); got != want {
+		t.Errorf("before 83,600,000: gas limit = %d, want the static ceiling %d", got, want)
+	}
+	if got, want := gl(83_600_000, 420_000_000), uint64(420_410_155); got != want {
+		t.Errorf("at 83,600,000: gas limit = %d, want CalcGasLimit %d", got, want)
+	}
 }

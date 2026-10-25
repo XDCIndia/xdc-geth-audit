@@ -51,6 +51,7 @@ import (
 	"github.com/ethereum/go-ethereum/metrics"
 	"github.com/ethereum/go-ethereum/p2p"
 	"github.com/ethereum/go-ethereum/p2p/enode"
+	"github.com/ethereum/go-ethereum/params"
 )
 
 const (
@@ -127,8 +128,47 @@ type handlerConfig struct {
 	Sync             ethconfig.SyncMode     // Whether to snap or full sync
 	BloomCache       uint64                 // Megabytes to alloc for snap sync bloom
 	RequiredBlocks   map[uint64]common.Hash // Hard coded map of required block hashes for sync challenges
-	SnapV2           bool                   // Whether to advertise and sync via the snap/2 protocol
+	SnapV2           *bool                  // Snap/2 state syncer: on, off, or nil for automatic
 	FetchProbability uint64                 // Full blob fetch probability for sparse blobpool (blobFetcher)
+}
+
+// snapV2AutoDelay is how long Amsterdam must have been active before the snap/2
+// state syncer is used.
+const snapV2AutoDelay = time.Hour
+
+// resolveSnapV2 decides whether the snap/2 state syncer is used. snap/2 heals
+// with block access lists, so it is only used once Amsterdam has been active
+// for snapV2AutoDelay, even if requested explicitly. Without an explicit
+// setting, snap/2 is then picked automatically unless an unfinished snap/1
+// sync is resumed.
+//
+// XDC: on XDPoS chains (config.XDPoS != nil) the automatic selection is
+// suppressed. snap/2 requires block access lists (BAL) from Amsterdam blocks;
+// the XDC fleet runs snap/1 and has not validated BAL-based healing. An
+// operator may still opt in explicitly with --snap.v2=true.
+func resolveSnapV2(explicit *bool, config *params.ChainConfig, db ethdb.Database) bool {
+	if explicit != nil && !*explicit {
+		return false
+	}
+	// XDC: suppress automatic snap/2 selection on XDPoS chains.
+	if explicit == nil && config.XDPoS != nil {
+		return false
+	}
+	if config.AmsterdamTime == nil || uint64(time.Now().Add(-snapV2AutoDelay).Unix()) < *config.AmsterdamTime {
+		if explicit != nil {
+			amsterdam := "unscheduled"
+			if config.AmsterdamTime != nil {
+				amsterdam = fmt.Sprint(*config.AmsterdamTime)
+			}
+			log.Warn("Snap/2 requested before Amsterdam, falling back to snap/1", "amsterdam", amsterdam)
+		}
+		return false
+	}
+	if explicit == nil && snap.HasLegacySyncProgress(db) {
+		log.Info("Resuming unfinished snap/1 sync, snap/2 deferred to a fresh sync")
+		return false
+	}
+	return true
 }
 
 type handler struct {
@@ -189,7 +229,11 @@ func newHandler(config *handlerConfig) (*handler, error) {
 		handlerStartCh: make(chan struct{}),
 	}
 	// Construct the downloader (long sync)
-	h.downloader = downloader.New(config.Database, config.Sync, h.chain, h.removePeer, h.enableSyncedFeatures, config.SnapV2)
+	snapV2 := resolveSnapV2(config.SnapV2, config.Chain.Config(), config.Database)
+	h.downloader = downloader.New(config.Database, config.Sync, h.chain, h.removePeer, h.enableSyncedFeatures, snapV2)
+	if h.downloader.ConfigSyncMode() == ethconfig.SnapSync {
+		log.Info("Selected snap sync state syncer", "version", h.downloader.SnapSyncVersion())
+	}
 
 	// XDC gap-pivot enumeration — Phase A.5 of #844.
 	// Inject the chain config (for gap formula) and a snapshot callback so
@@ -470,7 +514,9 @@ func (h *handler) runEthPeer(peer *eth.Peer, handler eth.Handler) error {
 	dead := make(chan struct{})
 	defer close(dead)
 
-	// If we have any explicit peer required block hashes, request them
+	// If we have any explicit peer required block hashes, request them. Read the
+	// challenge timeout once here, not in each goroutine.
+	challengeTimeout := syncChallengeTimeout
 	for number, hash := range h.requiredBlocks {
 		resCh := make(chan *eth.Response)
 
@@ -482,7 +528,42 @@ func (h *handler) runEthPeer(peer *eth.Peer, handler eth.Handler) error {
 			// Ensure the request gets cancelled in case of error/drop
 			defer req.Close()
 
-			timeout := time.NewTimer(syncChallengeTimeout)
+			// XDPOS2 peers route BlockHeaders replies to peer.XDCHeaderResp
+			// rather than through the request-id dispatcher (the legacy wire
+			// has no RequestId on responses). Wait on XDCHeaderResp with a
+			// bounded timeout; on timeout keep the peer — silence on legacy
+			// wire is not evidence of misbehaviour. Only an explicit hash
+			// mismatch at the requested number warrants a drop.
+			if eth.IsXDPOS2Family(peer.Version()) {
+				timeout := time.NewTimer(challengeTimeout)
+				defer timeout.Stop()
+				select {
+				case headers := <-peer.XDCHeaderResp:
+					if len(headers) == 0 || headers[0].Number.Uint64() != number {
+						// Empty response or a different number than we asked for:
+						// this response is not ours (could belong to xdcSyncer).
+						// Do not steal more reads; keep the peer.
+						return
+					}
+					if headers[0].Hash() != hash {
+						peer.Log().Info("Required block mismatch on XDPOS2 peer, dropping",
+							"number", number, "hash", headers[0].Hash(), "want", hash)
+						h.removePeer(peer.ID())
+						return
+					}
+					peer.Log().Debug("XDPOS2 peer required block verified", "number", number, "hash", hash)
+				case <-timeout.C:
+					// Keep the peer — XDPOS2 peers are often slow to reply and
+					// absence of a timely response is not a chain-fork indicator.
+					peer.Log().Debug("Required block challenge timed out on XDPOS2 peer, keeping",
+						"addr", peer.RemoteAddr())
+				case <-dead:
+					// Peer handler terminated; abort.
+				}
+				return
+			}
+
+			timeout := time.NewTimer(challengeTimeout)
 			defer timeout.Stop()
 
 			select {
@@ -592,6 +673,10 @@ func (h *handler) unregisterPeer(id string) {
 	h.txFetcher.Drop(id)
 	h.blobFetcher.Drop(id)
 	h.txTracker.NotifyPeerDrop(id)
+	if h.xdcSync != nil {
+		// #1876: a peer may resync onto the canonical branch before it reconnects.
+		h.xdcSync.forkGuardVerdicts.Delete(id)
+	}
 
 	if err := h.peers.unregisterPeer(id); err != nil {
 		logger.Error("Ethereum peer removal failed", "err", err)

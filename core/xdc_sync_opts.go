@@ -3,7 +3,10 @@
 
 package core
 
-import "sync/atomic"
+import (
+	"os"
+	"sync/atomic"
+)
 
 // XdcBulkSyncMode is set to true during initial block sync (when chain head is
 // far behind peers). When true, signing-tx processing is skipped (ECDSA
@@ -34,6 +37,21 @@ var XdcBulkSyncMode atomic.Bool
 // Kept in sync with the per-instance flag via BlockChain.storeCheckpointSyncNoState
 // (core/blockchain.go); there is one BlockChain per process so a global is safe.
 var CheckpointSyncNoStateActive atomic.Bool
+
+// XdcForceFullVerify pins strict (steady-state) verification on for the whole
+// process. It exists for the replay-parity harness (scripts/replay-parity.sh,
+// refs #1430), which must prove a binary accepts canonical history WITHOUT the
+// bulk-sync relaxations. While true:
+//   - XDPoS xdcFullVerify() is always true, even if XdcBulkSyncMode is set;
+//   - canMaskMissingState() is false (no A.93/A.94 EmptyRootHash masking);
+//   - checkpointSyncNoState cannot be latched (not even from the DB flag), so
+//     execution and state/receipt-root validation always run.
+//
+// It is set only from the XDC_FORCE_FULL_VERIFY=1 environment variable at
+// process start; nothing in the node sets it, so default behaviour is unchanged.
+var XdcForceFullVerify atomic.Bool
+
+func init() { XdcForceFullVerify.Store(os.Getenv("XDC_FORCE_FULL_VERIFY") == "1") }
 
 // XdcForkRecovering is set true by the xdcSyncer while it is escaping a fork
 // (repeated ErrUnknownAncestor → SetHead rollback) and cleared on the next

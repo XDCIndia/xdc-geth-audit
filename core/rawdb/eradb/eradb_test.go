@@ -17,13 +17,16 @@
 package eradb
 
 import (
+	"io"
 	"math/big"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 	"testing"
 
 	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/internal/era/execdb"
 	"github.com/ethereum/go-ethereum/internal/era/onedb"
 	"github.com/ethereum/go-ethereum/rlp"
@@ -129,16 +132,43 @@ func convertEra1ToEre(t *testing.T, era1Path, dir, network string, epoch int) {
 	defer f.Close()
 
 	builder := execdb.NewBuilder(f)
-	td, err := e.InitialTD()
-	require.NoError(t, err)
-
-	it, err := e.Iterator()
+	// The fixtures hold plain Ethereum headers, which lack the extra fields
+	// XDC headers always carry (Validators/Validator/Penalties), so they can't
+	// be decoded into types.Header (#1874). Convert the raw header RLP instead.
+	it, err := onedb.NewRawIterator(e.(*onedb.Era))
 	require.NoError(t, err)
 	for it.Next() {
-		block, receipts, err := it.BlockAndReceipts()
+		header, err := io.ReadAll(it.Header)
 		require.NoError(t, err)
-		td.Add(td, block.Difficulty())
-		require.NoError(t, builder.Add(block, receipts, new(big.Int).Set(td)))
+		body, err := io.ReadAll(it.Body)
+		require.NoError(t, err)
+		var receipts types.Receipts
+		require.NoError(t, rlp.Decode(it.Receipts, &receipts))
+		slim := make([]*types.SlimReceipt, len(receipts))
+		for i, r := range receipts {
+			slim[i] = (*types.SlimReceipt)(r)
+		}
+		slimRLP, err := rlp.EncodeToBytes(slim)
+		require.NoError(t, err)
+
+		// Pull number and difficulty out of the raw header list:
+		// parent, uncle, coinbase, root, tx, receipt, bloom, difficulty, number.
+		content, _, err := rlp.SplitList(header)
+		require.NoError(t, err)
+		var fields [9][]byte
+		for i := range fields {
+			fields[i], content, err = rlp.SplitString(content)
+			require.NoError(t, err)
+		}
+		var difficulty, number big.Int
+		difficulty.SetBytes(fields[7])
+		number.SetBytes(fields[8])
+
+		rawTD, err := io.ReadAll(it.TotalDifficulty)
+		require.NoError(t, err)
+		slices.Reverse(rawTD)
+		td := new(big.Int).SetBytes(rawTD)
+		require.NoError(t, builder.AddRLP(header, body, slimRLP, number.Uint64(), crypto.Keccak256Hash(header), td, &difficulty))
 	}
 	require.NoError(t, it.Error())
 

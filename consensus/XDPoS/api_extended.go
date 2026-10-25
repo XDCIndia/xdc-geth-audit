@@ -5,7 +5,9 @@
 package XDPoS
 
 import (
+	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math/big"
 	"os"
@@ -17,6 +19,8 @@ import (
 	"github.com/ethereum/go-ethereum/consensus/XDPoS/utils"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/log"
+	"github.com/ethereum/go-ethereum/params"
+	"github.com/ethereum/go-ethereum/rlp"
 	"github.com/ethereum/go-ethereum/rpc"
 )
 
@@ -30,10 +34,41 @@ type V2BlockInfo struct {
 	Error       string           `json:"error,omitempty"`
 }
 
-// MasternodesStatus contains masternode status for RPC
+// MasternodesStatus is the XDPoS_getMasternodesByNumber response. Field names,
+// order and omitempty tags match XinFinOrg/XDPoSChain consensus/XDPoS/api.go
+// (v3.0.0-testnet-1, the version Apothem runs): PascalCase keys, the
+// protector/observer/standby keys are omitted when empty, Error is null on
+// success.
 type MasternodesStatus struct {
-	Number      *big.Int         `json:"number"`
-	Masternodes []common.Address `json:"masternodes"`
+	Epoch           uint64
+	Number          uint64
+	Round           types.Round
+	MasternodesLen  int
+	Masternodes     []common.Address
+	PenaltyLen      int
+	Penalty         []common.Address
+	ProtectorLen    int              `json:",omitempty"`
+	Protectornodes  []common.Address `json:",omitempty"`
+	ObserverLen     int              `json:",omitempty"`
+	Observernodes   []common.Address `json:",omitempty"`
+	StandbynodesLen int              `json:",omitempty"`
+	Standbynodes    []common.Address `json:",omitempty"`
+	Error           error
+}
+
+// mainnetMasternodesStatus is the response of the XDPoSChain v2.6.8 mainnet
+// nodes (consensus/XDPoS/api.go:68): no Epoch, and the standby list is always
+// present, [] when empty.
+type mainnetMasternodesStatus struct {
+	Number          uint64
+	Round           types.Round
+	MasternodesLen  int
+	Masternodes     []common.Address
+	PenaltyLen      int
+	Penalty         []common.Address
+	StandbynodesLen int
+	Standbynodes    []common.Address
+	Error           error
 }
 
 // MessageStatus contains pool status information
@@ -114,22 +149,99 @@ func (api *API) GetV2BlockByHeader(header *types.Header, uncle bool) *V2BlockInf
 			info.Round = round
 		}
 		info.Masternodes = api.xdpos.GetMasternodes(api.chain, header)
+		// F-2026-19639: return the quorum certificate carried in the header.
+		var extra types.ExtraFields_v2
+		if err := utils.DecodeBytesExtraFields(header.Extra, &extra); err == nil && extra.QuorumCert != nil {
+			if enc, err := rlp.EncodeToBytes(extra.QuorumCert); err == nil {
+				info.EncodedQC = base64.StdEncoding.EncodeToString(enc)
+			}
+		}
 	}
 
 	return info
 }
 
-// GetMasternodesByNumber returns masternodes with status info
-func (api *API) GetMasternodesByNumber(number *rpc.BlockNumber) MasternodesStatus {
+// GetMasternodesByNumber reports the node set at a block like canonical
+// XDPoSChain: the epoch's masternodes and penalties (both from the epoch-switch
+// header) and its standby pool, which from TIPUpgradeReward on is split into the
+// protector and observer reward tiers. V1 blocks have no V2 epoch info, so the
+// lists are empty and Round is 0, as on canonical. Mainnet runs an older
+// canonical release whose response has no Epoch and no tiers (see
+// mainnetMasternodesStatus), so that is what mainnet returns.
+func (api *API) GetMasternodesByNumber(number *rpc.BlockNumber) interface{} {
+	st := api.masternodesStatus(number)
+	if cfg := api.chain.Config(); cfg != nil && cfg.ChainID != nil && cfg.ChainID.Cmp(params.XDCMainnetChainConfig.ChainID) == 0 {
+		m := mainnetMasternodesStatus{st.Number, st.Round, st.MasternodesLen, st.Masternodes, st.PenaltyLen, st.Penalty, st.StandbynodesLen, st.Standbynodes, st.Error}
+		if st.Error == nil && m.Standbynodes == nil {
+			m.Standbynodes = []common.Address{}
+		}
+		return m
+	}
+	return st
+}
+
+func (api *API) masternodesStatus(number *rpc.BlockNumber) MasternodesStatus {
 	header := api.getHeaderFromApiBlockNum(number)
 	if header == nil {
-		return MasternodesStatus{}
+		if number == nil {
+			return MasternodesStatus{Error: errors.New("can not get header by nil number")}
+		}
+		return MasternodesStatus{Error: fmt.Errorf("can not get header by number %d", number.Int64())}
 	}
-	masternodes := api.xdpos.GetMasternodes(api.chain, header)
-	return MasternodesStatus{
-		Number:      header.Number,
-		Masternodes: masternodes,
+	st := MasternodesStatus{
+		Number:      header.Number.Uint64(),
+		Masternodes: []common.Address{},
+		Penalty:     []common.Address{},
 	}
+	var standby []common.Address
+	if api.xdpos.IsV2Block(header) && api.xdpos.EngineV2 != nil {
+		round, err := api.xdpos.EngineV2.GetRoundNumber(header)
+		if err != nil {
+			return MasternodesStatus{Error: err}
+		}
+		st.Round = round
+		st.Masternodes = api.xdpos.GetMasternodes(api.chain, header)
+		if cr, ok := api.chain.(consensus.ChainReader); ok {
+			st.Penalty = api.xdpos.EngineV2.GetPreviousPenaltyByHash(cr, header.Hash(), 0)
+			// Legacy reads the standby pool at the epoch-switch block of this
+			// block's epoch (getEpochSwitchInfo), so every block in an epoch
+			// reports the same list.
+			switchHdr := header
+			if n, _, err := api.xdpos.EngineV2.GetCurrentEpochSwitchBlock(cr, header.Number); err == nil {
+				if h := cr.GetHeaderByNumber(n); h != nil {
+					switchHdr = h
+				}
+			}
+			standby = api.xdpos.EngineV2.GetStandbynodes(cr, switchHdr)
+		}
+	}
+	if st.Masternodes == nil {
+		st.Masternodes = []common.Address{}
+	}
+	if st.Penalty == nil {
+		st.Penalty = []common.Address{}
+	}
+	if api.xdpos.config.V2 != nil {
+		st.Epoch = api.xdpos.config.V2.SwitchEpoch
+	}
+	st.Epoch += uint64(st.Round) / api.xdpos.config.Epoch
+	st.MasternodesLen, st.PenaltyLen = len(st.Masternodes), len(st.Penalty)
+
+	cfg := api.chain.Config()
+	if cfg == nil || !cfg.IsTIPUpgradeReward(header.Number) {
+		st.Standbynodes, st.StandbynodesLen = standby, len(standby)
+		return st
+	}
+	var maxProtector, maxObserver int
+	if v2 := api.xdpos.config.V2.Config(uint64(st.Round)); v2 != nil {
+		maxProtector, maxObserver = v2.MaxProtectorNodes, v2.MaxObserverNodes
+	}
+	pEnd := min(maxProtector, len(standby))
+	oEnd := min(pEnd+maxObserver, len(standby))
+	st.Protectornodes, st.ProtectorLen = standby[:pEnd], pEnd
+	st.Observernodes, st.ObserverLen = standby[pEnd:oEnd], oEnd-pEnd
+	st.Standbynodes, st.StandbynodesLen = standby[oEnd:], len(standby)-oEnd
+	return st
 }
 
 // GetBlockInfoByEpochNum returns block info for a specific epoch number.
@@ -179,6 +291,17 @@ func (api *API) GetEpochNumbersBetween(begin, end *rpc.BlockNumber) ([]uint64, e
 
 	// Use V2 engine for ranges fully in V2 (both headers past the switch block).
 	if api.xdpos.IsV2Block(beginHeader) && api.xdpos.EngineV2 != nil {
+		// Reject ranges that span more than 1000 epochs to prevent a single RPC
+		// call from walking the entire chain (review R1-R02).
+		const maxEpochSpan = uint64(1000)
+		epoch := api.xdpos.config.Epoch
+		endNum := endHeader.Number.Uint64()
+		beginNum := beginHeader.Number.Uint64()
+		if endNum > beginNum && endNum-beginNum > maxEpochSpan*epoch {
+			return nil, fmt.Errorf("range spans %d blocks, exceeding the %d-epoch limit of %d blocks",
+				endNum-beginNum, maxEpochSpan, maxEpochSpan*epoch)
+		}
+
 		chainReader, ok := api.chain.(consensus.ChainReader)
 		if !ok {
 			return nil, fmt.Errorf("chain does not implement ChainReader")
@@ -194,15 +317,10 @@ func (api *API) GetEpochNumbersBetween(begin, end *rpc.BlockNumber) ([]uint64, e
 		return result, nil
 	}
 
-	// V1: block-number arithmetic.
-	beginNum := beginHeader.Number.Uint64()
-	endNum := endHeader.Number.Uint64()
-	epoch := api.xdpos.config.Epoch
-	epochs := make([]uint64, 0)
-	for i := beginNum / epoch; i <= endNum/epoch; i++ {
-		epochs = append(epochs, i)
-	}
-	return epochs, nil
+	// F-2026-19639: a range that starts at or before the V2 switch has no
+	// round-based epoch switches to report, and block-number division gave
+	// wrong values. Return the canonical XDPoSChain error instead.
+	return nil, errors.New("not supported in the v1 consensus")
 }
 
 // GetMissedRoundsInEpochByBlockNum returns missed rounds info for the epoch containing the given block.
@@ -252,8 +370,15 @@ func (api *API) NetworkInformation() NetworkInfo {
 		api.xdpos.config.V2.CurrentConfig.MaxMasternodes > 0 {
 		maxValidators = api.xdpos.config.V2.CurrentConfig.MaxMasternodes
 	}
+	// Use the configured chain ID (review R1-R03): Apothem (51), devnets and
+	// private networks must not report 50. Fall back to 50 only when the chain
+	// config is unavailable, which should not happen in production.
+	networkID := big.NewInt(50)
+	if cfg := api.chain.Config(); cfg != nil && cfg.ChainID != nil {
+		networkID = new(big.Int).Set(cfg.ChainID)
+	}
 	info := NetworkInfo{
-		NetworkId:     big.NewInt(50), // XDC Mainnet chain ID
+		NetworkId:     networkID,
 		XDCValidators: maxValidators,
 		Epoch:         api.xdpos.config.Epoch,
 	}
@@ -263,16 +388,16 @@ func (api *API) NetworkInformation() NetworkInfo {
 	return info
 }
 
-// GetRewardByAccount returns reward history for an account by scanning reward files in StoreRewardFolder.
+// GetRewardByAccount returns reward history for an account by scanning reward files in the --store-reward folder.
 // Fix #65: Reads per-block reward JSON files written by Finalize and filters by account address.
 // Reward file format: map[string]map[string]map[string]*big.Int (validator -> voter -> field -> amount)
 // TODO: Support reward DB lookup for non-file-based storage.
 func (api *API) GetRewardByAccount(account common.Address, begin rpc.BlockNumber, end rpc.BlockNumber) (AccountRewardResponse, error) {
 	log.Debug("[GetRewardByAccount]", "account", account.Hex(), "begin", begin, "end", end)
 
-	if len(StoreRewardFolder) == 0 {
+	if len(common.StoreRewardFolder) == 0 {
 		return AccountRewardResponse{Rewards: make([]AccountEpochReward, 0)},
-			fmt.Errorf("StoreRewardFolder not configured; start node with --store-reward-folder to enable reward history")
+			fmt.Errorf("reward folder not configured; start node with --store-reward to enable reward history")
 	}
 
 	// Resolve block range
@@ -297,11 +422,20 @@ func (api *API) GetRewardByAccount(account common.Address, begin rpc.BlockNumber
 	epoch := api.xdpos.config.Epoch
 	accountHex := strings.ToLower(account.Hex())
 
+	// Reject ranges that span more than 1000 epochs to prevent a single RPC call
+	// from listing and decoding every reward file the node has stored (review R2-N01).
+	const maxEpochSpan = uint64(1000)
+	if endNum > beginNum && endNum-beginNum > maxEpochSpan*epoch {
+		return AccountRewardResponse{Rewards: make([]AccountEpochReward, 0)},
+			fmt.Errorf("range spans %d blocks, exceeding the %d-epoch limit of %d blocks",
+				endNum-beginNum, maxEpochSpan, maxEpochSpan*epoch)
+	}
+
 	// Read all reward files in the folder and match by block range and account
-	entries, err := os.ReadDir(StoreRewardFolder)
+	entries, err := os.ReadDir(common.StoreRewardFolder)
 	if err != nil {
 		return AccountRewardResponse{Rewards: make([]AccountEpochReward, 0)},
-			fmt.Errorf("cannot read StoreRewardFolder %s: %w", StoreRewardFolder, err)
+			fmt.Errorf("cannot read reward folder %s: %w", common.StoreRewardFolder, err)
 	}
 
 	rewards := make([]AccountEpochReward, 0)
@@ -319,7 +453,7 @@ func (api *API) GetRewardByAccount(account common.Address, begin rpc.BlockNumber
 			continue
 		}
 
-		data, err := os.ReadFile(filepath.Join(StoreRewardFolder, name))
+		data, err := os.ReadFile(filepath.Join(common.StoreRewardFolder, name))
 		if err != nil {
 			log.Warn("[GetRewardByAccount] cannot read reward file", "file", name, "err", err)
 			continue
@@ -370,4 +504,18 @@ func (api *API) GetRewardByAccount(account common.Address, begin rpc.BlockNumber
 	}
 
 	return AccountRewardResponse{Rewards: rewards}, nil
+}
+
+// GetCheckpointByEpochNumber returns the epoch-switch block of a V2 epoch
+// (epochNum >= V2.SwitchEpoch) from the round-based V2 engine. ok is false
+// for V1 epochs, which keep the block-number formula. F-2026-19639.
+func (x *XDPoS) GetCheckpointByEpochNumber(chain consensus.ChainReader, epochNum uint64) (number uint64, ok bool, err error) {
+	if x.config.V2 == nil || x.config.V2.SwitchBlock == nil || epochNum < x.config.V2.SwitchEpoch || x.EngineV2 == nil {
+		return 0, false, nil
+	}
+	info, err := x.EngineV2.GetBlockByEpochNumber(chain, epochNum)
+	if err != nil {
+		return 0, true, err
+	}
+	return info.Number.Uint64(), true, nil
 }

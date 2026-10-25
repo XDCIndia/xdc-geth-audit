@@ -2,12 +2,12 @@
   "current": {
     "activationTime": 0,
     "blobSchedule": {
-      "baseFeeUpdateFraction": 3338477,
+      "target": 3,
       "max": 6,
-      "target": 3
+      "baseFeeUpdateFraction": 3338477
     },
     "chainId": "0x88bb0",
-    "forkId": "0xbef71d30",
+    "forkId": "0x8622e2af",
     "precompiles": {
       "BLAKE2F": "0x0000000000000000000000000000000000000009",
       "BN254_ADD": "0x0000000000000000000000000000000000000006",
@@ -27,12 +27,12 @@
   "next": {
     "activationTime": 1742999832,
     "blobSchedule": {
-      "baseFeeUpdateFraction": 5007716,
+      "target": 6,
       "max": 9,
-      "target": 6
+      "baseFeeUpdateFraction": 5007716
     },
     "chainId": "0x88bb0",
-    "forkId": "0x0929e24e",
+    "forkId": "0xbe1d70f8",
     "precompiles": {
       "BLAKE2F": "0x0000000000000000000000000000000000000009",
       "BLS12_G1ADD": "0x000000000000000000000000000000000000000b",
@@ -63,12 +63,12 @@
   "last": {
     "activationTime": 1742999832,
     "blobSchedule": {
-      "baseFeeUpdateFraction": 5007716,
+      "target": 6,
       "max": 9,
-      "target": 6
+      "baseFeeUpdateFraction": 5007716
     },
     "chainId": "0x88bb0",
-    "forkId": "0x0929e24e",
+    "forkId": "0xbe1d70f8",
     "precompiles": {
       "BLAKE2F": "0x0000000000000000000000000000000000000009",
       "BLS12_G1ADD": "0x000000000000000000000000000000000000000b",

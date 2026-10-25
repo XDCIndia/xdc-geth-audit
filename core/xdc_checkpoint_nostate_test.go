@@ -242,3 +242,34 @@ func TestNoStateMaskingPredicateOnRealChain(t *testing.T) {
 		})
 	}
 }
+
+// TestForceFullVerifyDisablesRelaxedPaths pins the replay-parity switch (#1430):
+// with XdcForceFullVerify set, a bulk-syncing XDC follower must neither mask a
+// missing state nor latch checkpointSyncNoState (which would skip execution and
+// state/receipt-root validation).
+func TestForceFullVerifyDisablesRelaxedPaths(t *testing.T) {
+	prevBulk, prevForce := XdcBulkSyncMode.Load(), XdcForceFullVerify.Load()
+	defer func() {
+		XdcBulkSyncMode.Store(prevBulk)
+		XdcForceFullVerify.Store(prevForce)
+		CheckpointSyncNoStateActive.Store(false)
+	}()
+	XdcBulkSyncMode.Store(true)
+
+	bc := &BlockChain{
+		chainConfig: &params.ChainConfig{ChainID: big.NewInt(50), XDPoS: &params.XDPoSConfig{}},
+		cfg:         &BlockChainConfig{},
+	}
+	if !bc.canMaskMissingState() {
+		t.Fatal("precondition: a bulk-syncing follower should be able to mask without the switch")
+	}
+
+	XdcForceFullVerify.Store(true)
+	if bc.canMaskMissingState() {
+		t.Fatal("canMaskMissingState() = true with XdcForceFullVerify set")
+	}
+	bc.storeCheckpointSyncNoState(true)
+	if bc.checkpointSyncNoState.Load() || CheckpointSyncNoStateActive.Load() {
+		t.Fatal("checkpointSyncNoState latched with XdcForceFullVerify set")
+	}
+}

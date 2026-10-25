@@ -47,10 +47,18 @@ func (q *balQueue) next() (uint64, bool) {
 	return q.queue.NextBAL()
 }
 
+// servesBALs reports whether a peer speaking this eth version can serve block
+// access lists. XDPOS2 (100, 101) sorts above eth/71 numerically but has no
+// GetBlockAccessLists handler: such a request is an invalid message there and
+// the peer disconnects.
+func servesBALs(version uint) bool {
+	return version >= eth.ETH71 && !eth.IsXDPOS2Family(version)
+}
+
 // capacity is responsible for calculating how many access lists a particular
 // peer is estimated to be able to retrieve within the allotted round trip time.
 func (q *balQueue) capacity(peer *peerConnection, rtt time.Duration) int {
-	if peer.version < eth.ETH71 {
+	if !servesBALs(peer.version) {
 		return 0
 	}
 	return peer.BALCapacity(rtt)
@@ -66,7 +74,7 @@ func (q *balQueue) updateCapacity(peer *peerConnection, items int, span time.Dur
 // lists from the download queue to the specified peer. Peers below eth/71
 // cannot serve access lists and are never assigned any.
 func (q *balQueue) reserve(peer *peerConnection, items int) (*fetchRequest, bool, bool) {
-	if peer.version < eth.ETH71 {
+	if !servesBALs(peer.version) {
 		return nil, false, false
 	}
 	return q.queue.ReserveBALs(peer, items)

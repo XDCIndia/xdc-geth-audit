@@ -17,6 +17,7 @@
 package legacypool
 
 import (
+	"math/big"
 	"sort"
 	"time"
 
@@ -155,11 +156,15 @@ func (q *queue) add(tx *types.Transaction) (*common.Hash, error) {
 // for promotion any that are now executable. It also drops any transactions that are
 // deemed too old (nonce too low) or too costly (insufficient funds or over gas limit).
 //
+// trc21Issuers maps TRC21 token addresses to their fee capacity; when non-nil, txs
+// to registered tokens are retained if the fee capacity covers their TRC21 cost.
+// trc21CostFn computes the TRC21 cost for such a tx.
+//
 // Returns three lists:
 // - all transactions that were removed from the queue and selected for promotion;
 // - all other transactions that were removed from the queue and dropped;
 // - the list of addresses removed.
-func (q *queue) promoteExecutables(accounts []common.Address, gasLimit uint64, currentState *state.StateDB, nonces *noncer) ([]*types.Transaction, []common.Hash, []common.Address) {
+func (q *queue) promoteExecutables(accounts []common.Address, gasLimit uint64, currentState *state.StateDB, nonces *noncer, trc21Issuers map[common.Address]*big.Int, trc21CostFn func(*types.Transaction) *big.Int) ([]*types.Transaction, []common.Hash, []common.Address) {
 	// Track the promotable transactions to broadcast them at once
 	var (
 		promotable       []*types.Transaction
@@ -179,8 +184,10 @@ func (q *queue) promoteExecutables(accounts []common.Address, gasLimit uint64, c
 		}
 		log.Trace("Removing old queued transactions", "count", len(forwards))
 
-		// Drop all transactions that are too costly (low balance or out of gas)
-		drops, _ := list.Filter(currentState.GetBalance(addr), gasLimit)
+		// Drop all transactions that are too costly (low balance or out of gas).
+		// XDC TRC21: pass issuer capacities so TRC21 txs affordable from fee
+		// capacity are not evicted here.
+		drops, _ := list.Filter(currentState.GetBalance(addr), gasLimit, trc21Issuers, trc21CostFn)
 		for _, tx := range drops {
 			dropped = append(dropped, tx.Hash())
 		}

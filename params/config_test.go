@@ -139,6 +139,36 @@ func TestConfigRules(t *testing.T) {
 	}
 }
 
+// TestXDCUBTInvariant verifies that UBT is impossible on XDC chains even when
+// UBTTime=0 and EnableUBTAtGenesis=true are set in the config. On XDC the
+// isUBT gate in Rules() is unconditionally false (guarded on !c.IsXDC()), so
+// witness-gas rules cannot fire and EIP-2929 cannot be disabled by a UBT flag.
+func TestXDCUBTInvariant(t *testing.T) {
+	// Clone XDCMainnetChainConfig and force-arm every UBT knob.
+	cfg := *XDCMainnetChainConfig
+	zero := uint64(0)
+	cfg.UBTTime = &zero           // would activate UBT at timestamp 0 on a non-XDC chain
+	cfg.EnableUBTAtGenesis = true // would switch genesis to binary trie on a non-XDC chain
+
+	// Use a block number and timestamp well past all XDC fork activations.
+	// Block 99_000_000 is past EIP-1559 (98_800_200) so IsEIP2929 would be true.
+	num := big.NewInt(99_000_000)
+	r := cfg.Rules(num, true, 0)
+
+	if r.IsUBT {
+		t.Error("IsUBT must be false on XDC chains regardless of UBTTime")
+	}
+	if r.IsEIP4762 {
+		t.Error("IsEIP4762 must be false on XDC chains when VerkleTime is nil")
+	}
+	if !r.IsEIP2929 {
+		t.Error("IsEIP2929 must still be true on XDC chains past EIP-1559 when UBT is armed but blocked")
+	}
+	if cfg.IsEIP4762(num, 0) {
+		t.Error("ChainConfig.IsEIP4762 must be false on XDC chains when VerkleTime is nil")
+	}
+}
+
 func TestTimestampCompatError(t *testing.T) {
 	require.Equal(t, new(ConfigCompatError).Error(), "")
 
@@ -154,4 +184,45 @@ func TestTimestampCompatError(t *testing.T) {
 
 	require.Equal(t, newTimestampCompatError(errWhat, newUint64(0), newUint64(1681338455)).Error(),
 		"mismatching Shanghai fork timestamp in database (have timestamp 0, want timestamp 1681338455, rewindto timestamp 0)")
+}
+
+func TestCheckConfigForkOrderBPO(t *testing.T) {
+	tests := []struct {
+		name                     string
+		osaka, amsterdam, bogota *uint64
+		bpo1, bpo2, bpo3, bpo4   *uint64
+		wantErr                  bool
+	}{
+		{name: "bpo3 before amsterdam", osaka: newUint64(0), bpo1: newUint64(0), bpo2: newUint64(0), bpo3: newUint64(10), amsterdam: newUint64(20), wantErr: true},
+		{name: "bpo2 before amsterdam", osaka: newUint64(0), bpo1: newUint64(0), bpo2: newUint64(10), amsterdam: newUint64(20)},
+		{name: "bpo after amsterdam", osaka: newUint64(0), bpo1: newUint64(0), bpo2: newUint64(0), amsterdam: newUint64(0), bpo3: newUint64(15000)},
+		{name: "bpo transition after amsterdam", osaka: newUint64(0), amsterdam: newUint64(0), bpo3: newUint64(0), bpo4: newUint64(15000)},
+		{name: "bpo with bogota", osaka: newUint64(0), bpo1: newUint64(0), bpo2: newUint64(0), amsterdam: newUint64(0), bogota: newUint64(100), bpo3: newUint64(100)},
+		{name: "bpo before osaka", osaka: newUint64(10), bpo1: newUint64(5), wantErr: true},
+		{name: "bpo out of order", osaka: newUint64(0), bpo3: newUint64(20), bpo4: newUint64(10), wantErr: true},
+		{name: "amsterdam before osaka", osaka: newUint64(10), amsterdam: newUint64(5), wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			config := *MergedTestChainConfig
+			config.OsakaTime = tt.osaka
+			config.AmsterdamTime = tt.amsterdam
+			config.BogotaTime = tt.bogota
+			config.BPO1Time, config.BPO2Time, config.BPO3Time, config.BPO4Time = tt.bpo1, tt.bpo2, tt.bpo3, tt.bpo4
+			config.BlobScheduleConfig = &BlobScheduleConfig{
+				Cancun: DefaultCancunBlobConfig,
+				Prague: DefaultPragueBlobConfig,
+				BPO1:   DefaultBPO1BlobConfig,
+				BPO2:   DefaultBPO2BlobConfig,
+				BPO3:   DefaultBPO3BlobConfig,
+				BPO4:   DefaultBPO4BlobConfig,
+			}
+			err := config.CheckConfigForkOrder()
+			if tt.wantErr {
+				require.Error(t, err)
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
 }

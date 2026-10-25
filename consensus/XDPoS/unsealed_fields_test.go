@@ -103,9 +103,79 @@ func TestRejectUnsealedHeaderFieldsV2(t *testing.T) {
 		CurrentConfig: &params.V2Config{MaxMasternodes: 108, MinePeriod: 2},
 		AllConfigs:    map[uint64]*params.V2Config{0: {MaxMasternodes: 108, MinePeriod: 2}},
 	}
+	// AmsterdamBlock is nil (not set) so the unseal check applies in full.
+	chainCfg := &params.ChainConfig{ChainID: big.NewInt(551), XDPoS: &cfg}
+	chain := &unsealedChain{cfg: chainCfg}
 	engine := New(&cfg, rawdb.NewMemoryDatabase())
 	h := &types.Header{Number: big.NewInt(901), WithdrawalsHash: &types.EmptyWithdrawalsHash}
-	if err := engine.verifyHeader(nil, h, nil); !errors.Is(err, errUnsealedHeaderFields) {
+	if err := engine.verifyHeader(chain, h, nil); !errors.Is(err, errUnsealedHeaderFields) {
 		t.Fatalf("V2 header with WithdrawalsHash: got %v, want %v", err, errUnsealedHeaderFields)
+	}
+}
+
+// canonicalAmsterdamHeader returns a header with all mandatory Amsterdam XDC
+// optional fields set to their canonical empty values plus a non-nil BAL hash.
+func canonicalAmsterdamHeader() *types.Header {
+	zeroHash := common.Hash{}
+	blobZero := uint64(0)
+	balHash := types.EmptyBlockAccessListHash
+	return &types.Header{
+		Number:              big.NewInt(31500),
+		WithdrawalsHash:     &types.EmptyWithdrawalsHash,
+		BlobGasUsed:         &blobZero,
+		ExcessBlobGas:       &blobZero,
+		ParentBeaconRoot:    &zeroHash,
+		RequestsHash:        &types.EmptyRequestsHash,
+		BlockAccessListHash: &balHash,
+	}
+}
+
+// TestAmsterdamXDCCanonicalHeaderAccepted: a header carrying all canonical
+// empty placeholder values passes verifyNoUnsealedFields on Amsterdam blocks.
+func TestAmsterdamXDCCanonicalHeaderAccepted(t *testing.T) {
+	amsterdamBlock := big.NewInt(31500)
+	chainCfg := &params.ChainConfig{
+		ChainID:        big.NewInt(2030),
+		XDPoS:          testConfig,
+		AmsterdamBlock: amsterdamBlock,
+	}
+	if err := verifyNoUnsealedFields(chainCfg, canonicalAmsterdamHeader()); err != nil {
+		t.Fatalf("canonical Amsterdam header rejected: %v", err)
+	}
+}
+
+// TestAmsterdamXDCHeaderRejectsArbitraryValues: a header with an arbitrary
+// ParentBeaconRoot (non-zero) is rejected even when Amsterdam is active.
+func TestAmsterdamXDCHeaderRejectsArbitraryValues(t *testing.T) {
+	chainCfg := &params.ChainConfig{
+		ChainID:        big.NewInt(2030),
+		XDPoS:          testConfig,
+		AmsterdamBlock: big.NewInt(31500),
+	}
+	cases := []struct {
+		name   string
+		mutate func(h *types.Header)
+	}{
+		{"nil WithdrawalsHash", func(h *types.Header) { h.WithdrawalsHash = nil }},
+		{"nil BlobGasUsed", func(h *types.Header) { h.BlobGasUsed = nil }},
+		{"nil ExcessBlobGas", func(h *types.Header) { h.ExcessBlobGas = nil }},
+		{"nil ParentBeaconRoot", func(h *types.Header) { h.ParentBeaconRoot = nil }},
+		{"nil RequestsHash", func(h *types.Header) { h.RequestsHash = nil }},
+		{"nil BlockAccessListHash", func(h *types.Header) { h.BlockAccessListHash = nil }},
+		{"non-zero ParentBeaconRoot", func(h *types.Header) {
+			h.ParentBeaconRoot = &common.Hash{1}
+		}},
+		{"non-empty WithdrawalsHash", func(h *types.Header) {
+			wh := common.Hash{2}
+			h.WithdrawalsHash = &wh
+		}},
+		{"SlotNumber set", func(h *types.Header) { h.SlotNumber = new(uint64) }},
+	}
+	for _, tc := range cases {
+		h := canonicalAmsterdamHeader()
+		tc.mutate(h)
+		if err := verifyNoUnsealedFields(chainCfg, h); !errors.Is(err, errUnsealedHeaderFields) {
+			t.Errorf("%s: got %v, want %v", tc.name, err, errUnsealedHeaderFields)
+		}
 	}
 }

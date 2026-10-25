@@ -477,8 +477,39 @@ func (b *EthAPIBackend) SubscribeNewTxsEvent(ch chan<- core.NewTxsEvent) event.S
 	return b.eth.txPool.SubscribeTransactions(ch, true)
 }
 
+// NodeSyncInfo reports the configured sync mode, the gc mode ("archive" when
+// state pruning is off, else "full") and the state scheme the chain uses.
+// ethstats sends it so dashboards can show each node's type.
+func (b *EthAPIBackend) NodeSyncInfo() (syncMode, gcMode, stateScheme string) {
+	gcMode = "full"
+	if b.eth.config.NoPruning {
+		gcMode = "archive"
+	}
+	return b.eth.config.SyncMode.String(), gcMode, b.eth.blockchain.TrieDB().Scheme()
+}
+
 func (b *EthAPIBackend) SyncProgress(ctx context.Context) ethereum.SyncProgress {
 	prog := b.eth.Downloader().Progress()
+
+	// Fixes #1841: if downloader is done but xdcSyncer still catching up,
+	// report progress to indicate sync is not complete.
+	const syncMargin = 64 // reuse fsMinFullBlocks constant concept
+	if prog.Done() {
+		xdcSync := b.eth.handler.xdcSync
+		if xdcSync != nil {
+			highestPeer, startBlock := xdcSync.SyncProgress()
+			localHead := b.eth.blockchain.CurrentBlock().Number.Uint64()
+			// If highest-seen peer is beyond local head + margin, we're still behind.
+			if highestPeer > localHead+syncMargin {
+				prog = ethereum.SyncProgress{
+					StartingBlock: startBlock,
+					CurrentBlock:  localHead,
+					HighestBlock:  highestPeer,
+				}
+			}
+		}
+	}
+
 	if txProg, err := b.eth.blockchain.TxIndexProgress(); err == nil {
 		prog.TxIndexFinishedBlocks = txProg.Indexed
 		prog.TxIndexRemainingBlocks = txProg.Remaining
@@ -509,7 +540,7 @@ func (b *EthAPIBackend) BaseFee(ctx context.Context) *big.Int {
 }
 
 func (b *EthAPIBackend) BlobBaseFee(ctx context.Context) *big.Int {
-	if excess := b.CurrentHeader().ExcessBlobGas; excess != nil {
+	if excess := b.CurrentHeader().ExcessBlobGas; excess != nil && !b.ChainConfig().IsXDC() {
 		return eip4844.CalcBlobFee(b.ChainConfig(), b.CurrentHeader())
 	}
 	return nil

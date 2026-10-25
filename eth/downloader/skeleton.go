@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"math/rand"
 	"sort"
+	"sync"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -211,6 +212,11 @@ type headerRequest struct {
 	// silently mis-validate honest replies. Today every emitter sets this
 	// from s.cycleBatch, so behavior is unchanged.
 	batch int
+
+	// XDC fix #1868: mark requests from XDC keep-and-retry paths that should
+	// have their peer re-added to idles on failure for reassignment.
+	// Upstream paths (timeout, drop) leave this false to maintain drop semantics.
+	keep bool
 }
 
 // headerResponse is an already verified remote response to a header request.
@@ -279,6 +285,12 @@ type skeleton struct {
 	// XDC fix #131: track consecutive empty-header responses per peer.
 	// Peers that repeatedly return 0 headers get dropped to unblock skeleton sync.
 	emptyResponseCount map[string]int // consecutive empty-header counts per peer ID
+	emptyMu            sync.Mutex     // guards emptyResponseCount; executeTask goroutines update it
+
+	// XDC fix #1868: track consecutive request failures per peer.
+	// Peers that fail requests are re-added to idles, but we avoid tight retry loops
+	// by not immediately re-adding peers that just failed.
+	failureCount map[string]int // consecutive failure counts per peer ID
 
 	progress *skeletonProgress // Sync progress tracker for resumption and metrics
 	started  time.Time         // Timestamp when the skeleton syncer was created
@@ -337,6 +349,7 @@ func newSkeleton(db ethdb.Database, peers *peerSet, drop peerDropFn, filler back
 		terminate:          make(chan chan error),
 		terminated:         make(chan struct{}),
 		emptyResponseCount: make(map[string]int), // XDC fix #131
+		failureCount:       make(map[string]int), // XDC fix #1868
 	}
 	go sk.startup()
 	return sk
@@ -713,7 +726,7 @@ func (s *skeleton) sync(head *types.Header) (*types.Header, error) {
 	var xdpos2Count, ethCount int
 	for _, peer := range s.peers.AllPeers() {
 		s.idles[peer.id] = peer
-		if peer.version == eth.XDPOS2 {
+		if eth.IsXDPOS2Family(peer.version) {
 			xdpos2Count++
 		} else {
 			ethCount++
@@ -762,14 +775,23 @@ func (s *skeleton) sync(head *types.Header) (*types.Header, error) {
 			peerid := event.peer.id
 			if event.join {
 				log.Debug("Joining skeleton peer", "id", peerid)
-				s.idles[peerid] = event.peer
+				// XDC fix #1868: an XDPOS2-family peer caps replies at 192, so it
+				// cannot serve a cycle that already chose the 512 batch. Keep it
+				// out of idles until the next cycle re-picks the batch.
+				if !(eth.IsXDPOS2Family(event.peer.version) && s.cycleBatch > requestHeadersXDPOS2) {
+					s.idles[peerid] = event.peer
+				}
 			} else {
 				log.Debug("Leaving skeleton peer", "id", peerid)
 				s.revertRequests(peerid)
 				delete(s.idles, peerid)
 				// XDC fix #131: clear empty-response counter for departed peer
-				if s.emptyResponseCount != nil {
-					delete(s.emptyResponseCount, peerid)
+				s.emptyMu.Lock()
+				delete(s.emptyResponseCount, peerid)
+				s.emptyMu.Unlock()
+				// XDC fix #1868: clear failure counter for departed peer
+				if s.failureCount != nil {
+					delete(s.failureCount, peerid)
 				}
 			}
 
@@ -816,6 +838,22 @@ func (s *skeleton) sync(head *types.Header) (*types.Header, error) {
 
 		case req := <-requestFails:
 			s.revertRequest(req)
+
+			// XDC fix #1868: re-add kept peers to idles after a reverted request.
+			// Only re-add on XDC keep-and-retry paths (marked with req.keep=true).
+			// Upstream paths (timeout, drop) don't re-add to maintain drop semantics.
+			if req.keep && s.failureCount[req.peer] == 0 {
+				if peer := s.peers.Peer(req.peer); peer != nil {
+					// Peer is still registered; re-add to idles on first failure.
+					// To avoid tight retry loops against peers that repeatedly fail,
+					// don't re-add if they've already failed once.
+					s.idles[req.peer] = peer
+				}
+			}
+			// Track consecutive failures per peer (only for keep paths)
+			if req.keep {
+				s.failureCount[req.peer]++
+			}
 
 		case res := <-responses:
 			// Process the batch of headers. If though processing we managed to
@@ -1180,26 +1218,37 @@ func (s *skeleton) executeTask(peer *peerConnection, req *headerRequest) {
 			// rescheduling so the peer gets another chance. On a healthier
 			// fleet (count > floor) the original drop semantics apply.
 			const maxEmptyResponses = 5
+			// This runs in the request's own goroutine: lock the counter, and
+			// size the fleet from the peer set (s.idles belongs to the sync loop).
+			s.emptyMu.Lock()
 			s.emptyResponseCount[peer.id]++
 			count := s.emptyResponseCount[peer.id]
-			totalIdles := len(s.idles)
-			peerStarved := totalIdles <= skeletonEmptyDropPeerFloor
+			if count >= maxEmptyResponses {
+				s.emptyResponseCount[peer.id] = 0
+			}
+			s.emptyMu.Unlock()
+			totalPeers := s.peers.Len()
+			peerStarved := totalPeers <= skeletonEmptyDropPeerFloor
 			if count >= maxEmptyResponses && !peerStarved {
 				peer.log.Warn("Skeleton: dropping peer after repeated empty header responses",
-					"peer", peer.id, "consecutive", count, "idles", totalIdles)
-				s.emptyResponseCount[peer.id] = 0
+					"peer", peer.id, "consecutive", count, "peers", totalPeers)
 				res.Done <- errors.New("no headers delivered")
 				s.scheduleRevertRequest(req)
 				s.drop(peer.id)
 			} else {
 				if count >= maxEmptyResponses && peerStarved {
 					peer.log.Warn("Skeleton: keeping peer despite empties (peer-starved)",
-						"peer", peer.id, "consecutive", count, "idles", totalIdles)
-					s.emptyResponseCount[peer.id] = 0 // give the peer a fresh budget
+						"peer", peer.id, "consecutive", count, "peers", totalPeers)
+					// the counter was reset above: the peer gets a fresh budget
 				} else {
 					peer.log.Debug("No headers delivered (will retry)", "consecutive", count)
 				}
-				res.Done <- errors.New("no headers delivered")
+				// Keep the peer: an error on Done makes the eth handler disconnect
+				// it on request-id (xdpos2 v101, eth/66+) responses. An empty reply
+				// is a legitimate answer here; the request is rescheduled below.
+				res.Done <- nil
+				// XDC fix #1868: mark for re-add on revert (keep-and-retry path)
+				req.keep = true
 				s.scheduleRevertRequest(req)
 			}
 
@@ -1216,7 +1265,9 @@ func (s *skeleton) executeTask(peer *peerConnection, req *headerRequest) {
 			// (XDPoSChain/eth/handler.go:445 MaxHeaderFetch); rejecting their
 			// 192-header replies with want=512 stalled the skeleton indefinitely.
 			peer.log.Debug("Invalid non-genesis header count", "have", len(headers), "want", batch)
-			res.Done <- errors.New("not enough non-genesis headers delivered")
+			res.Done <- nil // keep the peer, see the empty-response case above
+			// XDC fix #1868: mark for re-add on revert (XDPOS2 short-batch path)
+			req.keep = true
 			s.scheduleRevertRequest(req)
 
 		case req.head < uint64(batch) && uint64(len(headers)) != req.head:
@@ -1358,8 +1409,13 @@ func (s *skeleton) processResponse(res *headerResponse) (linked bool, merged boo
 	s.idles[res.peer.id] = res.peer
 
 	// XDC fix #131: successful header delivery — reset empty-response counter
-	if s.emptyResponseCount != nil {
-		delete(s.emptyResponseCount, res.peer.id)
+	s.emptyMu.Lock()
+	delete(s.emptyResponseCount, res.peer.id)
+	s.emptyMu.Unlock()
+
+	// XDC fix #1868: reset consecutive failure counter on successful delivery
+	if s.failureCount != nil {
+		delete(s.failureCount, res.peer.id)
 	}
 
 	// Ensure the response is for a valid request

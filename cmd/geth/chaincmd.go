@@ -102,20 +102,6 @@ if one is set.  Otherwise it prints the genesis from the datadir.`,
 			utils.CachePreimagesFlag,
 			utils.NoCompactionFlag,
 			utils.LogSlowBlockFlag,
-			utils.MetricsEnabledFlag,
-			utils.MetricsHTTPFlag,
-			utils.MetricsPortFlag,
-			utils.MetricsEnableInfluxDBFlag,
-			utils.MetricsEnableInfluxDBV2Flag,
-			utils.MetricsInfluxDBEndpointFlag,
-			utils.MetricsInfluxDBDatabaseFlag,
-			utils.MetricsInfluxDBUsernameFlag,
-			utils.MetricsInfluxDBPasswordFlag,
-			utils.MetricsInfluxDBTagsFlag,
-			utils.MetricsInfluxDBIntervalFlag,
-			utils.MetricsInfluxDBTokenFlag,
-			utils.MetricsInfluxDBBucketFlag,
-			utils.MetricsInfluxDBOrganizationFlag,
 			utils.StateSizeTrackingFlag, // deprecated
 			utils.VMTraceFlag,
 			utils.VMTraceJsonConfigFlag,
@@ -126,7 +112,7 @@ if one is set.  Otherwise it prints the genesis from the datadir.`,
 			utils.StateHistoryFlag,
 			utils.TrienodeHistoryFlag,
 			utils.TrienodeHistoryFullValueCheckpointFlag,
-		}, utils.DatabaseFlags, debug.Flags),
+		}, utils.DatabaseFlags, utils.MetricsFlags, debug.Flags),
 		Before: func(ctx *cli.Context) error {
 			flags.MigrateGlobalFlags(ctx)
 			return debug.Setup(ctx)
@@ -291,8 +277,8 @@ func initGenesis(ctx *cli.Context) error {
 	}
 	defer file.Close()
 
-	genesis := new(core.Genesis)
-	if err := json.NewDecoder(file).Decode(genesis); err != nil {
+	genesis, err := core.DecodeGenesisJSON(file)
+	if err != nil {
 		utils.Fatalf("invalid genesis file: %v", err)
 	}
 	// Open and initialise both full and light databases

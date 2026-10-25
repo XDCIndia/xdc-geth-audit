@@ -17,12 +17,18 @@
 package XDPoS
 
 import (
+	"errors"
+
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/consensus"
 	"github.com/ethereum/go-ethereum/consensus/XDPoS/utils"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/rpc"
 )
+
+// maxProposals caps the in-memory proposals map to prevent unbounded growth
+// from repeated XDPoS_propose calls on the authenticated endpoint.
+const maxProposals = 200
 
 // API is a user facing RPC API to allow controlling the signer and voting
 // mechanisms of the XDPoS consensus engine.
@@ -111,15 +117,29 @@ func (api *API) Proposals() map[common.Address]bool {
 	return proposals
 }
 
-// Propose injects a new authorization proposal that the signer will attempt to push through.
-func (api *API) Propose(address common.Address, auth bool) {
+// AdminAPI is a restricted XDPoS API for node operators.
+// It is registered with Authenticated: true and is therefore only accessible
+// over the local IPC or --authrpc endpoint, not over public HTTP/WS.
+type AdminAPI struct {
+	chain consensus.ChainHeaderReader
+	xdpos *XDPoS
+}
+
+// Propose injects a new authorization proposal that the signer will attempt to
+// push through. It returns an error when the proposals map is full to prevent
+// unbounded memory growth from repeated calls.
+func (api *AdminAPI) Propose(address common.Address, auth bool) error {
 	api.xdpos.lock.Lock()
 	defer api.xdpos.lock.Unlock()
+	if _, exists := api.xdpos.proposals[address]; !exists && len(api.xdpos.proposals) >= maxProposals {
+		return errors.New("proposals map full: discard an existing proposal first")
+	}
 	api.xdpos.proposals[address] = auth
+	return nil
 }
 
 // Discard drops a currently running proposal.
-func (api *API) Discard(address common.Address) {
+func (api *AdminAPI) Discard(address common.Address) {
 	api.xdpos.lock.Lock()
 	defer api.xdpos.lock.Unlock()
 	delete(api.xdpos.proposals, address)

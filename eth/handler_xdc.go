@@ -37,10 +37,12 @@ func (h *handler) BroadcastVote(vote *types.Vote) {
 	h.peers.lock.RUnlock()
 
 	for _, p := range peers {
-		if err := p.Peer.Send(eth.VoteMsg, vote); err != nil {
-			log.Trace("[XDC-P2P] Send vote failed", "peer", p.ID(), "err", err)
-			continue
-		}
+		p := p
+		go func() {
+			if err := p.Peer.Send(eth.VoteMsg, vote); err != nil {
+				log.Trace("[XDC-P2P] Send vote failed", "peer", p.ID(), "err", err)
+			}
+		}()
 	}
 	log.Debug("[XDC-P2P] Vote broadcast complete", "peers", len(peers), "round", vote.ProposedBlockInfo.Round)
 }
@@ -62,10 +64,12 @@ func (h *handler) BroadcastTimeout(timeout *types.Timeout) {
 	h.peers.lock.RUnlock()
 
 	for _, p := range peers {
-		if err := p.Peer.Send(eth.TimeoutMsg, timeout); err != nil {
-			log.Trace("[XDC-P2P] Send timeout failed", "peer", p.ID(), "err", err)
-			continue
-		}
+		p := p
+		go func() {
+			if err := p.Peer.Send(eth.TimeoutMsg, timeout); err != nil {
+				log.Trace("[XDC-P2P] Send timeout failed", "peer", p.ID(), "err", err)
+			}
+		}()
 	}
 	log.Debug("[XDC-P2P] Timeout broadcast complete", "peers", len(peers), "round", timeout.Round)
 }
@@ -85,10 +89,12 @@ func (h *handler) BroadcastSyncInfo(syncInfo *types.SyncInfo) {
 	h.peers.lock.RUnlock()
 
 	for _, p := range peers {
-		if err := p.Peer.Send(eth.SyncInfoMsg, syncInfo); err != nil {
-			log.Trace("[XDC-P2P] Send syncInfo failed", "peer", p.ID(), "err", err)
-			continue
-		}
+		p := p
+		go func() {
+			if err := p.Peer.Send(eth.SyncInfoMsg, syncInfo); err != nil {
+				log.Trace("[XDC-P2P] Send syncInfo failed", "peer", p.ID(), "err", err)
+			}
+		}()
 	}
 	log.Debug("[XDC-P2P] SyncInfo broadcast complete", "peers", len(peers))
 }
@@ -119,24 +125,31 @@ func (h *handler) BroadcastBlock(block *types.Block) {
 		return
 	}
 
-	// TD: use block.Difficulty() as the announced total difficulty.
-	// XDPoS V2 blocks all have the same difficulty value set by engine.Prepare;
-	// peers do not use TD for chain selection in V2 (QC-chain rule wins).
-	// This matches XDPoSChain's approach of parent.TD + block.Difficulty.
-	td := new(big.Int).Set(block.Difficulty())
+	// XDC #1645: TD for NewBlock must be parent.TD + block.Difficulty(), matching
+	// canonical XDPoSChain (eth/handler.go:1074). Legacy peers compute
+	// trueTD = announced TD - block.Difficulty() and start a sync only when
+	// trueTD > ownTD. Sending only block.Difficulty() (= 1 for V2) meant
+	// trueTD = 0, so legacy nodes behind the tip never triggered a sync.
+	var td *big.Int
+	if parentTD := h.chain.GetTd(block.ParentHash(), block.NumberU64()-1); parentTD != nil {
+		td = new(big.Int).Add(parentTD, block.Difficulty())
+	} else {
+		// ponytail: fallback if parent TD not yet stored (rare race on fresh node).
+		td = new(big.Int).Set(block.Difficulty())
+	}
 
 	pkt := &eth.NewBlockPacket{
 		Block: block,
 		TD:    td,
 	}
-	var sent int
 	for _, p := range peers {
-		if err := p.Peer.Send(eth.NewBlockMsg, pkt); err != nil {
-			log.Trace("[XDC-P2P] Send NewBlock failed", "peer", p.ID(), "err", err)
-			continue
-		}
-		sent++
+		p := p
+		go func() {
+			if err := p.Peer.Send(eth.NewBlockMsg, pkt); err != nil {
+				log.Trace("[XDC-P2P] Send NewBlock failed", "peer", p.ID(), "err", err)
+			}
+		}()
 	}
-	log.Debug("[XDC-P2P] Block broadcast complete",
-		"number", block.NumberU64(), "hash", block.Hash(), "peers", sent)
+	log.Debug("[XDC-P2P] Block broadcast started",
+		"number", block.NumberU64(), "hash", block.Hash(), "peers", len(peers))
 }

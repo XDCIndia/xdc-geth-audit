@@ -229,6 +229,11 @@ func xdcFillGapAncients(ancient ethdb.AncientWriter, from, to uint64) error {
 				if err := op.AppendRaw(ChainFreezerReceiptTable, i, []byte{0x00}); err != nil {
 					return err
 				}
+				// Every table advances in lockstep (#1882): nil is the absence
+				// placeholder for an access list.
+				if err := op.AppendRaw(ChainFreezerBALTable, i, nil); err != nil {
+					return err
+				}
 			}
 			return nil
 		})

@@ -8,11 +8,11 @@
 package legacypool
 
 import (
+	"crypto/ecdsa"
 	"errors"
 	"math/big"
+	"sync"
 	"testing"
-
-	"crypto/ecdsa"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/contracts"
@@ -25,6 +25,42 @@ import (
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/holiman/uint256"
 )
+
+// spyReserver is a txpool.Reserver that records which addresses are currently held.
+// Used by R1-M02 tests to verify that the special-tx fast path holds the reservation.
+type spyReserver struct {
+	mu   sync.Mutex
+	held map[common.Address]bool
+}
+
+func newSpyReserver() *spyReserver {
+	return &spyReserver{held: make(map[common.Address]bool)}
+}
+
+func (s *spyReserver) Hold(addr common.Address) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.held[addr] {
+		return errors.New("spyReserver: already held")
+	}
+	s.held[addr] = true
+	return nil
+}
+
+func (s *spyReserver) Release(addr common.Address) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.held, addr)
+	return nil
+}
+
+func (s *spyReserver) Has(_ common.Address) bool { return false }
+
+func (s *spyReserver) isHeld(addr common.Address) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.held[addr]
+}
 
 // xdcSpecialPool returns a pool with a 1 Gwei MinTip to exercise the
 // special-tx exemption (ordinary gasPrice=0 txs would fail at this MinTip).
@@ -611,5 +647,221 @@ func TestXDCSpecialTxFullPoolCap(t *testing.T) {
 	// Signer at its pending nonce: accepted despite the full pool.
 	if err := pool.addRemoteSync(makeSpecialTx(0, common.BlockSignersBinary, signerKey)); err != nil {
 		t.Fatalf("signer special tx rejected: %v", err)
+	}
+}
+
+// TestXDCSpecialTxSignSelectorFastPath verifies Hacken F-2026-19457 residual fix:
+// the IsSigner fast path is restricted to calldata matching a known method selector.
+//
+// Observable: the fast path routes through promoteSpecialTx which returns
+// ErrDuplicateSpecialTransaction on a same-nonce conflict.  The normal add() path
+// routes through list.Add whose price-bump check returns ErrReplaceUnderpriced.
+//
+// Setup:
+//  1. A masternode sends a sign tx (correct HexSignMethod calldata, 68 bytes, nonce=0)
+//     → fast path → admitted to pending.
+//  2. The same masternode sends a wrong-calldata tx at nonce=0 (arbitrary selector)
+//     → must NOT take the fast path → goes to list.Add → ErrReplaceUnderpriced.
+//
+// Before the fix the wrong-calldata tx would take the fast path and return
+// ErrDuplicateSpecialTransaction instead.
+func TestXDCSpecialTxSignSelectorFastPath(t *testing.T) {
+	t.Parallel()
+
+	pool, close := xdcSpecialPool(t)
+	defer close()
+
+	masterKey, _ := crypto.GenerateKey()
+	master := crypto.PubkeyToAddress(masterKey.PublicKey)
+
+	pool.IsSigner = func(addr common.Address) bool { return addr == master }
+
+	pool.mu.Lock()
+	pool.currentState.AddBalance(master, new(uint256.Int).SetUint64(1), tracing.BalanceChangeUnspecified)
+	pool.mu.Unlock()
+
+	// Step 1: correct sign calldata (4-byte HexSignMethod selector + 32-byte blockNumber
+	// + 32-byte blockHash = 68 bytes total, matching contracts.CreateTxSign).
+	signData := make([]byte, 68)
+	copy(signData[:4], common.Hex2Bytes(common.HexSignMethod))
+	copy(signData[4:36], common.LeftPadBytes(big.NewInt(100).Bytes(), 32))
+	// signData[36:68] stays zero (blockHash placeholder)
+
+	rawSign := types.NewTransaction(0, common.BlockSignersBinary, big.NewInt(0), 200000, big.NewInt(0), signData)
+	signTx, _ := types.SignTx(rawSign, types.HomesteadSigner{}, masterKey)
+
+	// Correct calldata → fast path → admitted.
+	if errs := pool.Add([]*types.Transaction{signTx}, true); errs[0] != nil {
+		t.Fatalf("sign tx with correct calldata rejected: %v", errs[0])
+	}
+	pending, _ := pool.Pending(txpool.PendingFilter{})
+	if _, ok := pending[master]; !ok {
+		t.Fatal("sign tx not in pending after IsSigner fast path")
+	}
+
+	// Step 2: wrong calldata — same sender, same nonce=0, non-sign 4-byte selector.
+	// After the fix: NOT fast-pathed → normal list.Add → price-bump check fails
+	// (0-tip can't replace 0-tip incumbent) → ErrReplaceUnderpriced.
+	// Before the fix: would take the fast path → ErrDuplicateSpecialTransaction.
+	wrongData := make([]byte, 68)
+	wrongData[0] = 0xDE // not 0xe3 (first byte of sign selector)
+	wrongData[1] = 0xAD
+	wrongData[2] = 0xBE
+	wrongData[3] = 0xEF
+
+	rawWrong := types.NewTransaction(0, common.BlockSignersBinary, big.NewInt(0), 200000, big.NewInt(0), wrongData)
+	wrongTx, _ := types.SignTx(rawWrong, types.HomesteadSigner{}, masterKey)
+
+	err := pool.addRemoteSync(wrongTx)
+	if err == nil {
+		t.Fatal("0x89 tx with wrong calldata must be rejected (non-fast-path, no price bump)")
+	}
+	// The rejection must come from the normal pending-replacement price-bump check,
+	// not from promoteSpecialTx's ErrDuplicateSpecialTransaction.
+	if errors.Is(err, ErrDuplicateSpecialTransaction) {
+		t.Fatalf("wrong calldata must NOT take the fast path: got ErrDuplicateSpecialTransaction, want ErrReplaceUnderpriced")
+	}
+	if !errors.Is(err, txpool.ErrReplaceUnderpriced) {
+		t.Fatalf("wrong calldata took unexpected path: %v", err)
+	}
+}
+
+// ─── R1-M01: pending nonce must not be lowered on expired-tx replacement ──────
+
+// TestXDCPromoteSpecialTxDoesNotLowerPendingNonce verifies R1-M01: when a
+// signer replaces an expired signing tx at nonce K while later nonces K+1..N
+// are already pending, promoteSpecialTx must not lower pendingNonces to K+1.
+//
+// Before the fix, promoteSpecialTx called pendingNonces.set(from, K+1),
+// unconditionally overwriting the tip N+1.  That blocked the next tx at N+1
+// from taking the fast path (pendingNonces==tx.Nonce() check fails) until the
+// next pool reset re-synced nonces.
+//
+// After the fix, pendingNonces.setIfHigher is used, so K+1 < N+1 is ignored
+// and the tip remains N+1.
+func TestXDCPromoteSpecialTxDoesNotLowerPendingNonce(t *testing.T) {
+	t.Parallel()
+
+	const epoch = uint64(900)
+	pool, close := xdcSpecialPoolWithEpoch(t, epoch)
+	defer close()
+
+	privKey, _ := crypto.GenerateKey()
+	addr := crypto.PubkeyToAddress(privKey.PublicKey)
+
+	pool.IsSigner = func(a common.Address) bool { return a == addr }
+	pool.mu.Lock()
+	pool.currentState.AddBalance(addr, new(uint256.Int).SetUint64(1), tracing.BalanceChangeUnspecified)
+	pool.mu.Unlock()
+
+	// Insert signing tx at nonce 0, targeting block 15 (will be made expired).
+	tx0 := makeSigningTxForBlock(0, 15, privKey)
+	if errs := pool.Add([]*types.Transaction{tx0}, true); errs[0] != nil {
+		t.Fatalf("tx0 rejected: %v", errs[0])
+	}
+	// Insert signing tx at nonce 1 (fresh, targeting current head area).
+	tx1 := makeSigningTxForBlock(1, 100, privKey)
+	if errs := pool.Add([]*types.Transaction{tx1}, true); errs[0] != nil {
+		t.Fatalf("tx1 rejected: %v", errs[0])
+	}
+	// pendingNonces[addr] is now 2.
+
+	// Advance head past expiry of tx0: 15 + 900*2 + 1 = 1816.
+	pool.mu.Lock()
+	pool.currentHead.Store(&types.Header{Number: big.NewInt(1816), Difficulty: common.Big0, GasLimit: 10_000_000})
+	pool.mu.Unlock()
+
+	// Replace the now-expired tx0 with a fresh signing tx at the same nonce.
+	// This exercises the recovery path (pendingN > tx.Nonce() && expired).
+	tx0new := makeSigningTxForBlock(0, 1816, privKey)
+	if errs := pool.Add([]*types.Transaction{tx0new}, true); errs[0] != nil {
+		t.Fatalf("replacement of expired tx0 rejected: %v", errs[0])
+	}
+
+	// After replacement pendingNonces must still be 2, not 1.
+	// Verify by adding a signing tx at nonce 2 via the fast path: it is
+	// admitted only when pendingNonces[addr]==2.
+	tx2 := makeSigningTxForBlock(2, 1816, privKey)
+	if errs := pool.Add([]*types.Transaction{tx2}, true); errs[0] != nil {
+		t.Fatalf("tx2 (nonce=2) rejected — pendingNonce was lowered by the replacement (R1-M01): %v", errs[0])
+	}
+
+	// Confirm all three nonces are in pending.
+	pending, _ := pool.Pending(txpool.PendingFilter{})
+	got := len(pending[addr])
+	if got != 3 {
+		t.Fatalf("want 3 pending txs (nonces 0,1,2), got %d — R1-M01 regression", got)
+	}
+}
+
+// ─── R1-M02: subpool reservation must be held on the special-tx fast path ─────
+
+// xdcSpecialPoolWithSpy returns a pool that uses a spyReserver so tests can
+// inspect whether an address is held after a fast-path add.
+func xdcSpecialPoolWithSpy(t *testing.T) (*LegacyPool, *spyReserver, func()) {
+	t.Helper()
+
+	cpy := *params.TestChainConfig
+	cpy.LondonBlock = common.Big0
+	cpy.BerlinBlock = common.Big0
+
+	statedb, _ := state.New(types.EmptyRootHash, state.NewDatabaseForTesting())
+	bc := newTestBlockChain(&cpy, 10_000_000, statedb, new(event.Feed))
+
+	cfg := DefaultConfig
+	cfg.Journal = ""
+	cfg.NoLocals = true
+
+	spy := newSpyReserver()
+	pool := New(cfg, bc)
+	if err := pool.Init(cfg.PriceLimit, bc.CurrentBlock(), spy); err != nil {
+		t.Fatalf("pool init: %v", err)
+	}
+	<-pool.initDoneCh
+	pool.SetGasTip(big.NewInt(1_000_000_000))
+
+	return pool, spy, func() { pool.Close() }
+}
+
+// TestXDCSpecialTxFastPathHoldsReservation verifies R1-M02: the subpool
+// reservation must be held for a new sender whose first tx takes the special-tx
+// fast path (IsSigner, nonce == pendingNonces).
+//
+// Before the fix, add() returned through promoteSpecialTx before reaching the
+// pool.reserver.Hold(from) call, leaving the account in pool.pending with no
+// reservation.  Another subpool could then Hold the same address, breaking the
+// invariant that each account is tracked by at most one subpool.
+//
+// After the fix, Hold is called before promoteSpecialTx when the account has
+// no pending or queued transactions, and Released if promoteSpecialTx fails.
+func TestXDCSpecialTxFastPathHoldsReservation(t *testing.T) {
+	t.Parallel()
+
+	pool, spy, close := xdcSpecialPoolWithSpy(t)
+	defer close()
+
+	privKey, _ := crypto.GenerateKey()
+	addr := crypto.PubkeyToAddress(privKey.PublicKey)
+
+	pool.IsSigner = func(a common.Address) bool { return a == addr }
+	pool.mu.Lock()
+	pool.currentState.AddBalance(addr, new(uint256.Int).SetUint64(1), tracing.BalanceChangeUnspecified)
+	pool.mu.Unlock()
+
+	// First tx from this address — takes the fast path.
+	tx := makeSpecialTx(0, common.BlockSignersBinary, privKey)
+	if errs := pool.Add([]*types.Transaction{tx}, true); errs[0] != nil {
+		t.Fatalf("fast-path special tx rejected: %v", errs[0])
+	}
+
+	// The reserver must hold the address after a successful fast-path add.
+	if !spy.isHeld(addr) {
+		t.Fatal("address not held by reserver after fast-path special-tx add (R1-M02)")
+	}
+
+	// The tx must be in pending.
+	pending, _ := pool.Pending(txpool.PendingFilter{})
+	if _, ok := pending[addr]; !ok {
+		t.Fatal("special tx not in pending after fast-path add")
 	}
 }

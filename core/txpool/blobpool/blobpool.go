@@ -752,7 +752,7 @@ func (p *BlobPool) Init(gasTip uint64, head *types.Header, reserver txpool.Reser
 		basefee = uint256.MustFromBig(eip1559.CalcBaseFee(p.chain.Config(), head))
 		blobfee = uint256.NewInt(params.BlobTxMinBlobGasprice)
 	)
-	if head.ExcessBlobGas != nil {
+	if head.ExcessBlobGas != nil && !p.chain.Config().IsXDC() {
 		blobfee = uint256.MustFromBig(eip4844.CalcBlobFee(p.chain.Config(), head))
 	}
 	p.evict = newPriceHeap(basefee, blobfee, p.index, p.blockedAccount)
@@ -1303,7 +1303,7 @@ func (p *BlobPool) Reset(oldHead, newHead *types.Header) {
 		basefee = uint256.MustFromBig(eip1559.CalcBaseFee(p.chain.Config(), newHead))
 		blobfee = uint256.MustFromBig(big.NewInt(params.BlobTxMinBlobGasprice))
 	)
-	if newHead.ExcessBlobGas != nil {
+	if newHead.ExcessBlobGas != nil && !p.chain.Config().IsXDC() {
 		blobfee = uint256.MustFromBig(eip4844.CalcBlobFee(p.chain.Config(), newHead))
 	}
 	p.evict.reinit(basefee, blobfee, false)

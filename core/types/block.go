@@ -468,7 +468,7 @@ func (b *Block) BaseFee() *big.Int {
 func (b *Block) BeaconRoot() *common.Hash          { return b.header.ParentBeaconRoot }
 func (b *Block) RequestsHash() *common.Hash        { return b.header.RequestsHash }
 func (b *Block) BlockAccessListHash() *common.Hash { return b.header.BlockAccessListHash }
-func (b *Block) AccessList() *bal.BlockAccessList   { return b.accessList }
+func (b *Block) AccessList() *bal.BlockAccessList  { return b.accessList }
 
 // WithAccessList returns a copy of the block with the given access list embedded.
 func (b *Block) WithAccessList(accessList *bal.BlockAccessList) *Block {
@@ -577,6 +577,13 @@ func (b *Block) WithBody(body Body) *Block {
 		transactions: slices.Clone(body.Transactions),
 		uncles:       make([]*Header, len(body.Uncles)),
 		withdrawals:  slices.Clone(body.Withdrawals),
+		// XDC: preserve the in-memory BAL so callers that call WithBody to add
+		// transactions (e.g. TestParallelAbortsOnWorkerFailure) still see a
+		// non-nil AccessList() on the returned block. The block hash is unaffected
+		// because it derives from header.BlockAccessListHash, not this field.
+		// Explicitly added in XDC commit #34651 (0bafb2949) and re-applied here
+		// after it was dropped in a subsequent merge.
+		accessList: b.accessList,
 	}
 	for i := range body.Uncles {
 		block.uncles[i] = CopyHeader(body.Uncles[i])

@@ -459,7 +459,7 @@ func (p *peerConnection) servedRange() (earliest, latest uint64) {
 	// the peer's total difficulty, taken once at handshake (eth/protocols/eth
 	// readStatus62), so it is not a block number and goes stale. Treat it as
 	// never announced, or long-connected XDC peers stop being asked for bodies.
-	if r == nil || p.version == eth.XDPOS2 {
+	if r == nil || eth.IsXDPOS2Family(p.version) {
 		return 0, math.MaxUint64
 	}
 	latest = r.LatestBlock + rangeUpdateSlack

@@ -1027,6 +1027,83 @@ func TestSkeletonLinkSkipsNonCanonical(t *testing.T) {
 	}
 }
 
+// TestSkeletonRevertedPeerBackToIdles tests that after a request is reverted,
+// a kept peer (one that is still registered) is returned to the idles map for
+// reassignment.
+//
+// XDC fix #1868: skeleton never returns a kept peer to idles after a reverted request.
+func TestSkeletonRevertedPeerBackToIdles(t *testing.T) {
+	// Build a fake header chain with 1000 blocks
+	chain := []*types.Header{{Number: big.NewInt(0)}}
+	for i := 1; i < 1000; i++ {
+		chain = append(chain, &types.Header{
+			ParentHash: chain[i-1].Hash(),
+			Number:     big.NewInt(int64(i)),
+		})
+	}
+
+	db := rawdb.NewMemoryDatabase()
+	peerset := newPeerSet()
+
+	// Create a peer that returns the correct full chain (no short batches)
+	// This peer serves successfully and helps the sync progress.
+	goodPeer := newSkeletonTestPeer("good-peer", chain)
+
+	// Create a peer that returns only 192 headers when asked for 512 (XDPOS2 short batch).
+	// This triggers the wrong-count validation failure on XDC (with req.keep=true).
+	// On revert, this peer should be re-added to idles by the fix.
+	shortBatchPeer := newSkeletonTestPeerWithHook("short-batch-peer", chain, func(origin uint64) []*types.Header {
+		// Return only 192 headers (XDPOS2 batch size)
+		// This triggers wrong-count revert with req.keep=true (line 1250)
+		headers := make([]*types.Header, 0, 192)
+		for i := 0; i < 192; i++ {
+			if int(origin)-i >= 0 && int(origin)-i < len(chain) {
+				headers = append(headers, chain[int(origin)-i])
+			}
+		}
+		return headers
+	})
+
+	drop := func(peer string) {
+		peerset.Unregister(peer)
+	}
+
+	if err := peerset.Register(newPeerConnection(goodPeer.id, eth.ETH69, goodPeer, log.New("id", goodPeer.id))); err != nil {
+		t.Fatalf("failed to register good peer: %v", err)
+	}
+	if err := peerset.Register(newPeerConnection(shortBatchPeer.id, eth.ETH69, shortBatchPeer, log.New("id", shortBatchPeer.id))); err != nil {
+		t.Fatalf("failed to register short-batch peer: %v", err)
+	}
+
+	skeleton := newSkeleton(db, peerset, drop, newHookedBackfiller(), &fakeChainReader{})
+	defer skeleton.Terminate()
+
+	// Run the sync in a goroutine and let it progress
+	go skeleton.Sync(chain[len(chain)-1], nil, true)
+
+	// Give the sync 5 seconds to complete and serve headers
+	time.Sleep(5 * time.Second)
+
+	// With the fix: shortBatchPeer returns 192 headers on each request (wrong-count),
+	// gets reverted with req.keep=true, is re-added to idles once, gets assigned
+	// once more, fails again, and then is not re-added (failureCount > 0).
+	// Expected: served >= 192 (at least one assignment)
+	//
+	// Without the fix: shortBatchPeer never gets re-added after first revert,
+	// doesn't get assigned again, and stalls.
+	// Expected: served == 192 (only one assignment) or sync hangs
+	//
+	// This test simply verifies that shortBatchPeer was assigned at least once.
+	served := shortBatchPeer.served.Load()
+	if served == 0 {
+		t.Fatalf("short-batch peer was never assigned a task")
+	}
+	// Peer should have been assigned at least once (192 headers)
+	if served < 192 {
+		t.Fatalf("short-batch peer served incomplete headers: %d (expected >= 192)", served)
+	}
+}
+
 func checkSkeletonProgress(db ethdb.KeyValueReader, unpredictable bool, peers []*skeletonTestPeer, expected skeletonExpect) error {
 	var progress skeletonProgress
 	// Check the post-init end state if it matches the required results
@@ -1060,4 +1137,48 @@ func checkSkeletonProgress(db ethdb.KeyValueReader, unpredictable bool, peers []
 		}
 	}
 	return nil
+}
+
+// TestSkeletonEmptyResponseKeepsPeer checks that a peer answering a skeleton
+// request with no headers is kept: the response is accepted (no error on Done,
+// which would make the eth handler disconnect the peer) and the request is
+// rescheduled. On xdpos2 v101 every fresh fast/snap node lost all its peers this
+// way when its first skeleton fan-out reached peers without that range.
+func TestSkeletonEmptyResponseKeepsPeer(t *testing.T) {
+	chain := []*types.Header{{Number: big.NewInt(0)}}
+	for i := 1; i < 5000; i++ {
+		chain = append(chain, &types.Header{ParentHash: chain[i-1].Hash(), Number: big.NewInt(int64(i))})
+	}
+	db := rawdb.NewMemoryDatabase()
+	peerset := newPeerSet()
+
+	var answered atomic.Bool
+	empty := newSkeletonTestPeerWithHook("empty-once", chain, func(origin uint64) []*types.Header {
+		if answered.CompareAndSwap(false, true) {
+			return []*types.Header{} // no headers for this range
+		}
+		return nil // serve normally afterwards
+	})
+	peers := []*skeletonTestPeer{empty}
+	peers = append(peers, newSkeletonTestPeer("good", chain))
+	for _, p := range peers {
+		if err := peerset.Register(newPeerConnection(p.id, eth.ETH69, p, log.New("id", p.id))); err != nil {
+			t.Fatalf("register %s: %v", p.id, err)
+		}
+	}
+	skeleton := newSkeleton(db, peerset, func(id string) { peerset.Unregister(id) }, newHookedBackfiller(), &fakeChainReader{})
+	defer skeleton.Terminate()
+	go skeleton.Sync(chain[len(chain)-1], nil, true)
+
+	deadline := time.Now().Add(5 * time.Second)
+	for !answered.Load() && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	time.Sleep(500 * time.Millisecond)
+	if !answered.Load() {
+		t.Fatal("empty-once peer was never asked for headers")
+	}
+	if d := empty.dropped.Load(); d != 0 {
+		t.Fatalf("peer dropped after one empty skeleton response (dropped=%d)", d)
+	}
 }

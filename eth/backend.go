@@ -153,6 +153,32 @@ type Ethereum struct {
 	shutdownTracker *shutdowncheck.ShutdownTracker // Tracks if and when the node has shutdown ungracefully
 }
 
+// logXDCEffectiveTIPs logs every effective TIP fork activation block at startup
+// (#1528 G0.3). For registered chains these are the constants set by
+// CopyXDCConstants; for custom geneses they come from ChainConfig fields.
+func logXDCEffectiveTIPs(c *params.ChainConfig) {
+	effBlock := func(field, fallback *big.Int) interface{} {
+		if field != nil {
+			return field
+		}
+		if fallback != nil {
+			return fallback
+		}
+		return "nil"
+	}
+	log.Info("XDC effective TIP fork values",
+		"tipSigning", effBlock(c.TIPSigningBlock, common.TIPSigning),
+		"tip2019", effBlock(c.TIP2019Block, common.TIP2019Block),
+		"tipNoHalvingMNReward", effBlock(c.TIPNoHalvingMNRewardBlock, common.TIPNoHalvingMNReward),
+		"tipRandomize", effBlock(c.TIPRandomizeBlock, common.TIPRandomize),
+		"tipXDCX", effBlock(c.TIPXDCXBlock, common.TIPXDCX),
+		"tipTRC21Fee", effBlock(c.TIPTRC21FeeBlock, common.TIPTRC21Fee),
+		"gas50x", effBlock(c.Gas50xBlock, common.BlockNumberGas50x),
+		"dynamicGasLimit", c.DynamicGasLimitBlock,
+		"tipEpochHalving", c.TIPEpochHalvingBlock,
+	)
+}
+
 // New creates a new Ethereum object (including the initialisation of the common Ethereum object),
 // whose lifecycle will be managed by the provided node.
 func New(stack *node.Node, config *ethconfig.Config) (*Ethereum, error) {
@@ -227,6 +253,21 @@ func New(stack *node.Node, config *ethconfig.Config) (*Ethereum, error) {
 			common.TIPSigning = new(big.Int).Set(chainConfig.TIPSigningBlock)
 			log.Info("XDC: genesis tipSigningBlock override applied", "block", common.TIPSigning)
 		}
+		// XDC: canonical XDPoSChain applies the address denylist from the
+		// genesis "denylistBlock" (params/config_forks.go:97 IsDenylist, used by
+		// core/state_processor.go:170-180, the miner and the txpool). Honour it
+		// over the per-chainID BlackListHFNumber, which for an unregistered chain
+		// ID is the mainnet 38,383,838: before this, a private net with
+		// denylistBlock set accepted, pooled and minted denylisted txs that the
+		// canonical nodes reject. nil (every built-in network) keeps the default.
+		if chainConfig.DenylistBlock != nil {
+			common.BlackListHFNumber = chainConfig.DenylistBlock.Uint64()
+			log.Info("XDC: genesis denylistBlock override applied", "block", common.BlackListHFNumber)
+		}
+		// Log all effective TIP values (#1528 G0.3). For registered chains these
+		// are the constants set by CopyXDCConstants; for custom geneses they come
+		// from the genesis ChainConfig fields via xdcTIPBlock.
+		logXDCEffectiveTIPs(chainConfig)
 	}
 	engine, err := ethconfig.CreateConsensusEngine(chainConfig, chainDb)
 	if err != nil {
@@ -516,26 +557,19 @@ func New(stack *node.Node, config *ethconfig.Config) (*Ethereum, error) {
 			config.FastSyncPivotNumber,
 			config.FastSyncPivotHash,
 		)
-	} else if config.SyncMode == ethconfig.FastSync && config.FastSyncPivotNumber != 0 {
-		// A.89 dynamic anchor is only installed in degraded mode (operator pivot set).
-		// A.97.5 (refs #894): on the clean path (operatorPivotNumber==0) no anchor is
-		// installed. QC verification runs unconditionally using header-derived masternodes
-		// from getEpochSwitchInfoWithParents → GetMasternodesFromEpochSwitchHeader →
-		// header.Validators. This is the pure geth-aligned fast-sync path: the masternode
-		// set is 100% derived from signed header bytes, no trust anchor required.
-		// inCheckpointCatchup returns false when no anchor is active, so the A.89
-		// commit-rule skip and the GetMasternodesWithParents anchor fallback are dormant.
-		//
-		// Degraded-recovery layer (operator-pin / A.96 / A.94 / checkpointSyncNoState /
-		// snap-heal) stays intact for scenarios where the clean path is unavailable
-		// (e.g. pruned-peer, no-archive, operatorPivotNumber != 0).
+	} else if config.SyncMode == ethconfig.FastSync {
+		// Clean fast-sync path: install the dynamic anchor callback so that when
+		// the downloader selects a pivot from peer heads, verifyHeader relaxes QC
+		// checks for the entire backfill range below it. Without this, BeaconSync
+		// rejects every pre-pivot header with a gap-number mismatch or epoch-switch
+		// error because the referenced epoch-switch blocks have not been downloaded
+		// yet. The downloader authenticates the backfill range via parent-hash chain
+		// from the pivot; this merely wires that trust signal to the consensus engine.
+		// refs #1847 #1851 #1859
 		bc := eth.blockchain
 		eth.handler.downloader.SetFastSyncAnchorFn(func(n uint64, h common.Hash) {
 			bc.SetFastSyncTrustedAnchor(n, h)
 		})
-	} else if config.SyncMode == ethconfig.FastSync {
-		// Clean fast-sync path: no anchor installed. Log for operator visibility.
-		log.Info("XDC fast-sync A.97.5: clean path — no trusted anchor installed; QC will be verified from header-derived masternodes (refs #894)")
 	}
 
 	eth.dropper = newDropper(eth.p2pServer.MaxDialedConns(), eth.p2pServer.MaxInboundConns())
@@ -829,12 +863,16 @@ func (s *Ethereum) StopMining() {
 	}
 }
 
-// Protocols returns all the currently configured
-// network protocols to start.
+// Protocols returns all the currently configured network protocols to start.
 func (s *Ethereum) Protocols() []p2p.Protocol {
 	protos := eth.MakeProtocols((*ethHandler)(s.handler), s.networkID, s.discmix)
 	if s.config.SnapshotCache > 0 {
-		protos = append(protos, snap.MakeProtocols((*snapHandler)(s.handler), s.config.SnapV2)...)
+		// SNAP/2 drops the trie node requests SNAP/1 healing needs, and peers
+		// negotiate the highest shared version, so a node syncing via SNAP/1
+		// must not advertise it. Every other node serves both versions.
+		dl := s.handler.downloader
+		advertiseV2 := dl.SnapSyncVersion() == snap.SNAP2 || dl.ConfigSyncMode() != ethconfig.SnapSync
+		protos = append(protos, snap.MakeProtocols((*snapHandler)(s.handler), advertiseV2)...)
 	}
 	return protos
 }
