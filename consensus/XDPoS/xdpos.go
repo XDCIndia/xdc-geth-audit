@@ -2472,6 +2472,10 @@ func (c *XDPoS) snapshot(chain consensus.ChainHeaderReader, number uint64, hash 
 				}
 				// Successfully found in chain DB — clear parents so we don't re-check
 				parents = nil
+			} else {
+				// Matched: consume it so the next step compares against the
+				// next ancestor, not the same tip again (#1888).
+				parents = parents[:len(parents)-1]
 			}
 		} else {
 			header = chain.GetHeader(hash, number)
