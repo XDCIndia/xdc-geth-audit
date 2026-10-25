@@ -776,6 +776,10 @@ func (x *XDPoS_v2) Finalize(chain consensus.ChainReader, header *types.Header, s
 		return nil, err
 	}
 
+	if isEpochSwitch && parentState != nil {
+		x.repairSeededGapAtSwitch(chain, header, parentState.Copy())
+	}
+
 	if x.HookReward != nil && isEpochSwitch {
 		log.Info("[Finalize] V2 HookReward firing", "block", header.Number.Uint64(), "hash", header.Hash().Hex())
 		rewards, err := x.HookReward(chain, state, parentState, header)
@@ -2124,6 +2128,90 @@ func (x *XDPoS_v2) SeedSnapshotAtHash(number uint64, hash common.Hash, ms, penal
 	return nil
 }
 
+// sortCandidatesByStake orders the 0x88 contract candidates by capacity
+// (descending, zero address dropped) exactly as v2.6.8 UpdateM1 does. It is
+// the single source of the pool stored as a gap snapshot's NextEpochCandidates.
+func sortCandidatesByStake(statedb *state.StateDB, candidates []common.Address) []common.Address {
+	type candidateStake struct {
+		addr  common.Address
+		stake *big.Int
+	}
+	cs := make([]candidateStake, 0, len(candidates))
+	for _, c := range candidates {
+		if c != (common.Address{}) {
+			cs = append(cs, candidateStake{addr: c, stake: state.GetCandidateCap(statedb, c)})
+		}
+	}
+	// Use frozen Go-1.18 quicksort (canonical's xdc_sort) — see comment in
+	// repairSnapshot above for why stdlib sort.Slice (pdqsort) diverges.
+	xdc_sort.Slice(cs, func(i, j int) bool {
+		return cs[i].stake.Cmp(cs[j].stake) >= 0
+	})
+	out := make([]common.Address, len(cs))
+	for i, c := range cs {
+		out[i] = c.addr
+	}
+	return out
+}
+
+// RepairSeededCandidatePool fixes a gap snapshot that was seeded from an
+// epoch-switch header (fast/snap sync: A.70, A.97.4). Such a seed stores the
+// header's active Validators as NextEpochCandidates, but a fully-synced node
+// stores the full stake-sorted contract pool there, and the pre-TIPUpgradePenalty
+// comeback branch of HookPenalty intersects the previous epoch's penalties with
+// that pool. When the stored candidate list equals switchValidators (i.e. it is
+// the header seed) and statedb yields a different pool, the pool is replaced;
+// Penalties are kept. Returns true if the snapshot was rewritten. A snapshot
+// built from real state is never touched.
+func (x *XDPoS_v2) RepairSeededCandidatePool(gapHeader *types.Header, switchValidators []common.Address, statedb *state.StateDB) (bool, error) {
+	snap, err := loadSnapshot(x.db, gapHeader.Hash())
+	if err != nil || snap == nil || len(snap.NextEpochCandidates) == 0 {
+		return false, nil
+	}
+	if len(snap.NextEpochCandidates) != len(switchValidators) {
+		return false, nil
+	}
+	for i, a := range switchValidators {
+		if snap.NextEpochCandidates[i] != a {
+			return false, nil
+		}
+	}
+	pool := sortCandidatesByStake(statedb, state.GetCandidates(statedb))
+	if len(pool) <= len(switchValidators) {
+		return false, nil
+	}
+	fixed := newSnapshotWithPenalties(snap.Number, snap.Hash, pool, snap.Penalties)
+	if err := storeSnapshot(fixed, x.db); err != nil {
+		return false, err
+	}
+	x.snapshots.Add(fixed.Hash, fixed)
+	log.Info("[RepairSeededCandidatePool] replaced header-seeded candidates with contract pool",
+		"gap", snap.Number, "seeded", len(switchValidators), "pool", len(pool), "penalties", len(snap.Penalties))
+	return true, nil
+}
+
+// repairSeededGapAtSwitch replaces the SYNC-11 seed of this epoch-switch block's
+// gap snapshot. sync11SeedGap runs in verifyHeader, where no state is reachable,
+// so it stores only the header's active validators; Reward 2.0 (GetStandbynodes)
+// reads that snapshot's pool one epoch later and would find no standby nodes.
+// State used: statedb (the switch block's parent), not the gap block's (residual
+// risk: a candidate that joined or resigned in between, at most one gap window).
+// A snapshot built from real state is never touched. Refs #1902.
+func (x *XDPoS_v2) repairSeededGapAtSwitch(chain consensus.ChainReader, switchHdr *types.Header, statedb *state.StateDB) {
+	num := switchHdr.Number.Uint64()
+	base := num - num%x.config.Epoch
+	if base < x.config.Gap {
+		return
+	}
+	gapHdr := chain.GetHeaderByNumber(base - x.config.Gap)
+	if gapHdr == nil {
+		return
+	}
+	if _, err := x.RepairSeededCandidatePool(gapHdr, x.GetMasternodesFromEpochSwitchHeader(chain, switchHdr), statedb); err != nil {
+		log.Warn("[Finalize] repair seeded gap pool failed", "gap", gapHdr.Number, "err", err)
+	}
+}
+
 // UpdateMasternodesFromHeader computes and stores the V2 masternode snapshot
 // for a gap block. This must be called during block import so that future
 // epoch switch blocks can resolve their masternode set.
@@ -2169,27 +2257,7 @@ func (x *XDPoS_v2) UpdateMasternodesFromHeader(chain consensus.ChainReader, head
 			log.Info("[UpdateMasternodesFromHeader] carrying forward parent snapshot candidates", "number", number, "candidates", len(candidates))
 		}
 	} else {
-		// Sort candidates by stake (descending) to match v2.6.8 behavior
-		type candidateStake struct {
-			addr  common.Address
-			stake *big.Int
-		}
-		cs := make([]candidateStake, 0, len(candidates))
-		for _, c := range candidates {
-			if c != (common.Address{}) {
-				cap := state.GetCandidateCap(statedb, c)
-				cs = append(cs, candidateStake{addr: c, stake: cap})
-			}
-		}
-		// Use frozen Go-1.18 quicksort (canonical's xdc_sort) — see comment in
-		// repairSnapshot above for why stdlib sort.Slice (pdqsort) diverges.
-		xdc_sort.Slice(cs, func(i, j int) bool {
-			return cs[i].stake.Cmp(cs[j].stake) >= 0
-		})
-		candidates = make([]common.Address, len(cs))
-		for i, c := range cs {
-			candidates[i] = c.addr
-		}
+		candidates = sortCandidatesByStake(statedb, candidates)
 		log.Info("[UpdateMasternodesFromHeader] candidates from smart contract", "number", number, "candidates", len(candidates))
 		if len(candidates) > 0 {
 			log.Debug("V2 snapshot candidates", "block", number, "count", len(candidates),
@@ -2216,6 +2284,12 @@ func (x *XDPoS_v2) UpdateMasternodesFromHeader(chain consensus.ChainReader, head
 		// Check if there is already a snapshot with ActiveMasternodesLen>0 at this hash
 		// (e.g. from a trusted-checkpoint A.70 seed) — prefer it to avoid overwrite hazard.
 		if existing, lerr := loadSnapshot(x.db, header.Hash()); lerr == nil && existing != nil && existing.ActiveMasternodesLen > 0 && len(existing.Penalties) > 0 {
+			// A header seed holds only the epoch-switch validators (and that
+			// header's penalties), not what a fully-synced node computes here;
+			// now that the gap block's state exists, store the computed snapshot (#1901).
+			if len(existing.NextEpochCandidates) < len(candidates) {
+				return x.UpdateMasternodesWithPenalties(chain, header, candidates, penalties)
+			}
 			log.Info("[UpdateMasternodesFromHeader] existing penalty-aware snapshot found (A.70 seed), skipping overwrite",
 				"number", number, "existingActive", existing.ActiveMasternodesLen, "existingPenalties", len(existing.Penalties))
 			return nil

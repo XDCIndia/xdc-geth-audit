@@ -24,6 +24,7 @@ import (
 	xdcutils "github.com/ethereum/go-ethereum/consensus/XDPoS/utils"
 	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/core/rawdb"
+	"github.com/ethereum/go-ethereum/core/state"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/eth/downloader"
 	"github.com/ethereum/go-ethereum/eth/ethconfig"
@@ -549,6 +550,10 @@ func (s *xdcSyncer) start() {
 	core.XdcBulkSyncMode.Store(true)
 	s.spawn(s.loop)
 	s.spawn(s.snapEventLoop) // refs #807 Phase 3b.3
+	// A gap snapshot seeded from a header by older code carries the 108
+	// header validators instead of the contract pool; fix it now that state
+	// is on disk (refs #1884).
+	s.spawn(s.repairSeededGapPools)
 	// SYNC-06: after a restart a node whose snap sync already finished runs as
 	// a full node and never re-enters the snap event loop, so resume an
 	// unfinished history backfill here. Gated on the head having passed the
@@ -1686,6 +1691,23 @@ func (s *xdcSyncer) maybeStartSnapHeal() {
 	})
 }
 
+// peersConfirmAtTip reports whether the local head is at the network tip: some
+// peer's advertised head hash equals ours AND we are within one epoch of the
+// best known tip (max of peer-advertised heads and the verified networkTip).
+// A lagging or frozen peer sitting at our height must not, on its own, make a
+// node millions of blocks behind believe it is at tip. Refs #1884.
+func peersConfirmAtTip(cur *types.Header, ranges []*eth.BlockRangeUpdatePacket, networkTip, epoch uint64) bool {
+	best, match := networkTip, false
+	for _, rng := range ranges {
+		if rng == nil {
+			continue
+		}
+		best = max(best, rng.LatestBlock)
+		match = match || rng.LatestBlockHash == cur.Hash()
+	}
+	return match && cur.Number.Uint64()+epoch >= best
+}
+
 // maybeTransitionToAtTip advances phaseTipCatch → phaseAtTip when the
 // local head matches a peer's claimed head hash (i.e. we've caught up
 // post-snap-sync). Also flips core.XdcBulkSyncMode off so the at-tip
@@ -1704,39 +1726,41 @@ func (s *xdcSyncer) maybeTransitionToAtTip() {
 	if cur == nil {
 		return
 	}
-	localHash := cur.Hash()
+	var ranges []*eth.BlockRangeUpdatePacket
 	for _, p := range s.handler.peers.all() {
-		rng := p.BlockRange()
-		if rng == nil {
-			continue
-		}
-		if rng.LatestBlockHash == localHash {
-			log.Info("xdcSyncer: TIP_CATCH complete; transitioning to AT_TIP",
-				"head", cur.Number.Uint64(),
-				"hash", localHash.Hex())
-			s.snapPhase.Store(int32(phaseAtTip))
-			// A.73 (refs #844 #859): re-apply A.70 seeds one final time before
-			// flipping to strict mode. During TIP_CATCH, block-import of each
-			// post-pivot gap block calls UpdateMasternodesFromHeader (reads
-			// contract state, sorts candidates by stake) and can overwrite the
-			// SyncCompleted-time seed. Re-seeding here restores authoritative
-			// header.Validators as the active set so the first fullVerify=true
-			// epoch-switch verify after this flip sees the canonical 108-of-N
-			// truncation rather than the contract-state-sorted divergent one.
-			s.reapplyA70Seeds()
-			// A.97.2: flip bulk-mode first (gate B must run with bulk=false),
-			// THEN start the heal goroutine. Ordering is critical: gate B
-			// checks that XdcBulkSyncMode is false so A.94 cannot fire and
-			// any mismatch surfaces as a real error. Refs #894.
-			core.XdcBulkSyncMode.Store(false)
-			s.maybeStartSnapHeal()
-			// Authoritative at-tip transition: re-enable state validation now that
-			// bulk-sync is over, so the miner opens the real head state instead of
-			// EmptyRootHash. No-op unless the flag is set, and refuses (loudly) if the
-			// head state is missing — that DB needs a resync, not a flag flip.
-			s.handler.chain.ClearCheckpointSyncNoState()
-			return
-		}
+		ranges = append(ranges, p.BlockRange())
+	}
+	var epoch uint64 = 900
+	if x := s.handler.chain.Config().XDPoS; x != nil && x.Epoch > 0 {
+		epoch = x.Epoch
+	}
+	localHash := cur.Hash()
+	if peersConfirmAtTip(cur, ranges, s.networkTipSeen.Load(), epoch) {
+		log.Info("xdcSyncer: TIP_CATCH complete; transitioning to AT_TIP",
+			"head", cur.Number.Uint64(),
+			"hash", localHash.Hex())
+		s.snapPhase.Store(int32(phaseAtTip))
+		// A.73 (refs #844 #859): re-apply A.70 seeds one final time before
+		// flipping to strict mode. During TIP_CATCH, block-import of each
+		// post-pivot gap block calls UpdateMasternodesFromHeader (reads
+		// contract state, sorts candidates by stake) and can overwrite the
+		// SyncCompleted-time seed. Re-seeding here restores authoritative
+		// header.Validators as the active set so the first fullVerify=true
+		// epoch-switch verify after this flip sees the canonical 108-of-N
+		// truncation rather than the contract-state-sorted divergent one.
+		s.reapplyA70Seeds()
+		// A.97.2: flip bulk-mode first (gate B must run with bulk=false),
+		// THEN start the heal goroutine. Ordering is critical: gate B
+		// checks that XdcBulkSyncMode is false so A.94 cannot fire and
+		// any mismatch surfaces as a real error. Refs #894.
+		core.XdcBulkSyncMode.Store(false)
+		s.maybeStartSnapHeal()
+		// Authoritative at-tip transition: re-enable state validation now that
+		// bulk-sync is over, so the miner opens the real head state instead of
+		// EmptyRootHash. No-op unless the flag is set, and refuses (loudly) if the
+		// head state is missing — that DB needs a resync, not a flag flip.
+		s.handler.chain.ClearCheckpointSyncNoState()
+		return
 	}
 }
 
@@ -4628,6 +4652,7 @@ func (s *xdcSyncer) seedMasternodeSnapshotsFromPrefetch(allHeaders []*types.Head
 //
 // Refs #844 #859 A.70.
 func (s *xdcSyncer) reapplyA70Seeds() {
+	defer s.repairSeededGapPools()
 	s.a70SeedMu.Lock()
 	defer s.a70SeedMu.Unlock()
 	if len(s.a70SeedCache) == 0 {
@@ -4662,6 +4687,78 @@ func (s *xdcSyncer) reapplyA70Seeds() {
 	}
 	log.Info("xdcSyncer: A.70 re-seeded V2 masternode snapshots post-SyncCompleted",
 		"gap_reseeds", gapSeeds, "anchor_reseeds", anchorSeeds, "total_cached", len(s.a70SeedCache))
+}
+
+// repairSeededGapPools replaces header-seeded gap snapshots (NextEpochCandidates
+// == epoch-switch header Validators, written during fast/snap sync) of the most
+// recent epochs with the real 0x88 candidate pool, so HookPenalty computes the
+// same penalties as on a fully-synced node. State used: the gap block's own if
+// present, else the head's, else the last snap pivot's (residual risk: a
+// candidate that resigned or joined between the gap and that state). Safe to
+// call repeatedly. Refs #1884.
+func (s *xdcSyncer) repairSeededGapPools() {
+	chain := s.handler.chain
+	cfg := chain.Config()
+	xdposEngine, ok := chain.Engine().(*XDPoS.XDPoS)
+	if !ok || cfg.XDPoS == nil || cfg.XDPoS.Epoch == 0 {
+		return
+	}
+	v2, ok := xdposEngine.EngineV2.(*engine_v2.XDPoS_v2)
+	if !ok || v2 == nil {
+		return
+	}
+	head := chain.CurrentBlock()
+	if head == nil {
+		return
+	}
+	epoch, gap := cfg.XDPoS.Epoch, cfg.XDPoS.Gap
+	// Fallback state: head, then the stored snap pivot.
+	var fallback *state.StateDB
+	if st, err := chain.StateAt(head.Root, head.Number, head.Time); err == nil {
+		fallback = st
+	} else if p := rawdb.ReadLastPivotNumber(s.handler.database); p != nil {
+		if ph := chain.GetHeaderByNumber(*p); ph != nil {
+			if st, err := chain.StateAt(ph.Root, ph.Number, ph.Time); err == nil {
+				fallback = st
+			}
+		}
+	}
+	headNum := head.Number.Uint64()
+	hdrNum := max(headNum, chain.CurrentHeader().Number.Uint64())
+	next := headNum - headNum%epoch + epoch
+	for cp := next; cp > next-4*epoch && cp > gap; cp -= epoch {
+		gapNum := cp - gap
+		gapHeader := chain.GetHeaderByNumber(gapNum)
+		if gapHeader == nil || gapNum > headNum {
+			continue
+		}
+		var sw *types.Header
+		// The switch header may be above the head block (header-synced, block not
+		// yet imported): that is exactly a SYNC-11 seed about to be consumed.
+		for n := gapNum + 1; n <= gapNum+2*epoch && n <= hdrNum; n++ {
+			if h := chain.GetHeaderByNumber(n); h != nil {
+				if isSwitch, _, err := v2.IsEpochSwitch(h); err == nil && isSwitch {
+					sw = h
+					break
+				}
+			}
+		}
+		if sw == nil {
+			continue
+		}
+		statedb := fallback
+		if chain.HasState(gapHeader.Root) {
+			if st, err := chain.StateAt(gapHeader.Root, gapHeader.Number, gapHeader.Time); err == nil {
+				statedb = st
+			}
+		}
+		if statedb == nil {
+			continue
+		}
+		if _, err := v2.RepairSeededCandidatePool(gapHeader, v2.GetMasternodesFromEpochSwitchHeader(chain, sw), statedb.Copy()); err != nil {
+			log.Warn("xdcSyncer: repair seeded gap pool failed", "gap", gapNum, "err", err)
+		}
+	}
 }
 
 // seedSnapPivotGapSnapshots seeds V2 masternode snapshots for every XDPoS gap
