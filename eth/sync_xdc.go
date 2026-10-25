@@ -450,6 +450,12 @@ type xdcSyncer struct {
 	// bulk sync learns real peer head numbers. Fixes #1841.
 	highestPeerBlockSeen atomic.Uint64
 
+	// networkTipSeen is the best verified peer tip (fetchPeerTip results);
+	// highestPeerBlockSeen only reaches the top of the last header batch.
+	// tipRefreshAt (unix nanos) throttles the bulk-sync refresh. Fixes #1887.
+	networkTipSeen atomic.Uint64
+	tipRefreshAt   atomic.Int64
+
 	// bulkSyncStartBlock records the local head when bulk sync starts, once per
 	// catch-up cycle. Used to report progress in eth_syncing while behind peers.
 	bulkSyncStartBlock atomic.Uint64
@@ -594,7 +600,7 @@ func (s *xdcSyncer) stop() {
 // for this bulk-sync cycle. Used by eth_syncing to report progress while
 // catching up. Returns (0, 0) if no peer head data is available. Fixes #1841.
 func (s *xdcSyncer) SyncProgress() (highestPeerBlock, startBlock uint64) {
-	return s.highestPeerBlockSeen.Load(), s.bulkSyncStartBlock.Load()
+	return max(s.networkTipSeen.Load(), s.highestPeerBlockSeen.Load()), s.bulkSyncStartBlock.Load()
 }
 
 func (s *xdcSyncer) loop() {
@@ -2462,6 +2468,13 @@ func (s *xdcSyncer) fullSyncOnce() {
 	// This is used to report progress in eth_syncing while behind peers.
 	s.bulkSyncStartBlock.CompareAndSwap(0, localHead)
 
+	// Fixes #1887: learn the real network tip (at most one fetch per 30s) so
+	// eth_syncing does not stop at the top of the last header batch.
+	if now := time.Now().UnixNano(); now-s.tipRefreshAt.Load() > int64(30*time.Second) {
+		s.tipRefreshAt.Store(now)
+		s.refreshOperatorPivotHead()
+	}
+
 	// A.75: parallel fan-out to top xdcMaxPeerTriesPerSync candidates.
 	// Worst-case round time: xdcBulkReqTimeout (4s) instead of
 	// xdcMaxPeerTriesPerSync × xdcReqTimeout (32s) — collapses the
@@ -3835,6 +3848,9 @@ func (s *xdcSyncer) fetchPeerTip(p *eth.Peer, hash common.Hash) *types.Header {
 	h := s.fetchHeaderByHash(p, hash)
 	if h == nil || !s.onCanonicalBranch(p, h) {
 		return nil
+	}
+	n := h.Number.Uint64()
+	for cur := s.networkTipSeen.Load(); n > cur && !s.networkTipSeen.CompareAndSwap(cur, n); cur = s.networkTipSeen.Load() {
 	}
 	return h
 }

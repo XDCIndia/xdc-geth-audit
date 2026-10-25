@@ -51,8 +51,9 @@ func TestFullSyncLookaheadContiguous(t *testing.T) {
 	for _, p := range peers {
 		p.mu.Lock()
 		for _, o := range p.headerReqs {
-			// The sliding window also asks for the range past the chain end.
-			if o != 1 && o <= want {
+			// The sliding window also asks for the range past the chain end;
+			// origin 0 is the by-hash peer-tip fetch.
+			if o > 1 && o <= want {
 				lookahead = append(lookahead, o)
 			}
 		}

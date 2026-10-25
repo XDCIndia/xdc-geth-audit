@@ -291,3 +291,29 @@ func (n *xdcFakeNet) newTestXDCSyncer(t *testing.T) *xdcSyncer {
 	t.Cleanup(func() { core.XdcBulkSyncMode.Store(bulk); core.XdcForkRecovering.Store(fork) })
 	return s
 }
+
+// TestSyncProgressReportsNetworkTip: after one bulk round on a chain far longer
+// than one header batch, eth_syncing's highest block is the peer's tip, not the
+// top of the batch just fetched (#1887).
+func TestSyncProgressReportsNetworkTip(t *testing.T) {
+	const remoteBlocks = 3 * xdpos2MaxHeaderFetch
+	n := newXDCFakeNet(t, 5, remoteBlocks)
+	core.XdcBulkSyncMode.Store(true)
+	// A by-hash request (the peer-tip fetch) arrives with origin 0: serve the tip.
+	n.addPeer(t, 1, func(origin uint64, amount int) []*types.Header {
+		if origin == 0 {
+			return n.canonicalHeaders(remoteBlocks, 1)
+		}
+		return n.canonicalHeaders(origin, amount)
+	})
+
+	s := n.newTestXDCSyncer(t)
+	s.fullSyncOnce()
+
+	if head := n.chain.CurrentBlock().Number.Uint64(); head >= remoteBlocks-xdpos2MaxHeaderFetch {
+		t.Fatalf("one round synced to %d; test needs a chain longer than a batch", head)
+	}
+	if highest, _ := s.SyncProgress(); highest != remoteBlocks {
+		t.Fatalf("SyncProgress highest = %d, want network tip %d", highest, remoteBlocks)
+	}
+}
