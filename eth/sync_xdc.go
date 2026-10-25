@@ -2459,7 +2459,7 @@ func (s *xdcSyncer) fullSyncOnce() {
 	localHead := cur.Number.Uint64()
 	fromBlock := localHead + 1
 
-	candidates := s.rankedPeers()
+	candidates := s.dropAbandonedPeers(s.rankedPeers(), fromBlock)
 	if len(candidates) == 0 {
 		return
 	}
@@ -3903,21 +3903,66 @@ func (s *xdcSyncer) onCanonicalBranch(p *eth.Peer, head *types.Header) bool {
 	if head.Number.Uint64() == g.Number {
 		return head.Hash() == g.Hash
 	}
+	canonical, known := s.guardCheck(p, g.Number, g.Hash)
+	return known && canonical // no answer: not cached, the peer may answer next time
+}
+
+// guardCheck asks p for the fork-guard block and caches whether p is on the
+// canonical branch; known is false when p did not answer (nothing cached).
+func (s *xdcSyncer) guardCheck(p *eth.Peer, num uint64, want common.Hash) (canonical, known bool) {
 	if v, ok := s.forkGuardVerdicts.Load(p.ID()); ok {
-		return v.(bool)
+		return v.(bool), true
 	}
-	hdrs := s.fetchHeaderBatchTimeout(p, g.Number, 1, xdcBulkReqTimeout)
+	hdrs := s.fetchHeaderBatchTimeout(p, num, 1, xdcBulkReqTimeout)
 	if len(hdrs) == 0 {
-		return false // not cached: the peer may answer next time
+		return false, false
 	}
-	canonical := hdrs[0].Hash() == g.Hash
+	canonical = hdrs[0].Hash() == want
 	s.forkGuardVerdicts.Store(p.ID(), canonical)
 	if !canonical {
-		log.Warn("xdcSyncer: peer is on an abandoned branch; not using its head as sync tip",
-			"peer", p.ID()[:12], "head", head.Number.Uint64(), "guard", g.Number,
-			"have", hdrs[0].Hash(), "want", g.Hash)
+		log.Warn("xdcSyncer: peer is on an abandoned branch; excluded from sync",
+			"peer", p.ID()[:12], "guard", num, "have", hdrs[0].Hash(), "want", want)
 	}
-	return canonical
+	return canonical, true
+}
+
+// onAbandonedBranch reports whether p is known to follow a branch abandoned
+// at a chain rewind (see xdcForkGuards).
+func (s *xdcSyncer) onAbandonedBranch(id string) bool {
+	v, ok := s.forkGuardVerdicts.Load(id)
+	return ok && !v.(bool)
+}
+
+// dropAbandonedPeers removes peers on an abandoned branch from candidates when
+// syncing above this chain's fork guard. Unchecked peers are asked for the
+// guard block once (concurrently, cached per connection); a peer that does not
+// answer is kept. Bulk sync fetches by number, so a peer on the abandoned
+// branch serves its own blocks at our height and every batch from it fails as
+// an unknown ancestor (#1884: a snap-synced Apothem node stuck at 84,524,595).
+func (s *xdcSyncer) dropAbandonedPeers(candidates []*eth.Peer, from uint64) []*eth.Peer {
+	cid := s.handler.chain.Config().ChainID
+	if cid == nil {
+		return candidates
+	}
+	g, ok := xdcForkGuards[cid.Uint64()]
+	if !ok || from <= g.Number {
+		return candidates
+	}
+	var wg sync.WaitGroup
+	for _, p := range candidates {
+		if _, ok := s.forkGuardVerdicts.Load(p.ID()); !ok {
+			wg.Add(1)
+			go func(p *eth.Peer) { defer wg.Done(); s.guardCheck(p, g.Number, g.Hash) }(p)
+		}
+	}
+	wg.Wait()
+	kept := candidates[:0:0]
+	for _, p := range candidates {
+		if !s.onAbandonedBranch(p.ID()) {
+			kept = append(kept, p)
+		}
+	}
+	return kept
 }
 
 // snapPivotBackoff is the number of blocks to step BACK from peer's
@@ -5845,7 +5890,7 @@ func (s *xdcSyncer) rankedPeers() []*eth.Peer {
 		// xdcForkTaintTTL, this peer delivered the block that put us on a
 		// non-canonical fork; without exclusion bestPeer keeps re-picking
 		// them and post-rollback sync immediately re-imports the same fork.
-		if s.isPeerTainted(p.ID()) {
+		if s.isPeerTainted(p.ID()) || s.onAbandonedBranch(p.ID()) {
 			skippedTainted++
 			continue
 		}
@@ -5888,7 +5933,7 @@ func (s *xdcSyncer) rankedPeersNoCD() []*eth.Peer {
 		if p.BlockRange() == nil {
 			continue
 		}
-		if s.isPeerTainted(p.ID()) {
+		if s.isPeerTainted(p.ID()) || s.onAbandonedBranch(p.ID()) {
 			continue
 		}
 		// NOTE: isPeerOnEmptyCooldown is intentionally omitted here.
