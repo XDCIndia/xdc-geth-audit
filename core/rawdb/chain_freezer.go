@@ -359,6 +359,11 @@ func (f *chainFreezer) freezeRange(nfdb *nofreezedb, number, limit uint64) (hash
 				if err := op.AppendRaw(ChainFreezerReceiptTable, number, []byte{0x00}); err != nil {
 					return fmt.Errorf("xdc: can't write placeholder receipts for block %d: %v", number, err)
 				}
+				// Every table must advance in lockstep; bals gets its nil absence
+				// placeholder too, else the batch fails with "table bals is at item".
+				if err := op.AppendRaw(ChainFreezerBALTable, number, nil); err != nil {
+					return fmt.Errorf("xdc: can't write placeholder bals for block %d: %v", number, err)
+				}
 				hashes = append(hashes, common.Hash{})
 				continue
 			}
