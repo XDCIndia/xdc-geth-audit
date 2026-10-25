@@ -775,7 +775,12 @@ func (s *skeleton) sync(head *types.Header) (*types.Header, error) {
 			peerid := event.peer.id
 			if event.join {
 				log.Debug("Joining skeleton peer", "id", peerid)
-				s.idles[peerid] = event.peer
+				// XDC fix #1868: an XDPOS2-family peer caps replies at 192, so it
+				// cannot serve a cycle that already chose the 512 batch. Keep it
+				// out of idles until the next cycle re-picks the batch.
+				if !(eth.IsXDPOS2Family(event.peer.version) && s.cycleBatch > requestHeadersXDPOS2) {
+					s.idles[peerid] = event.peer
+				}
 			} else {
 				log.Debug("Leaving skeleton peer", "id", peerid)
 				s.revertRequests(peerid)
