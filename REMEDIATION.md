@@ -2,6 +2,77 @@
 
 Report: Hacken final report, 2026-10-13. Audited commit: `45e2b6ee`.
 
+## Fourth hand-over (25 October 2026): revalidate `7520ece168f792f39835882d5f13b74c4491f9b0`
+
+### Scope
+
+| Item | Value |
+|---|---|
+| Repository | XDCIndia/xdc-geth-audit |
+| Branch | `audit/main-uplift-11710-xdc20-r11` |
+| Commit to revalidate | **`7520ece168f792f39835882d5f13b74c4491f9b0`** |
+| Previously revalidated commit (base) | `08d60e39096625b798a901e91a2470ed994c6be8` (third hand-over, branch `audit/main-uplift-11710-xdc20-r10`) |
+| Source | XDCIndia/go-ethereum `504a353c31c11f055e448010242b69563be9f82e` (main after v1.17.10-xdc.20) |
+| Upstream | unchanged: go-ethereum v1.17.10 (no upstream merge in this hand-over) |
+| Out of scope | docs, scripts, CI and audit reports |
+
+### Structure: one commit per fix
+
+The branch is a fast-forward of the third hand-over: **18 commits on top of `08d60e390966`, one per source fix**, in source order, no merges.
+- Each commit has the fix's original message and author, its code (and changes to tests already in the base), and a `Source: XDCIndia/go-ethereum <sha>` line.
+- No commit changes block, vote or QC validity rules. Two commits restore parity with the canonical client on nodes that start from fast/snap sync or from an empty data directory:
+  - `core: patch missing fork blocks in the fresh-datadir chain config`: the consensus hooks of a node started from an empty data directory used the fork schedule without the missing-fork patch until the first restart (Apothem paid flat rewards after `TIPUpgradeRewardBlock`).
+  - `consensus/XDPoS, eth: replace header-seeded gap snapshots with the contract pool`: a gap snapshot seeded from an epoch-switch header during fast/snap sync is replaced with the stake-sorted 0x88 candidate pool, as a fully synced node stores it.
+- The other commits are sync, downloader, RPC-shape and storage fixes.
+
+**XDC test files.** 12 XDC test files that would be new in this hand-over are not included, to keep the review diff small. Tests already in the base follow the source. The suite compiles (`go vet ./...` passes).
+
+Excluded files:
+
+- `consensus/XDPoS/api_masternodes_1900_test.go`
+- `consensus/XDPoS/engines/engine_v2/repair_seeded_pool_1884_test.go`
+- `consensus/XDPoS/snapshot_inbatch_parents_1888_test.go`
+- `core/blockchain_pathdb_archive_test.go`
+- `core/genesis_fresh_fork_patch_test.go`
+- `core/rawdb/chain_freezer_test.go`
+- `eth/downloader/fetchers_concurrent_bals_xdc_test.go`
+- `eth/protocols/eth/receipts_xdpos2_1889_test.go`
+- `eth/sync_xdc_1876_test.go`
+- `eth/sync_xdc_1884_test.go`
+- `eth/sync_xdc_buildblocks_test.go`
+- `eth/sync_xdc_stopwait_test.go`
+
+### How to verify
+
+```
+git log --first-parent --oneline 08d60e390966..7520ece168f7   # 18 fix commits
+git checkout 7520ece168f7 && go build ./... && go vet ./...
+go test -timeout 60m ./consensus/XDPoS/... ./core/... ./eth/...
+```
+
+### Commits (audit commit → source commit)
+
+| Audit commit | Source | Change |
+|---|---|---|
+| `65f377504a2e8aa8f9830f51447cd80e3af632b7` | `d5caa7dc4dac` | eth: bulk-sync lookahead window, hedged ranges and partial-import resume (review SYNC-12) |
+| `320f8e451275b76e0b63d572e9d5cc836ce7665d` | `c2af9504159a` | eth, eth/downloader: keep peers through fresh fast/snap sync on xdpos2 v101 |
+| `781bb043b93dd1a386414a006c78612ddd609428` | `a828ed43248f` | eth: skip snap peers that are still syncing when choosing the snap pivot |
+| `db4d7934d5487f2fc5e8a6edf13ec5a767f47d3b` | `221cc08a8a53` | core/rawdb/eradb: convert the upstream era fixtures from raw rlp in TestEreDatabase |
+| `e43b0aa94b88d2436474ba4cc5d7ca33f6762777` | `dce9d3394954` | eth: wait for xdc syncer background goroutines before the database closes |
+| `73ba0ff6099b7b6a9eb4041a60409ba2d8951b48` | `a6ec713f3ec3` | eth/protocols/eth: accept the eth/69 receipt shape on xdpos2 receive |
+| `928ec10578f704897c874b0174a0fa7326d63141` | `4e21daea06f4` | core: back off the xdc td backfill while history below the pivot is missing |
+| `2c7f58d40077e8a5eff1d1e679380df1e7a0f998` | `32e68433b9d7` | eth: snap sync on apothem — fork-guarded tip, anchor from the head's peer, keep progress across re-pivots |
+| `f9a17739d69183138c6d1a04be9825b57ada740e` | `78406034afa3` | core/rawdb: write the bals placeholder in the freezer's fast-sync gap fill |
+| `0b7f63669536cca65ad26a61b029eebdf5b4a5be` | `90afae1cc817` | consensus/XDPoS: consume each in-batch parent in the v1 snapshot walk-back |
+| `283c7c180aaff5caf23e895746bdb60d207c89d4` | `256871988906` | eth: report the network tip, not the last header batch, in eth_syncing |
+| `8990c1812d12eebfa25453e0e381acf5f87f4852` | `0466dd5708f8` | eth: walk a peer's announced head forward to its real tip |
+| `07defb3cd315f34cd70aa5f938399d4eaaf1cb18` | `67ae1e12aec0` | eth: keep peers on an abandoned branch out of bulk sync |
+| `e80a43d2b7ca8018aed583160d6b3046b1e40060` | `219a3bb0d090` | core: patch missing fork blocks in the fresh-datadir chain config |
+| `9ce73cad1e9f2a9c2e514f53fbae0b073f920971` | `2d81f8f903b0` | consensus/XDPoS, eth: replace header-seeded gap snapshots with the contract pool |
+| `1d21b439f17c35ab9ac04b51ed2a84b856b3d4ed` | `7b52d831d67c` | core: index state history immediately for path-scheme archive nodes |
+| `66ab40aec31a1312a67a7f2ad76b0bda98eac73a` | `377dfbcd6273` | eth/downloader: keep xdpos2 peers out of 512-batch skeleton cycles |
+| `7520ece168f792f39835882d5f13b74c4491f9b0` | `504a353c31c1` | consensus/XDPoS: match canonical XDPoS_getMasternodesByNumber response |
+
 ## Third hand-over (24 October 2026): revalidate `08d60e39096625b798a901e91a2470ed994c6be8`
 
 ### Scope
