@@ -258,6 +258,13 @@ type xdcSyncer struct {
 	syncing atomic.Bool
 	quitCh  chan struct{}
 
+	// bgMu/bgStopped/bg track every background goroutine that touches the
+	// chain database so stop() can wait for them before the database is
+	// closed (pebble panics on Close with live iterators). Refs #1877.
+	bgMu      sync.Mutex
+	bgStopped bool
+	bg        sync.WaitGroup
+
 	// Self-healing state. When InsertChain returns consensus.ErrUnknownAncestor
 	// for the same fromBlock xdcUnknownAncestorThreshold times in a row, we
 	// infer the local tip is on a non-canonical competing-slot block and
@@ -527,22 +534,53 @@ func (s *xdcSyncer) start() {
 	// When true: signing-tx ECDSA recovery skipped, larger TriesInMemory
 	// (4096 vs 128), chainHeadEvent throttled, sender cache skipped.
 	core.XdcBulkSyncMode.Store(true)
-	go s.loop()
-	go s.snapEventLoop() // refs #807 Phase 3b.3
+	s.spawn(s.loop)
+	s.spawn(s.snapEventLoop) // refs #807 Phase 3b.3
 	// SYNC-06: after a restart a node whose snap sync already finished runs as
 	// a full node and never re-enters the snap event loop, so resume an
 	// unfinished history backfill here. Gated on the head having passed the
 	// stored pivot, so it never overlaps a running state download.
 	if p := rawdb.ReadLastPivotNumber(s.handler.database); p != nil && *p > 1 {
 		if cur := s.handler.chain.CurrentBlock(); cur != nil && cur.Number.Uint64() >= *p {
-			go s.runSnapHistoryBackfill()
+			s.spawn(s.runSnapHistoryBackfill)
 		}
 	}
 }
 
+// xdcStopWaitTimeout bounds how long stop() waits for background goroutines.
+const xdcStopWaitTimeout = 15 * time.Second
+
+// spawn runs f as a tracked background goroutine. After stop() has begun it
+// is a no-op, so nothing can start touching the database during shutdown.
+func (s *xdcSyncer) spawn(f func()) {
+	s.bgMu.Lock()
+	defer s.bgMu.Unlock()
+	if s.bgStopped {
+		return
+	}
+	s.bg.Add(1)
+	go func() {
+		defer s.bg.Done()
+		f()
+	}()
+}
+
+// stop signals every background goroutine to quit and waits for them, so the
+// caller may close the chain database afterwards. Refs #1877.
 func (s *xdcSyncer) stop() {
 	core.XdcBulkSyncMode.Store(false)
+	s.bgMu.Lock()
+	s.bgStopped = true
+	s.bgMu.Unlock()
 	close(s.quitCh)
+
+	done := make(chan struct{})
+	go func() { s.bg.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(xdcStopWaitTimeout):
+		log.Warn("xdcSyncer: background goroutines still running at shutdown", "timeout", xdcStopWaitTimeout)
+	}
 }
 
 // SyncProgress returns the highest peer block seen and the starting block
@@ -743,7 +781,7 @@ func (s *xdcSyncer) maybeSync() {
 	if !s.syncing.CompareAndSwap(false, true) {
 		return
 	}
-	go func() {
+	s.spawn(func() {
 		defer s.syncing.Store(false)
 		defer func() {
 			if r := recover(); r != nil {
@@ -751,7 +789,7 @@ func (s *xdcSyncer) maybeSync() {
 			}
 		}()
 		s.syncOnce()
-	}()
+	})
 }
 
 // syncOnce dispatches to the phase-specific action. Default is
@@ -1247,7 +1285,7 @@ func (s *xdcSyncer) fastRunningCheck() {
 		"head", headHdr.Number.Uint64(),
 		"head_hash", headHdr.Hash().Hex(),
 		"head_root", headHdr.Root.Hex())
-	go func() {
+	s.spawn(func() {
 		// BeaconSync(head, final=nil): final=nil means no trusted finalized
 		// point — the downloader will use its pivot heuristic (head-64).
 		// For fast sync we rely on processFastSyncContent + NodeData for
@@ -1340,7 +1378,7 @@ func (s *xdcSyncer) fastRunningCheck() {
 				return
 			}
 		}
-	}()
+	})
 }
 
 // refreshOperatorPivotHead re-queries the best-ranked peer for its current
@@ -1477,7 +1515,7 @@ func (s *xdcSyncer) maybeStartSnapHeal() {
 		return
 	}
 
-	go func() {
+	s.spawn(func() {
 		now := time.Now()
 		s.healStatusMu.Lock()
 		s.healStatus = xdcHealStatus{
@@ -1632,7 +1670,7 @@ func (s *xdcSyncer) maybeStartSnapHeal() {
 		s.healStatus.InProgress = false
 		s.healStatus.LastError = ""
 		s.healStatusMu.Unlock()
-	}()
+	})
 }
 
 // maybeTransitionToAtTip advances phaseTipCatch → phaseAtTip when the
@@ -2181,7 +2219,7 @@ func (s *xdcSyncer) snapRunningCheck() {
 	// channel and returns); the actual state download runs in the
 	// downloader's worker goroutines. We listen for the completion
 	// event via the subscription created in start().
-	go func() {
+	s.spawn(func() {
 		if err := s.handler.downloader.BeaconSync(headHdr, pivot.Block); err != nil {
 			log.Error("xdcSyncer: BeaconSync failed; falling back to FULL_SYNC",
 				"err", err, "pivot", pivot.Block.Number.Uint64())
@@ -2192,7 +2230,7 @@ func (s *xdcSyncer) snapRunningCheck() {
 		}
 		log.Info("xdcSyncer: BeaconSync kicked off; awaiting completion via SyncEvent",
 			"pivot", pivot.Block.Number.Uint64())
-	}()
+	})
 }
 
 // snapEventLoop listens for downloader SyncEvents and transitions the
@@ -2237,7 +2275,7 @@ func (s *xdcSyncer) snapEventLoop() {
 					// SYNC-06: kick the post-snap history backfill as a background
 					// goroutine so head-following (TIP_CATCH fullSyncOnce) is not blocked.
 					// runSnapHistoryBackfill carries its own one-shot CAS guard.
-					go s.runSnapHistoryBackfill()
+					s.spawn(s.runSnapHistoryBackfill)
 				case downloader.SyncFailed:
 					log.Warn("xdcSyncer: snap-sync failed; falling back to FULL_SYNC",
 						"pivot", s.snapPivotBlock(), "err", ev.Err)
@@ -2274,7 +2312,7 @@ func (s *xdcSyncer) snapEventLoop() {
 					// set by SetFastSyncPivot), making eth_getBlockByNumber(1) and
 					// old receipts available on the fully-synced node.
 					// Refs: #1848 (SYNC-06), #1850.
-					go s.runSnapHistoryBackfill()
+					s.spawn(s.runSnapHistoryBackfill)
 					// A.70 (refs #844 #859): re-apply cached V2 masternode-snapshot
 					// seeds. Fast-sync block-import's UpdateMasternodesFromHeader
 					// at gap blocks runs BEFORE this point and overwrites our
