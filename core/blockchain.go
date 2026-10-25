@@ -335,6 +335,11 @@ func (cfg *BlockChainConfig) triedbConfig(isUBT bool) *triedb.Config {
 			StateHistory:        stateHistory,
 			TrienodeHistory:     cfg.TrienodeHistory,
 			EnableStateIndexing: cfg.ArchiveMode,
+			// Archive nodes must serve historical state while still catching up
+			// (e.g. full sync from genesis). Without this the indexer idles until
+			// the head is within 6h of wall clock, and every historical query
+			// fails with "historical state ... is not available" meanwhile.
+			NoHistoryIndexDelay: cfg.ArchiveMode,
 			FullValueCheckpoint: cfg.NodeFullValueCheckpoint,
 
 			// Testing configurations
