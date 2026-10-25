@@ -254,6 +254,8 @@ func (p xdcSnapPhase) String() string {
 }
 
 type xdcSyncer struct {
+	forkGuardVerdicts sync.Map // peer ID -> bool: head on the canonical branch past xdcForkGuards (#1876)
+
 	handler *handler
 	syncing atomic.Bool
 	quitCh  chan struct{}
@@ -346,6 +348,11 @@ type xdcSyncer struct {
 	// respond empty, the downloader logs "Peer rejected account range",
 	// and snap.Syncer.Progress().AccountSynced stays at 0).
 	snapBeaconStartedAt atomic.Int64
+
+	// Snap state-download progress seen by snapRunningCheck (#1884); only that
+	// check reads or writes them.
+	snapLastProgressBytes float64
+	snapLastProgressAt    time.Time
 
 	// Fast-sync peer-wait bookkeeping (refs #844 A.11).
 	// fastWaitStartedAt is the time we first noticed insufficient peers
@@ -1155,7 +1162,7 @@ func (s *xdcSyncer) fastRunningCheck() {
 				continue
 			}
 			attempts++
-			if h := s.fetchHeaderByHash(p, rng.LatestBlockHash); h != nil {
+			if h := s.fetchPeerTip(p, rng.LatestBlockHash); h != nil {
 				// A.71 (refs #844 #859): when the operator pinned a fast-sync
 				// pivot, refuse to engage BeaconSync with a peer-tip below
 				// the pivot. The peer is either misreporting its head (some
@@ -1401,7 +1408,7 @@ func (s *xdcSyncer) refreshOperatorPivotHead() *types.Header {
 			continue
 		}
 		attempts++
-		if h := s.fetchHeaderByHash(p, rng.LatestBlockHash); h != nil {
+		if h := s.fetchPeerTip(p, rng.LatestBlockHash); h != nil {
 			return h
 		}
 	}
@@ -1895,7 +1902,7 @@ func (s *xdcSyncer) snapSelectOnce() {
 		if rng == nil || rng.LatestBlockHash == (common.Hash{}) {
 			continue
 		}
-		hdr := s.fetchHeaderByHash(p, rng.LatestBlockHash)
+		hdr := s.fetchPeerTip(p, rng.LatestBlockHash)
 		if hdr == nil {
 			continue
 		}
@@ -2023,14 +2030,30 @@ func (s *xdcSyncer) snapRunningCheck() {
 		// SnapshotCache>0; handlers.go serves from TrieDB iterators), so an
 		// empty AccountSynced after the B1 fix most likely means state download
 		// was reached but the requested pivot root has no serving peer / drifted.
-		const snapStallGrace = 10 * time.Minute
+		//
+		// #1884: judge progress, not elapsed time. The pivot is frozen, and a
+		// serving peer keeps state for its recent blocks only, so after a few
+		// minutes it answers the old root with empty ranges. A fixed 10-minute
+		// "AccountSynced still 0" check never fired once progress was kept, yet
+		// a node could sit stalled for the whole window. Restart (and re-pivot,
+		// keeping the downloaded state) after snapStallGrace without new bytes.
+		const snapStallGrace = 3 * time.Minute
 		startNS := s.snapBeaconStartedAt.Load()
-		if startNS > 0 && time.Since(time.Unix(0, startNS)) > snapStallGrace {
-			progress := s.handler.downloader.SnapSyncer.Progress()
-			if progress.AccountSynced == 0 {
-				log.Warn("xdcSyncer: snap-sync stalled — no AccountSynced after grace; falling back to FULL_SYNC",
-					"grace", snapStallGrace,
-					"hint", "state download not reached or peer served empty AccountRange (refs #810/#836)")
+		if startNS > 0 {
+			p := s.handler.downloader.SnapSyncer.Progress()
+			done := float64(p.AccountBytes + p.BytecodeBytes + p.StorageBytes + p.TrienodeHealBytes + p.BytecodeHealBytes)
+			now := time.Now()
+			if done > s.snapLastProgressBytes {
+				s.snapLastProgressBytes, s.snapLastProgressAt = done, now
+			}
+			since := s.snapLastProgressAt
+			if since.UnixNano() < startNS {
+				since = time.Unix(0, startNS)
+			}
+			if now.Sub(since) > snapStallGrace {
+				log.Warn("xdcSyncer: snap-sync stalled — no state progress; restarting with a fresh pivot",
+					"for", now.Sub(since).Round(time.Second), "downloaded", common.StorageSize(done),
+					"hint", "pivot root no longer served (refs #810/#836/#1884)")
 				s.snapPhase.Store(int32(phaseFullSync))
 				s.snapBeaconStarted.Store(false)
 				s.snapBeaconStartedAt.Store(0)
@@ -2068,6 +2091,7 @@ func (s *xdcSyncer) snapRunningCheck() {
 	// → worst-case 15s before falling back to FULL_SYNC.
 	const headFetchMaxAttempts = 3
 	var headHdr *types.Header
+	var headPeer *eth.Peer // served headHdr, so it has its ancestors
 	attempts := 0
 	for _, p := range s.rankedPeers() {
 		if attempts >= headFetchMaxAttempts {
@@ -2078,8 +2102,8 @@ func (s *xdcSyncer) snapRunningCheck() {
 			continue
 		}
 		attempts++
-		if h := s.fetchHeaderByHash(p, rng.LatestBlockHash); h != nil {
-			headHdr = h
+		if h := s.fetchPeerTip(p, rng.LatestBlockHash); h != nil {
+			headHdr, headPeer = h, p
 			break
 		}
 	}
@@ -2102,8 +2126,12 @@ func (s *xdcSyncer) snapRunningCheck() {
 	// invalidation logic depends on the offset matching.
 	const downloaderFsMinFullBlocks = 64
 	newDownloaderPivot := headHdr.Number.Uint64() - downloaderFsMinFullBlocks
-	if lastPivot := rawdb.ReadLastPivotNumber(s.handler.database); lastPivot != nil && *lastPivot != newDownloaderPivot {
-		log.Warn("xdcSyncer: invalidating stale snap-sync state (pivot changed)",
+	// #1884: only when the pivot moves back. A forward move is the normal
+	// re-pivot after a stall: snap ranges are hash ranges and healing reconciles
+	// them to the new root (fast sync relies on this), so wiping them made every
+	// re-pivot start from zero and Apothem snap never finished.
+	if lastPivot := rawdb.ReadLastPivotNumber(s.handler.database); lastPivot != nil && *lastPivot > newDownloaderPivot {
+		log.Warn("xdcSyncer: invalidating stale snap-sync state (pivot moved back)",
 			"old_pivot", *lastPivot, "new_pivot", newDownloaderPivot)
 		// Write garbage that fails JSON decode → snap.Syncer.loadSyncStatus
 		// logs a decode error and falls through to fresh init.
@@ -2167,11 +2195,10 @@ func (s *xdcSyncer) snapRunningCheck() {
 		// Walk back from headHdr one parent at a time via a peer (XDPOS2 wire serves
 		// single headers by hash). primeHeadersNeeded = pivotDist+1 ascending headers.
 		primeHeadersNeeded := int(pivotDist) + 1
-		var primeSourcePeer *eth.Peer
-		for _, p := range s.rankedPeers() {
-			primeSourcePeer = p
-			break
-		}
+		// Walk back on the peer that served the head: it holds the head's
+		// ancestors. The best-ranked peer may be a legacy or lagging peer
+		// without them, and then every tick failed the same way (#1884).
+		primeSourcePeer := headPeer
 		if primeSourcePeer != nil {
 			primeHeaders := make([]*types.Header, 0, primeHeadersNeeded)
 			primeHeaders = append(primeHeaders, headHdr)
@@ -3788,6 +3815,63 @@ func (s *xdcSyncer) isConsensusFailedBlock(hash common.Hash) bool {
 	return ok
 }
 
+// xdcForkGuards pins one canonical block per chain after a chain rewind. A
+// peer still following the abandoned branch announces a head above the real
+// tip, and the sync tip is taken from peers' announced heads, so such a peer
+// could steer fast or snap sync onto the dead branch (#1876). A head above the
+// pinned height is used as a sync tip only if the same peer serves the pinned
+// block. Apothem rewound to 83,599,999 for the v2.9 rules; 84,000,000 is past it
+// (hash checked against two local nodes and three public Apothem RPCs).
+var xdcForkGuards = map[uint64]struct {
+	Number uint64
+	Hash   common.Hash
+}{
+	51: {84_000_000, common.HexToHash("0x6c715a4644acbda91545108bec722921164941d08e58173bf78095570b195782")},
+}
+
+// fetchPeerTip fetches a peer's announced head header for use as a sync tip,
+// or nil if the peer does not serve it or is on an abandoned branch.
+func (s *xdcSyncer) fetchPeerTip(p *eth.Peer, hash common.Hash) *types.Header {
+	h := s.fetchHeaderByHash(p, hash)
+	if h == nil || !s.onCanonicalBranch(p, h) {
+		return nil
+	}
+	return h
+}
+
+// onCanonicalBranch reports whether head, announced by p, is past this chain's
+// fork guard on the canonical branch. Heads below the guard and chains without
+// one always pass. The verdict is cached per peer until it disconnects
+// (handler.unregisterPeer), so a peer that resyncs is checked again.
+func (s *xdcSyncer) onCanonicalBranch(p *eth.Peer, head *types.Header) bool {
+	cid := s.handler.chain.Config().ChainID
+	if cid == nil {
+		return true
+	}
+	g, ok := xdcForkGuards[cid.Uint64()]
+	if !ok || head.Number.Uint64() < g.Number {
+		return true
+	}
+	if head.Number.Uint64() == g.Number {
+		return head.Hash() == g.Hash
+	}
+	if v, ok := s.forkGuardVerdicts.Load(p.ID()); ok {
+		return v.(bool)
+	}
+	hdrs := s.fetchHeaderBatchTimeout(p, g.Number, 1, xdcBulkReqTimeout)
+	if len(hdrs) == 0 {
+		return false // not cached: the peer may answer next time
+	}
+	canonical := hdrs[0].Hash() == g.Hash
+	s.forkGuardVerdicts.Store(p.ID(), canonical)
+	if !canonical {
+		log.Warn("xdcSyncer: peer is on an abandoned branch; not using its head as sync tip",
+			"peer", p.ID()[:12], "head", head.Number.Uint64(), "guard", g.Number,
+			"have", hdrs[0].Hash(), "want", g.Hash)
+	}
+	return canonical
+}
+
 // snapPivotBackoff is the number of blocks to step BACK from peer's
 // current head when selecting a snap pivot (#807 Phase 11). Peers'
 // XDPOS2 BlockHeaders responses come from a batch cache that lags
@@ -3844,7 +3928,7 @@ func (s *xdcSyncer) fetchPeerHeadHeader() *types.Header {
 		if ep.snapExt == nil {
 			continue
 		}
-		headHdr := s.fetchHeaderByHash(p, rng.LatestBlockHash)
+		headHdr := s.fetchPeerTip(p, rng.LatestBlockHash)
 		if headHdr == nil {
 			continue
 		}

@@ -673,6 +673,10 @@ func (h *handler) unregisterPeer(id string) {
 	h.txFetcher.Drop(id)
 	h.blobFetcher.Drop(id)
 	h.txTracker.NotifyPeerDrop(id)
+	if h.xdcSync != nil {
+		// #1876: a peer may resync onto the canonical branch before it reconnects.
+		h.xdcSync.forkGuardVerdicts.Delete(id)
+	}
 
 	if err := h.peers.unregisterPeer(id); err != nil {
 		logger.Error("Ethereum peer removal failed", "err", err)
