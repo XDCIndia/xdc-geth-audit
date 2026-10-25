@@ -226,3 +226,32 @@ func BenchmarkXDCTDBackfillReal(b *testing.B) {
 		fmt.Printf("  alloc delta: %d KB\n", allocDelta/1024)
 	}
 }
+
+// TestXDCTDBackfillGapBackoff asserts that a pass blocked by a canonical gap
+// (block 1 missing, as on a fast-synced node) backs off exponentially instead
+// of retrying every 10 ms forever.
+func TestXDCTDBackfillGapBackoff(t *testing.T) {
+	bc, _, _ := syntheticXDCBackfillChain(t, 3)
+	rawdb.DeleteCanonicalHash(bc.db, 1)
+
+	var delays []time.Duration
+	orig := xdcTDBackfillSleep
+	defer func() { xdcTDBackfillSleep = orig }()
+	xdcTDBackfillSleep = func(bc *BlockChain, d time.Duration) {
+		delays = append(delays, d)
+		if len(delays) == 5 {
+			bc.stopping.Store(true)
+		}
+	}
+	bc.xdcTDBackfill()
+
+	want := []time.Duration{10, 20, 40, 80, 160}
+	if len(delays) != len(want) {
+		t.Fatalf("got %d sleeps, want %d", len(delays), len(want))
+	}
+	for i, d := range delays {
+		if d != want[i]*time.Millisecond {
+			t.Errorf("sleep %d = %v, want %v", i, d, want[i]*time.Millisecond)
+		}
+	}
+}

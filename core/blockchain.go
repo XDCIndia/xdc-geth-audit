@@ -693,7 +693,10 @@ func (bc *BlockChain) xdcTDBackfill() {
 	const (
 		logInterval = 500_000
 		retryDelay  = 10 * time.Millisecond
+		maxDelay    = time.Minute
 	)
+	delay := retryDelay
+	gapLogged := false
 
 	// Seed genesis TD once (needed as the root for all forward walks).
 	genHash := rawdb.ReadCanonicalHash(bc.db, 0)
@@ -737,7 +740,7 @@ func (bc *BlockChain) xdcTDBackfill() {
 		runTD := new(big.Int).Set(rawdb.ReadTd(bc.db, anchorHash, anchorNum))
 		prevHash := anchorHash // canonical hash of the last-processed block
 
-		log.Info("XDC TD backfill: starting pass", "from", anchorNum+1, "to", headNum)
+		log.Debug("XDC TD backfill: starting pass", "from", anchorNum+1, "to", headNum)
 		batch := bc.db.NewBatch()
 		written := uint64(0)
 		lastWritten := anchorNum
@@ -754,7 +757,12 @@ func (bc *BlockChain) xdcTDBackfill() {
 
 			hash := rawdb.ReadCanonicalHash(bc.db, num)
 			if hash == (common.Hash{}) {
-				log.Debug("XDC TD backfill: canonical gap, stopping pass", "num", num)
+				if gapLogged {
+					log.Debug("XDC TD backfill: canonical gap, stopping pass", "num", num)
+				} else {
+					log.Info("XDC TD backfill: canonical gap, waiting for history to be filled", "num", num, "head", headNum)
+					gapLogged = true
+				}
 				break
 			}
 
@@ -812,14 +820,36 @@ func (bc *BlockChain) xdcTDBackfill() {
 				log.Crit("XDC TD backfill: batch write failed", "err", err)
 			}
 		}
-		log.Info("XDC TD backfill: pass done", "from", anchorNum+1, "to", headNum, "written", written)
+		if written > 0 || lastWritten >= headNum {
+			log.Info("XDC TD backfill: pass done", "from", anchorNum+1, "to", headNum, "written", written)
+		} else {
+			log.Debug("XDC TD backfill: pass done", "from", anchorNum+1, "to", headNum, "written", written)
+		}
 
 		// If this pass did not reach headNum (canonical gap, reorg, or head
-		// moved), wait briefly before the next outer-loop iteration so we do
-		// not spin while waiting for a concurrent writer to fill the gap.
+		// moved), wait before the next outer-loop iteration so we do not spin
+		// while waiting for a concurrent writer to fill the gap. A pass that
+		// made no progress backs off exponentially (a fast-synced node may
+		// wait a long time for history below the pivot); progress resets it.
 		if lastWritten < headNum {
-			time.Sleep(retryDelay)
+			if lastWritten > anchorNum {
+				delay = retryDelay
+			}
+			xdcTDBackfillSleep(bc, delay)
+			if lastWritten <= anchorNum {
+				delay = min(delay*2, maxDelay)
+			}
 		}
+	}
+}
+
+// xdcTDBackfillSleep waits for d, returning early once the chain is stopping.
+// It is a variable so tests can observe the backoff.
+var xdcTDBackfillSleep = func(bc *BlockChain, d time.Duration) {
+	for d > 0 && !bc.stopping.Load() {
+		step := min(d, 100*time.Millisecond)
+		time.Sleep(step)
+		d -= step
 	}
 }
 
