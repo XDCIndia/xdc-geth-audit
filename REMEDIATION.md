@@ -2,6 +2,53 @@
 
 Report: Hacken final report, 2026-10-13. Audited commit: `45e2b6ee`.
 
+## Fifth hand-over (26 October 2026): revalidate `main` at `2eb1332f3eda9f0262e2561d69ef8287eaa92dad`
+
+### Scope
+
+| Item | Value |
+|---|---|
+| Repository | XDCIndia/xdc-geth-audit |
+| Final commit (`main`) | **`2eb1332f3eda9f0262e2561d69ef8287eaa92dad`**: merge of the branch below into `main`; its tree equals the branch head |
+| Branch / code head | `audit/main-uplift-11710-xdc20-r12` / **`5d31c76662306c68627d3cb2b41a4bf0b521d440`** |
+| Previously revalidated commit (base) | `7520ece168f792f39835882d5f13b74c4491f9b0` (fourth hand-over, r11) |
+| Source | XDCIndia/go-ethereum `aa0b36dec0be43f17a0f6b102ef13ad50747db67` |
+| Upstream | unchanged: go-ethereum v1.17.10 |
+| Out of scope | docs, scripts, CI and audit reports |
+
+### Structure: one commit per fix
+
+**6 commits on top of `7520ece168f7`, one per source fix**, in source order, no merges. Each has the fix's original message and author, its code, and a `Source: XDCIndia/go-ethereum <sha>` line.
+
+The last commit (`5d31c7666230`) is a correctness fix for the fourth hand-over. The gap-snapshot repair added there could rewrite a real gap snapshot as a header seed. That happens when the candidate pool equals the validator list (small networks) and the node restarts between the gap block and the epoch switch. It produced a different state root at that switch. The repair now runs only for gaps below a recorded snap/fast-sync pivot, the only place header seeds exist. Validated with a full sync from genesis on a private test network: the previous code reproduces the divergence; this code matches the canonical root.
+
+**XDC test files.** 2 new XDC test files are not included. Tests already in the base follow the source. The suite compiles (`go vet ./...` passes).
+
+Excluded files:
+
+- `consensus/XDPoS/finalize_hooked_state_test.go`
+- `eth/sync_xdc_1886_test.go`
+
+### How to verify
+
+```
+git log --first-parent --oneline 7520ece168f7..5d31c7666230   # 6 fix commits
+git rev-parse 2eb1332f3eda^{tree} 5d31c7666230^{tree}           # equal trees
+git checkout 2eb1332f3eda && go build ./... && go vet ./...
+go test -timeout 60m ./consensus/XDPoS/... ./core/... ./eth/...
+```
+
+### Commits (audit commit → source commit)
+
+| Audit commit | Source | Change |
+|---|---|---|
+| `a8d2b97c9198e13e59be7ae25bedfe77429dd533` | `d9e9590dfc91` | eth: drop empty-strike counts on peer disconnect and stop the gap repair on quit |
+| `6ea6fb61d44d65ae8e4ada8d9b25712af54ee3bd` | `e8f9f307a111` | consensus/XDPoS: unwrap the tracing hooked state in every Finalize path |
+| `c2cf53e50d084c08b2391e0ff7e1168165928383` | `de6424a0bdd9` | eth: prefer history-serving peers in snap backfill, batch receipts, log progress |
+| `ce185d3094127be7f74f0fd7666b8a2fbd9867dd` | `9dfc8684da94` | eth: keep the log index paused for the whole xdc bulk sync |
+| `2bfb4e07170b12adad2fc829679982f032259fa4` | `2bdae9c064af` | core/rawdb: read backfilled canonical hashes behind zero freezer placeholders |
+| `5d31c76662306c68627d3cb2b41a4bf0b521d440` | `aa0b36dec0be` | consensus/XDPoS, eth: repair header-seeded gap snapshots only below the sync pivot |
+
 ## Fourth hand-over (25 October 2026): revalidate `7520ece168f792f39835882d5f13b74c4491f9b0`
 
 ### Scope
