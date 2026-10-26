@@ -88,8 +88,7 @@ func (x *XDPoS_v2) VerifyVoteMessage(chain consensus.ChainReader, vote *types.Vo
 func (x *XDPoS_v2) VoteHandler(chain consensus.ChainReader, voteMsg *types.Vote) error {
 	// Cheap round check under read lock before the expensive verify (#1665).
 	x.lock.RLock()
-	notInRange := voteMsg.ProposedBlockInfo.Round != x.currentRound &&
-		voteMsg.ProposedBlockInfo.Round != x.currentRound+1
+	notInRange := !voteRoundInRange(voteMsg.ProposedBlockInfo.Round, x.currentRound)
 	x.lock.RUnlock()
 	if notInRange {
 		return &utils.ErrIncomingMessageRoundTooFarFromCurrentRound{
@@ -124,9 +123,21 @@ func (x *XDPoS_v2) VoteHandler(chain consensus.ChainReader, voteMsg *types.Vote)
 	return x.voteHandler(chain, voteMsg)
 }
 
+// voteRoundLookahead is how many rounds past currentRound a vote is still
+// pooled. A node that imports blocks a few rounds late under load otherwise
+// drops the votes for the block it is about to receive; when it is the next
+// leader it has no QC and the round stalls until it times out (#1665).
+// Pooling only defers the vote: the threshold, block and signature checks run
+// unchanged once the block arrives, and hygieneVotePool prunes stale rounds.
+const voteRoundLookahead = 5
+
+func voteRoundInRange(vote, current types.Round) bool {
+	return vote >= current && vote <= current+voteRoundLookahead
+}
+
 func (x *XDPoS_v2) voteHandler(chain consensus.ChainReader, voteMsg *types.Vote) error {
 	// Check round
-	if voteMsg.ProposedBlockInfo.Round != x.currentRound && voteMsg.ProposedBlockInfo.Round != x.currentRound+1 {
+	if !voteRoundInRange(voteMsg.ProposedBlockInfo.Round, x.currentRound) {
 		return &utils.ErrIncomingMessageRoundTooFarFromCurrentRound{
 			Type:          "vote",
 			IncomingRound: voteMsg.ProposedBlockInfo.Round,
