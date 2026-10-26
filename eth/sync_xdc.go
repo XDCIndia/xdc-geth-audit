@@ -162,6 +162,11 @@ const (
 	xdcPeerEmptyStrikeMax   = 3
 	xdcPeerEmptyCooldownTTL = 2 * time.Minute
 
+	// emptyClusterThreshold is the number of consecutive all-empty rounds for
+	// the same fromBlock before the stuck-cluster rotation kicks in (#1665 Bug B).
+	// At xdcBulkReqTimeout (4s) per round, 2 rounds = 8s before exclusion starts.
+	emptyClusterThreshold = 2
+
 	// maxConsensusFailedBlocks caps the consensusFailedBlocks map to prevent
 	// unbounded growth in the pathological case where many distinct bad blocks
 	// arrive. 256 entries is far more than needed in practice. Fixes #1670.
@@ -307,6 +312,20 @@ type xdcSyncer struct {
 	// Note: for XDC, handshake TD is a ranking metric, not a block height; an
 	// XDPOS2 peer stuck at genesis can rank first in candidates.
 	lastEmptyRoundIDs map[string]bool
+
+	// #1665 Bug B: per-fromBlock stuck-cluster rotation. When the top-K peers
+	// keep returning empty headers for the same fromBlock across consecutive
+	// all-empty rounds, lower-ranked healthy peers never get a slot. We
+	// accumulate the IDs of peers that returned empty for the current fromBlock
+	// and, after emptyClusterThreshold all-empty rounds, exclude them from the
+	// candidate window so fresh (lower-ranked) peers are tried instead. State
+	// resets whenever fromBlock advances (any import) or a winner is found.
+	// Only accessed from the single-flight sync goroutine — no mutex required.
+	// Peer-disconnect safe: stale IDs are stored as strings; they simply do not
+	// match any live peer when re-evaluated.
+	emptyClusterFrom   uint64
+	emptyClusterPeers  map[string]bool
+	emptyClusterRounds int
 
 	// consensusFailedBlocksMu protects consensusFailedBlocks.
 	consensusFailedBlocksMu sync.Mutex
@@ -2489,6 +2508,30 @@ func (s *xdcSyncer) fullSyncOnce() {
 		return
 	}
 
+	// #1665 Bug B: stuck-cluster rotation. After emptyClusterThreshold consecutive
+	// all-empty rounds for fromBlock, exclude peers already confirmed empty so
+	// lower-ranked healthy peers get a slot. Only activates when the filtered set
+	// is non-empty; falls back to the full set when ALL candidates are stuck.
+	if s.emptyClusterFrom == fromBlock && s.emptyClusterRounds >= emptyClusterThreshold && len(s.emptyClusterPeers) > 0 {
+		filtered := candidates[:0:0]
+		for _, p := range candidates {
+			if !s.emptyClusterPeers[p.ID()] {
+				filtered = append(filtered, p)
+			}
+		}
+		if len(filtered) > 0 {
+			candidates = filtered
+			log.Debug("xdcSyncer: #1665 stuck-cluster rotation — excluding confirmed-empty peers",
+				"from", fromBlock, "rounds", s.emptyClusterRounds,
+				"excluded", len(s.emptyClusterPeers), "remaining", len(candidates))
+		}
+	} else if s.emptyClusterFrom != fromBlock {
+		// fromBlock advanced (progress made): reset cluster state.
+		s.emptyClusterFrom = 0
+		s.emptyClusterPeers = nil
+		s.emptyClusterRounds = 0
+	}
+
 	// Record the starting block once per catch-up cycle (Fixes #1841).
 	// This is used to report progress in eth_syncing while behind peers.
 	s.bulkSyncStartBlock.CompareAndSwap(0, localHead)
@@ -2582,10 +2625,28 @@ func (s *xdcSyncer) fullSyncOnce() {
 			}
 			return
 		}
+		// #1665 Bug B: accumulate raced peers into the stuck-cluster set.
+		// After emptyClusterThreshold rounds, the filtering above will exclude
+		// them so lower-ranked healthy peers get a slot in the next round.
+		if s.emptyClusterFrom == fromBlock {
+			s.emptyClusterRounds++
+		} else {
+			s.emptyClusterFrom = fromBlock
+			s.emptyClusterRounds = 1
+			s.emptyClusterPeers = make(map[string]bool, len(racedIDs))
+		}
+		for id := range racedIDs {
+			s.emptyClusterPeers[id] = true
+		}
 		log.Debug("xdcSyncer: no peer served headers this round",
-			"from", fromBlock, "tried", tried, "atTipPeers", atTipCount)
+			"from", fromBlock, "tried", tried, "atTipPeers", atTipCount,
+			"emptyClusterRounds", s.emptyClusterRounds, "emptyClusterPeers", len(s.emptyClusterPeers))
 		return
 	}
+	// Winner found: reset stuck-cluster state.
+	s.emptyClusterFrom = 0
+	s.emptyClusterPeers = nil
+	s.emptyClusterRounds = 0
 	peer := res.peer
 	r := res.rng
 	headers := res.headers
@@ -2786,6 +2847,25 @@ func (s *xdcSyncer) fullSyncOnce() {
 		"from", fromBlock, "count", n,
 		"newHead", s.handler.chain.CurrentBlock().Number.Uint64(),
 		"peerTD", r.LatestBlock) // XDPOS2 wire: TD, not block number
+
+	// #1665 Bug A: FULL_SYNC at-tip by head freshness. After a successful import,
+	// if the new head's timestamp is within atTipFreshnessWindow of now, the node
+	// is at or near the network tip. Clear XdcBulkSyncMode immediately so the
+	// BFT validator can seal the next round. Without this, BulkSyncMode is only
+	// cleared by the heartbeat's tipCatchAtPeerTicks path (3 × 30 s = 90 s) —
+	// longer than the 60 s BFT timeout — so a FULL_SYNC validator that catches
+	// up to tip just before its designated round always misses it. The freshness
+	// check uses only local state (head block's own timestamp, not a peer signal)
+	// and cannot be gamed by a peer returning a short batch.
+	if cur := s.handler.chain.CurrentBlock(); cur != nil && core.XdcBulkSyncMode.Load() {
+		freshnessSecs := atTipFreshnessWindow(s.handler.chain.Config())
+		age := time.Now().Unix() - int64(cur.Time)
+		if age >= 0 && age <= freshnessSecs {
+			core.XdcBulkSyncMode.Store(false)
+			log.Info("xdcSyncer: head fresh after import — flipped XdcBulkSyncMode=false",
+				"head", cur.Number.Uint64(), "ageS", age)
+		}
+	}
 
 	// Advance engine's highestQuorumCert to the just-imported tip so the miner
 	// worker's FindParentBlockToAssign returns the actual chain head and Prepare
