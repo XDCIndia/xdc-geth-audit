@@ -4713,15 +4713,21 @@ func (s *xdcSyncer) repairSeededGapPools() {
 		return
 	}
 	epoch, gap := cfg.XDPoS.Epoch, cfg.XDPoS.Gap
+	// Only snap/fast-synced nodes header-seed gap snapshots. A full-sync node
+	// (no snap pivot) has never header-seeded anything; bailing avoids misfire
+	// on real V5 snapshots that happen to equal switchValidators (upgrade hole,
+	// refs #1915). RepairSeededCandidatePool enforces the same check.
+	pivot := rawdb.ReadLastPivotNumber(s.handler.database)
+	if pivot == nil {
+		return
+	}
 	// Fallback state: head, then the stored snap pivot.
 	var fallback *state.StateDB
 	if st, err := chain.StateAt(head.Root, head.Number, head.Time); err == nil {
 		fallback = st
-	} else if p := rawdb.ReadLastPivotNumber(s.handler.database); p != nil {
-		if ph := chain.GetHeaderByNumber(*p); ph != nil {
-			if st, err := chain.StateAt(ph.Root, ph.Number, ph.Time); err == nil {
-				fallback = st
-			}
+	} else if ph := chain.GetHeaderByNumber(*pivot); ph != nil {
+		if st, err := chain.StateAt(ph.Root, ph.Number, ph.Time); err == nil {
+			fallback = st
 		}
 	}
 	headNum := head.Number.Uint64()
@@ -4732,6 +4738,9 @@ func (s *xdcSyncer) repairSeededGapPools() {
 		gapHeader := chain.GetHeaderByNumber(gapNum)
 		if gapHeader == nil || gapNum > headNum {
 			continue
+		}
+		if gapNum >= *pivot {
+			continue // above pivot: fully executed, not header-seeded
 		}
 		var sw *types.Header
 		// The switch header may be above the head block (header-synced, block not
