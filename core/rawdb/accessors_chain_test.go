@@ -1063,3 +1063,41 @@ func TestBALStorage(t *testing.T) {
 		t.Fatalf("deleted BAL returned: %v", b)
 	}
 }
+
+// TestReadCanonicalHashZeroPlaceholder checks that a zero hash in the freezer
+// (the XDC snap gap-fill placeholder) falls back to the key-value canonical
+// hash, while a real freezer hash always wins over a key-value entry (#1911).
+func TestReadCanonicalHashZeroPlaceholder(t *testing.T) {
+	kv := NewMemoryDatabase()
+	fr := NewMemoryFreezer(false, chainFreezerTableConfigs)
+	db := &freezerdb{KeyValueStore: kv, chainFreezer: &chainFreezer{ancients: fr}}
+	if err := xdcFillGapAncients(fr, 0, 3); err != nil {
+		t.Fatal(err)
+	}
+	kvHash, frHash := common.HexToHash("0x01"), common.HexToHash("0x02")
+	WriteCanonicalHash(kv, kvHash, 1)
+	if got := ReadCanonicalHash(db, 1); got != kvHash {
+		t.Fatalf("placeholder: have %x, want kv hash %x", got, kvHash)
+	}
+	if got := ReadCanonicalHash(db, 2); got != (common.Hash{}) {
+		t.Fatalf("no kv entry: have %x, want zero", got)
+	}
+	// Real freezer hash at block 3 beats a different kv entry.
+	if _, err := fr.ModifyAncients(func(op ethdb.AncientWriteOp) error {
+		for _, tbl := range []string{ChainFreezerHeaderTable, ChainFreezerBodiesTable, ChainFreezerReceiptTable} {
+			if err := op.AppendRaw(tbl, 3, []byte{0}); err != nil {
+				return err
+			}
+		}
+		if err := op.AppendRaw(ChainFreezerBALTable, 3, nil); err != nil {
+			return err
+		}
+		return op.AppendRaw(ChainFreezerHashTable, 3, frHash[:])
+	}); err != nil {
+		t.Fatal(err)
+	}
+	WriteCanonicalHash(kv, kvHash, 3)
+	if got := ReadCanonicalHash(db, 3); got != frHash {
+		t.Fatalf("real freezer hash: have %x, want %x", got, frHash)
+	}
+}
