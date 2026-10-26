@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -4712,15 +4713,21 @@ func (s *xdcSyncer) repairSeededGapPools() {
 		return
 	}
 	epoch, gap := cfg.XDPoS.Epoch, cfg.XDPoS.Gap
+	// Only snap/fast-synced nodes header-seed gap snapshots. A full-sync node
+	// (no snap pivot) has never header-seeded anything; bailing avoids misfire
+	// on real V5 snapshots that happen to equal switchValidators (upgrade hole,
+	// refs #1915). RepairSeededCandidatePool enforces the same check.
+	pivot := rawdb.ReadLastPivotNumber(s.handler.database)
+	if pivot == nil {
+		return
+	}
 	// Fallback state: head, then the stored snap pivot.
 	var fallback *state.StateDB
 	if st, err := chain.StateAt(head.Root, head.Number, head.Time); err == nil {
 		fallback = st
-	} else if p := rawdb.ReadLastPivotNumber(s.handler.database); p != nil {
-		if ph := chain.GetHeaderByNumber(*p); ph != nil {
-			if st, err := chain.StateAt(ph.Root, ph.Number, ph.Time); err == nil {
-				fallback = st
-			}
+	} else if ph := chain.GetHeaderByNumber(*pivot); ph != nil {
+		if st, err := chain.StateAt(ph.Root, ph.Number, ph.Time); err == nil {
+			fallback = st
 		}
 	}
 	headNum := head.Number.Uint64()
@@ -4732,10 +4739,19 @@ func (s *xdcSyncer) repairSeededGapPools() {
 		if gapHeader == nil || gapNum > headNum {
 			continue
 		}
+		if gapNum >= *pivot {
+			continue // above pivot: fully executed, not header-seeded
+		}
 		var sw *types.Header
 		// The switch header may be above the head block (header-synced, block not
 		// yet imported): that is exactly a SYNC-11 seed about to be consumed.
 		for n := gapNum + 1; n <= gapNum+2*epoch && n <= hdrNum; n++ {
+			// Up to 4*2*epoch header reads: stop() must not outwait us on slow disks.
+			select {
+			case <-s.quitCh:
+				return
+			default:
+			}
 			if h := chain.GetHeaderByNumber(n); h != nil {
 				if isSwitch, _, err := v2.IsEpochSwitch(h); err == nil && isSwitch {
 					sw = h
@@ -6227,6 +6243,70 @@ const (
 	snapHistoryMaxModernPeers = 4   // max concurrent eth/69+ peers for body+receipt fan-out (SYNC-10)
 )
 
+// historyPeers is the backfill's private memory of which peers can serve deep
+// history (#1886). Most Apothem peers are themselves snap/fast-synced and answer
+// body requests for old blocks with nothing; ranking by TD alone keeps asking the
+// same ones. A peer that serves nothing is parked for a growing back-off and
+// peers that have served are tried first. This is local to one backfill run and
+// never taints a peer for normal sync.
+type historyPeers struct {
+	served map[string]int       // blocks completed per peer
+	empty  map[string]int       // consecutive fruitless requests per peer
+	parked map[string]time.Time // do not ask before this time
+	nEmpty int                  // total fruitless requests (for the progress log)
+}
+
+func newHistoryPeers() *historyPeers {
+	return &historyPeers{served: map[string]int{}, empty: map[string]int{}, parked: map[string]time.Time{}}
+}
+
+// record notes the outcome of one request: got is the number of blocks it completed.
+func (h *historyPeers) record(id string, got int) {
+	if got > 0 {
+		h.served[id] += got
+		h.empty[id] = 0
+		delete(h.parked, id)
+		return
+	}
+	h.nEmpty++
+	h.empty[id]++
+	h.parked[id] = time.Now().Add(min(10*time.Minute, 15*time.Second<<min(h.empty[id], 6)))
+}
+
+// order returns peers that are not parked, proven servers first (stable, so the
+// TD ranking still breaks ties). If every peer is parked it returns them all.
+func (h *historyPeers) order(peers []*eth.Peer) []*eth.Peer {
+	now := time.Now()
+	out := make([]*eth.Peer, 0, len(peers))
+	for _, p := range peers {
+		if !h.parked[p.ID()].After(now) {
+			out = append(out, p)
+		}
+	}
+	if len(out) == 0 {
+		return peers
+	}
+	sort.SliceStable(out, func(i, j int) bool { return h.served[out[i].ID()] > h.served[out[j].ID()] })
+	return out
+}
+
+// localCompleteBatch returns the [top-want+1, top] headers, ascending, if every
+// one is stored under the hash chain that ends at topHash and is complete per
+// snapBlockComplete; otherwise nil.
+func localCompleteBatch(db ethdb.Database, topHash common.Hash, top uint64, want int) []*types.Header {
+	out := make([]*types.Header, want)
+	hash := topHash
+	for i := want - 1; i >= 0; i-- {
+		h := rawdb.ReadHeader(db, hash, top-uint64(want-1-i))
+		if h == nil || !snapBlockComplete(db, hash, h.Number.Uint64(), h.TxHash) {
+			return nil
+		}
+		out[i] = h
+		hash = h.ParentHash
+	}
+	return out
+}
+
 func (s *xdcSyncer) runSnapHistoryBackfill() {
 	// One-shot guard: exactly one backfill goroutine per syncer lifetime.
 	if !s.snapHistoryBackfillDone.CompareAndSwap(false, true) {
@@ -6298,6 +6378,8 @@ func (s *xdcSyncer) runSnapHistoryBackfill() {
 	// This prevents a partial peer from holding XDCHeaderReqMu for xdcReqTimeout
 	// (8s) on every batch iteration and stalling the fullSyncOnce fanout.
 	historyBlind := make(map[string]bool)
+	hp := newHistoryPeers()
+	lastLog := time.Now()
 
 	for nextTop >= 1 {
 		select {
@@ -6306,6 +6388,13 @@ func (s *xdcSyncer) runSnapHistoryBackfill() {
 			return
 		default:
 		}
+		// Never go silent: one line per 30 s whether or not blocks are moving.
+		if time.Since(lastLog) >= 30*time.Second {
+			lastLog = time.Now()
+			log.Info("xdcSyncer: SYNC-06 history backfill progress", "next", nextTop,
+				"written", written, "skipped", skipped,
+				"peers", len(s.rankedPeers()), "servers", len(hp.served), "emptyReplies", hp.nEmpty)
+		}
 
 		// Batch: [lo, nextTop], ascending, at most snapHistoryBatchSize blocks.
 		lo := nextTop + 1 - uint64(snapHistoryBatchSize)
@@ -6313,6 +6402,19 @@ func (s *xdcSyncer) runSnapHistoryBackfill() {
 			lo = 1
 		}
 		want := int(nextTop-lo) + 1
+
+		// Local fast path: a batch already stored and complete (an earlier run got
+		// this far) is verified by walking parent hashes from topHash in our own DB;
+		// no peer round trip, so resuming over finished history costs microseconds.
+		if local := localCompleteBatch(db, topHash, nextTop, want); local != nil {
+			skipped += uint64(len(local))
+			topHash = local[0].ParentHash
+			if lo <= 1 {
+				break
+			}
+			nextTop = lo - 1
+			continue
+		}
 
 		// Fetch headers from the best available peer.  Use xdcBulkReqTimeout (4s)
 		// rather than xdcReqTimeout (8s) so a peer that can't serve the old range
@@ -6460,6 +6562,7 @@ func (s *xdcSyncer) runSnapHistoryBackfill() {
 			// non-overlapping chunk so several requests are in flight simultaneously.
 			// Falls through to the XDPOS2 legacy path when no modern peers are available
 			// or when modern peers deliver no new data this round.
+			peers = hp.order(peers)
 			var modern []*eth.Peer
 			for _, p := range peers {
 				if peerHasRequestID(p) {
@@ -6471,6 +6574,7 @@ func (s *xdcSyncer) runSnapHistoryBackfill() {
 				chunkSize := max(1, min(reqSize, (len(bodyPending)+n-1)/n))
 				prevPending := len(bodyPending)
 				var wg sync.WaitGroup
+				var mu sync.Mutex
 				offset := 0
 				for i := 0; i < n && offset < len(bodyPending); i++ {
 					end := min(offset+chunkSize, len(bodyPending))
@@ -6482,6 +6586,15 @@ func (s *xdcSyncer) runSnapHistoryBackfill() {
 						if s.backfillBodyReceiptChunkModern(peer, headers, db) {
 							s.taintPeer(peer)
 						}
+						done := 0
+						for _, h := range headers {
+							if snapBlockComplete(db, h.Hash(), h.Number.Uint64(), h.TxHash) {
+								done++
+							}
+						}
+						mu.Lock()
+						hp.record(peer.ID(), done)
+						mu.Unlock()
 					}(p, chunk)
 					offset = end
 				}
@@ -6508,11 +6621,7 @@ func (s *xdcSyncer) runSnapHistoryBackfill() {
 			}
 
 			// XDPOS2 legacy path (pre-SYNC-10).
-			var activePeer *eth.Peer
-			if len(peers) > 0 {
-				activePeer = peers[0]
-			}
-			if activePeer == nil {
+			if len(peers) == 0 {
 				select {
 				case <-time.After(2 * time.Second):
 				case <-s.quitCh:
@@ -6522,12 +6631,22 @@ func (s *xdcSyncer) runSnapHistoryBackfill() {
 			}
 
 			// Request at most reqSize bodies to stay within the peer's response limit.
+			// Walk the ordered peers (at most 3) until one answers: a peer with no
+			// history this deep replies empty and is parked, not asked again at once.
 			sendN := min(reqSize, len(bodyPending))
 			hashes := make([]common.Hash, sendN)
 			for i, h := range bodyPending[:sendN] {
 				hashes[i] = h.Hash()
 			}
-			rawBodies := s.fetchBodiesBatch(activePeer, hashes)
+			var activePeer *eth.Peer
+			var rawBodies []eth.BlockBody
+			for _, p := range peers[:min(3, len(peers))] {
+				activePeer = p
+				if rawBodies = s.fetchBodiesBatch(p, hashes); len(rawBodies) > 0 {
+					break
+				}
+				hp.record(p.ID(), 0)
+			}
 			if len(rawBodies) == 0 {
 				// Peer returned nothing — halve the request size so the next attempt
 				// asks for fewer (possibly oversized) blocks at once.
@@ -6548,13 +6667,14 @@ func (s *xdcSyncer) runSnapHistoryBackfill() {
 
 			pairCount := min(len(rawBodies), len(bodyPending))
 
-			// Write each verified body and its receipts immediately, one block at a
-			// time.  Direct rawdb writes avoid PrimeAncestorBodies's hard requirement
+			// Write each verified body, then its receipts. Direct rawdb writes avoid
+			// PrimeAncestorBodies's hard requirement
 			// that receipts and headers have equal lengths, which breaks silently when
 			// fetchReceiptsBatch returns an empty-but-non-nil slice for an oversized
 			// receipt response.
 			batch := db.NewBatch()
 			badPeer := false
+			var rcptHeaders []*types.Header
 			for i := 0; i < pairCount && !badPeer; i++ {
 				rb := rawBodies[i]
 				h := bodyPending[i]
@@ -6596,23 +6716,40 @@ func (s *xdcSyncer) runSnapHistoryBackfill() {
 				// them; the tx indexer already ran before this backfill.
 				rawdb.WriteTxLookupEntriesByBlock(batch, types.NewBlockWithHeader(h).WithBody(*body))
 
-				// Fetch receipt for this one block and write immediately.  If the
-				// peer cannot serve it right now the body write still lands; the
-				// block stays in bodyPending (snapBlockComplete requires receipts)
-				// and will be retried on the next attempt.
-				rcpSlice := s.fetchReceiptsBatch(activePeer, []*types.Header{h})
-				if len(rcpSlice) == 1 && rcpSlice[0] != nil {
-					rcpHash := types.DeriveSha(rcpSlice[0], trie.NewStackTrie(nil))
-					if rcpHash != h.ReceiptHash {
-						log.Warn("xdcSyncer: SYNC-06 history backfill — receipt hash mismatch; tainting peer",
-							"block", num, "peer", activePeer.ID())
-						badPeer = true
+				if !rawdb.HasReceipts(db, hash, num) || needsBody {
+					rcptHeaders = append(rcptHeaders, h)
+				}
+			}
+			// Request receipts for every verified block that needs them, as many per
+			// round trip as the peer will give (#1886: one request per block made a
+			// 128-block batch take seconds). A short reply is a verified prefix and
+			// the remainder is asked for again; a peer that answers a multi-block
+			// request with nothing (response too large) is asked for one block.
+			for rest := rcptHeaders; len(rest) > 0 && !badPeer; {
+				rcpts := s.fetchReceiptsBatch(activePeer, rest)
+				if len(rcpts) == 0 && len(rest) > 1 {
+					rcpts = s.fetchReceiptsBatch(activePeer, rest[:1])
+				}
+				n := min(len(rcpts), len(rest))
+				for i := 0; i < n; i++ {
+					h := rest[i]
+					if rcpts[i] == nil {
+						n = i
 						break
 					}
-					if !rawdb.HasReceipts(db, hash, num) || needsBody {
-						rawdb.WriteReceipts(batch, hash, num, rcpSlice[0])
+					if types.DeriveSha(rcpts[i], trie.NewStackTrie(nil)) != h.ReceiptHash {
+						log.Warn("xdcSyncer: SYNC-06 history backfill — receipt hash mismatch; tainting peer",
+							"block", h.Number.Uint64(), "peer", activePeer.ID())
+						badPeer = true
+						n = i
+						break
 					}
+					rawdb.WriteReceipts(batch, h.Hash(), h.Number.Uint64(), rcpts[i])
 				}
+				if n == 0 {
+					break // peer cannot serve these receipts now; retry next attempt
+				}
+				rest = rest[n:]
 			}
 			if err := batch.Write(); err != nil {
 				log.Warn("xdcSyncer: SYNC-06 history backfill — batch write failed", "err", err)
@@ -6628,6 +6765,7 @@ func (s *xdcSyncer) runSnapHistoryBackfill() {
 					stillPending = append(stillPending, h)
 				}
 			}
+			hp.record(activePeer.ID(), len(bodyPending)-len(stillPending))
 			bodyPending = stillPending
 			if len(bodyPending) > 0 {
 				select {
@@ -6640,7 +6778,8 @@ func (s *xdcSyncer) runSnapHistoryBackfill() {
 
 		if len(bodyPending) > 0 {
 			log.Warn("xdcSyncer: SYNC-06 history backfill — bodies still incomplete after retries; will resume later",
-				"remaining", len(bodyPending), "lo", lo, "hi", nextTop)
+				"remaining", len(bodyPending), "lo", lo, "hi", nextTop,
+				"peers", len(peers), "servers", len(hp.served), "emptyReplies", hp.nEmpty)
 			// Do NOT advance nextTop — the outer loop will revisit this batch on
 			// the next iteration (headers already present, PrimeAncestorHeaders is
 			// idempotent, and the skip check will push toWrite past the complete prefix).

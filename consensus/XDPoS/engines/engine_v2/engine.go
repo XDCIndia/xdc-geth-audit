@@ -2162,10 +2162,31 @@ func sortCandidatesByStake(statedb *state.StateDB, candidates []common.Address) 
 // that pool. When the stored candidate list equals switchValidators (i.e. it is
 // the header seed) and statedb yields a different pool, the pool is replaced;
 // Penalties are kept. Returns true if the snapshot was rewritten. A snapshot
-// built from real state is never touched.
+// built from real state (Version >= 6) is never touched.
 func (x *XDPoS_v2) RepairSeededCandidatePool(gapHeader *types.Header, switchValidators []common.Address, statedb *state.StateDB) (bool, error) {
 	snap, err := loadSnapshot(x.db, gapHeader.Hash())
 	if err != nil || snap == nil || len(snap.NextEpochCandidates) == 0 {
+		return false, nil
+	}
+	// Only header-seeded gaps require repair: those are below the recorded snap/
+	// fast-sync pivot, which is written by the downloader on every snap/fast sync.
+	// A full-synced node has no pivot entry, so every V5 gap snapshot it holds was
+	// produced from real contract state and must not be overwritten (upgrade hole:
+	// refs #1915). A gap at or above the pivot was also fully executed and real.
+	pivot := rawdb.ReadLastPivotNumber(x.db)
+	if pivot == nil || gapHeader.Number.Uint64() >= *pivot {
+		return false, nil
+	}
+	// Version 6 means the snapshot was computed from real chain state by
+	// UpdateMasternodesFromHeader or rebuildGapSnapshotFromState. These
+	// snapshots are authoritative and must never be overwritten, even when
+	// their candidate list happens to equal switchValidators (which occurs on
+	// small networks where all staked candidates are also active validators).
+	// Rewriting such a snapshot with parentState candidates (which may include
+	// proposals submitted after the gap block) corrupts reward/standby
+	// computation and causes a state-root divergence at the epoch switch.
+	// Refs #1905 misfire on net2040 block 180,553.
+	if snap.Version >= 6 {
 		return false, nil
 	}
 	if len(snap.NextEpochCandidates) != len(switchValidators) {

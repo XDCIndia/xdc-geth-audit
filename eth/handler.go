@@ -676,6 +676,11 @@ func (h *handler) unregisterPeer(id string) {
 	if h.xdcSync != nil {
 		// #1876: a peer may resync onto the canonical branch before it reconnects.
 		h.xdcSync.forkGuardVerdicts.Delete(id)
+		// The strike count would otherwise outlive the peer (emptyCooldown is
+		// kept: it expires on read, and reconnecting must not skip it).
+		h.xdcSync.emptyStrikesMu.Lock()
+		delete(h.xdcSync.emptyStrikes, id)
+		h.xdcSync.emptyStrikesMu.Unlock()
 	}
 
 	if err := h.peers.unregisterPeer(id); err != nil {

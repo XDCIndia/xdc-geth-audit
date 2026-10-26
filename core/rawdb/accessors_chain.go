@@ -39,7 +39,9 @@ func ReadCanonicalHash(db ethdb.Reader, number uint64) common.Hash {
 	var data []byte
 	db.ReadAncients(func(reader ethdb.AncientReaderOp) error {
 		data, _ = reader.Ancient(ChainFreezerHashTable, number)
-		if len(data) == 0 {
+		// An all-zero entry is the XDC snap gap-fill placeholder, not a hash:
+		// treat it as missing so backfilled canonical hashes in leveldb are used.
+		if len(data) == 0 || common.BytesToHash(data) == (common.Hash{}) {
 			// Get it by hash from leveldb
 			data, _ = db.Get(headerHashKey(number))
 		}

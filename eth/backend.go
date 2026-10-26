@@ -952,9 +952,23 @@ func (s *Ethereum) updateFilterMapsHeads() {
 		case ev := <-headEventCh:
 			setHead(ev.Header)
 		case blockProc := <-blockProcCh:
+			// During XdcBulkSyncMode, keep filtermaps suspended across the entire
+			// bulk-sync window rather than toggling on each 30ms InsertChain call.
+			// Per-call signals (true→false→true…) fire faster than filtermaps can
+			// react, so the indexer races the importer and consumes ~12% CPU plus
+			// GC pressure that slows full-sync throughput. Holding the pause for the
+			// whole bulk-sync window eliminates this overhead. (#1869)
+			if core.XdcBulkSyncMode.Load() {
+				blockProc = true
+			}
 			s.filterMaps.SetBlockProcessing(blockProc)
 		case <-time.After(time.Second * 10):
 			setHead(s.blockchain.CurrentBlock())
+			// Re-sync filtermaps pause state in case the bulk-sync → at-tip
+			// transition was missed between blockProc events.
+			if core.XdcBulkSyncMode.Load() {
+				s.filterMaps.SetBlockProcessing(true)
+			}
 		case ch := <-s.closeFilterMaps:
 			close(ch)
 			return
