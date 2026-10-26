@@ -1525,13 +1525,7 @@ func (c *XDPoS) Finalize(chain consensus.ChainHeaderReader, header *types.Header
 			// wrapped state, skipping the masternode snapshot write and causing
 			// chain-halt at the next V2 epoch boundary (devnet-5151 root cause
 			// #3, 2026-06-13). Use Underlying() accessor on hookedStateDB.
-			var sdb *state.StateDB
-			if direct, ok := statedb.(*state.StateDB); ok {
-				sdb = direct
-			} else if hooked, ok := statedb.(interface{ Underlying() *state.StateDB }); ok {
-				sdb = hooked.Underlying()
-			}
-			if sdb != nil {
+			if sdb := underlyingStateDB(statedb); sdb != nil {
 				if err := c.EngineV2.UpdateMasternodesFromHeader(cr, header, sdb); err != nil {
 					// Do NOT panic — a devnet/test chain may have no smart contract
 					// candidates at the first gap block (Finalize runs before the block
@@ -1553,7 +1547,7 @@ func (c *XDPoS) Finalize(chain consensus.ChainHeaderReader, header *types.Header
 	// snapshot persistence) and ignore the assembled block. See FinalizeAndAssemble
 	// for the assembled-block path.
 	if c.IsV2Block(header) && c.EngineV2 != nil {
-		if sdb, ok := statedb.(*state.StateDB); ok {
+		if sdb := underlyingStateDB(statedb); sdb != nil {
 			if cr, ok2 := chain.(consensus.ChainReader); ok2 {
 				parentState := c.parentStateForReward
 				if parentState == nil {
@@ -1588,7 +1582,7 @@ func (c *XDPoS) Finalize(chain consensus.ChainHeaderReader, header *types.Header
 	}
 
 	if shouldApplyReward {
-		if sdb, ok := statedb.(*state.StateDB); ok {
+		if sdb := underlyingStateDB(statedb); sdb != nil {
 			// Use pre-tx parentState for reading voter/owner info (matches v2.6.8)
 			parentState := c.parentStateForReward
 			if parentState == nil {
@@ -2786,3 +2780,17 @@ func (c *XDPoS) GetCachedSigningTxs(hash common.Hash) ([]*types.Transaction, boo
 var wiggleTime = 500 * time.Millisecond
 
 var _ consensus.Engine = (*XDPoS)(nil)
+
+// underlyingStateDB returns the *state.StateDB behind statedb, unwrapping the
+// tracing hooked state (tracing.NewHookedState in state_processor.go). A bare
+// type assertion fails for wrapped state and silently skips V2 Finalize,
+// rewards and the gap snapshot write (devnet-5151 halt, audit R8-01).
+func underlyingStateDB(statedb vm.StateDB) *state.StateDB {
+	if direct, ok := statedb.(*state.StateDB); ok {
+		return direct
+	}
+	if hooked, ok := statedb.(interface{ Underlying() *state.StateDB }); ok {
+		return hooked.Underlying()
+	}
+	return nil
+}
