@@ -245,6 +245,10 @@ type LegacyPool struct {
 	signer      types.Signer
 	mu          sync.RWMutex
 
+	// resetsSinceFullDemote counts resets since the last full demote walk;
+	// only runReorg touches it, and runReorg runs one at a time (#1665).
+	resetsSinceFullDemote int
+
 	// IsSigner is an optional callback set by the XDPoS consensus engine to
 	// check whether an address is a currently-registered masternode signer.
 	// When set, gasPrice=0 special-txs (to BlockSigners/RandomizeSMC) from
@@ -1562,6 +1566,31 @@ func (pool *LegacyPool) runReorg(done chan struct{}, reset *txpoolResetRequest, 
 		// Ignore errors here; reset() will retry under pool.mu and handle them.
 	}
 
+	// #1665 cont: pre-compute the set of senders whose state changed in the new
+	// head block, outside pool.mu.  Only these accounts need demotion checks and
+	// promote-on-reset passes, because:
+	//   • nonces only advance for accounts that had txs included in the block.
+	//   • balances only decrease for senders (recipients can only gain balance,
+	//     which cannot cause demotion and is reflected by dirtyAccounts adds).
+	// This scopes demoteUnexecutables and the reset-promote from O(pending) to
+	// O(txs-in-block), cutting lock-held time under load.
+	// Scoping is only exact for a one-block step on the previous head with an
+	// unchanged gas limit; reorgs, multi-block resets and gas-limit changes, and
+	// every fullDemoteEvery-th reset (accounts drained by other senders, e.g.
+	// EIP-7702 delegation or TRC21 issuer fees), keep the full walk (nil set).
+	var blockSenders map[common.Address]struct{}
+	pool.resetsSinceFullDemote++
+	if reset != nil && canScopeReset(reset.oldHead, reset.newHead, pool.resetsSinceFullDemote) {
+		if blk := pool.chain.GetBlock(reset.newHead.Hash(), reset.newHead.Number.Uint64()); blk != nil {
+			blockSenders = make(map[common.Address]struct{}, len(blk.Transactions()))
+			for _, tx := range blk.Transactions() {
+				if sender, err := types.Sender(pool.signer, tx); err == nil {
+					blockSenders[sender] = struct{}{}
+				}
+			}
+		}
+	}
+
 	// resetOK is set to true when pool.reset successfully loads new-head state.
 	// Head-specific post-processing is skipped when it is false (CertiK XDC-36).
 	var resetOK bool
@@ -1599,8 +1628,27 @@ func (pool *LegacyPool) runReorg(done chan struct{}, reset *txpoolResetRequest, 
 				}
 			}
 		}
-		// Reset needs promote for all addresses
-		promoteAddrs = pool.queue.addresses()
+		// #1665: on reset, only promote accounts whose nonce advanced (block
+		// senders) or that just had new txs added (dirtyAccounts).  All other
+		// queued accounts had no state change and cannot become newly executable.
+		// Fall back to all-queue if blockSenders is nil (e.g. block unavailable).
+		if blockSenders != nil {
+			seen := make(map[common.Address]struct{}, len(blockSenders))
+			for addr := range blockSenders {
+				seen[addr] = struct{}{}
+				promoteAddrs = append(promoteAddrs, addr)
+			}
+			if dirtyAccounts != nil {
+				for _, addr := range dirtyAccounts.flatten() {
+					if _, ok := seen[addr]; !ok {
+						promoteAddrs = append(promoteAddrs, addr)
+					}
+				}
+			}
+		} else {
+			// Safety fallback: promote everything (pre-#1665 behaviour).
+			promoteAddrs = pool.queue.addresses()
+		}
 	}
 	// Check for pending transactions for every account that sent new ones
 	promoted := pool.promoteExecutables(promoteAddrs)
@@ -1609,7 +1657,10 @@ func (pool *LegacyPool) runReorg(done chan struct{}, reset *txpoolResetRequest, 
 	// remove any transaction that has been included in the block or was invalidated
 	// because of another transaction (e.g. higher gas price).
 	if reset != nil && resetOK {
-		pool.demoteUnexecutables()
+		if blockSenders == nil {
+			pool.resetsSinceFullDemote = 0
+		}
+		pool.demoteUnexecutables(blockSenders)
 		if reset.newHead != nil {
 			if pool.chainconfig.IsLondon(new(big.Int).Add(reset.newHead.Number, big.NewInt(1))) {
 				pendingBaseFee := eip1559.CalcBaseFee(pool.chainconfig, reset.newHead)
@@ -1971,11 +2022,35 @@ func (pool *LegacyPool) truncateQueue() {
 // Note: transactions are not marked as removed in the priced list because re-heaping
 // is always explicitly triggered by SetBaseFee and it would be unnecessary and wasteful
 // to trigger a re-heap is this function
-func (pool *LegacyPool) demoteUnexecutables() {
-	// Iterate over all accounts and demote any non-executable transactions
+//
+// #1665: when accounts is non-nil, only those accounts are examined.  This is
+// safe because a block can only decrease the nonce or balance of accounts that
+// appear as senders in it; all other pending txs remain valid after the block.
+// fullDemoteEvery bounds how many scoped resets may pass before a full walk.
+const fullDemoteEvery = 64
+
+// canScopeReset reports whether a reset from oldHead to newHead may limit the
+// demote and promote passes to the new block's senders: only for a one-block
+// step on oldHead with an unchanged gas limit, and not on every
+// fullDemoteEvery-th reset.
+func canScopeReset(oldHead, newHead *types.Header, sinceFull int) bool {
+	return oldHead != nil && newHead != nil &&
+		newHead.ParentHash == oldHead.Hash() &&
+		newHead.GasLimit == oldHead.GasLimit &&
+		sinceFull < fullDemoteEvery
+}
+
+func (pool *LegacyPool) demoteUnexecutables(accounts map[common.Address]struct{}) {
+	// Iterate over all accounts and demote any non-executable transactions.
+	// When a scoped set is provided, restrict iteration to those accounts only.
 	gasLimit := pool.currentHead.Load().GasLimit
 	trc21Issuers, trc21CostFn := pool.trc21Data()
 	for addr, list := range pool.pending {
+		if accounts != nil {
+			if _, ok := accounts[addr]; !ok {
+				continue
+			}
+		}
 		nonce := pool.currentState.GetNonce(addr)
 
 		// Drop all transactions that are deemed too old (low nonce)
