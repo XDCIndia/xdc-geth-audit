@@ -1549,6 +1549,19 @@ func (pool *LegacyPool) runReorg(done chan struct{}, reset *txpoolResetRequest, 
 		// the flatten operation can be avoided.
 		promoteAddrs = dirtyAccounts.flatten()
 	}
+
+	// #1665: pre-open state DB before pool.mu.Lock so that the expensive
+	// disk I/O in pool.chain.StateAt does not stall txpool.Add callers
+	// (which hold the per-peer read loop blocked while the lock is held,
+	// which fills TCP receive buffers and delays BroadcastBlock/Vote sends).
+	// runReorg is serial — only one goroutine runs it per pool at any time —
+	// so reading from the chain without pool.mu is safe here.
+	var preState *state.StateDB
+	if reset != nil && reset.newHead != nil {
+		preState, _ = pool.chain.StateAt(reset.newHead.Root, reset.newHead.Number, reset.newHead.Time)
+		// Ignore errors here; reset() will retry under pool.mu and handle them.
+	}
+
 	// resetOK is set to true when pool.reset successfully loads new-head state.
 	// Head-specific post-processing is skipped when it is false (CertiK XDC-36).
 	var resetOK bool
@@ -1575,7 +1588,7 @@ func (pool *LegacyPool) runReorg(done chan struct{}, reset *txpoolResetRequest, 
 		// XDC-36: capture whether reset succeeded; skip head-specific post-processing
 		// (nonce forwarding, demotion, base-fee repricing) when it did not, so we do
 		// not operate on stale currentState / pendingNonces for the requested head.
-		resetOK = pool.reset(reset.oldHead, reset.newHead)
+		resetOK = pool.reset(reset.oldHead, reset.newHead, preState)
 
 		if resetOK {
 			// Nonces were reset, discard any events that became stale
@@ -1664,7 +1677,12 @@ func (pool *LegacyPool) runReorg(done chan struct{}, reset *txpoolResetRequest, 
 // to newHead, and false when an error prevented that update.  Callers must
 // skip head-specific post-processing (nonce forwarding, demotion, base-fee
 // repricing) when reset returns false (CertiK XDC-36).
-func (pool *LegacyPool) reset(oldHead, newHead *types.Header) bool {
+//
+// preState is an optional *state.StateDB already opened for newHead (before
+// pool.mu was acquired). When non-nil the expensive pool.chain.StateAt call is
+// skipped, eliminating the lock-held disk-I/O stall that blocked txpool.Add
+// and the p2p read loops behind it (#1665).
+func (pool *LegacyPool) reset(oldHead, newHead *types.Header, preState *state.StateDB) bool {
 	// If we're reorging an old state, reinject all dropped transactions
 	var reinject types.Transactions
 	// included tracks txs in the newly confirmed chain (populated during reorg;
@@ -1749,18 +1767,23 @@ func (pool *LegacyPool) reset(oldHead, newHead *types.Header) bool {
 	if newHead == nil {
 		newHead = pool.chain.CurrentBlock() // Special case during testing
 	}
-	statedb, err := pool.chain.StateAt(newHead.Root, newHead.Number, newHead.Time)
-	if err != nil {
-		// XDC A.99.6: fast-sync checkpointSyncNoState — real head state root not yet
-		// in trie DB. Keep old state and skip reset rather than flooding ERROR log.
-		// Refs: #1037.
-		if core.CheckpointSyncNoStateActive.Load() {
-			log.Debug("legacypool: head state not yet available (snap-heal pending), skipping reset",
-				"block", newHead.Number, "root", newHead.Root)
+	statedb := preState
+	if statedb == nil {
+		// Slow path: no pre-opened state (testing or pre-open failed).
+		var err error
+		statedb, err = pool.chain.StateAt(newHead.Root, newHead.Number, newHead.Time)
+		if err != nil {
+			// XDC A.99.6: fast-sync checkpointSyncNoState — real head state root not yet
+			// in trie DB. Keep old state and skip reset rather than flooding ERROR log.
+			// Refs: #1037.
+			if core.CheckpointSyncNoStateActive.Load() {
+				log.Debug("legacypool: head state not yet available (snap-heal pending), skipping reset",
+					"block", newHead.Number, "root", newHead.Root)
+				return false
+			}
+			log.Error("Failed to reset txpool state", "err", err)
 			return false
 		}
-		log.Error("Failed to reset txpool state", "err", err)
-		return false
 	}
 	pool.currentHead.Store(newHead)
 	pool.currentState = statedb

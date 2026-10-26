@@ -486,7 +486,7 @@ func TestQueue2(t *testing.T) {
 	tx3 := transaction(11, 100, key)
 	from, _ := deriveSender(tx1)
 	testAddBalance(pool, from, big.NewInt(1000))
-	pool.reset(nil, nil)
+	pool.reset(nil, nil, nil)
 
 	pool.enqueueTx(tx1.Hash(), tx1, true)
 	pool.enqueueTx(tx2.Hash(), tx2, true)
