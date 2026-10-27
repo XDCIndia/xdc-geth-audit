@@ -147,6 +147,13 @@ type SyncProgress struct {
 	// "historical data indexing" fields
 	StateIndexRemaining    uint64 // Number of states remain unindexed
 	TrienodeIndexRemaining uint64 // Number of trienodes remain unindexed
+
+	// "SYNC-06 history backfill" fields (XDC-specific, refs #1927).
+	// After fast/snap sync reaches the tip, a background goroutine downloads
+	// headers/bodies/receipts for the range [genesis, pivot-1] that the skeleton
+	// skipped.  HistoryBackfillRemainingBlocks > 0 while it is in progress.
+	HistoryBackfillFinishedBlocks  uint64 // Blocks backfilled so far
+	HistoryBackfillRemainingBlocks uint64 // Blocks still to backfill (0 = not started/done)
 }
 
 // Done returns the indicator if the initial sync is finished or not.

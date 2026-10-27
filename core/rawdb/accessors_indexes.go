@@ -186,7 +186,13 @@ func ReadCanonicalTransaction(db ethdb.Reader, hash common.Hash) (*types.Transac
 	if blockHash == (common.Hash{}) {
 		return nil, common.Hash{}, 0, 0
 	}
-	bodyRLP := ReadCanonicalBodyRLP(db, *blockNumber, &blockHash)
+	// Use ReadBodyRLP (hash-keyed) rather than ReadCanonicalBodyRLP so that
+	// the isCanon check falls through to LDB for gap blocks whose freezer
+	// entry is an A.85 zero-hash placeholder (invalid RLP, len=1).
+	// ReadCanonicalBodyRLP would return that placeholder because len>0,
+	// causing findTxInBlockBody to fail even after SYNC-06 wrote the real
+	// body to LDB.  Refs #1927.
+	bodyRLP := ReadBodyRLP(db, blockHash, *blockNumber)
 	if bodyRLP == nil {
 		log.Error("Transaction referenced missing", "number", *blockNumber, "hash", blockHash)
 		return nil, common.Hash{}, 0, 0
@@ -273,7 +279,11 @@ type RawReceiptContext struct {
 // that the additional positional fields are not directly included in the receipt.
 // Notably, only receipts from the canonical chain are visible.
 func ReadCanonicalRawReceipt(db ethdb.Reader, blockHash common.Hash, blockNumber, txIndex uint64) (*types.Receipt, RawReceiptContext, error) {
-	receiptIt, err := rlp.NewListIterator(ReadCanonicalReceiptsRLP(db, blockNumber, &blockHash))
+	// Use ReadReceiptsRLP instead of ReadCanonicalReceiptsRLP so the isCanon
+	// check gates ancient reads: A.85 gap-fill placeholders (0x00) written by
+	// freezeRange for blocks missing from LDB during fast-sync are skipped, and
+	// the real receipts written by SYNC-06 history backfill are found in LDB.
+	receiptIt, err := rlp.NewListIterator(ReadReceiptsRLP(db, blockHash, blockNumber))
 	if err != nil {
 		return nil, RawReceiptContext{}, err
 	}

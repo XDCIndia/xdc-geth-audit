@@ -406,6 +406,13 @@ type BlockChain struct {
 	currentFinalBlock atomic.Pointer[types.Header] // Latest (consensus) finalized block
 	currentSafeBlock  atomic.Pointer[types.Header] // Latest (consensus) safe block
 	historyPrunePoint atomic.Pointer[history.PrunePoint]
+	// fastSyncAnchor is the trusted checkpoint installed by SetFastSyncTrustedAnchor
+	// for the XDPoS V2 engine's inCheckpointCatchup gate.  Kept separate from
+	// historyPrunePoint so that an in-progress fast-sync does NOT cause
+	// HistoryPruningCutoff() to return a non-zero value, which would make the
+	// RPC layer return "pruned history unavailable" for pre-pivot blocks even
+	// after the SYNC-06 history backfill has written them.  Refs #1927.
+	fastSyncAnchor atomic.Pointer[history.PrunePoint]
 
 	bodyCache     *lru.Cache[common.Hash, *types.Body]
 	bodyRLPCache  *lru.Cache[common.Hash, rlp.RawValue]

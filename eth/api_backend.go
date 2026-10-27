@@ -519,6 +519,12 @@ func (b *EthAPIBackend) SyncProgress(ctx context.Context) ethereum.SyncProgress 
 		prog.StateIndexRemaining = stateRemain
 		prog.TrienodeIndexRemaining = trienodeRemain
 	}
+	// SYNC-06 history backfill progress (#1927).
+	if xdcSync := b.eth.handler.xdcSync; xdcSync != nil {
+		fin, rem := xdcSync.HistoryBackfillProgress()
+		prog.HistoryBackfillFinishedBlocks = fin
+		prog.HistoryBackfillRemainingBlocks = rem
+	}
 	return prog
 }
 
