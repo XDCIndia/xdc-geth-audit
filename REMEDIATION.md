@@ -2,30 +2,32 @@
 
 Report: Hacken final report, 2026-10-13. Audited commit: `45e2b6ee`.
 
-## Sixth hand-over (27 October 2026): revalidate `619e08a835929e671d7078de301d24e3147ab55f`
+## Sixth hand-over (27 October 2026): revalidate `14eb294ba8b8147dc99ca6fa2e4d02aba284257a`
 
 ### Scope
 
 | Item | Value |
 |---|---|
 | Repository | XDCIndia/xdc-geth-audit |
-| Branch / code head | `audit/main-uplift-11710-xdc20-r13` / **`619e08a835929e671d7078de301d24e3147ab55f`** |
+| Branch / code head | `audit/main-uplift-11710-xdc20-r13` / **`14eb294ba8b8147dc99ca6fa2e4d02aba284257a`** |
 | Previously revalidated commit (base) | `5d31c76662306c68627d3cb2b41a4bf0b521d440` (fifth hand-over, r12; `main` `2eb1332f3eda` has the same tree) |
-| Source | XDCIndia/go-ethereum `66176966e305425c14a5b9b206e4943bb48aff7e` |
+| Source | XDCIndia/go-ethereum `08d25cafd425d249cf213ea68e05866434399f0a` |
 | Upstream | unchanged: go-ethereum v1.17.10 |
 | Out of scope | docs, scripts, CI and audit reports |
 
 ### Structure: one commit per fix
 
-**9 commits on top of `5d31c7666230`, one per source fix**, in source order, no merges. Each has the fix's original message and author, its code, and a `Source: XDCIndia/go-ethereum <sha>` line.
+**12 commits on top of `5d31c7666230`, one per source fix**, in source order, no merges. Each has the fix's original message and author, its code, and a `Source: XDCIndia/go-ethereum <sha>` line.
 
 Summary of the changes:
 
 - Transaction pool: the reorg opens the new head state before it takes the pool lock, and reset demote/promote is limited to the senders in the new block.
 - Consensus engine (no rule change): votes are pooled up to 5 rounds ahead. An epoch switch after fast sync is not rejected when the gap state is missing below the sync pivot. Engine start-up does not walk the full chain under the engine lock.
-- Sync: bulk-mode lock fix, snap/2 advertisement, fetcher back-off on XDPoS, and full block history after fast and snap sync.
+- Sync: bulk-mode lock fix, snap/2 advertisement, fetcher back-off on XDPoS, and full block history after fast and snap sync. A node synced with a history cutoff can restart and rewind.
+- Consensus engine (no rule change): a gap snapshot seeded from an epoch-switch header below the snap pivot is not used for the penalty check; the header penalties are trusted and rechecked later.
+- **New fork (Apothem only):** TIPProportionalReward at block 84,733,000, ported from XDPoSChain v3.0.0-testnet-2. From that checkpoint each masternode, protector and observer gets `perNodeReward × min(sign, signSlots) / signSlots`; the unearned share is not minted. Mainnet is not scheduled. `tipUpgradeRewardBlock` is renamed `tipFixedRewardBlock` (legacy key still read).
 
-**XDC test files.** 10 new XDC test files are not included. Tests already in the base follow the source. The suite compiles (`go vet ./...` passes).
+**XDC test files.** 13 new XDC test files are not included. Tests already in the base follow the source. The suite compiles (`go vet ./...` passes).
 
 Excluded files:
 
@@ -39,12 +41,15 @@ Excluded files:
 - `eth/snap_advertise_1922_test.go`
 - `eth/sync_xdc_1665_test.go`
 - `eth/sync_xdc_1927_test.go`
+- `consensus/XDPoS/engines/engine_v2/snapshot_below_pivot_1931_test.go`
+- `consensus/XDPoS/reward_proportional_test.go`
+- `core/blockchain_xdc_gapfill_test.go`
 
 ### How to verify
 
 ```
-git log --first-parent --oneline 5d31c7666230..619e08a83592   # 9 fix commits
-git checkout 619e08a83592 && go build ./... && go vet ./...
+git log --first-parent --oneline 5d31c7666230..14eb294ba8b8   # 12 fix commits
+git checkout 14eb294ba8b8 && go build ./... && go vet ./...
 go test -timeout 60m ./consensus/XDPoS/... ./core/... ./eth/...
 ```
 
@@ -61,6 +66,9 @@ go test -timeout 60m ./consensus/XDPoS/... ./core/... ./eth/...
 | `dd23befcac67b48513d268fe89a96bfafd75a79c` | `0b5bc3c3bd85` | consensus/XDPoS, eth: do not reject epoch switch after fast sync on missing gap state |
 | `966eba64d1e7b5dd84a61dff60cf44db3c0a07cc` | `965b95df7ee1` | consensus/XDPoS: drop O(chain) header walk under engine lock in initial |
 | `619e08a835929e671d7078de301d24e3147ab55f` | `66176966e305` | core, eth: backfill full block history after fast and snap sync |
+| `82edabec667aa41b51205eeb596f3c99325c5c22` | `8a2d545621f3` | consensus/XDPoS: keep header-seeded gap snapshots below the snap pivot from penalty checks |
+| `e92a644d393827478c7cc8a303b4a2cd04088d58` | `ab1119ac00b2` | core, eth: repair the history tail after fast and snap sync with a history cutoff |
+| `14eb294ba8b8147dc99ca6fa2e4d02aba284257a` | `08d25cafd425` | params, eth/hooks, consensus/XDPoS: add the proportional reward fork (Apothem 84,733,000) |
 
 ## Fifth hand-over (26 October 2026): revalidate `main` at `2eb1332f3eda9f0262e2561d69ef8287eaa92dad`
 
