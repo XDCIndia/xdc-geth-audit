@@ -2,6 +2,66 @@
 
 Report: Hacken final report, 2026-10-13. Audited commit: `45e2b6ee`.
 
+## Sixth hand-over (27 October 2026): revalidate `619e08a835929e671d7078de301d24e3147ab55f`
+
+### Scope
+
+| Item | Value |
+|---|---|
+| Repository | XDCIndia/xdc-geth-audit |
+| Branch / code head | `audit/main-uplift-11710-xdc20-r13` / **`619e08a835929e671d7078de301d24e3147ab55f`** |
+| Previously revalidated commit (base) | `5d31c76662306c68627d3cb2b41a4bf0b521d440` (fifth hand-over, r12; `main` `2eb1332f3eda` has the same tree) |
+| Source | XDCIndia/go-ethereum `66176966e305425c14a5b9b206e4943bb48aff7e` |
+| Upstream | unchanged: go-ethereum v1.17.10 |
+| Out of scope | docs, scripts, CI and audit reports |
+
+### Structure: one commit per fix
+
+**9 commits on top of `5d31c7666230`, one per source fix**, in source order, no merges. Each has the fix's original message and author, its code, and a `Source: XDCIndia/go-ethereum <sha>` line.
+
+Summary of the changes:
+
+- Transaction pool: the reorg opens the new head state before it takes the pool lock, and reset demote/promote is limited to the senders in the new block.
+- Consensus engine (no rule change): votes are pooled up to 5 rounds ahead. An epoch switch after fast sync is not rejected when the gap state is missing below the sync pivot. Engine start-up does not walk the full chain under the engine lock.
+- Sync: bulk-mode lock fix, snap/2 advertisement, fetcher back-off on XDPoS, and full block history after fast and snap sync.
+
+**XDC test files.** 10 new XDC test files are not included. Tests already in the base follow the source. The suite compiles (`go vet ./...` passes).
+
+Excluded files:
+
+- `consensus/XDPoS/engines/engine_v2/gap_snapshot_below_pivot_test.go`
+- `consensus/XDPoS/engines/engine_v2/penalty_ancestor_missing_test.go`
+- `consensus/XDPoS/engines/engine_v2/reinitbft_walk_1929_test.go`
+- `consensus/XDPoS/engines/engine_v2/vote_lookahead_1665_test.go`
+- `core/blockchain_trusted_anchor_test.go`
+- `core/txpool/legacypool/legacypool_1665_scoped_demote_test.go`
+- `eth/fetcher/tx_fetcher_xdc_1665_test.go`
+- `eth/snap_advertise_1922_test.go`
+- `eth/sync_xdc_1665_test.go`
+- `eth/sync_xdc_1927_test.go`
+
+### How to verify
+
+```
+git log --first-parent --oneline 5d31c7666230..619e08a83592   # 9 fix commits
+git checkout 619e08a83592 && go build ./... && go vet ./...
+go test -timeout 60m ./consensus/XDPoS/... ./core/... ./eth/...
+```
+
+### Commits (audit commit → source commit)
+
+| Audit commit | Source | Change |
+|---|---|---|
+| `7324162d75c073c242e69755ab5942026fffd914` | `7bfee6b49c37` | core/txpool/legacypool: open the new head's state before taking pool.mu in runReorg |
+| `5280c04cdc2208b18cc129bad493dee003e04480` | `e686e8fc9e25` | core/txpool/legacypool: scope reset demote and promote to the new block's senders |
+| `7f8ecf807a33728570a3068155eee66e8748d977` | `b966e2d522e4` | eth: fix xdcSyncer bulk-mode lock and stuck-peer cluster |
+| `93997f84facce7e2dfa7c16ff42dd0851f7024d9` | `0ae7f6389369` | consensus/XDPoS: pool votes up to 5 rounds ahead |
+| `fefbca182c973fa256510c56b0e373336035f1b0` | `87f9b81b4e4c` | eth/fetcher: skip the refused-batch sleep on XDPoS chains |
+| `fab69d04ade7505c308500b0c71699f6ba19bbb2` | `a64fdd477664` | eth: do not advertise snap/2 on fast-sync nodes healing over snap/1 |
+| `dd23befcac67b48513d268fe89a96bfafd75a79c` | `0b5bc3c3bd85` | consensus/XDPoS, eth: do not reject epoch switch after fast sync on missing gap state |
+| `966eba64d1e7b5dd84a61dff60cf44db3c0a07cc` | `965b95df7ee1` | consensus/XDPoS: drop O(chain) header walk under engine lock in initial |
+| `619e08a835929e671d7078de301d24e3147ab55f` | `66176966e305` | core, eth: backfill full block history after fast and snap sync |
+
 ## Fifth hand-over (26 October 2026): revalidate `main` at `2eb1332f3eda9f0262e2561d69ef8287eaa92dad`
 
 ### Scope
