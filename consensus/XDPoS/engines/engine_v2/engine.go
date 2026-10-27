@@ -1114,6 +1114,23 @@ func (x *XDPoS_v2) getSnapshot(chain consensus.ChainReader, number uint64, forSi
 			log.Warn("[getSnapshot] evicting cached snapshot with V1 candidate count (13) at V2 checkpoint", "checkpoint", checkpointNumber, "gap", gapNumber, "hash", gapHeader.Hash(), "version", snap.Version, "candidates", len(snap.NextEpochCandidates))
 			x.snapshots.Remove(gapHeader.Hash())
 		} else {
+			// Issue #1931: after snap sync the gap block may be below the pivot, meaning
+			// its EVM state was never downloaded and UpdateMasternodesFromHeader never ran.
+			// A cached snapshot built from the epoch-switch header's Validators field
+			// contains only the 108 elected masternodes, not the full ~368-entry contract
+			// candidate pool. calcMasternodes (!forSigning) uses NextEpochCandidates as the
+			// input to HookPenalty; the intersection of penalised addresses with the
+			// truncated set is empty, so localPenalties=[] diverges from the 5-entry
+			// canonical Penalties field → ErrPenaltiesNotLegit → bogus SetHead.
+			// Return ErrV2SnapshotMissing so RecheckDeferredSwitches keeps the entry
+			// deferred instead of labelling the canonical block forged.
+			// forSigning callers (proposer/leader selection) use Validators, not the full
+			// pool, and correctly see the elected set — do not block them.
+			if !forSigning {
+				if pivot := rawdb.ReadLastPivotNumber(x.db); pivot != nil && gapNumber < *pivot {
+					return nil, fmt.Errorf("%w at gap %d (checkpoint %d, pivot %d): cached snapshot below snap pivot — candidates from epoch-switch header only, not contract pool", utils.ErrV2SnapshotMissing, gapNumber, checkpointNumber, *pivot)
+				}
+			}
 			return snap, nil
 		}
 		// Fall through to rebuild after eviction
@@ -1134,6 +1151,12 @@ func (x *XDPoS_v2) getSnapshot(chain consensus.ChainReader, number uint64, forSi
 			// Version 4+ snapshots were created by our code (newSnapshot sets Version=4).
 			// They are trusted — no V1-format heuristic needed regardless of candidate count.
 			// This handles devnet / chains with V2 from genesis where 3 masternodes is valid.
+			// Issue #1931: same pivot guard as the cache path above.
+			if !forSigning {
+				if pivot := rawdb.ReadLastPivotNumber(x.db); pivot != nil && gapNumber < *pivot {
+					return nil, fmt.Errorf("%w at gap %d (checkpoint %d, pivot %d): db snapshot (v%d) below snap pivot — candidates from epoch-switch header only, not contract pool", utils.ErrV2SnapshotMissing, gapNumber, checkpointNumber, *pivot, snap.Version)
+				}
+			}
 			x.snapshots.Add(snap.Hash, snap)
 			return snap, nil
 		} else if checkpointNumber > x.config.V2.SwitchBlock.Uint64() && len(snap.NextEpochCandidates) > 0 && len(snap.NextEpochCandidates) <= 20 {
