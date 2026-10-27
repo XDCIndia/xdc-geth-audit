@@ -63,11 +63,11 @@ func (f *comebackFakeV2) IsEpochSwitch(_ *types.Header) (bool, uint64, error) { 
 func (f *comebackFakeV2) GetMasternodesByHash(_ consensus.ChainReader, _ common.Hash) []common.Address {
 	return nil
 }
-func (f *comebackFakeV2) GetPreviousPenaltyByHash(_ consensus.ChainReader, _ common.Hash, limit int) []common.Address {
+func (f *comebackFakeV2) GetPreviousPenaltyByHash(_ consensus.ChainReader, _ common.Hash, limit int) ([]common.Address, error) {
 	if f.penaltiesAtEpoch != nil {
-		return f.penaltiesAtEpoch(limit)
+		return f.penaltiesAtEpoch(limit), nil
 	}
-	return nil
+	return nil, nil
 }
 func (f *comebackFakeV2) GetMasternodesFromEpochSwitchHeader(_ consensus.ChainReader, _ *types.Header) []common.Address {
 	return nil

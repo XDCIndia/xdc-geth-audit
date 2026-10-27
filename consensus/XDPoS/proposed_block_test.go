@@ -89,8 +89,8 @@ func (f *fakeEngineV2) IsEpochSwitch(_ *types.Header) (bool, uint64, error) {
 func (f *fakeEngineV2) GetMasternodesByHash(_ consensus.ChainReader, _ common.Hash) []common.Address {
 	return nil
 }
-func (f *fakeEngineV2) GetPreviousPenaltyByHash(_ consensus.ChainReader, _ common.Hash, _ int) []common.Address {
-	return nil
+func (f *fakeEngineV2) GetPreviousPenaltyByHash(_ consensus.ChainReader, _ common.Hash, _ int) ([]common.Address, error) {
+	return nil, nil
 }
 func (f *fakeEngineV2) GetMasternodesFromEpochSwitchHeader(_ consensus.ChainReader, _ *types.Header) []common.Address {
 	return nil

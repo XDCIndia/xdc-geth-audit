@@ -348,15 +348,15 @@ type EngineV2Iface interface {
 	VerifyHeaderWithParents(chain consensus.ChainReader, header *types.Header, parents []*types.Header, fullVerify bool) error
 	GetRoundNumber(header *types.Header) (types.Round, error) // (#117) per-round config dispatch
 	UpdateMasternodesFromHeader(chain consensus.ChainReader, header *types.Header, statedb *state.StateDB) error
-	UpdateMasternodes(chain consensus.ChainReader, header *types.Header, ms []common.Address) error                         // direct snapshot seed (used for trusted-checkpoint pre-seed when state isn't available)
-	UpdateMasternodesWithPenalties(chain consensus.ChainReader, header *types.Header, ms, penalties []common.Address) error // direct snapshot seed recording both the active set and the penalty pool (checkpoint-sync anchors)
-	Author(header *types.Header) (common.Address, error)                                                                    // (#407) V2-compatible sigHash recovery
-	IsEpochSwitch(header *types.Header) (bool, uint64, error)                                                               // (#410) round-based epoch boundary
-	GetMasternodesByHash(chain consensus.ChainReader, hash common.Hash) []common.Address                                    // (#402) post-penalty active masternodes
-	GetPreviousPenaltyByHash(chain consensus.ChainReader, hash common.Hash, limitPenaltyEpoch int) []common.Address         // (#412) comeback seeding
-	GetMasternodesFromEpochSwitchHeader(chain consensus.ChainReader, header *types.Header) []common.Address                 // V2 era epoch-switch masternode list (reads header.Validators, falls back to Extra at switch block)
-	GetStandbynodes(chain consensus.ChainReader, header *types.Header) []common.Address                                     // Reward 2.0 standby pool of an epoch, from its historical snapshot (#2612)
-	GetMasternodesV2(chain consensus.ChainReader, header *types.Header) []common.Address                                    // active masternode set for any V2-era header via getEpochSwitchInfo
+	UpdateMasternodes(chain consensus.ChainReader, header *types.Header, ms []common.Address) error                          // direct snapshot seed (used for trusted-checkpoint pre-seed when state isn't available)
+	UpdateMasternodesWithPenalties(chain consensus.ChainReader, header *types.Header, ms, penalties []common.Address) error  // direct snapshot seed recording both the active set and the penalty pool (checkpoint-sync anchors)
+	Author(header *types.Header) (common.Address, error)                                                                     // (#407) V2-compatible sigHash recovery
+	IsEpochSwitch(header *types.Header) (bool, uint64, error)                                                                // (#410) round-based epoch boundary
+	GetMasternodesByHash(chain consensus.ChainReader, hash common.Hash) []common.Address                                     // (#402) post-penalty active masternodes
+	GetPreviousPenaltyByHash(chain consensus.ChainReader, hash common.Hash, limitPenaltyEpoch int) ([]common.Address, error) // (#412) comeback seeding; returns ErrPenaltyAncestorMissing when A.68.2 priming is incomplete
+	GetMasternodesFromEpochSwitchHeader(chain consensus.ChainReader, header *types.Header) []common.Address                  // V2 era epoch-switch masternode list (reads header.Validators, falls back to Extra at switch block)
+	GetStandbynodes(chain consensus.ChainReader, header *types.Header) []common.Address                                      // Reward 2.0 standby pool of an epoch, from its historical snapshot (#2612)
+	GetMasternodesV2(chain consensus.ChainReader, header *types.Header) []common.Address                                     // active masternode set for any V2-era header via getEpochSwitchInfo
 
 	// Mining-side wrapper dispatch surface (audit IDs M-1..M-7).
 	// Iter 4 (interface-only): widen EngineV2Iface so iter 5 can route the

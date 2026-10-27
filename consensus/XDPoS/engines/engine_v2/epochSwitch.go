@@ -10,6 +10,7 @@ import (
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/consensus"
+	"github.com/ethereum/go-ethereum/consensus/XDPoS/utils"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/log"
 )
@@ -17,6 +18,13 @@ import (
 // getPreviousEpochSwitchInfoByHash walks backward through epoch switches.
 // Returns the epoch switch info `limit` epochs before the epoch containing `hash`.
 // Matches v2.6.8 engines/engine_v2/epochSwitch.go.
+//
+// If the walk stops early because the chain is too young (no previous V2
+// epoch), the info for the earliest available epoch is returned without error.
+// If the walk stops because an epoch-switch header is absent from the local DB
+// (A.68.2 priming incomplete or its depth less than the penalty lookback
+// window), ErrPenaltyAncestorMissing is returned so the caller can treat the
+// missing-data case as retryable rather than silently computing wrong penalties.
 func (x *XDPoS_v2) getPreviousEpochSwitchInfoByHash(chain consensus.ChainReader, hash common.Hash, limit int) (*types.EpochSwitchInfo, error) {
 	epochSwitchInfo, err := x.getEpochSwitchInfo(chain, nil, hash)
 	if err != nil {
@@ -24,8 +32,15 @@ func (x *XDPoS_v2) getPreviousEpochSwitchInfoByHash(chain consensus.ChainReader,
 		return nil, err
 	}
 	for i := 0; i < limit; i++ {
-		parentHash, ok := x.epochSwitchParentHash(chain, epochSwitchInfo)
+		parentHash, ok, lookupErr := x.epochSwitchParentHashOrErr(chain, epochSwitchInfo)
+		if lookupErr != nil {
+			// Epoch-switch header not in DB — retryable, not a bad block.
+			log.Warn("[getPreviousEpochSwitchInfoByHash] epoch-switch header missing from DB",
+				"iteration", i, "limit", limit, "err", lookupErr)
+			return nil, lookupErr
+		}
 		if !ok {
+			// Chain too young: no previous V2 epoch. Stop without error.
 			break
 		}
 		epochSwitchInfo, err = x.getEpochSwitchInfo(chain, nil, parentHash)
@@ -35,6 +50,36 @@ func (x *XDPoS_v2) getPreviousEpochSwitchInfoByHash(chain consensus.ChainReader,
 		}
 	}
 	return epochSwitchInfo, nil
+}
+
+// epochSwitchParentHashOrErr is like epochSwitchParentHash but distinguishes
+// two kinds of "not found":
+//   - (hash{}, false, nil): no previous V2 epoch (chain too young)
+//   - (hash{}, false, ErrPenaltyAncestorMissing): epoch-switch header not in DB
+//
+// Used by getPreviousEpochSwitchInfoByHash so the penalty lookback can signal
+// a retryable missing-data condition instead of silently computing incorrect
+// penalties. GetEpochSwitchInfoBetween continues to use epochSwitchParentHash
+// (the old 2-value form) to preserve existing break-on-missing behaviour for
+// the reward-window walk.
+func (x *XDPoS_v2) epochSwitchParentHashOrErr(chain consensus.ChainReader, info *types.EpochSwitchInfo) (common.Hash, bool, error) {
+	if info.EpochSwitchParentBlockInfo != nil {
+		return info.EpochSwitchParentBlockInfo.Hash, true, nil
+	}
+	es := info.EpochSwitchBlockInfo
+	if es == nil || es.Number == nil || es.Number.Cmp(x.config.V2.SwitchBlock) <= 0 {
+		// Chain too young: no previous V2 epoch, not an error.
+		return common.Hash{}, false, nil
+	}
+	header := chain.GetHeaderByHash(es.Hash)
+	if header == nil {
+		// Header exists in the epoch-switch chain but is absent from the local
+		// DB. This is a transient, retryable condition (A.68.2 still priming).
+		log.Warn("[epochSwitchParentHashOrErr] epoch-switch header not in DB; penalty ancestor missing",
+			"number", es.Number, "hash", es.Hash)
+		return common.Hash{}, false, utils.ErrPenaltyAncestorMissing
+	}
+	return header.ParentHash, true, nil
 }
 
 // epochSwitchParentHash returns the hash of the block before the epoch switch

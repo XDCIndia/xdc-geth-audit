@@ -376,7 +376,12 @@ func AttachConsensusV2Hooks(adaptor *XDPoS.XDPoS, bc *core.BlockChain, chainConf
 			if !chainConfig.IsTIPUpgradePenalty(number) {
 				comebackHeight := (common.LimitPenaltyEpochV2+1)*chainConfig.XDPoS.Epoch + chainConfig.XDPoS.V2.SwitchBlock.Uint64()
 				if number.Uint64() > comebackHeight {
-					pens := adaptor.EngineV2.GetPreviousPenaltyByHash(chain, currentHash, common.LimitPenaltyEpochV2)
+					pens, penErr := adaptor.EngineV2.GetPreviousPenaltyByHash(chain, currentHash, common.LimitPenaltyEpochV2)
+					if penErr != nil {
+						// Ancestor epoch-switch header not yet in DB (A.68.2 still priming).
+						// Return the error so calcMasternodes can surface it as retryable.
+						return nil, penErr
+					}
 					penComebacks := []common.Address{}
 					for _, p := range pens {
 						for _, addr := range candidates {
@@ -458,7 +463,12 @@ func AttachConsensusV2Hooks(adaptor *XDPoS.XDPoS, bc *core.BlockChain, chainConf
 					// lastPenalty is the most-recent (i==0) epoch's penalty list.
 					lastPenalty := []common.Address{}
 					for i := 0; i < limitPenaltyEpoch; i++ {
-						pens := adaptor.EngineV2.GetPreviousPenaltyByHash(chain, currentHash, i)
+						pens, penErr := adaptor.EngineV2.GetPreviousPenaltyByHash(chain, currentHash, i)
+						if penErr != nil {
+							// Ancestor epoch-switch header not yet in DB (A.68.2 still priming).
+							// Return the error so calcMasternodes can surface it as retryable.
+							return nil, penErr
+						}
 						for _, p := range pens {
 							penParoleeMap[p]++
 						}

@@ -250,6 +250,17 @@ func (x *XDPoS_v2) verifyHeader(chain consensus.ChainReader, header *types.Heade
 					seedGapNum = gapN
 					log.Warn("[verifyHeader] SYNC-11: gap below snap pivot, deferring seed to after all checks",
 						"switch", header.Number, "gap", gapN)
+				} else if errors.Is(err, utils.ErrPenaltyAncestorMissing) {
+					// #1925: A.68.2 ancestor-header priming is incomplete (or its
+					// depth < penalty lookback window). HookPenalty cannot compute
+					// the correct penalty set without the missing epoch-switch headers.
+					// Fall through to the bulk-sync trust path (header.Validators /
+					// header.Penalties are trusted, proposer-signature check still
+					// enforces signer membership). XDC-10 deferred recheck will
+					// re-verify once all needed ancestor headers are in the DB.
+					// seedGapFromSwitch stays false → the existing bulk-sync fallback applies.
+					log.Warn("[verifyHeader] #1925: penalty ancestor not in DB under fullVerify, deferring to XDC-10 recheck",
+						"block", header.Number, "hash", header.Hash(), "err", err)
 				} else {
 					log.Error("[verifyHeader] calcMasternodes failed under fullVerify", "Number", header.Number, "Hash", header.Hash(), "err", err)
 					return err

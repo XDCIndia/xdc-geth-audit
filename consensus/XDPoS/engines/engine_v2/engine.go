@@ -1268,6 +1268,21 @@ func (x *XDPoS_v2) getSnapshot(chain consensus.ChainReader, number uint64, forSi
 			// !isGapInput, non-bulk-sync caller (mining, public API,
 			// post-import). DB has ancestors at steady-state; walk back
 			// is safe.
+			//
+			// #1925 (stale-gap): after fast/snap sync the gap block may be
+			// below the snap pivot, meaning its state was never downloaded and
+			// UpdateMasternodesFromHeader never ran there. A backward seed from
+			// the previous epoch-switch header gives only the ACTIVE set (e.g.
+			// 36 masternodes) not the full candidate pool from the contract
+			// (e.g. 108 on mainnet). HookPenalty over this truncated pool
+			// produces a wrong penalty list → ErrPenaltiesNotLegit under
+			// fullVerify. Signal via ErrV2SnapshotMissing so sync11ShouldRelax
+			// in verifyHeader can detect gap<pivot and fall through to the
+			// header.Validators/Penalties trust path; sync11SeedGap will then
+			// seed the correct snapshot from the verified epoch-switch header.
+			if pivot := rawdb.ReadLastPivotNumber(x.db); pivot != nil && gapNumber < *pivot {
+				return nil, fmt.Errorf("%w at gap %d (checkpoint %d): gap below snap pivot %d, state unavailable — no safe backward seed", utils.ErrV2SnapshotMissing, gapNumber, checkpointNumber, *pivot)
+			}
 			epochSwitchHeader = x.findEpochSwitchAtOrBefore(chain, number, nil)
 			seedDir = "backward"
 		default:
@@ -3357,11 +3372,16 @@ func (x *XDPoS_v2) GetMasternodesByHash(chain consensus.ChainReader, hash common
 // the same header.Penalties bytes at the time the epoch info was computed (see
 // getEpochSwitchInfoInner).  This is identical data, not an approximation, so
 // full-sync consensus correctness is unaffected.
-func (x *XDPoS_v2) GetPreviousPenaltyByHash(chain consensus.ChainReader, hash common.Hash, limit int) []common.Address {
+//
+// If A.68.2 ancestor-header priming has not yet delivered the needed epoch-
+// switch header to the local DB, getPreviousEpochSwitchInfoByHash returns
+// ErrPenaltyAncestorMissing; this is propagated here so HookPenalty can
+// surface the retryable condition to calcMasternodes → verifyHeader.
+func (x *XDPoS_v2) GetPreviousPenaltyByHash(chain consensus.ChainReader, hash common.Hash, limit int) ([]common.Address, error) {
 	epochSwitchInfo, err := x.getPreviousEpochSwitchInfoByHash(chain, hash, limit)
 	if err != nil {
 		log.Error("[GetPreviousPenaltyByHash] getPreviousEpochSwitchInfoByHash error", "err", err)
-		return []common.Address{}
+		return nil, err
 	}
 	header := chain.GetHeaderByHash(epochSwitchInfo.EpochSwitchBlockInfo.Hash)
 	if header == nil {
@@ -3373,9 +3393,9 @@ func (x *XDPoS_v2) GetPreviousPenaltyByHash(chain consensus.ChainReader, hash co
 			"epochSwitchHash", epochSwitchInfo.EpochSwitchBlockInfo.Hash.Hex(),
 			"epochSwitchNumber", epochSwitchInfo.EpochSwitchBlockInfo.Number,
 			"cachedPenalties", len(epochSwitchInfo.Penalties))
-		return epochSwitchInfo.Penalties
+		return epochSwitchInfo.Penalties, nil
 	}
-	return contracts.ExtractAddressFromBytes(header.Penalties)
+	return contracts.ExtractAddressFromBytes(header.Penalties), nil
 }
 
 // extractAddressesFromBytes converts a packed byte array of 20-byte addresses

@@ -14,32 +14,32 @@ import (
 
 // Common errors
 var (
-	ErrUnknownBlock       = errors.New("unknown block")
-	ErrInvalidQC          = errors.New("invalid quorum certificate")
-	ErrInvalidQCSignatures = errors.New("invalid QC signatures")
-	ErrInvalidTC          = errors.New("invalid timeout certificate")
-	ErrInvalidTCSignatures = errors.New("invalid TC signatures")
-	ErrInvalidVote        = errors.New("invalid vote")
-	ErrInvalidTimeout     = errors.New("invalid timeout")
-	ErrNotReadyToMine     = errors.New("not ready to mine")
-	ErrNotReadyToPropose  = errors.New("not ready to propose")
-	ErrInvalidUncleHash   = errors.New("invalid uncle hash")
-	ErrInvalidDifficulty  = errors.New("invalid difficulty")
-	ErrInvalidV2Extra     = errors.New("invalid v2 extra data")
-	ErrInvalidQuorumCert  = errors.New("invalid quorum certificate")
-	ErrInvalidTimestamp   = errors.New("invalid timestamp")
-	ErrRoundInvalid       = errors.New("invalid round")
-	ErrInvalidCheckpointVote = errors.New("invalid checkpoint vote")
-	ErrEmptyEpochSwitchValidators = errors.New("empty epoch switch validators")
-	ErrInvalidCheckpointSigners = errors.New("invalid checkpoint signers")
-	ErrValidatorsNotLegit = errors.New("validators not legit")
-	ErrPenaltiesNotLegit  = errors.New("penalties not legit")
-	ErrInvalidFieldInNonEpochSwitch = errors.New("invalid field in non-epoch switch")
+	ErrUnknownBlock                  = errors.New("unknown block")
+	ErrInvalidQC                     = errors.New("invalid quorum certificate")
+	ErrInvalidQCSignatures           = errors.New("invalid QC signatures")
+	ErrInvalidTC                     = errors.New("invalid timeout certificate")
+	ErrInvalidTCSignatures           = errors.New("invalid TC signatures")
+	ErrInvalidVote                   = errors.New("invalid vote")
+	ErrInvalidTimeout                = errors.New("invalid timeout")
+	ErrNotReadyToMine                = errors.New("not ready to mine")
+	ErrNotReadyToPropose             = errors.New("not ready to propose")
+	ErrInvalidUncleHash              = errors.New("invalid uncle hash")
+	ErrInvalidDifficulty             = errors.New("invalid difficulty")
+	ErrInvalidV2Extra                = errors.New("invalid v2 extra data")
+	ErrInvalidQuorumCert             = errors.New("invalid quorum certificate")
+	ErrInvalidTimestamp              = errors.New("invalid timestamp")
+	ErrRoundInvalid                  = errors.New("invalid round")
+	ErrInvalidCheckpointVote         = errors.New("invalid checkpoint vote")
+	ErrEmptyEpochSwitchValidators    = errors.New("empty epoch switch validators")
+	ErrInvalidCheckpointSigners      = errors.New("invalid checkpoint signers")
+	ErrValidatorsNotLegit            = errors.New("validators not legit")
+	ErrPenaltiesNotLegit             = errors.New("penalties not legit")
+	ErrInvalidFieldInNonEpochSwitch  = errors.New("invalid field in non-epoch switch")
 	ErrValidatorNotWithinMasternodes = errors.New("validator not within masternodes")
-	ErrCoinbaseAndValidatorMismatch = errors.New("coinbase and validator mismatch")
-	ErrNotItsTurn         = errors.New("not its turn")
-	ErrInvalidMixDigest   = errors.New("invalid mix digest")
-	ErrNoValidatorSignatureV2 = errors.New("no validator signature v2")
+	ErrCoinbaseAndValidatorMismatch  = errors.New("coinbase and validator mismatch")
+	ErrNotItsTurn                    = errors.New("not its turn")
+	ErrInvalidMixDigest              = errors.New("invalid mix digest")
+	ErrNoValidatorSignatureV2        = errors.New("no validator signature v2")
 	// ErrInvalidSignature is returned by RecoverUniqueSigners when a
 	// signature is not in canonical low-S form (an ECDSA-malleated
 	// high-S counterpart), or is otherwise malformed. See #1074.
@@ -106,6 +106,17 @@ var ErrEpochSwitchParentNotInDB = errors.New("epoch switch parent header not in 
 // fullVerify=true, since the local node cannot recompute the canonical
 // masternode set without the gap-block state.
 var ErrV2SnapshotMissing = errors.New("V2 snapshot missing — gap-block import skipped state")
+
+// ErrPenaltyAncestorMissing is returned when a penalty lookback walk cannot
+// find an epoch-switch header in the local DB. This happens when A.68.2
+// ancestor-header priming is incomplete (still in progress) or its depth
+// (2×Epoch = 1800 headers) is less than the penalty lookback window
+// (limitPenaltyEpoch×Epoch ≤ 4×900 = 3600 headers). Unlike a missing gap
+// snapshot, this is a transient condition: once the needed headers arrive
+// the computation will succeed.  Callers in verifyHeader treat this as a
+// retryable condition (trust header.Validators/Penalties and queue for
+// XDC-10 deferred recheck) rather than marking the block bad.
+var ErrPenaltyAncestorMissing = errors.New("penalty epoch-switch ancestor header not in DB")
 
 // V1 engine errors (ported from v2.6.8)
 // NOTE: Some errors below are intentionally duplicates of V2 errors above.
