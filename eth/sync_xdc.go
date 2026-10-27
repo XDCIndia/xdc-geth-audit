@@ -6976,6 +6976,23 @@ func (s *xdcSyncer) runSnapHistoryBackfill() {
 		nextTop = lo - 1
 	}
 
+	// Advance the freezer block-data tail to min(frozen, cutoff) so that a
+	// restart with --history.chain does not need to scan the placeholder range
+	// on startup (refs #1933). Without this, initializeHistoryPruning sees
+	// freezerTail=0 < target, finds latest!=0, and returns historyPruningRequired
+	// on every restart even though the data below the target is only A.85
+	// gap-fill placeholders (0x00 bytes, not real history).
+	if cutoffNum > 1 {
+		if frozen, err := db.Ancients(); err == nil && frozen > 0 {
+			newTail := min(frozen, cutoffNum)
+			if prev, err := db.TruncateTail(rawdb.ChainFreezerBlockDataGroup, newTail); err != nil {
+				log.Warn("xdcSyncer: SYNC-06 failed to advance history tail", "target", newTail, "err", err)
+			} else if prev < newTail {
+				log.Info("xdcSyncer: SYNC-06 history tail advanced", "from", prev, "to", newTail)
+			}
+		}
+	}
+
 	// Clear the remaining counter: backfill is done (#1927).
 	s.historyBackfillRemaining.Store(0)
 	s.historyBackfillWritten.Store(written + skipped)

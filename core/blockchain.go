@@ -1098,14 +1098,16 @@ func (bc *BlockChain) initializeHistoryPruning(latest uint64) error {
 					if err != nil {
 						return fmt.Errorf("failed to read block body %d: %w", number, err)
 					}
-					if len(body) != 0 {
+					// Accept both nil (vanilla snap) and the single-byte 0x00 written by
+					// XDC A.85 fast-sync gap fill (chain_freezer.go freezeRange).
+					if len(body) != 0 && !xdcGapFillPlaceholder(body) {
 						return bc.historyPruningRequired(policy, freezerTail, frozen, latest)
 					}
 					receipts, err := bc.db.Ancient(rawdb.ChainFreezerReceiptTable, number)
 					if err != nil {
 						return fmt.Errorf("failed to read block receipts %d: %w", number, err)
 					}
-					if len(receipts) != 0 {
+					if len(receipts) != 0 && !xdcGapFillPlaceholder(receipts) {
 						return bc.historyPruningRequired(policy, freezerTail, frozen, latest)
 					}
 				}
@@ -1120,6 +1122,27 @@ func (bc *BlockChain) initializeHistoryPruning(latest uint64) error {
 		// Database needs pruning (freezerTail < target).
 		if latest != 0 {
 			frozen, _ := bc.db.Ancients()
+			// XDC fast-sync (A.85, refs #1933): after sync completes, the ancient
+			// store holds 0x00 placeholder bodies for blocks below the pivot, but
+			// TruncateTail was never called so freezerTail stays at 0. Prove that
+			// every entry from freezerTail to min(frozen, target) is a gap-fill
+			// placeholder; if so, advance the tail and proceed. Real history below
+			// the target still reaches historyPruningRequired. The scan is O(N) but
+			// runs only once: the write-time fix (runSnapHistoryBackfill) sets the
+			// tail at the end of the backfill so subsequent restarts find
+			// freezerTail == target and skip this path entirely.
+			if frozen > 0 {
+				repairTo := min(frozen, target.BlockNumber)
+				if repairTo > freezerTail && xdcIsPlaceholderRange(bc.db, max(freezerTail, 1), repairTo) {
+					log.Warn("xdc: repairing history tail — gap-fill placeholders below target",
+						"tail", freezerTail, "frozen", frozen, "target", target.BlockNumber, "newTail", repairTo)
+					if _, err := bc.db.TruncateTail(rawdb.ChainFreezerBlockDataGroup, repairTo); err != nil {
+						return fmt.Errorf("failed to repair chain history tail: %w", err)
+					}
+					bc.historyPrunePoint.Store(target)
+					return nil
+				}
+			}
 			return bc.historyPruningRequired(policy, freezerTail, frozen, latest)
 		}
 		// Fresh database (latest == 0), will sync from target point.
@@ -1129,6 +1152,31 @@ func (bc *BlockChain) initializeHistoryPruning(latest uint64) error {
 	default:
 		return fmt.Errorf("invalid history mode: %d", policy.Mode)
 	}
+}
+
+// xdcGapFillPlaceholder reports whether b is the single-byte 0x00 placeholder
+// that XDC A.85 fast-sync gap fill (chain_freezer.go freezeRange) writes for
+// body and receipt ancient entries when the block was not downloaded.
+func xdcGapFillPlaceholder(b []byte) bool {
+	return len(b) == 1 && b[0] == 0x00
+}
+
+// xdcIsPlaceholderRange returns true when every body and receipt entry in the
+// ancient store for blocks [from, to) is nil or an XDC A.85 gap-fill placeholder
+// (the single byte 0x00). Any non-placeholder entry means real history exists
+// below the target and the node must run 'geth prune-history' instead.
+func xdcIsPlaceholderRange(db ethdb.Database, from, to uint64) bool {
+	for number := from; number < to; number++ {
+		body, err := db.Ancient(rawdb.ChainFreezerBodiesTable, number)
+		if err != nil || (len(body) != 0 && !xdcGapFillPlaceholder(body)) {
+			return false
+		}
+		receipts, err := db.Ancient(rawdb.ChainFreezerReceiptTable, number)
+		if err != nil || (len(receipts) != 0 && !xdcGapFillPlaceholder(receipts)) {
+			return false
+		}
+	}
+	return true
 }
 
 // historyPruningRequired logs the instructions for pruning the chain history to
