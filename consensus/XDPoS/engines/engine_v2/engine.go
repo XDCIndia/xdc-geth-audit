@@ -484,16 +484,13 @@ func (x *XDPoS_v2) initial(chain consensus.ChainReader, header *types.Header) er
 
 	snap, _ := loadSnapshot(x.db, lastGapHeader.Hash())
 	if snap == nil {
+		// O(1) lookup by canonical number is sufficient. When the switch block
+		// is in the DB (fast/snap sync always downloads all headers) this
+		// returns it immediately. When it returns nil — e.g. the ancient store
+		// was filled with zero-hash placeholders before the pivot was set —
+		// the checkpointHeader == nil branch below defers snapshot init safely
+		// so we never hold x.lock for an O(chain-length) parent walk. #1929
 		checkpointHeader := chain.GetHeaderByNumber(x.config.V2.SwitchBlock.Uint64())
-		// Walk back through parent chain to find the switch block
-		if header != nil && header.Number.Uint64() >= x.config.V2.SwitchBlock.Uint64() {
-			for h := header; h != nil && h.Number.Uint64() >= x.config.V2.SwitchBlock.Uint64(); h = chain.GetHeader(h.ParentHash, h.Number.Uint64()-1) {
-				if h.Number.Uint64() == x.config.V2.SwitchBlock.Uint64() {
-					checkpointHeader = h
-					break
-				}
-			}
-		}
 
 		if checkpointHeader == nil {
 			// Still not found — this is expected during very early sync.
