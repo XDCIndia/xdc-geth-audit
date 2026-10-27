@@ -102,7 +102,7 @@ func TestXDCDevnet551SetupGenesisMatchesCanonical(t *testing.T) {
 		{"EIP-1559", cfg.Eip1559Block, 25000},
 		{"Cancun", cfg.CancunBlock, 25000},
 		{"Prague", cfg.PragueBlock, 50000},
-		{"TIPUpgradeReward", cfg.TIPUpgradeRewardBlock, 50000},
+		{"TIPFixedReward", cfg.TIPFixedRewardBlock, 50000},
 		{"TIPUpgradePenalty", cfg.TIPUpgradePenaltyBlock, 50000},
 		{"Gas2500x", cfg.Gas2500xBlock, 1385100},
 		{"Osaka", cfg.OsakaBlock, -1},
@@ -155,12 +155,12 @@ func TestXDCRegisteredGenesisProfilesUnchanged(t *testing.T) {
 			// pragueBlock 84,333,000 from XDPoSChain v3.0.0-testnet-1 (#1673),
 			// amsterdamBlock 99,999,999,999 far-future placeholder (#1644),
 			// CertiK rule blocks 99,999,999,999 placeholders (#1721-#1723).
-			"6832b8e88092563210034adbb93979b6d9dbe784e978880effb3afc73859dd19",
-			"6832b8e88092563210034adbb93979b6d9dbe784e978880effb3afc73859dd19"},
+			"a362e52da8ffce0c38dc52f5a60c57dbf45a35863b8ee6f8307f40f258382139",
+			"a362e52da8ffce0c38dc52f5a60c57dbf45a35863b8ee6f8307f40f258382139"},
 		{"devnet5551", DefaultXDCDevnetGenesisBlock, params.XDCDevnetChainConfig,
 			"0xb8be003946a9c2688e9f1e255a5567c3d144293ccde2ffb38452a5840081b402",
-			"fff564302f00f0707421fa0214a3abf5444189c319b81aa5dcd365f8def165c2",
-			"752e4ac336b22149cc00be37c91e8eb3b5c413c7fdcb14bdb13f716664d8a34b"},
+			"ebac2834642261bf4d26e57d50ac80a55769162236cef902f5a9b3425eec53d4",
+			"3052308f4a5930905ec6fb20047d8113c215cd47b2da75812827f64ac9d71e70"},
 	} {
 		if got := tc.genesis().ToBlock().Hash(); got != common.HexToHash(tc.hash) {
 			t.Errorf("%s genesis hash = %s, want %s", tc.name, got.Hex(), tc.hash)

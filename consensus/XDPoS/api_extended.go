@@ -228,7 +228,7 @@ func (api *API) masternodesStatus(number *rpc.BlockNumber) MasternodesStatus {
 	st.MasternodesLen, st.PenaltyLen = len(st.Masternodes), len(st.Penalty)
 
 	cfg := api.chain.Config()
-	if cfg == nil || !cfg.IsTIPUpgradeReward(header.Number) {
+	if cfg == nil || !cfg.IsTIPTieredReward(header.Number) {
 		st.Standbynodes, st.StandbynodesLen = standby, len(standby)
 		return st
 	}

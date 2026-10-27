@@ -278,9 +278,43 @@ func CalculateRewardForSignerFixed(
 	return resultSigners, nil
 }
 
+// CalculateRewardForSignerProportional gives each signer
+// chainReward * min(sign, signSlots) / signSlots, rounded down (big.Int floor
+// division). This is the TIPProportionalReward payout (XinFinOrg/XDPoSChain#2869).
+// When signSlots == 0 every signer is kept with a zero reward.
+// The unearned share (due to floor division) is not paid to anyone.
+//
+// Verbatim semantics from canonical
+// eth/hooks/engine_v2_hooks.go CalculateRewardForSignerProportional.
+func CalculateRewardForSignerProportional(
+	chainReward *big.Int,
+	signers map[common.Address]*RewardLog,
+	signSlots uint64,
+) (map[common.Address]*big.Int, error) {
+	resultSigners := make(map[common.Address]*big.Int)
+	for signer, rLog := range signers {
+		calcReward := new(big.Int)
+		if signSlots > 0 {
+			sign := rLog.Sign
+			if sign > signSlots {
+				sign = signSlots
+			}
+			calcReward.Mul(chainReward, new(big.Int).SetUint64(sign))
+			calcReward.Div(calcReward, new(big.Int).SetUint64(signSlots))
+		}
+		rLog.Reward = calcReward
+		resultSigners[signer] = calcReward
+	}
+	log.Info("Signers data (proportional)", "percapitaReward", chainReward, "signSlots", signSlots)
+	for addr, signer := range signers {
+		log.Debug("Signer reward (proportional)", "signer", addr, "sign", signer.Sign, "reward", signer.Reward)
+	}
+	return resultSigners, nil
+}
+
 // GetRewardBalancesRateUpgrade mirrors the canonical v2.8.0 contracts.GetRewardBalancesRate
 // (XDPoSChain contracts/utils.go GetRewardBalancesRate) used on the tiered
-// (TIPUpgradeReward) path.
+// (TIPTieredReward) path.
 //
 // Differences vs the legacy GetRewardBalancesRate above (DO NOT MODIFY that one):
 //   - NO owner-skip: the owner share (90%) is ALWAYS credited, even when the
@@ -341,7 +375,7 @@ func GetRewardBalancesRateUpgrade(chainConfig *params.ChainConfig, foundationWal
 
 	// Canonical v2.8 fork-aware foundation gate: accumulate only when the upgrade
 	// fork is active AND the foundation already has an entry; otherwise assign.
-	if chainConfig != nil && chainConfig.IsTIPUpgradeReward(blockNumber) && balances[foundationWalletAddr] != nil {
+	if chainConfig != nil && chainConfig.IsTIPTieredReward(blockNumber) && balances[foundationWalletAddr] != nil {
 		balances[foundationWalletAddr].Add(balances[foundationWalletAddr], foundationReward)
 	} else {
 		balances[foundationWalletAddr] = foundationReward

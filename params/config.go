@@ -1029,31 +1029,32 @@ var (
 	// SLOAD/BALANCE/EXTCODEHASH (EIP-1884) and rewrite SSTORE (EIP-2200), causing
 	// gas overcharge on early-history blocks vs canonical (~30k/tx at block 17).
 	XDCApothemChainConfig = &ChainConfig{
-		ChainID:                big.NewInt(51),
-		HomesteadBlock:         big.NewInt(1),
-		DAOForkBlock:           nil,
-		DAOForkSupport:         false,
-		EIP150Block:            big.NewInt(2),
-		EIP155Block:            big.NewInt(3),
-		EIP158Block:            big.NewInt(3),
-		ByzantiumBlock:         big.NewInt(4),
-		ConstantinopleBlock:    big.NewInt(61_290_000), // align with Berlin; effective Istanbul activation via TIPXDCXCancellationFee=23779191
-		PetersburgBlock:        big.NewInt(61_290_000),
-		IstanbulBlock:          big.NewInt(61_290_000),
-		MuirGlacierBlock:       nil,
-		BerlinBlock:            big.NewInt(61_290_000),     // XDPoSChain TestnetConstant.berlinBlock — Target 31st March 2024
-		LondonBlock:            big.NewInt(61_290_000),     // XDPoSChain TestnetConstant.londonBlock — Target 31st March 2024
-		Eip1559Block:           big.NewInt(71_550_000),     // XDPoSChain TestnetConstant.eip1559Block — Target 14th Feb 2025
-		CancunBlock:            big.NewInt(71_551_800),     // XDPoSChain TestnetConstant.cancunBlock
-		TIPUpgradeRewardBlock:  big.NewInt(83_600_000),     // XinFinOrg/XDPoSChain#2383 (v2.8.0); activation verified on canonical (round>27,360,000; header@83,577,112 carries 25 validators)
-		TIPUpgradePenaltyBlock: big.NewInt(83_600_000),     // XinFinOrg/XDPoSChain#2383 (v2.8.0)
-		Gas2500xBlock:          big.NewInt(83_600_000),     // XinFinOrg/XDPoSChain#2516 #2695 (v2.9.0-testnet): base fee 625 gwei
-		DynamicGasLimitBlock:   big.NewInt(83_600_000),     // XDPoSChain v2.9.3-testnet genesis/testnet.json dynamicGasLimitBlock
-		PragueBlock:            big.NewInt(84_333_000),     // XDPoSChain v3.0.0-testnet-1 genesis/testnet.json pragueBlock (#2815, moved from 87,633,000)
-		AmsterdamBlock:         big.NewInt(99_999_999_999), // Glamsterdam incl. EIP-7928 BAL: placeholder far-future block, not scheduled (#1644)
-		SigningTxBoundBlock:    big.NewInt(99_999_999_999), // CertiK XDC-04/XDC-09: placeholder far-future block, scheduled with legacy (#1721)
-		ValidatorOrderBlock:    big.NewInt(99_999_999_999), // CertiK XDC-11: placeholder far-future block, scheduled with legacy (#1722)
-		ParoleDedupBlock:       big.NewInt(99_999_999_999), // CertiK XDC-12: placeholder far-future block, scheduled with legacy (#1723)
+		ChainID:                    big.NewInt(51),
+		HomesteadBlock:             big.NewInt(1),
+		DAOForkBlock:               nil,
+		DAOForkSupport:             false,
+		EIP150Block:                big.NewInt(2),
+		EIP155Block:                big.NewInt(3),
+		EIP158Block:                big.NewInt(3),
+		ByzantiumBlock:             big.NewInt(4),
+		ConstantinopleBlock:        big.NewInt(61_290_000), // align with Berlin; effective Istanbul activation via TIPXDCXCancellationFee=23779191
+		PetersburgBlock:            big.NewInt(61_290_000),
+		IstanbulBlock:              big.NewInt(61_290_000),
+		MuirGlacierBlock:           nil,
+		BerlinBlock:                big.NewInt(61_290_000),     // XDPoSChain TestnetConstant.berlinBlock — Target 31st March 2024
+		LondonBlock:                big.NewInt(61_290_000),     // XDPoSChain TestnetConstant.londonBlock — Target 31st March 2024
+		Eip1559Block:               big.NewInt(71_550_000),     // XDPoSChain TestnetConstant.eip1559Block — Target 14th Feb 2025
+		CancunBlock:                big.NewInt(71_551_800),     // XDPoSChain TestnetConstant.cancunBlock
+		TIPFixedRewardBlock:        big.NewInt(83_600_000),     // XinFinOrg/XDPoSChain#2383 (v2.8.0); activation verified on canonical (round>27,360,000; header@83,577,112 carries 25 validators)
+		TIPUpgradePenaltyBlock:     big.NewInt(83_600_000),     // XinFinOrg/XDPoSChain#2383 (v2.8.0)
+		TIPProportionalRewardBlock: big.NewInt(84_733_000),     // XinFinOrg/XDPoSChain#2869 (v3.0.0-testnet-2); apothem activation ~2026-10-30 07:40 UTC
+		Gas2500xBlock:              big.NewInt(83_600_000),     // XinFinOrg/XDPoSChain#2516 #2695 (v2.9.0-testnet): base fee 625 gwei
+		DynamicGasLimitBlock:       big.NewInt(83_600_000),     // XDPoSChain v2.9.3-testnet genesis/testnet.json dynamicGasLimitBlock
+		PragueBlock:                big.NewInt(84_333_000),     // XDPoSChain v3.0.0-testnet-1 genesis/testnet.json pragueBlock (#2815, moved from 87,633,000)
+		AmsterdamBlock:             big.NewInt(99_999_999_999), // Glamsterdam incl. EIP-7928 BAL: placeholder far-future block, not scheduled (#1644)
+		SigningTxBoundBlock:        big.NewInt(99_999_999_999), // CertiK XDC-04/XDC-09: placeholder far-future block, scheduled with legacy (#1721)
+		ValidatorOrderBlock:        big.NewInt(99_999_999_999), // CertiK XDC-11: placeholder far-future block, scheduled with legacy (#1722)
+		ParoleDedupBlock:           big.NewInt(99_999_999_999), // CertiK XDC-12: placeholder far-future block, scheduled with legacy (#1723)
 		XDPoS: &XDPoSConfig{
 			Period:              2,                                                                 // 2 second block time
 			Epoch:               900,                                                               // 900 blocks per epoch (~30 minutes)
@@ -1575,9 +1576,10 @@ var (
 	//   - EIP1559Block = 25000, CancunBlock = 25000 (London fee-market + Cancun
 	//     blob/4788 features at block 25000).
 	//   - PragueBlock = 50000, plus the XDC v2.8.0 per-network fork blocks
-	//     TIPUpgradeRewardBlock / TIPUpgradePenaltyBlock = 50000 (the tiered
-	//     reward + penalty upgrade lands together with the v2.8.0 DevnetV2Configs
-	//     round-50000 tier). Osaka and TIPEpochHalving are disabled (nil) on devnet.
+	//     TIPProportionalRewardBlock / TIPUpgradePenaltyBlock = 50000 (mirrors
+	//     canonical genesis/devnet.json XinFinOrg/XDPoSChain#2869: fixed reward
+	//     is unset, proportional reward activates at 50000 together with
+	//     DevnetV2Configs[50000]). Osaka and TIPEpochHalving are disabled (nil).
 	//
 	// Note: DynamicGasLimitBlock is deliberately unset. The canonical
 	// DynamicGasLimitBlock = 50000 belongs to devnet 551 (XDPoSChain v2.9.3/v3.0.0
@@ -1614,10 +1616,12 @@ var (
 		Eip1559Block:        big.NewInt(25000),
 		CancunBlock:         big.NewInt(25000),
 		PragueBlock:         big.NewInt(50000),
-		// XDC v2.8.0 (#963) per-network fork blocks — devnet activates the tiered
-		// reward + penalty upgrade at block 50000, in step with DevnetV2Configs[50000].
-		TIPUpgradeRewardBlock:  big.NewInt(50000),
-		TIPUpgradePenaltyBlock: big.NewInt(50000),
+		// XDC v2.8.0-v3.0.0 (#963, #2869) per-network fork blocks — devnet mirrors
+		// canonical genesis/devnet.json: fixed reward is unset (nil), proportional
+		// reward activates at block 50000 in step with DevnetV2Configs[50000].
+		TIPFixedRewardBlock:        nil,
+		TIPProportionalRewardBlock: big.NewInt(50000),
+		TIPUpgradePenaltyBlock:     big.NewInt(50000),
 		XDPoS: &XDPoSConfig{
 			Period:              2,                                                                 // 2 second block time
 			Epoch:               900,                                                               // 900 blocks per epoch
@@ -1672,7 +1676,7 @@ var (
 		CancunBlock:                 big.NewInt(25000),
 		PragueBlock:                 big.NewInt(50000),
 		DynamicGasLimitBlock:        big.NewInt(50000),
-		TIPUpgradeRewardBlock:       big.NewInt(50000),
+		TIPFixedRewardBlock:         big.NewInt(50000), // chain 551 is not canonical devnet 5551; proportional reward unset
 		TIPUpgradePenaltyBlock:      big.NewInt(50000),
 		XDPoS: &XDPoSConfig{
 			Period:              2,
@@ -2032,9 +2036,17 @@ type ChainConfig struct {
 	AmsterdamBlock      *big.Int `json:"amsterdamBlock,omitempty"`      // Amsterdam (Glamsterdam, EIP-7773) features switch block (nil = no fork, block-number based for XDC); net2030: 31500
 	// XDC v2.8.0 (#963) per-network fork-block fields. nil = disabled. These
 	// supersede the disabled global sentinels (common.TIPUpgradeReward etc.).
-	TIPUpgradeRewardBlock  *big.Int `json:"tipUpgradeRewardBlock,omitempty"`  // Tiered (masternode/protector/observer) reward fork; XDPoSChain v2.8.0 apothem: 83,600,000 (held disabled)
-	TIPUpgradePenaltyBlock *big.Int `json:"tipUpgradePenaltyBlock,omitempty"` // Penalty-upgrade fork; XDPoSChain v2.8.0 apothem: 83,600,000 (held disabled)
-	Gas2500xBlock          *big.Int `json:"gas2500xBlock,omitempty"`          // XDC gas price tier x2500 (base fee 625 gwei); XDPoSChain v2.9.x apothem: 83,600,000
+	// TIPFixedRewardBlock (formerly TIPUpgradeRewardBlock) switches on the
+	// tiered masternode/protector/observer reward with a fixed per-node payout.
+	// Its payout is wrong: any node that signs at least one sign slot earns the
+	// full reward no matter how few slots it signed. It stays as-is because
+	// Apothem already ran it from 83,600,000; new networks use
+	// TIPProportionalRewardBlock instead. JSON key: tipFixedRewardBlock; the
+	// legacy key tipUpgradeRewardBlock is still accepted on read.
+	TIPFixedRewardBlock        *big.Int `json:"tipFixedRewardBlock,omitempty"`        // Fixed tiered reward fork (XDPoSChain v2.8.0 / TIPUpgradeReward); apothem: 83,600,000
+	TIPUpgradePenaltyBlock     *big.Int `json:"tipUpgradePenaltyBlock,omitempty"`     // Penalty-upgrade fork; XDPoSChain v2.8.0 apothem: 83,600,000 (held disabled)
+	TIPProportionalRewardBlock *big.Int `json:"tipProportionalRewardBlock,omitempty"` // Proportional tiered reward fork; apothem: 84,733,000 (XinFinOrg/XDPoSChain#2869)
+	Gas2500xBlock              *big.Int `json:"gas2500xBlock,omitempty"`              // XDC gas price tier x2500 (base fee 625 gwei); XDPoSChain v2.9.x apothem: 83,600,000
 	// CertiK XDC-12 per-network fork-block field. nil = disabled on all networks.
 	ParoleDedupBlock *big.Int `json:"paroleDedupBlock,omitempty"` // Parole counting deduplicates (signer, signed-block-hash) pairs (CertiK XDC-12)
 	// CertiK XDC-11 per-network fork-block field. nil = disabled on all networks.
@@ -2175,7 +2187,7 @@ func getKnownChainConfigKeys() map[string]struct{} {
 			"byzantiumBlock", "constantinopleBlock", "petersburgBlock", "istanbulBlock",
 			"muirGlacierBlock", "berlinBlock", "londonBlock",
 			"eip1559Block", "cancunBlock", "pragueBlock",
-			"tipUpgradeRewardBlock", "tipUpgradePenaltyBlock", "gas2500xBlock",
+			"tipFixedRewardBlock", "tipUpgradeRewardBlock", "tipProportionalRewardBlock", "tipUpgradePenaltyBlock", "gas2500xBlock",
 			"tipSigningBlock",
 			// XDC canonical fork keys (#1528)
 			"tip2019Block", "tipRandomizeBlock", "tipIncreaseMasternodesBlock",
@@ -2317,6 +2329,63 @@ func (c *XDPoSConfig) UnmarshalJSON(data []byte) error {
 		c.FoudationWalletAddr = *aux.FoundationWalletAddr
 	}
 	return nil
+}
+
+// legacyTIPFixedRewardJSONKey is the key TIPFixedRewardBlock was stored under
+// before it was renamed from TIPUpgradeRewardBlock in XinFinOrg/XDPoSChain#2869.
+// Genesis files and chain configs persisted by older nodes still carry it.
+const legacyTIPFixedRewardJSONKey = "tipUpgradeRewardBlock"
+
+// UnmarshalJSON for ChainConfig handles the rename of tipUpgradeRewardBlock
+// → tipFixedRewardBlock (XinFinOrg/XDPoSChain#2869): if the legacy key is
+// present, map it to TIPFixedRewardBlock. If both keys are present with
+// different values, the decode fails rather than silently picking one.
+func (c *ChainConfig) UnmarshalJSON(data []byte) error {
+	type chainConfigAlias ChainConfig
+	if err := json.Unmarshal(data, (*chainConfigAlias)(c)); err != nil {
+		return err
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	return c.decodeLegacyTIPFixedRewardBlock(raw)
+}
+
+// decodeLegacyTIPFixedRewardBlock maps the legacy tipUpgradeRewardBlock key
+// onto TIPFixedRewardBlock. Both keys carrying different values is rejected.
+func (c *ChainConfig) decodeLegacyTIPFixedRewardBlock(raw map[string]json.RawMessage) error {
+	legacy, ok := raw[legacyTIPFixedRewardJSONKey]
+	if !ok {
+		return nil
+	}
+	var legacyBlock *big.Int
+	if err := json.Unmarshal(legacy, &legacyBlock); err != nil {
+		return fmt.Errorf("invalid chain config field %s: %w", legacyTIPFixedRewardJSONKey, err)
+	}
+	if _, ok := raw["tipFixedRewardBlock"]; ok {
+		// Both keys present: reject if they disagree.
+		if !configNumEqual(c.TIPFixedRewardBlock, legacyBlock) {
+			return fmt.Errorf("invalid chain config: tipFixedRewardBlock %v conflicts with legacy %s %v",
+				c.TIPFixedRewardBlock, legacyTIPFixedRewardJSONKey, legacyBlock)
+		}
+		return nil
+	}
+	// Only the legacy key: adopt its value.
+	c.TIPFixedRewardBlock = legacyBlock
+	return nil
+}
+
+// configNumEqual reports whether two *big.Int values are equal, treating two
+// nils as equal and a nil/non-nil pair as not equal.
+func configNumEqual(a, b *big.Int) bool {
+	if a == nil && b == nil {
+		return true
+	}
+	if a == nil || b == nil {
+		return false
+	}
+	return a.Cmp(b) == 0
 }
 
 // V2 holds XDPoS 2.0 configuration
@@ -3313,11 +3382,35 @@ func (c *ChainConfig) IsTIPEpochHalving(num *big.Int) bool {
 	return isBlockForked(c.TIPEpochHalvingBlock, num)
 }
 
-// IsTIPUpgradeReward checks if block number is past TIPUpgradeReward fork.
-// XDC v2.8.0 (#963): gated per-network on ChainConfig.TIPUpgradeRewardBlock
-// (nil = disabled), superseding the disabled global common.TIPUpgradeReward.
+// IsTIPFixedReward returns whether the TIPFixedReward fork (formerly
+// TIPUpgradeReward) is active at num. The fixed reward pays every signer the
+// full per-node reward no matter how many sign slots it signed; use
+// IsTIPProportionalReward for the corrected payout.
+func (c *ChainConfig) IsTIPFixedReward(num *big.Int) bool {
+	return isBlockForked(c.TIPFixedRewardBlock, num)
+}
+
+// IsTIPProportionalReward returns whether the TIPProportionalReward fork
+// (XinFinOrg/XDPoSChain#2869) is active at num. When active each signer
+// earns chainReward * min(sign, signSlots) / signSlots; the unearned share
+// is not minted. nil = disabled.
+func (c *ChainConfig) IsTIPProportionalReward(num *big.Int) bool {
+	return isBlockForked(c.TIPProportionalRewardBlock, num)
+}
+
+// IsTIPTieredReward reports whether the per-role tiered reward model
+// (masternode / protector / observer) is active at num. Both the fixed and
+// the proportional reward forks enable it; either one is sufficient.
+func (c *ChainConfig) IsTIPTieredReward(num *big.Int) bool {
+	return c.IsTIPFixedReward(num) || c.IsTIPProportionalReward(num)
+}
+
+// IsTIPUpgradeReward is a backward-compatible alias for IsTIPTieredReward.
+// Callers that predated the rename of TIPUpgradeRewardBlock→TIPFixedRewardBlock
+// are updated to use IsTIPTieredReward; this alias keeps any remaining
+// references building until they are ported.
 func (c *ChainConfig) IsTIPUpgradeReward(num *big.Int) bool {
-	return isBlockForked(c.TIPUpgradeRewardBlock, num)
+	return c.IsTIPTieredReward(num)
 }
 
 // IsGas2500x checks if block number is past the Gas2500x gas price tier fork

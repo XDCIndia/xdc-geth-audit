@@ -416,7 +416,7 @@ func TestNetV12GenesisAuthoritativeByzantiumOnly(t *testing.T) {
 		{"Eip1559Block", cfg.Eip1559Block},
 		{"CancunBlock", cfg.CancunBlock},
 		{"PragueBlock", cfg.PragueBlock},
-		{"TIPUpgradeRewardBlock", cfg.TIPUpgradeRewardBlock},
+		{"TIPFixedRewardBlock", cfg.TIPFixedRewardBlock},
 		{"TIPUpgradePenaltyBlock", cfg.TIPUpgradePenaltyBlock},
 	} {
 		if tc.block != nil {
@@ -616,7 +616,7 @@ func TestRegisteredNetsForkResolutionUnchanged(t *testing.T) {
 			check("Eip1559Block", cfg.Eip1559Block, tc.defaults.Eip1559Block)
 			check("CancunBlock", cfg.CancunBlock, tc.defaults.CancunBlock)
 			check("PragueBlock", cfg.PragueBlock, tc.defaults.PragueBlock)
-			check("TIPUpgradeRewardBlock", cfg.TIPUpgradeRewardBlock, tc.defaults.TIPUpgradeRewardBlock)
+			check("TIPFixedRewardBlock", cfg.TIPFixedRewardBlock, tc.defaults.TIPFixedRewardBlock)
 			check("TIPUpgradePenaltyBlock", cfg.TIPUpgradePenaltyBlock, tc.defaults.TIPUpgradePenaltyBlock)
 			check("DynamicGasLimitBlock", cfg.DynamicGasLimitBlock, tc.defaults.DynamicGasLimitBlock)
 

@@ -789,7 +789,7 @@ func LoadChainConfig(db ethdb.Database, genesis *Genesis) (cfg *params.ChainConf
 		// XDC: patch missing fork blocks here too, as SetupGenesisBlock and the
 		// stored-config branch do. On a fresh datadir this config feeds the
 		// consensus hooks and engine (eth/backend.go); unpatched, Apothem paid
-		// flat rewards past TIPUpgradeRewardBlock until the first restart.
+		// flat rewards past TIPFixedRewardBlock until the first restart.
 		if genesis.Config != nil && genesis.Config.ChainID != nil {
 			switch genesis.Config.ChainID.Uint64() {
 			case 50:
@@ -869,7 +869,8 @@ func forkLadder(cfg, defaults *params.ChainConfig) []forkLadderEntry {
 		{"eip1559Block", &cfg.Eip1559Block, defaults.Eip1559Block, true},
 		{"cancunBlock", &cfg.CancunBlock, defaults.CancunBlock, true},
 		{"pragueBlock", &cfg.PragueBlock, defaults.PragueBlock, true},
-		{"tipUpgradeRewardBlock", &cfg.TIPUpgradeRewardBlock, defaults.TIPUpgradeRewardBlock, true},
+		{"tipFixedRewardBlock", &cfg.TIPFixedRewardBlock, defaults.TIPFixedRewardBlock, true},
+		{"tipProportionalRewardBlock", &cfg.TIPProportionalRewardBlock, defaults.TIPProportionalRewardBlock, true},
 		{"tipUpgradePenaltyBlock", &cfg.TIPUpgradePenaltyBlock, defaults.TIPUpgradePenaltyBlock, true},
 		{"gas2500xBlock", &cfg.Gas2500xBlock, defaults.Gas2500xBlock, true},
 		{"osakaBlock", &cfg.OsakaBlock, defaults.OsakaBlock, true},
@@ -955,7 +956,8 @@ func patchMissingForkBlocks(cfg, defaults *params.ChainConfig, network string, m
 		patch(&cfg.PragueBlock, defaults.PragueBlock, "PragueBlock")
 		patch(&cfg.OsakaBlock, defaults.OsakaBlock, "OsakaBlock")
 		patch(&cfg.AmsterdamBlock, defaults.AmsterdamBlock, "AmsterdamBlock")
-		patch(&cfg.TIPUpgradeRewardBlock, defaults.TIPUpgradeRewardBlock, "TIPUpgradeRewardBlock")
+		patch(&cfg.TIPFixedRewardBlock, defaults.TIPFixedRewardBlock, "TIPFixedRewardBlock")
+		patch(&cfg.TIPProportionalRewardBlock, defaults.TIPProportionalRewardBlock, "TIPProportionalRewardBlock")
 		patch(&cfg.TIPUpgradePenaltyBlock, defaults.TIPUpgradePenaltyBlock, "TIPUpgradePenaltyBlock")
 		patch(&cfg.Gas2500xBlock, defaults.Gas2500xBlock, "Gas2500xBlock")
 		patch(&cfg.DynamicGasLimitBlock, defaults.DynamicGasLimitBlock, "DynamicGasLimitBlock")
