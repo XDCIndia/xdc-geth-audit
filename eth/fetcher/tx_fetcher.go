@@ -219,6 +219,10 @@ type TxFetcher struct {
 	clock    mclock.Clock     // Monotonic clock or simulated clock for tests
 	realTime func() time.Time // Real system time or simulated time for tests
 	rand     *mrand.Rand      // Randomizer to use in tests instead of map range loops (soft-random)
+
+	// XDC: skip the refused-batch sleep on XDPoS chains (#1665). Enqueue runs
+	// on the peer's message loop, which also carries NewBlock and BFT votes.
+	noThrottle bool
 }
 
 // NewTxFetcher creates a transaction fetcher to retrieve transaction
@@ -260,6 +264,7 @@ func NewTxFetcherForTests(
 		clock:          clock,
 		realTime:       realTime,
 		rand:           rand,
+		noThrottle:     chain != nil && chain.Config().XDPoS != nil,
 	}
 }
 
@@ -458,7 +463,12 @@ func (f *TxFetcher) Enqueue(peer string, version uint, txs []*types.Transaction,
 		// If more than 25% of the batch was refused, sleep a bit to throttle
 		// the peer. Capacity refusals count towards this (the backpressure is
 		// intended) but are reported separately.
-		if refused := otherreject + nocapacity; refused > int64((len(hashes)+3)/4) {
+		//
+		// XDC: not on XDPoS chains. On XDC this message loop also carries
+		// NewBlock and BFT votes; under load most gossiped txs are already
+		// mined, and the sleeps delayed blocks by tens of seconds. Canonical
+		// XDPoSChain hands txs to the pool without throttling.
+		if refused := otherreject + nocapacity; !f.noThrottle && refused > int64((len(hashes)+3)/4) {
 			if nocapacity > otherreject {
 				log.Debug("Peer delivering transactions faster than there is room for", "refused", nocapacity)
 			} else {

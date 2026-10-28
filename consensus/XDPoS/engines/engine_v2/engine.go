@@ -484,16 +484,13 @@ func (x *XDPoS_v2) initial(chain consensus.ChainReader, header *types.Header) er
 
 	snap, _ := loadSnapshot(x.db, lastGapHeader.Hash())
 	if snap == nil {
+		// O(1) lookup by canonical number is sufficient. When the switch block
+		// is in the DB (fast/snap sync always downloads all headers) this
+		// returns it immediately. When it returns nil — e.g. the ancient store
+		// was filled with zero-hash placeholders before the pivot was set —
+		// the checkpointHeader == nil branch below defers snapshot init safely
+		// so we never hold x.lock for an O(chain-length) parent walk. #1929
 		checkpointHeader := chain.GetHeaderByNumber(x.config.V2.SwitchBlock.Uint64())
-		// Walk back through parent chain to find the switch block
-		if header != nil && header.Number.Uint64() >= x.config.V2.SwitchBlock.Uint64() {
-			for h := header; h != nil && h.Number.Uint64() >= x.config.V2.SwitchBlock.Uint64(); h = chain.GetHeader(h.ParentHash, h.Number.Uint64()-1) {
-				if h.Number.Uint64() == x.config.V2.SwitchBlock.Uint64() {
-					checkpointHeader = h
-					break
-				}
-			}
-		}
 
 		if checkpointHeader == nil {
 			// Still not found — this is expected during very early sync.
@@ -1117,6 +1114,23 @@ func (x *XDPoS_v2) getSnapshot(chain consensus.ChainReader, number uint64, forSi
 			log.Warn("[getSnapshot] evicting cached snapshot with V1 candidate count (13) at V2 checkpoint", "checkpoint", checkpointNumber, "gap", gapNumber, "hash", gapHeader.Hash(), "version", snap.Version, "candidates", len(snap.NextEpochCandidates))
 			x.snapshots.Remove(gapHeader.Hash())
 		} else {
+			// Issue #1931: after snap sync the gap block may be below the pivot, meaning
+			// its EVM state was never downloaded and UpdateMasternodesFromHeader never ran.
+			// A cached snapshot built from the epoch-switch header's Validators field
+			// contains only the 108 elected masternodes, not the full ~368-entry contract
+			// candidate pool. calcMasternodes (!forSigning) uses NextEpochCandidates as the
+			// input to HookPenalty; the intersection of penalised addresses with the
+			// truncated set is empty, so localPenalties=[] diverges from the 5-entry
+			// canonical Penalties field → ErrPenaltiesNotLegit → bogus SetHead.
+			// Return ErrV2SnapshotMissing so RecheckDeferredSwitches keeps the entry
+			// deferred instead of labelling the canonical block forged.
+			// forSigning callers (proposer/leader selection) use Validators, not the full
+			// pool, and correctly see the elected set — do not block them.
+			if !forSigning {
+				if pivot := rawdb.ReadLastPivotNumber(x.db); pivot != nil && gapNumber < *pivot {
+					return nil, fmt.Errorf("%w at gap %d (checkpoint %d, pivot %d): cached snapshot below snap pivot — candidates from epoch-switch header only, not contract pool", utils.ErrV2SnapshotMissing, gapNumber, checkpointNumber, *pivot)
+				}
+			}
 			return snap, nil
 		}
 		// Fall through to rebuild after eviction
@@ -1137,6 +1151,12 @@ func (x *XDPoS_v2) getSnapshot(chain consensus.ChainReader, number uint64, forSi
 			// Version 4+ snapshots were created by our code (newSnapshot sets Version=4).
 			// They are trusted — no V1-format heuristic needed regardless of candidate count.
 			// This handles devnet / chains with V2 from genesis where 3 masternodes is valid.
+			// Issue #1931: same pivot guard as the cache path above.
+			if !forSigning {
+				if pivot := rawdb.ReadLastPivotNumber(x.db); pivot != nil && gapNumber < *pivot {
+					return nil, fmt.Errorf("%w at gap %d (checkpoint %d, pivot %d): db snapshot (v%d) below snap pivot — candidates from epoch-switch header only, not contract pool", utils.ErrV2SnapshotMissing, gapNumber, checkpointNumber, *pivot, snap.Version)
+				}
+			}
 			x.snapshots.Add(snap.Hash, snap)
 			return snap, nil
 		} else if checkpointNumber > x.config.V2.SwitchBlock.Uint64() && len(snap.NextEpochCandidates) > 0 && len(snap.NextEpochCandidates) <= 20 {
@@ -1268,6 +1288,21 @@ func (x *XDPoS_v2) getSnapshot(chain consensus.ChainReader, number uint64, forSi
 			// !isGapInput, non-bulk-sync caller (mining, public API,
 			// post-import). DB has ancestors at steady-state; walk back
 			// is safe.
+			//
+			// #1925 (stale-gap): after fast/snap sync the gap block may be
+			// below the snap pivot, meaning its state was never downloaded and
+			// UpdateMasternodesFromHeader never ran there. A backward seed from
+			// the previous epoch-switch header gives only the ACTIVE set (e.g.
+			// 36 masternodes) not the full candidate pool from the contract
+			// (e.g. 108 on mainnet). HookPenalty over this truncated pool
+			// produces a wrong penalty list → ErrPenaltiesNotLegit under
+			// fullVerify. Signal via ErrV2SnapshotMissing so sync11ShouldRelax
+			// in verifyHeader can detect gap<pivot and fall through to the
+			// header.Validators/Penalties trust path; sync11SeedGap will then
+			// seed the correct snapshot from the verified epoch-switch header.
+			if pivot := rawdb.ReadLastPivotNumber(x.db); pivot != nil && gapNumber < *pivot {
+				return nil, fmt.Errorf("%w at gap %d (checkpoint %d): gap below snap pivot %d, state unavailable — no safe backward seed", utils.ErrV2SnapshotMissing, gapNumber, checkpointNumber, *pivot)
+			}
 			epochSwitchHeader = x.findEpochSwitchAtOrBefore(chain, number, nil)
 			seedDir = "backward"
 		default:
@@ -3357,11 +3392,16 @@ func (x *XDPoS_v2) GetMasternodesByHash(chain consensus.ChainReader, hash common
 // the same header.Penalties bytes at the time the epoch info was computed (see
 // getEpochSwitchInfoInner).  This is identical data, not an approximation, so
 // full-sync consensus correctness is unaffected.
-func (x *XDPoS_v2) GetPreviousPenaltyByHash(chain consensus.ChainReader, hash common.Hash, limit int) []common.Address {
+//
+// If A.68.2 ancestor-header priming has not yet delivered the needed epoch-
+// switch header to the local DB, getPreviousEpochSwitchInfoByHash returns
+// ErrPenaltyAncestorMissing; this is propagated here so HookPenalty can
+// surface the retryable condition to calcMasternodes → verifyHeader.
+func (x *XDPoS_v2) GetPreviousPenaltyByHash(chain consensus.ChainReader, hash common.Hash, limit int) ([]common.Address, error) {
 	epochSwitchInfo, err := x.getPreviousEpochSwitchInfoByHash(chain, hash, limit)
 	if err != nil {
 		log.Error("[GetPreviousPenaltyByHash] getPreviousEpochSwitchInfoByHash error", "err", err)
-		return []common.Address{}
+		return nil, err
 	}
 	header := chain.GetHeaderByHash(epochSwitchInfo.EpochSwitchBlockInfo.Hash)
 	if header == nil {
@@ -3373,9 +3413,9 @@ func (x *XDPoS_v2) GetPreviousPenaltyByHash(chain consensus.ChainReader, hash co
 			"epochSwitchHash", epochSwitchInfo.EpochSwitchBlockInfo.Hash.Hex(),
 			"epochSwitchNumber", epochSwitchInfo.EpochSwitchBlockInfo.Number,
 			"cachedPenalties", len(epochSwitchInfo.Penalties))
-		return epochSwitchInfo.Penalties
+		return epochSwitchInfo.Penalties, nil
 	}
-	return contracts.ExtractAddressFromBytes(header.Penalties)
+	return contracts.ExtractAddressFromBytes(header.Penalties), nil
 }
 
 // extractAddressesFromBytes converts a packed byte array of 20-byte addresses

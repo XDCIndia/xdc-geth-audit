@@ -572,7 +572,9 @@ func (bc *BlockChain) HistoryPruningCutoff() (uint64, common.Hash) {
 // XDC/v2.7.0-stable (162.55.17.224) attached and serving headers cleanly
 // for 32s before this failure.
 func (bc *BlockChain) GetTrustedCheckpointAnchor() (uint64, common.Hash, bool) {
-	pt := bc.historyPrunePoint.Load()
+	// Refs #1927: read from fastSyncAnchor, not historyPrunePoint, so that the
+	// trusted-anchor gate and the history-pruning cutoff are independent.
+	pt := bc.fastSyncAnchor.Load()
 	if pt == nil {
 		return 0, common.Hash{}, false
 	}
@@ -592,15 +594,17 @@ func (bc *BlockChain) GetTrustedCheckpointAnchor() (uint64, common.Hash, bool) {
 
 // SetFastSyncTrustedAnchor installs an operator-pinned fast-sync pivot as
 // the trusted-checkpoint anchor. Called from eth/backend.go init when
-// --fastsyncpivot{number,hash} are configured. Refs #857 A.60.5.
+// --fastsyncpivot{number,hash} are configured, or dynamically from the
+// downloader when it selects a pivot. Refs #857 A.60.5.
 //
-// This piggy-backs on the existing historyPrunePoint plumbing so the
-// XDPoS V2 engine's `inCheckpointCatchup` check (utils.go:141) finds an
-// active anchor without a separate atomic pointer. The pivot stays
-// installed for the life of the process; `GetTrustedCheckpointAnchor`
-// computes active=false once head climbs past anchor + 2*Epoch.
+// The anchor is stored in fastSyncAnchor (not historyPrunePoint) so that
+// HistoryPruningCutoff() is unaffected: the RPC layer must NOT return
+// "pruned history unavailable" for pre-pivot blocks merely because a
+// fast-sync pivot is in use.  The SYNC-06 history backfill writes those
+// blocks to the database after sync completes, and they should be served
+// normally once written.  Refs #1927.
 func (bc *BlockChain) SetFastSyncTrustedAnchor(number uint64, hash common.Hash) {
-	bc.historyPrunePoint.Store(&history.PrunePoint{
+	bc.fastSyncAnchor.Store(&history.PrunePoint{
 		BlockNumber: number,
 		BlockHash:   hash,
 	})

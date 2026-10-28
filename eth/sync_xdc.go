@@ -162,6 +162,11 @@ const (
 	xdcPeerEmptyStrikeMax   = 3
 	xdcPeerEmptyCooldownTTL = 2 * time.Minute
 
+	// emptyClusterThreshold is the number of consecutive all-empty rounds for
+	// the same fromBlock before the stuck-cluster rotation kicks in (#1665 Bug B).
+	// At xdcBulkReqTimeout (4s) per round, 2 rounds = 8s before exclusion starts.
+	emptyClusterThreshold = 2
+
 	// maxConsensusFailedBlocks caps the consensusFailedBlocks map to prevent
 	// unbounded growth in the pathological case where many distinct bad blocks
 	// arrive. 256 entries is far more than needed in practice. Fixes #1670.
@@ -307,6 +312,20 @@ type xdcSyncer struct {
 	// Note: for XDC, handshake TD is a ranking metric, not a block height; an
 	// XDPOS2 peer stuck at genesis can rank first in candidates.
 	lastEmptyRoundIDs map[string]bool
+
+	// #1665 Bug B: per-fromBlock stuck-cluster rotation. When the top-K peers
+	// keep returning empty headers for the same fromBlock across consecutive
+	// all-empty rounds, lower-ranked healthy peers never get a slot. We
+	// accumulate the IDs of peers that returned empty for the current fromBlock
+	// and, after emptyClusterThreshold all-empty rounds, exclude them from the
+	// candidate window so fresh (lower-ranked) peers are tried instead. State
+	// resets whenever fromBlock advances (any import) or a winner is found.
+	// Only accessed from the single-flight sync goroutine — no mutex required.
+	// Peer-disconnect safe: stale IDs are stored as strings; they simply do not
+	// match any live peer when re-evaluated.
+	emptyClusterFrom   uint64
+	emptyClusterPeers  map[string]bool
+	emptyClusterRounds int
 
 	// consensusFailedBlocksMu protects consensusFailedBlocks.
 	consensusFailedBlocksMu sync.Mutex
@@ -474,6 +493,13 @@ type xdcSyncer struct {
 	// runs at most once per snap-sync invocation.
 	snapHistoryBackfillDone atomic.Bool
 
+	// SYNC-06 progress counters for eth_syncing (#1927).
+	// historyBackfillWritten is the number of blocks backfilled so far.
+	// historyBackfillRemaining is the estimated number still to go (updated
+	// each batch; zero when backfill has not started or has completed).
+	historyBackfillWritten   atomic.Uint64
+	historyBackfillRemaining atomic.Uint64
+
 	// SYNC-12 (#1869): per-peer body request statistics for hedge peer ranking.
 	// bodyStatsMu guards bodyLatency and bodyTimeouts.
 	// bodyLatency is an EWMA of successful response times (α=0.25).
@@ -607,6 +633,14 @@ func (s *xdcSyncer) stop() {
 // catching up. Returns (0, 0) if no peer head data is available. Fixes #1841.
 func (s *xdcSyncer) SyncProgress() (highestPeerBlock, startBlock uint64) {
 	return max(s.networkTipSeen.Load(), s.highestPeerBlockSeen.Load()), s.bulkSyncStartBlock.Load()
+}
+
+// HistoryBackfillProgress returns the SYNC-06 history backfill progress for
+// eth_syncing (#1927): (finished, remaining) block counts.
+// remaining==0 means the backfill has not started, has completed, or is not
+// applicable (KeepAll, no pivot).
+func (s *xdcSyncer) HistoryBackfillProgress() (finished, remaining uint64) {
+	return s.historyBackfillWritten.Load(), s.historyBackfillRemaining.Load()
 }
 
 func (s *xdcSyncer) loop() {
@@ -2430,6 +2464,21 @@ func (s *xdcSyncer) snapEventLoop() {
 								// re-enter via maybeEngageFast naturally.
 							}()
 						}
+						// SYNC-06 on fast-sync SyncFailed: when the downloader wrote the
+						// pivot to rawdb (state download completed) but the beacon header
+						// backfill failed (e.g. A.97.4 epoch-switch gap), kick the history
+						// backfill so old blocks are available to callers regardless of
+						// whether a subsequent BeaconSync retry eventually succeeds.
+						// The one-shot CAS guard in runSnapHistoryBackfill ensures at most
+						// one backfill runs per process lifetime even across multiple
+						// SyncFailed retries or a later SyncCompleted. Refs #1927.
+						if p := rawdb.ReadLastPivotNumber(s.handler.database); p != nil && *p > 1 {
+							if cur := s.handler.chain.CurrentBlock(); cur != nil && cur.Number.Uint64() >= *p {
+								log.Info("xdcSyncer: fast-sync SyncFailed with pivot on disk — kicking SYNC-06 history backfill",
+									"pivot", *p, "head", cur.Number.Uint64())
+								s.spawn(s.runSnapHistoryBackfill)
+							}
+						}
 					} else {
 						log.Warn("xdcSyncer: fast-sync failed; falling back to FULL_SYNC",
 							"err", ev.Err)
@@ -2487,6 +2536,30 @@ func (s *xdcSyncer) fullSyncOnce() {
 	candidates := s.dropAbandonedPeers(s.rankedPeers(), fromBlock)
 	if len(candidates) == 0 {
 		return
+	}
+
+	// #1665 Bug B: stuck-cluster rotation. After emptyClusterThreshold consecutive
+	// all-empty rounds for fromBlock, exclude peers already confirmed empty so
+	// lower-ranked healthy peers get a slot. Only activates when the filtered set
+	// is non-empty; falls back to the full set when ALL candidates are stuck.
+	if s.emptyClusterFrom == fromBlock && s.emptyClusterRounds >= emptyClusterThreshold && len(s.emptyClusterPeers) > 0 {
+		filtered := candidates[:0:0]
+		for _, p := range candidates {
+			if !s.emptyClusterPeers[p.ID()] {
+				filtered = append(filtered, p)
+			}
+		}
+		if len(filtered) > 0 {
+			candidates = filtered
+			log.Debug("xdcSyncer: #1665 stuck-cluster rotation — excluding confirmed-empty peers",
+				"from", fromBlock, "rounds", s.emptyClusterRounds,
+				"excluded", len(s.emptyClusterPeers), "remaining", len(candidates))
+		}
+	} else if s.emptyClusterFrom != fromBlock {
+		// fromBlock advanced (progress made): reset cluster state.
+		s.emptyClusterFrom = 0
+		s.emptyClusterPeers = nil
+		s.emptyClusterRounds = 0
 	}
 
 	// Record the starting block once per catch-up cycle (Fixes #1841).
@@ -2582,10 +2655,28 @@ func (s *xdcSyncer) fullSyncOnce() {
 			}
 			return
 		}
+		// #1665 Bug B: accumulate raced peers into the stuck-cluster set.
+		// After emptyClusterThreshold rounds, the filtering above will exclude
+		// them so lower-ranked healthy peers get a slot in the next round.
+		if s.emptyClusterFrom == fromBlock {
+			s.emptyClusterRounds++
+		} else {
+			s.emptyClusterFrom = fromBlock
+			s.emptyClusterRounds = 1
+			s.emptyClusterPeers = make(map[string]bool, len(racedIDs))
+		}
+		for id := range racedIDs {
+			s.emptyClusterPeers[id] = true
+		}
 		log.Debug("xdcSyncer: no peer served headers this round",
-			"from", fromBlock, "tried", tried, "atTipPeers", atTipCount)
+			"from", fromBlock, "tried", tried, "atTipPeers", atTipCount,
+			"emptyClusterRounds", s.emptyClusterRounds, "emptyClusterPeers", len(s.emptyClusterPeers))
 		return
 	}
+	// Winner found: reset stuck-cluster state.
+	s.emptyClusterFrom = 0
+	s.emptyClusterPeers = nil
+	s.emptyClusterRounds = 0
 	peer := res.peer
 	r := res.rng
 	headers := res.headers
@@ -2786,6 +2877,25 @@ func (s *xdcSyncer) fullSyncOnce() {
 		"from", fromBlock, "count", n,
 		"newHead", s.handler.chain.CurrentBlock().Number.Uint64(),
 		"peerTD", r.LatestBlock) // XDPOS2 wire: TD, not block number
+
+	// #1665 Bug A: FULL_SYNC at-tip by head freshness. After a successful import,
+	// if the new head's timestamp is within atTipFreshnessWindow of now, the node
+	// is at or near the network tip. Clear XdcBulkSyncMode immediately so the
+	// BFT validator can seal the next round. Without this, BulkSyncMode is only
+	// cleared by the heartbeat's tipCatchAtPeerTicks path (3 × 30 s = 90 s) —
+	// longer than the 60 s BFT timeout — so a FULL_SYNC validator that catches
+	// up to tip just before its designated round always misses it. The freshness
+	// check uses only local state (head block's own timestamp, not a peer signal)
+	// and cannot be gamed by a peer returning a short batch.
+	if cur := s.handler.chain.CurrentBlock(); cur != nil && core.XdcBulkSyncMode.Load() {
+		freshnessSecs := atTipFreshnessWindow(s.handler.chain.Config())
+		age := time.Now().Unix() - int64(cur.Time)
+		if age >= 0 && age <= freshnessSecs {
+			core.XdcBulkSyncMode.Store(false)
+			log.Info("xdcSyncer: head fresh after import — flipped XdcBulkSyncMode=false",
+				"head", cur.Number.Uint64(), "ageS", age)
+		}
+	}
 
 	// Advance engine's highestQuorumCert to the just-imported tip so the miner
 	// worker's FindParentBlockToAssign returns the actual chain head and Prepare
@@ -5781,7 +5891,7 @@ func (s *xdcSyncer) backfillBodyReceiptChunkModern(peer *eth.Peer, headers []*ty
 			rawdb.WriteBody(batch, hash, num, body)
 			needsBodySet[hash] = true
 		}
-		rawdb.WriteTxLookupEntriesByBlock(batch, types.NewBlockWithHeader(h).WithBody(*body))
+		writeBackfillTxLookups(db, num, body)
 
 		// Queue receipt if missing or body was just re-written.
 		if !rawdb.HasReceipts(db, hash, num) || needsBodySet[hash] {
@@ -6307,6 +6417,29 @@ func localCompleteBatch(db ethdb.Database, topHash common.Hash, top uint64, want
 	return out
 }
 
+// backfillTxLookupMu orders the read-compare-write in writeBackfillTxLookups
+// across the concurrent per-peer chunk writers of one backfill range.
+var backfillTxLookupMu sync.Mutex
+
+// writeBackfillTxLookups indexes body's transactions at block num, but keeps an
+// existing entry that points at a higher block. XDC special transactions can be
+// included in several blocks under one hash, and a full node that imports
+// forward resolves such a hash to its latest inclusion; the backfill walks
+// backwards, so an unconditional write would resolve it to an older block.
+// Entries go straight to db, not to a caller's batch, so a concurrent chunk
+// sees them whichever of the two runs first.
+func writeBackfillTxLookups(db ethdb.Database, num uint64, body *types.Body) {
+	backfillTxLookupMu.Lock()
+	defer backfillTxLookupMu.Unlock()
+	hashes := make([]common.Hash, 0, len(body.Transactions))
+	for _, tx := range body.Transactions {
+		if prev := rawdb.ReadTxLookupEntry(db, tx.Hash()); prev == nil || *prev < num {
+			hashes = append(hashes, tx.Hash())
+		}
+	}
+	rawdb.WriteTxLookupEntries(db, num, hashes)
+}
+
 func (s *xdcSyncer) runSnapHistoryBackfill() {
 	// One-shot guard: exactly one backfill goroutine per syncer lifetime.
 	if !s.snapHistoryBackfillDone.CompareAndSwap(false, true) {
@@ -6364,9 +6497,29 @@ func (s *xdcSyncer) runSnapHistoryBackfill() {
 		return
 	}
 
+	// Respect --history.chain: do not backfill below the configured cutoff.
+	// With the default KeepAll policy the cutoff is 0 (go to genesis).
+	cutoffNum, _ := s.handler.chain.HistoryPruningCutoff()
+	loBound := uint64(1)
+	if cutoffNum > 1 {
+		loBound = cutoffNum
+		log.Info("xdcSyncer: SYNC-06 history backfill respecting --history.chain cutoff",
+			"cutoff", cutoffNum)
+	}
+	// If the resume point is already below the cutoff, nothing to do.
+	if nextTop < loBound {
+		log.Info("xdcSyncer: SYNC-06 history backfill already complete (at cutoff)", "pivot", pivotNum, "cutoff", loBound)
+		s.historyBackfillRemaining.Store(0)
+		return
+	}
+
 	log.Info("xdcSyncer: SYNC-06 snap history backfill starting",
-		"pivot", pivotNum, "backfill_hi", nextTop, "backfill_lo", 1,
+		"pivot", pivotNum, "backfill_hi", nextTop, "backfill_lo", loBound,
 		"v2GapHeader", lastGapNum)
+
+	// Seed progress counters for eth_syncing (#1927).
+	s.historyBackfillWritten.Store(0)
+	s.historyBackfillRemaining.Store(nextTop - loBound + 1)
 
 	written := uint64(0)
 	skipped := uint64(0)
@@ -6381,12 +6534,19 @@ func (s *xdcSyncer) runSnapHistoryBackfill() {
 	hp := newHistoryPeers()
 	lastLog := time.Now()
 
-	for nextTop >= 1 {
+	for nextTop >= loBound {
 		select {
 		case <-s.quitCh:
 			log.Info("xdcSyncer: SYNC-06 history backfill aborted", "written", written, "skipped", skipped)
 			return
 		default:
+		}
+		// Update eth_syncing progress counters (#1927).
+		if written > 0 {
+			s.historyBackfillWritten.Store(written + skipped)
+			if nextTop >= loBound {
+				s.historyBackfillRemaining.Store(nextTop - loBound + 1)
+			}
 		}
 		// Never go silent: one line per 30 s whether or not blocks are moving.
 		if time.Since(lastLog) >= 30*time.Second {
@@ -6398,8 +6558,8 @@ func (s *xdcSyncer) runSnapHistoryBackfill() {
 
 		// Batch: [lo, nextTop], ascending, at most snapHistoryBatchSize blocks.
 		lo := nextTop + 1 - uint64(snapHistoryBatchSize)
-		if nextTop < uint64(snapHistoryBatchSize) {
-			lo = 1
+		if nextTop < uint64(snapHistoryBatchSize) || lo < loBound {
+			lo = loBound
 		}
 		want := int(nextTop-lo) + 1
 
@@ -6409,7 +6569,7 @@ func (s *xdcSyncer) runSnapHistoryBackfill() {
 		if local := localCompleteBatch(db, topHash, nextTop, want); local != nil {
 			skipped += uint64(len(local))
 			topHash = local[0].ParentHash
-			if lo <= 1 {
+			if lo <= loBound {
 				break
 			}
 			nextTop = lo - 1
@@ -6498,7 +6658,7 @@ func (s *xdcSyncer) runSnapHistoryBackfill() {
 		if len(toWrite) == 0 {
 			// All blocks in this batch already complete; advance to next batch.
 			topHash = headers[0].ParentHash
-			if lo <= 1 {
+			if lo <= loBound {
 				break
 			}
 			nextTop = lo - 1
@@ -6712,9 +6872,20 @@ func (s *xdcSyncer) runSnapHistoryBackfill() {
 				if needsBody {
 					rawdb.WriteBody(batch, hash, num, body)
 				}
+				// Write the header and canonical-hash mapping to LDB so that
+				// ReadCanonicalHash / ReadHeader fall through from the freezer
+				// zero-hash placeholder (written by A.85 for pre-pivot fast-sync
+				// blocks) to the correct entry here.  Without these, the startup
+				// tx-indexer records tail=0 before bodies exist, and subsequent
+				// eth_getTransactionByHash / eth_getTransactionReceipt calls return
+				// null because ReadCanonicalHash returns zero and ReadCanonicalBodyRLP
+				// returns the 1-byte invalid-RLP placeholder instead of the body
+				// written above.  Refs #1927.
+				rawdb.WriteHeader(batch, h)
+				rawdb.WriteCanonicalHash(batch, hash, num)
 				// Index the transactions so eth_getTransactionByHash/Receipt find
 				// them; the tx indexer already ran before this backfill.
-				rawdb.WriteTxLookupEntriesByBlock(batch, types.NewBlockWithHeader(h).WithBody(*body))
+				writeBackfillTxLookups(db, num, body)
 
 				if !rawdb.HasReceipts(db, hash, num) || needsBody {
 					rcptHeaders = append(rcptHeaders, h)
@@ -6799,12 +6970,32 @@ func (s *xdcSyncer) runSnapHistoryBackfill() {
 
 		// Advance to the next (lower) batch.
 		topHash = headers[0].ParentHash
-		if lo <= 1 {
+		if lo <= loBound {
 			break
 		}
 		nextTop = lo - 1
 	}
 
+	// Advance the freezer block-data tail to min(frozen, cutoff) so that a
+	// restart with --history.chain does not need to scan the placeholder range
+	// on startup (refs #1933). Without this, initializeHistoryPruning sees
+	// freezerTail=0 < target, finds latest!=0, and returns historyPruningRequired
+	// on every restart even though the data below the target is only A.85
+	// gap-fill placeholders (0x00 bytes, not real history).
+	if cutoffNum > 1 {
+		if frozen, err := db.Ancients(); err == nil && frozen > 0 {
+			newTail := min(frozen, cutoffNum)
+			if prev, err := db.TruncateTail(rawdb.ChainFreezerBlockDataGroup, newTail); err != nil {
+				log.Warn("xdcSyncer: SYNC-06 failed to advance history tail", "target", newTail, "err", err)
+			} else if prev < newTail {
+				log.Info("xdcSyncer: SYNC-06 history tail advanced", "from", prev, "to", newTail)
+			}
+		}
+	}
+
+	// Clear the remaining counter: backfill is done (#1927).
+	s.historyBackfillRemaining.Store(0)
+	s.historyBackfillWritten.Store(written + skipped)
 	log.Info("xdcSyncer: SYNC-06 snap history backfill complete",
 		"written", written, "skipped", skipped, "pivot", pivotNum)
 }

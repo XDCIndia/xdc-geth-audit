@@ -486,7 +486,7 @@ func TestQueue2(t *testing.T) {
 	tx3 := transaction(11, 100, key)
 	from, _ := deriveSender(tx1)
 	testAddBalance(pool, from, big.NewInt(1000))
-	pool.reset(nil, nil)
+	pool.reset(nil, nil, nil)
 
 	pool.enqueueTx(tx1.Hash(), tx1, true)
 	pool.enqueueTx(tx2.Hash(), tx2, true)
@@ -2682,7 +2682,7 @@ func benchmarkPendingDemotion(b *testing.B, size int) {
 	// Benchmark the speed of pool validation
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		pool.demoteUnexecutables()
+		pool.demoteUnexecutables(nil) // nil = demote all accounts (benchmark path)
 	}
 }
 

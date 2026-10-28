@@ -155,7 +155,7 @@ func TestTRC21PoolAdmission(t *testing.T) {
 	// Case 2: survive demoteUnexecutables — simulate a head reset that keeps
 	// the sender's XDC balance at zero.
 	pool.mu.Lock()
-	pool.demoteUnexecutables()
+	pool.demoteUnexecutables(nil) // nil = demote all accounts (test path)
 	pool.mu.Unlock()
 
 	pool.mu.RLock()

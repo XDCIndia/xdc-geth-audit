@@ -74,7 +74,7 @@ func runTieredReward(t *testing.T, chainID int64) (ownerP, ownerQ *big.Int) {
 		ChainID: big.NewInt(chainID), HomesteadBlock: big.NewInt(0), EIP150Block: big.NewInt(0),
 		EIP155Block: big.NewInt(0), EIP158Block: big.NewInt(0), ByzantiumBlock: big.NewInt(0),
 		ConstantinopleBlock: big.NewInt(0), PetersburgBlock: big.NewInt(0), IstanbulBlock: big.NewInt(0),
-		BerlinBlock: big.NewInt(0), LondonBlock: big.NewInt(0), TIPUpgradeRewardBlock: big.NewInt(0),
+		BerlinBlock: big.NewInt(0), LondonBlock: big.NewInt(0), TIPFixedRewardBlock: big.NewInt(0),
 		XDPoS: &params.XDPoSConfig{
 			Epoch: 30, RewardCheckpoint: 30,
 			FoudationWalletAddr: common.HexToAddress("0xf0"),

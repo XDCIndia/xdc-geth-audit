@@ -871,10 +871,18 @@ func (s *Ethereum) Protocols() []p2p.Protocol {
 		// negotiate the highest shared version, so a node syncing via SNAP/1
 		// must not advertise it. Every other node serves both versions.
 		dl := s.handler.downloader
-		advertiseV2 := dl.SnapSyncVersion() == snap.SNAP2 || dl.ConfigSyncMode() != ethconfig.SnapSync
+		advertiseV2 := advertiseSnapV2(dl.SnapSyncVersion(), dl.ConfigSyncMode())
 		protos = append(protos, snap.MakeProtocols((*snapHandler)(s.handler), advertiseV2)...)
 	}
 	return protos
+}
+
+// advertiseSnapV2 reports whether this node may offer snap/2. XDC fast sync
+// downloads and heals path-scheme state over the same SNAP/1 syncer (SYNC-07),
+// so it is gated like snap sync: offering snap/2 made peers negotiate it and
+// drop the node on its first GetTrieNodes heal request (#1922).
+func advertiseSnapV2(syncerVersion uint, mode ethconfig.SyncMode) bool {
+	return syncerVersion == snap.SNAP2 || (mode != ethconfig.SnapSync && mode != ethconfig.FastSync)
 }
 
 // Start implements node.Lifecycle, starting all internal goroutines needed by the

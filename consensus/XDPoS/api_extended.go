@@ -202,7 +202,7 @@ func (api *API) masternodesStatus(number *rpc.BlockNumber) MasternodesStatus {
 		st.Round = round
 		st.Masternodes = api.xdpos.GetMasternodes(api.chain, header)
 		if cr, ok := api.chain.(consensus.ChainReader); ok {
-			st.Penalty = api.xdpos.EngineV2.GetPreviousPenaltyByHash(cr, header.Hash(), 0)
+			st.Penalty, _ = api.xdpos.EngineV2.GetPreviousPenaltyByHash(cr, header.Hash(), 0)
 			// Legacy reads the standby pool at the epoch-switch block of this
 			// block's epoch (getEpochSwitchInfo), so every block in an epoch
 			// reports the same list.
@@ -228,7 +228,7 @@ func (api *API) masternodesStatus(number *rpc.BlockNumber) MasternodesStatus {
 	st.MasternodesLen, st.PenaltyLen = len(st.Masternodes), len(st.Penalty)
 
 	cfg := api.chain.Config()
-	if cfg == nil || !cfg.IsTIPUpgradeReward(header.Number) {
+	if cfg == nil || !cfg.IsTIPTieredReward(header.Number) {
 		st.Standbynodes, st.StandbynodesLen = standby, len(standby)
 		return st
 	}

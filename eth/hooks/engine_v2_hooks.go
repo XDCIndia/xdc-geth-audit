@@ -90,7 +90,7 @@ func AttachConsensusV2Hooks(adaptor *XDPoS.XDPoS, bc *core.BlockChain, chainConf
 			// TRUE branch (here): the tiered masternode/protector/observer path
 			// ported from the reference HookReward else-branch, live from
 			// TIPUpgradeRewardBlock.
-			if chainConfig.IsTIPUpgradeReward(header.Number) {
+			if chainConfig.IsTIPTieredReward(header.Number) {
 				// Round drives the V2 config selection and epoch numbering.
 				// Our EngineV2 has NO Config(round) method (unlike the reference
 				// adaptor.EngineV2.Config); use chainConfig.XDPoS.V2.Config(round).
@@ -103,7 +103,9 @@ func AttachConsensusV2Hooks(adaptor *XDPoS.XDPoS, bc *core.BlockChain, chainConf
 				epochNum := chainConfig.XDPoS.V2.SwitchEpoch + uint64(round)/chainConfig.XDPoS.Epoch
 
 				// Get per-tier signers + burned fees for the rewarded epoch.
-				tierSigners, burnedInOneEpoch, terr := GetSigningTxCountTiered(adaptor, bc, header, chainConfig, currentConfig, parentState)
+				// signSlots is the count of block numbers i in [start,end] where
+				// i%MergeSignRange==0; used for proportional reward calculation.
+				tierSigners, signSlots, burnedInOneEpoch, terr := GetSigningTxCountTiered(adaptor, bc, header, chainConfig, currentConfig, parentState)
 				if terr != nil {
 					log.Error("[HookReward] Fail to get tiered signers count", "error", terr)
 					return nil, terr
@@ -111,6 +113,11 @@ func AttachConsensusV2Hooks(adaptor *XDPoS.XDPoS, bc *core.BlockChain, chainConf
 				rewards["signers"] = tierSigners[MasterNodeBeneficiary]
 				rewards["signersProtector"] = tierSigners[ProtectorNodeBeneficiary]
 				rewards["signersObserver"] = tierSigners[ObserverNodeBeneficiary]
+
+				proportional := chainConfig.IsTIPProportionalReward(header.Number)
+				if proportional {
+					rewards["signSlots"] = signSlots
+				}
 
 				rewardSum := new(big.Int)
 				type rewardWithType struct {
@@ -131,7 +138,13 @@ func AttachConsensusV2Hooks(adaptor *XDPoS.XDPoS, bc *core.BlockChain, chainConf
 					// chainConfig.XDCBlocksPerYear() (NOT common.BlocksPerYear) to
 					// match our existing path; equal for apothem (Period=2).
 					chainReward := util.RewardInflation(chain, originalReward, number, chainConfig.XDCBlocksPerYear())
-					rewardSigners, cerr := XDPoS.CalculateRewardForSignerFixed(chainReward, tierSigners[rwt.t])
+					var rewardSigners map[common.Address]*big.Int
+					var cerr error
+					if proportional {
+						rewardSigners, cerr = XDPoS.CalculateRewardForSignerProportional(chainReward, tierSigners[rwt.t], signSlots)
+					} else {
+						rewardSigners, cerr = XDPoS.CalculateRewardForSignerFixed(chainReward, tierSigners[rwt.t])
+					}
 					if cerr != nil {
 						log.Error("[HookReward] Fail to calculate tiered reward", "error", cerr, "type", rwt.t)
 						return nil, cerr
@@ -376,7 +389,12 @@ func AttachConsensusV2Hooks(adaptor *XDPoS.XDPoS, bc *core.BlockChain, chainConf
 			if !chainConfig.IsTIPUpgradePenalty(number) {
 				comebackHeight := (common.LimitPenaltyEpochV2+1)*chainConfig.XDPoS.Epoch + chainConfig.XDPoS.V2.SwitchBlock.Uint64()
 				if number.Uint64() > comebackHeight {
-					pens := adaptor.EngineV2.GetPreviousPenaltyByHash(chain, currentHash, common.LimitPenaltyEpochV2)
+					pens, penErr := adaptor.EngineV2.GetPreviousPenaltyByHash(chain, currentHash, common.LimitPenaltyEpochV2)
+					if penErr != nil {
+						// Ancestor epoch-switch header not yet in DB (A.68.2 still priming).
+						// Return the error so calcMasternodes can surface it as retryable.
+						return nil, penErr
+					}
 					penComebacks := []common.Address{}
 					for _, p := range pens {
 						for _, addr := range candidates {
@@ -458,7 +476,12 @@ func AttachConsensusV2Hooks(adaptor *XDPoS.XDPoS, bc *core.BlockChain, chainConf
 					// lastPenalty is the most-recent (i==0) epoch's penalty list.
 					lastPenalty := []common.Address{}
 					for i := 0; i < limitPenaltyEpoch; i++ {
-						pens := adaptor.EngineV2.GetPreviousPenaltyByHash(chain, currentHash, i)
+						pens, penErr := adaptor.EngineV2.GetPreviousPenaltyByHash(chain, currentHash, i)
+						if penErr != nil {
+							// Ancestor epoch-switch header not yet in DB (A.68.2 still priming).
+							// Return the error so calcMasternodes can surface it as retryable.
+							return nil, penErr
+						}
 						for _, p := range pens {
 							penParoleeMap[p]++
 						}
@@ -889,9 +912,12 @@ func GetSigningTxCount(c *XDPoS.XDPoS, chain *core.BlockChain, header *types.Hea
 //   - Candidate zero-check uses `!= (common.Address{})`; our common.Address has
 //     no IsZero() method (reference uses candidate.IsZero()).
 //
-// Live from TIPUpgradeReward (apothem TIPUpgradeRewardBlock = 83,600,000;
+// Live from TIPFixedReward (apothem TIPFixedRewardBlock = 83,600,000;
 // mainnet unscheduled).
-func GetSigningTxCountTiered(c *XDPoS.XDPoS, chain *core.BlockChain, header *types.Header, chainConfig *params.ChainConfig, currentConfig *params.V2Config, parentState *state.StateDB) (map[Beneficiary]map[common.Address]*XDPoS.RewardLog, *big.Int, error) {
+// Returns (signers, signSlots, burnedInOneEpoch, error).
+// signSlots is the count of block numbers i in [startBlockNumber, endBlockNumber]
+// where i%common.MergeSignRange==0; used by CalculateRewardForSignerProportional.
+func GetSigningTxCountTiered(c *XDPoS.XDPoS, chain *core.BlockChain, header *types.Header, chainConfig *params.ChainConfig, currentConfig *params.V2Config, parentState *state.StateDB) (map[Beneficiary]map[common.Address]*XDPoS.RewardLog, uint64, *big.Int, error) {
 	number := header.Number.Uint64()
 	rewardEpochCount := 2
 	signEpochCount := 1
@@ -906,7 +932,7 @@ func GetSigningTxCountTiered(c *XDPoS.XDPoS, chain *core.BlockChain, header *typ
 
 	// prevent overflow
 	if number == 0 {
-		return signers, burnedInOneEpoch, nil
+		return signers, 0, burnedInOneEpoch, nil
 	}
 
 	data := make(map[common.Hash][]common.Address)
@@ -926,7 +952,7 @@ func GetSigningTxCountTiered(c *XDPoS.XDPoS, chain *core.BlockChain, header *typ
 		h = chain.GetHeader(parentHash, i)
 		if h == nil {
 			log.Error("[GetSigningTxCountTiered] fail to get header", "number", i, "hash", parentHash)
-			return nil, burnedInOneEpoch, fmt.Errorf("fail to get header in GetSigningTxCountTiered at number: %v, hash: %v", i, parentHash)
+			return nil, 0, burnedInOneEpoch, fmt.Errorf("fail to get header in GetSigningTxCountTiered at number: %v, hash: %v", i, parentHash)
 		}
 		if epochCount == 0 && h.BaseFee != nil {
 			// add burned for the first epoch during loop
@@ -934,7 +960,7 @@ func GetSigningTxCountTiered(c *XDPoS.XDPoS, chain *core.BlockChain, header *typ
 		}
 		isEpochSwitch, _, err := c.IsEpochSwitch(h)
 		if err != nil {
-			return nil, burnedInOneEpoch, err
+			return nil, 0, burnedInOneEpoch, err
 		}
 		if isEpochSwitch && i != switchBlockPlusOne {
 			epochCount += 1
@@ -990,12 +1016,14 @@ func GetSigningTxCountTiered(c *XDPoS.XDPoS, chain *core.BlockChain, header *typ
 		}
 		// prevent overflow
 		if i == 0 {
-			return signers, burnedInOneEpoch, nil
+			return signers, 0, burnedInOneEpoch, nil
 		}
 	}
 
+	var signSlots uint64
 	for i := startBlockNumber; i <= endBlockNumber; i++ {
 		if i%common.MergeSignRange == 0 {
+			signSlots++
 			addrs := data[mapBlkHash[i]]
 			// Filter duplicate address.
 			if len(addrs) > 0 {
@@ -1033,8 +1061,8 @@ func GetSigningTxCountTiered(c *XDPoS.XDPoS, chain *core.BlockChain, header *typ
 		}
 	}
 
-	log.Info("Calculate tiered reward at checkpoint", "startBlock", startBlockNumber, "endBlock", endBlockNumber)
-	return signers, burnedInOneEpoch, nil
+	log.Info("Calculate tiered reward at checkpoint", "startBlock", startBlockNumber, "endBlock", endBlockNumber, "signSlots", signSlots)
+	return signers, signSlots, burnedInOneEpoch, nil
 }
 
 // legacyStandbyPool is the protector/observer pool of the legacy devnet 5551.

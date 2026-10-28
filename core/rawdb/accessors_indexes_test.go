@@ -24,6 +24,7 @@ import (
 	"github.com/davecgh/go-spew/spew"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/ethdb"
 	"github.com/ethereum/go-ethereum/internal/blocktest"
 	"github.com/ethereum/go-ethereum/rlp"
@@ -295,6 +296,141 @@ func TestExtractReceiptFields(t *testing.T) {
 				t.Fatalf("Unexpected logs, want %d, got %d", c.expLogs, logs)
 			}
 		}
+	}
+}
+
+// TestReadCanonicalTransactionLDBFallback is a regression test for #1927.
+// When a fast/snap sync node runs SYNC-06 history backfill, the startup tx
+// indexer may have already recorded tail=0 while block bodies were absent
+// (A.85 placeholder bodies in the freezer).  SYNC-06 later writes real bodies
+// to LDB but did NOT previously write the canonical-hash entry, so
+// ReadCanonicalHash returned zero and ReadCanonicalTransaction returned nil.
+//
+// The fix (this PR): SYNC-06 writes WriteHeader + WriteCanonicalHash to LDB,
+// and ReadCanonicalTransaction now calls ReadBodyRLP (hash-keyed, falls
+// through to LDB when the freezer hash is the A.85 zero placeholder) instead
+// of ReadCanonicalBodyRLP (which returns the 1-byte placeholder from the
+// freezer, causing findTxInBlockBody to fail).
+//
+// This test exercises the LDB-only fallback path: body + canonical-hash +
+// header are in LDB (as SYNC-06 writes them); the tx lookup entry is also in
+// LDB; ReadCanonicalTransaction must find the tx and the receipt.
+func TestReadCanonicalTransactionLDBFallback(t *testing.T) {
+	db := NewMemoryDatabase()
+
+	// Build a minimal block with one transaction.
+	signer := types.NewLondonSigner(big.NewInt(1))
+	key, _ := crypto.GenerateKey()
+	tx, _ := types.SignTx(types.NewTx(&types.LegacyTx{
+		Nonce:    0,
+		To:       new(common.Address),
+		Value:    big.NewInt(1),
+		Gas:      21000,
+		GasPrice: big.NewInt(1),
+	}), signer, key)
+
+	const blockNum = 209356 // representative pre-pivot block from the net2040 live test
+	blockHash := common.HexToHash("0xdeadbeef00000000000000000000000000000000000000000000000000000001")
+
+	header := &types.Header{
+		Number:     big.NewInt(blockNum),
+		ParentHash: common.Hash{},
+		GasLimit:   8000000,
+	}
+
+	body := &types.Body{Transactions: types.Transactions{tx}}
+	block := types.NewBlockWithHeader(header).WithBody(*body)
+
+	// Simulate what SYNC-06 writes to LDB for a gap block.
+	batch := db.NewBatch()
+	WriteHeader(batch, header)
+	WriteCanonicalHash(batch, blockHash, blockNum)
+	WriteBody(batch, blockHash, blockNum, body)
+	WriteTxLookupEntriesByBlock(batch, block)
+	if err := batch.Write(); err != nil {
+		t.Fatalf("batch write: %v", err)
+	}
+
+	// ReadCanonicalTransaction must find the tx even though there is no
+	// entry in the ancient/freezer (same code path as after SYNC-06 backfill).
+	txHash := tx.Hash()
+	got, gotBlockHash, gotNum, gotIdx := ReadCanonicalTransaction(db, txHash)
+	if got == nil {
+		t.Fatalf("ReadCanonicalTransaction returned nil; want tx %s", txHash)
+	}
+	if got.Hash() != txHash {
+		t.Errorf("tx hash mismatch: got %s, want %s", got.Hash(), txHash)
+	}
+	if gotNum != blockNum {
+		t.Errorf("block number mismatch: got %d, want %d", gotNum, blockNum)
+	}
+	if gotIdx != 0 {
+		t.Errorf("tx index mismatch: got %d, want 0", gotIdx)
+	}
+	_ = gotBlockHash // not checked; canonical-hash in LDB may differ from blockHash in real chains
+}
+
+// TestReadCanonicalRawReceiptLDBFallback is a regression test for the post-restart
+// "rlp: expected List" error on eth_getTransactionReceipt for SYNC-06 backfilled
+// blocks (#1927 follow-up).
+//
+// Root cause: ReadCanonicalRawReceipt called ReadCanonicalReceiptsRLP which reads
+// the ancient receipt table WITHOUT checking isCanon.  For A.85 gap blocks the
+// ancient table holds a 1-byte 0x00 placeholder, causing rlp.NewListIterator to
+// return "rlp: expected List".  After restart the bc.receiptsCache is empty so
+// this path is always hit.
+//
+// Fix: ReadCanonicalRawReceipt now calls ReadReceiptsRLP (isCanon-gated) which
+// returns false for the A.85 zero-hash and falls through to LDB where SYNC-06
+// wrote the real receipts.
+//
+// This test exercises the LDB-only receipt path: receipts + canonical-hash are in
+// LDB (as SYNC-06 writes them); ReadCanonicalRawReceipt must return the receipt
+// without error.
+func TestReadCanonicalRawReceiptLDBFallback(t *testing.T) {
+	db := NewMemoryDatabase()
+
+	signer := types.NewLondonSigner(big.NewInt(1))
+	key, _ := crypto.GenerateKey()
+	tx, _ := types.SignTx(types.NewTx(&types.LegacyTx{
+		Nonce:    0,
+		To:       new(common.Address),
+		Value:    big.NewInt(1),
+		Gas:      21000,
+		GasPrice: big.NewInt(1),
+	}), signer, key)
+
+	const blockNum = 209356
+	blockHash := common.HexToHash("0xdeadbeef00000000000000000000000000000000000000000000000000000002")
+
+	receipt := &types.Receipt{
+		Status:            types.ReceiptStatusSuccessful,
+		CumulativeGasUsed: 21000,
+		TxHash:            tx.Hash(),
+		GasUsed:           21000,
+	}
+
+	// Simulate what SYNC-06 writes: canonical hash + receipts in LDB.
+	batch := db.NewBatch()
+	WriteCanonicalHash(batch, blockHash, blockNum)
+	WriteReceipts(batch, blockHash, blockNum, types.Receipts{receipt})
+	if err := batch.Write(); err != nil {
+		t.Fatalf("batch write: %v", err)
+	}
+
+	// ReadCanonicalRawReceipt must return the receipt, not "rlp: expected List".
+	got, _, err := ReadCanonicalRawReceipt(db, blockHash, blockNum, 0)
+	if err != nil {
+		t.Fatalf("ReadCanonicalRawReceipt: %v", err)
+	}
+	if got == nil {
+		t.Fatal("ReadCanonicalRawReceipt returned nil receipt")
+	}
+	if got.Status != types.ReceiptStatusSuccessful {
+		t.Errorf("receipt status: got %d, want %d", got.Status, types.ReceiptStatusSuccessful)
+	}
+	if got.CumulativeGasUsed != 21000 {
+		t.Errorf("cumulative gas used: got %d, want 21000", got.CumulativeGasUsed)
 	}
 }
 

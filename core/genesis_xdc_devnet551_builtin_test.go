@@ -78,7 +78,7 @@ func TestXDCDevnet551BuiltinMatchesCanonical(t *testing.T) {
 		{"Prague", c.PragueBlock, 50000},
 		{"Osaka", c.OsakaBlock, -1},
 		{"DynamicGasLimit", c.DynamicGasLimitBlock, 50000},
-		{"TIPUpgradeReward", c.TIPUpgradeRewardBlock, 50000},
+		{"TIPFixedReward", c.TIPFixedRewardBlock, 50000},
 		{"TIPUpgradePenalty", c.TIPUpgradePenaltyBlock, 50000},
 		{"TIPEpochHalving", c.TIPEpochHalvingBlock, -1},
 	})
