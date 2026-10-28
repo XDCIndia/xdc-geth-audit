@@ -2,16 +2,17 @@
 
 Report: Hacken final report, 2026-10-13. Audited commit: `45e2b6ee`.
 
-## Sixth hand-over (27 October 2026): revalidate `14eb294ba8b8147dc99ca6fa2e4d02aba284257a`
+## Sixth hand-over (28 October 2026): revalidate `main` at `6dc4de6202a19ecd672acd74e1552f0476fd88a6`
 
 ### Scope
 
 | Item | Value |
 |---|---|
 | Repository | XDCIndia/xdc-geth-audit |
+| Final commit (`main`) | **`6dc4de6202a19ecd672acd74e1552f0476fd88a6`**: merge of the branch below into `main`; its tree equals the branch head |
 | Branch / code head | `audit/main-uplift-11710-xdc20-r13` / **`14eb294ba8b8147dc99ca6fa2e4d02aba284257a`** |
 | Previously revalidated commit (base) | `5d31c76662306c68627d3cb2b41a4bf0b521d440` (fifth hand-over, r12; `main` `2eb1332f3eda` has the same tree) |
-| Source | XDCIndia/go-ethereum `08d25cafd425d249cf213ea68e05866434399f0a` |
+| Source | XDCIndia/go-ethereum `08d25cafd425d249cf213ea68e05866434399f0a` (tag `v1.17.10-xdc.20`) |
 | Upstream | unchanged: go-ethereum v1.17.10 |
 | Out of scope | docs, scripts, CI and audit reports |
 
@@ -49,7 +50,8 @@ Excluded files:
 
 ```
 git log --first-parent --oneline 5d31c7666230..14eb294ba8b8   # 12 fix commits
-git checkout 14eb294ba8b8 && go build ./... && go vet ./...
+git rev-parse 6dc4de6202a1^{tree} 14eb294ba8b8^{tree}           # equal trees
+git checkout 6dc4de6202a1 && go build ./... && go vet ./...
 go test -timeout 60m ./consensus/XDPoS/... ./core/... ./eth/...
 ```
 
