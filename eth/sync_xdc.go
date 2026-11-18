@@ -662,11 +662,18 @@ func (s *xdcSyncer) loop() {
 			if head := s.handler.chain.CurrentBlock(); head != nil {
 				cur = head.Number.Uint64()
 			}
+			// While --syncmode fast waits to engage, bulk import is gated,
+			// so FULL_SYNC would misreport what the node is doing (#1937).
+			hbPhase := xdcSnapPhase(s.snapPhase.Load())
+			phaseLabel := hbPhase.String()
+			if hbPhase == phaseFullSync && s.handler.downloader.ConfigSyncMode() == ethconfig.FastSync && !s.fastEngagementResolved.Load() {
+				phaseLabel = "FAST_SYNC_PENDING"
+			}
 			log.Info("xdcSyncer heartbeat",
 				"head", cur,
 				"peers", s.handler.peers.len(),
 				"syncing", s.syncing.Load(),
-				"phase", xdcSnapPhase(s.snapPhase.Load()))
+				"phase", phaseLabel)
 
 			// A.73.1: stuck-TIP_CATCH watchdog (refs #844 #859).
 			// maybeTransitionToAtTip requires localHash == rng.LatestBlockHash
