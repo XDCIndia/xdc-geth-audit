@@ -5336,19 +5336,21 @@ func (s *xdcSyncer) tryFetchHeaderBatchTimeout(peer *eth.Peer, from uint64, coun
 	defer req.Close()
 	deadline := time.NewTimer(timeout)
 	defer deadline.Stop()
-	var lastMismatch []*types.Header
 	for {
 		select {
 		case headers := <-peer.XDCHeaderResp:
+			// A reply that does not start at from is a late answer to an earlier
+			// request on this peer (XDPOS2 replies carry no request ID). Never hand
+			// it back as this range: it would fail the linkage check and taint an
+			// honest peer. Refs #1938.
 			if len(headers) == 0 || headers[0].Number.Uint64() != from || len(headers) > count {
 				log.Debug("xdcSyncer.tryFetchHeaderBatchTimeout: response mismatch", "from", from, "got", len(headers))
-				lastMismatch = headers
 				continue
 			}
 			return headers, false
 		case <-deadline.C:
 			log.Debug("xdcSyncer.tryFetchHeaderBatchTimeout: timed out", "from", from)
-			return lastMismatch, false
+			return nil, false
 		case <-s.quitCh:
 			return nil, false
 		}
@@ -6937,6 +6939,11 @@ func (s *xdcSyncer) runSnapHistoryBackfill() {
 			return
 		}
 		headers := res.headers
+		if headers[0].Number.Uint64() != lo || headers[len(headers)-1].Number.Uint64() != hi {
+			// Not the range that was asked for; refetch without blaming the peer.
+			window[0] = pendingRange{lo: lo, hi: hi, headersC: startHdrFetch(lo, hi)}
+			continue
+		}
 
 		// Verify: top header must hash to topHash (links to the chain above).
 		gotTop := headers[len(headers)-1]
