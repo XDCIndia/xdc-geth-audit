@@ -5310,6 +5310,51 @@ func (s *xdcSyncer) fetchHeaderBatchTimeout(peer *eth.Peer, from uint64, count i
 	}
 }
 
+// tryFetchHeaderBatchTimeout is fetchHeaderBatchTimeout with TryLock instead of
+// Lock.  It returns (nil, true) immediately when the peer's header lock is
+// already held by another goroutine, letting the pipelined range-fetchers fan
+// out to different peers concurrently without queuing on the same one.
+// Callers fall back to the next ranked peer on a busy result.
+// Refs #1938 (SYNC-06 pipelined backfill).
+func (s *xdcSyncer) tryFetchHeaderBatchTimeout(peer *eth.Peer, from uint64, count int, timeout time.Duration) ([]*types.Header, bool) {
+	if !peer.XDCHeaderReqMu.TryLock() {
+		return nil, true // peer is already serving another concurrent range fetch
+	}
+	defer peer.XDCHeaderReqMu.Unlock()
+	select {
+	case <-peer.XDCHeaderResp:
+	default:
+	}
+	if count > xdpos2MaxHeaderFetch {
+		count = xdpos2MaxHeaderFetch
+	}
+	req, err := peer.RequestHeadersByNumber(from, count, 0, false, nil)
+	if err != nil {
+		log.Debug("xdcSyncer.tryFetchHeaderBatchTimeout: request failed", "from", from, "err", err)
+		return nil, false
+	}
+	defer req.Close()
+	deadline := time.NewTimer(timeout)
+	defer deadline.Stop()
+	var lastMismatch []*types.Header
+	for {
+		select {
+		case headers := <-peer.XDCHeaderResp:
+			if len(headers) == 0 || headers[0].Number.Uint64() != from || len(headers) > count {
+				log.Debug("xdcSyncer.tryFetchHeaderBatchTimeout: response mismatch", "from", from, "got", len(headers))
+				lastMismatch = headers
+				continue
+			}
+			return headers, false
+		case <-deadline.C:
+			log.Debug("xdcSyncer.tryFetchHeaderBatchTimeout: timed out", "from", from)
+			return lastMismatch, false
+		case <-s.quitCh:
+			return nil, false
+		}
+	}
+}
+
 // fetchHeadersParallel fans out header requests to the top xdcHeaderRacePeers
 // candidates concurrently and returns the first non-empty result (A.75).
 // atTipPeers counts candidates whose LatestBlockHash == curHash (skipped from
@@ -5929,6 +5974,103 @@ func (s *xdcSyncer) backfillBodyReceiptChunkModern(peer *eth.Peer, headers []*ty
 	return false
 }
 
+// backfillBodyReceiptChunkLegacy fetches and persists bodies and receipts for
+// headers from a legacy (non-request-ID) XDPOS2 peer.  Mirrors
+// backfillBodyReceiptChunkModern but uses the legacy XDPOS2 wire protocol
+// (GetBlockBodies / GetReceipts without request IDs).  Returns tainted=true
+// when the peer serves a body that fails hash verification.  Called
+// concurrently with backfillBodyReceiptChunkModern for non-overlapping chunks
+// of the same range when both peer types are available, satisfying requirement
+// 2 of issue #1938.
+func (s *xdcSyncer) backfillBodyReceiptChunkLegacy(peer *eth.Peer, headers []*types.Header, db ethdb.Database) (tainted bool) {
+	if len(headers) == 0 {
+		return false
+	}
+	hashes := make([]common.Hash, len(headers))
+	for i, h := range headers {
+		hashes[i] = h.Hash()
+	}
+	rawBodies := s.fetchBodiesBatch(peer, hashes)
+	if len(rawBodies) == 0 {
+		return false // peer returned nothing; not tainted, try again later
+	}
+	pairCount := min(len(rawBodies), len(headers))
+	batch := db.NewBatch()
+	var rcptHeaders []*types.Header
+	for i := 0; i < pairCount; i++ {
+		rb := rawBodies[i]
+		h := headers[i]
+		hash := h.Hash()
+		num := h.Number.Uint64()
+		txs, err := rb.Transactions.Items()
+		if err != nil {
+			_ = batch.Write()
+			return true
+		}
+		uncles, err := rb.Uncles.Items()
+		if err != nil {
+			_ = batch.Write()
+			return true
+		}
+		body := &types.Body{Transactions: txs, Uncles: uncles}
+		if rb.Withdrawals != nil {
+			if wd, err2 := rb.Withdrawals.Items(); err2 == nil {
+				body.Withdrawals = wd
+			}
+		}
+		if !verifyBodyAgainstHeader(h, body) {
+			log.Warn("xdcSyncer: SYNC-06 history backfill (legacy) — body hash mismatch; tainting peer",
+				"block", num, "peer", peer.ID())
+			_ = batch.Write()
+			return true
+		}
+		needsBody := !rawdb.HasBody(db, hash, num)
+		if !needsBody {
+			if ex := rawdb.ReadBody(db, hash, num); ex != nil && len(ex.Transactions) == 0 {
+				needsBody = true
+			}
+		}
+		if needsBody {
+			rawdb.WriteBody(batch, hash, num, body)
+		}
+		rawdb.WriteHeader(batch, h)
+		rawdb.WriteCanonicalHash(batch, hash, num)
+		writeBackfillTxLookups(db, num, body)
+		if !rawdb.HasReceipts(db, hash, num) || needsBody {
+			rcptHeaders = append(rcptHeaders, h)
+		}
+	}
+	for rest := rcptHeaders; len(rest) > 0; {
+		rcpts := s.fetchReceiptsBatch(peer, rest)
+		if len(rcpts) == 0 && len(rest) > 1 {
+			rcpts = s.fetchReceiptsBatch(peer, rest[:1])
+		}
+		n := min(len(rcpts), len(rest))
+		for i := 0; i < n; i++ {
+			h := rest[i]
+			if rcpts[i] == nil {
+				n = i
+				break
+			}
+			if types.DeriveSha(rcpts[i], trie.NewStackTrie(nil)) != h.ReceiptHash {
+				log.Warn("xdcSyncer: SYNC-06 history backfill (legacy) — receipt hash mismatch; tainting peer",
+					"block", h.Number.Uint64(), "peer", peer.ID())
+				_ = batch.Write()
+				return true
+			}
+			rawdb.WriteReceipts(batch, h.Hash(), h.Number.Uint64(), rcpts[i])
+		}
+		if n == 0 {
+			break // peer cannot serve these receipts; retry next attempt
+		}
+		rest = rest[n:]
+	}
+	if err := batch.Write(); err != nil {
+		log.Warn("xdcSyncer: SYNC-06 history backfill (legacy) — batch write failed", "err", err)
+	}
+	return false
+}
+
 // prefetchAncestorBodiesAndReceipts pre-fetches block bodies + receipts for
 // the same ancestor header range A.68.2 already primed (lo..hi). Used by
 // A.72 to populate the V2 reward-window so the first post-pivot epoch-switch
@@ -6351,7 +6493,15 @@ const (
 	snapHistoryBatchSize      = 128 // matches observed XDPOS2 body-response cap
 	snapHistoryMaxBodyRetry   = 10  // max body-fetch attempts per batch before giving up
 	snapHistoryMaxModernPeers = 4   // max concurrent eth/69+ peers for body+receipt fan-out (SYNC-10)
+	snapHistoryWindowSize     = 8   // #1938: concurrent header-fetch + body/receipt ranges in flight
 )
+
+// backfillHdrResult is the outcome of one speculative header fetch in the
+// pipelined history backfill window.  Refs #1938.
+type backfillHdrResult struct {
+	headers []*types.Header // nil when quit was signalled
+	peer    *eth.Peer       // the peer that served the headers; nil when none succeeded
+}
 
 // historyPeers is the backfill's private memory of which peers can serve deep
 // history (#1886). Most Apothem peers are themselves snap/fast-synced and answer
@@ -6524,107 +6674,289 @@ func (s *xdcSyncer) runSnapHistoryBackfill() {
 	written := uint64(0)
 	skipped := uint64(0)
 
-	// historyBlind tracks peers that returned 0 headers for the current batch
-	// range — they cannot serve old history (e.g. a fast-synced peer whose own
-	// backfill is still in progress).  Blind peers are skipped within a cycle
-	// and the set is reset when every peer is blind (triggering the 5s pause).
-	// This prevents a partial peer from holding XDCHeaderReqMu for xdcReqTimeout
-	// (8s) on every batch iteration and stalling the fullSyncOnce fanout.
-	historyBlind := make(map[string]bool)
+	// Pipeline: keep snapHistoryWindowSize ranges of headers fetching concurrently;
+	// body+receipt goroutines for each verified range also run concurrently.
+	// Header linkage is verified in strict descending order (range N's top-hash must
+	// equal the canonical hash of the lowest block of range N-1) before any write.
+	// Refs #1938.
+
+	// hp tracks which peers can serve deep history; shared across body/receipt
+	// goroutines and protected by hpMu (#1886).
 	hp := newHistoryPeers()
-	lastLog := time.Now()
+	var hpMu sync.Mutex
 
-	for nextTop >= loBound {
-		select {
-		case <-s.quitCh:
-			log.Info("xdcSyncer: SYNC-06 history backfill aborted", "written", written, "skipped", skipped)
-			return
-		default:
-		}
-		// Update eth_syncing progress counters (#1927).
-		if written > 0 {
-			s.historyBackfillWritten.Store(written + skipped)
-			if nextTop >= loBound {
-				s.historyBackfillRemaining.Store(nextTop - loBound + 1)
+	// startHdrFetch launches a goroutine that fetches want=(hi-lo+1) headers for
+	// [lo, hi] from the best available free peer.  TryLock lets W goroutines fan
+	// out to W different peers simultaneously instead of queuing on one.
+	// Sends exactly one backfillHdrResult to the returned channel; never blocks
+	// on s.quitCh.
+	startHdrFetch := func(lo, hi uint64) <-chan backfillHdrResult {
+		ch := make(chan backfillHdrResult, 1)
+		want := int(hi-lo) + 1
+		go func() {
+			blind := make(map[string]bool)
+			for {
+				select {
+				case <-s.quitCh:
+					ch <- backfillHdrResult{}
+					return
+				default:
+				}
+				peers := s.rankedPeers()
+				tried := false
+				anyBusy := false
+				allBlind := true
+				for _, p := range peers {
+					if blind[p.ID()] {
+						continue
+					}
+					allBlind = false
+					// TryLock: if another range-fetch goroutine is already using this
+					// peer, skip to the next so W goroutines fan out across W peers.
+					hdrs, busy := s.tryFetchHeaderBatchTimeout(p, lo, want, xdcBulkReqTimeout)
+					if busy {
+						anyBusy = true
+						continue
+					}
+					tried = true
+					if len(hdrs) == want {
+						ch <- backfillHdrResult{headers: hdrs, peer: p}
+						return
+					}
+					// Peer returned wrong count; skip it this round.
+					blind[p.ID()] = true
+				}
+				if allBlind {
+					blind = make(map[string]bool)
+				}
+				var wait time.Duration
+				switch {
+				case !tried && anyBusy:
+					wait = 500 * time.Millisecond // all non-blind peers busy; retry soon
+				case tried:
+					wait = 2 * time.Second // tried peers but none served a full batch
+				default:
+					wait = 5 * time.Second // no peers at all
+				}
+				select {
+				case <-time.After(wait):
+				case <-s.quitCh:
+					ch <- backfillHdrResult{}
+					return
+				}
+			}
+		}()
+		return ch
+	}
+
+	// Body+receipt goroutines run concurrently for up to snapHistoryWindowSize
+	// ranges.  Each goroutine fans out to all available peers (modern + legacy)
+	// simultaneously — satisfying requirement 2 of #1938.
+	var brWg sync.WaitGroup
+	brSem := make(chan struct{}, snapHistoryWindowSize)
+
+	doBodyReceipt := func(toWrite []*types.Header) {
+		defer func() { <-brSem; brWg.Done() }()
+
+		bodyPending := make([]*types.Header, 0, len(toWrite))
+		for _, h := range toWrite {
+			if h.TxHash != types.EmptyTxsHash && !snapBlockComplete(db, h.Hash(), h.Number.Uint64(), h.TxHash) {
+				bodyPending = append(bodyPending, h)
 			}
 		}
-		// Never go silent: one line per 30 s whether or not blocks are moving.
-		if time.Since(lastLog) >= 30*time.Second {
-			lastLog = time.Now()
-			log.Info("xdcSyncer: SYNC-06 history backfill progress", "next", nextTop,
-				"written", written, "skipped", skipped,
-				"peers", len(s.rankedPeers()), "servers", len(hp.served), "emptyReplies", hp.nEmpty)
-		}
-
-		// Batch: [lo, nextTop], ascending, at most snapHistoryBatchSize blocks.
-		lo := nextTop + 1 - uint64(snapHistoryBatchSize)
-		if nextTop < uint64(snapHistoryBatchSize) || lo < loBound {
-			lo = loBound
-		}
-		want := int(nextTop-lo) + 1
-
-		// Local fast path: a batch already stored and complete (an earlier run got
-		// this far) is verified by walking parent hashes from topHash in our own DB;
-		// no peer round trip, so resuming over finished history costs microseconds.
-		if local := localCompleteBatch(db, topHash, nextTop, want); local != nil {
-			skipped += uint64(len(local))
-			topHash = local[0].ParentHash
-			if lo <= loBound {
-				break
+		// The headers of this range are already written and the sequencer has moved
+		// on, so the range is retried until it is complete: giving up would leave
+		// blocks with a header but no body while the backfill reports completion.
+		// maxChunk halves after a fruitless round so a peer that answers an
+		// oversized (> soft response limit) request with nothing is asked for
+		// fewer bodies, down to one per request.
+		maxChunk := snapHistoryBatchSize
+		for attempt := 1; len(bodyPending) > 0; attempt++ {
+			select {
+			case <-s.quitCh:
+				return
+			default:
 			}
-			nextTop = lo - 1
-			continue
-		}
-
-		// Fetch headers from the best available peer.  Use xdcBulkReqTimeout (4s)
-		// rather than xdcReqTimeout (8s) so a peer that can't serve the old range
-		// releases XDCHeaderReqMu quickly, keeping it available for the concurrent
-		// fullSyncOnce fanout.  Peers returning 0 are added to historyBlind and
-		// skipped in subsequent batches until the set is reset.
-		var headers []*types.Header
-		peers := s.rankedPeers()
-		triedAny := false
-		for _, p := range peers {
-			if historyBlind[p.ID()] {
+			if attempt%snapHistoryMaxBodyRetry == 0 {
+				log.Warn("xdcSyncer: SYNC-06 history backfill — bodies still incomplete; retrying",
+					"remaining", len(bodyPending), "lo", bodyPending[0].Number.Uint64(), "attempts", attempt)
+			}
+			hpMu.Lock()
+			allPeers := hp.order(s.rankedPeers())
+			hpMu.Unlock()
+			if len(allPeers) == 0 {
+				select {
+				case <-time.After(2 * time.Second):
+				case <-s.quitCh:
+					return
+				}
 				continue
 			}
-			triedAny = true
-			headers = s.fetchHeaderBatchTimeout(p, lo, want, xdcBulkReqTimeout)
-			if len(headers) > 0 {
-				break
+			// Fan out bodyPending to up to snapHistoryMaxModernPeers peers — both
+			// modern (request-ID) and legacy XDPOS2 get chunks concurrently.
+			n := min(len(allPeers), snapHistoryMaxModernPeers)
+			chunkSize := max(1, min(maxChunk, (len(bodyPending)+n-1)/n))
+			prevPending := len(bodyPending)
+			var wg sync.WaitGroup
+			offset := 0
+			for i := 0; i < n && offset < len(bodyPending); i++ {
+				end := min(offset+chunkSize, len(bodyPending))
+				chunk := bodyPending[offset:end]
+				p := allPeers[i]
+				wg.Add(1)
+				go func(peer *eth.Peer, hdrs []*types.Header) {
+					defer wg.Done()
+					var tainted bool
+					if peerHasRequestID(peer) {
+						tainted = s.backfillBodyReceiptChunkModern(peer, hdrs, db)
+					} else {
+						tainted = s.backfillBodyReceiptChunkLegacy(peer, hdrs, db)
+					}
+					if tainted {
+						s.taintPeer(peer)
+					}
+					done := 0
+					for _, h := range hdrs {
+						if snapBlockComplete(db, h.Hash(), h.Number.Uint64(), h.TxHash) {
+							done++
+						}
+					}
+					hpMu.Lock()
+					hp.record(peer.ID(), done)
+					hpMu.Unlock()
+				}(p, chunk)
+				offset = end
 			}
-			// Peer can't serve this range; skip it for the remainder of this cycle.
-			historyBlind[p.ID()] = true
-		}
-		if !triedAny {
-			// All peers are blind; reset so the next iteration retries the full set.
-			historyBlind = make(map[string]bool)
-		}
-		if len(headers) == 0 {
-			log.Warn("xdcSyncer: SYNC-06 history backfill — no peer served headers; will retry",
-				"lo", lo, "hi", nextTop, "peers", len(peers))
+			wg.Wait()
+			var stillPending []*types.Header
+			for _, h := range bodyPending {
+				if !snapBlockComplete(db, h.Hash(), h.Number.Uint64(), h.TxHash) {
+					stillPending = append(stillPending, h)
+				}
+			}
+			bodyPending = stillPending
+			if len(bodyPending) < prevPending {
+				if len(bodyPending) > 0 {
+					select {
+					case <-time.After(time.Second):
+					case <-s.quitCh:
+						return
+					}
+				}
+				continue
+			}
+			// No progress: ask for fewer bodies per request and back off (2 s, up to 30 s).
+			maxChunk = max(1, maxChunk/2)
 			select {
-			case <-time.After(5 * time.Second):
+			case <-time.After(min(30*time.Second, 2*time.Second<<min(attempt/snapHistoryMaxBodyRetry, 4))):
 			case <-s.quitCh:
 				return
 			}
+		}
+	}
+
+	// Pipelined window: up to snapHistoryWindowSize concurrent header fetches.
+	type pendingRange struct {
+		lo, hi   uint64
+		headersC <-chan backfillHdrResult
+	}
+	window := make([]pendingRange, 0, snapHistoryWindowSize)
+	fetchTop := nextTop // top block of the next undispatched range
+
+	dispatch := func() {
+		for len(window) < snapHistoryWindowSize && fetchTop >= loBound {
+			hi := fetchTop
+			lo := hi + 1 - uint64(snapHistoryBatchSize)
+			if hi < uint64(snapHistoryBatchSize) || lo < loBound {
+				lo = loBound
+			}
+			window = append(window, pendingRange{lo: lo, hi: hi, headersC: startHdrFetch(lo, hi)})
+			if lo <= loBound {
+				fetchTop = 0 // all ranges queued
+				break
+			}
+			fetchTop = lo - 1
+		}
+	}
+	dispatch()
+
+	lastLog := time.Now()
+
+	for len(window) > 0 {
+		select {
+		case <-s.quitCh:
+			log.Info("xdcSyncer: SYNC-06 history backfill aborted", "written", written, "skipped", skipped)
+			brWg.Wait()
+			return
+		default:
+		}
+
+		front := window[0]
+		lo, hi := front.lo, front.hi
+		want := int(hi-lo) + 1
+
+		// Update eth_syncing progress counters (#1927).
+		s.historyBackfillWritten.Store(written + skipped)
+		if hi >= loBound {
+			s.historyBackfillRemaining.Store(hi - loBound + 1)
+		}
+
+		// 30 s progress log with inflight count (#1938).
+		if time.Since(lastLog) >= 30*time.Second {
+			lastLog = time.Now()
+			hpMu.Lock()
+			served, nEmpty := len(hp.served), hp.nEmpty
+			hpMu.Unlock()
+			log.Info("xdcSyncer: SYNC-06 history backfill progress",
+				"next", hi, "written", written, "skipped", skipped,
+				"inflight", len(window), "peers", len(s.rankedPeers()),
+				"servers", served, "emptyReplies", nEmpty)
+		}
+
+		// Local fast path: if this range is already complete in our DB, skip the fetch.
+		if local := localCompleteBatch(db, topHash, hi, want); local != nil {
+			skipped += uint64(len(local))
+			topHash = local[0].ParentHash
+			window = window[1:]
+			dispatch()
 			continue
 		}
 
-		// Canonical-hash check: the highest returned header must hash to topHash.
+		// Wait for the front range's header-fetch goroutine.
+		var res backfillHdrResult
+		select {
+		case res = <-front.headersC:
+		case <-s.quitCh:
+			log.Info("xdcSyncer: SYNC-06 history backfill aborted", "written", written, "skipped", skipped)
+			brWg.Wait()
+			return
+		}
+		if res.headers == nil {
+			// quitCh fired inside the fetch goroutine.
+			brWg.Wait()
+			return
+		}
+		headers := res.headers
+
+		// Verify: top header must hash to topHash (links to the chain above).
 		gotTop := headers[len(headers)-1]
 		if gotTop.Hash() != topHash {
 			log.Warn("xdcSyncer: SYNC-06 history backfill — top-hash mismatch, retrying",
 				"want", topHash.Hex()[:10], "got", gotTop.Hash().Hex()[:10], "block", gotTop.Number.Uint64())
+			if res.peer != nil {
+				s.taintPeer(res.peer)
+			}
+			window[0] = pendingRange{lo: lo, hi: hi, headersC: startHdrFetch(lo, hi)}
 			select {
 			case <-time.After(2 * time.Second):
 			case <-s.quitCh:
+				brWg.Wait()
 				return
 			}
 			continue
 		}
 
-		// Internal parent-hash linkage check.
+		// Verify internal parent-hash linkage.
 		chainOK := true
 		for i := 1; i < len(headers); i++ {
 			if headers[i].ParentHash != headers[i-1].Hash() {
@@ -6635,15 +6967,20 @@ func (s *xdcSyncer) runSnapHistoryBackfill() {
 			}
 		}
 		if !chainOK {
+			if res.peer != nil {
+				s.taintPeer(res.peer)
+			}
+			window[0] = pendingRange{lo: lo, hi: hi, headersC: startHdrFetch(lo, hi)}
 			select {
 			case <-time.After(2 * time.Second):
 			case <-s.quitCh:
+				brWg.Wait()
 				return
 			}
 			continue
 		}
 
-		// Skip prefix that already has complete history (idempotent restarts).
+		// Skip already-complete prefix (idempotent restarts).
 		toWrite := headers
 		for len(toWrite) > 0 {
 			h := toWrite[0]
@@ -6654,14 +6991,11 @@ func (s *xdcSyncer) runSnapHistoryBackfill() {
 				break
 			}
 		}
-
 		if len(toWrite) == 0 {
-			// All blocks in this batch already complete; advance to next batch.
+			// All blocks in this batch already complete.
 			topHash = headers[0].ParentHash
-			if lo <= loBound {
-				break
-			}
-			nextTop = lo - 1
+			window = window[1:]
+			dispatch()
 			continue
 		}
 
@@ -6669,18 +7003,18 @@ func (s *xdcSyncer) runSnapHistoryBackfill() {
 		if err := dl.PrimeAncestorHeaders(toWrite); err != nil {
 			log.Warn("xdcSyncer: SYNC-06 history backfill — PrimeAncestorHeaders failed",
 				"lo", toWrite[0].Number.Uint64(), "hi", toWrite[len(toWrite)-1].Number.Uint64(), "err", err)
+			window[0] = pendingRange{lo: lo, hi: hi, headersC: startHdrFetch(lo, hi)}
 			select {
 			case <-time.After(2 * time.Second):
 			case <-s.quitCh:
+				brWg.Wait()
 				return
 			}
 			continue
 		}
 		written += uint64(len(toWrite))
 
-		// Empty blocks have nothing to fetch: store their empty body and receipts
-		// now, as the upstream downloader does, so they are served like a full
-		// node's blocks.
+		// Empty blocks: write their placeholder body and empty receipts now.
 		emptyBatch := db.NewBatch()
 		for _, h := range toWrite {
 			if body := emptyHistoryBody(h); body != nil && !rawdb.HasBody(db, h.Hash(), h.Number.Uint64()) {
@@ -6692,289 +7026,27 @@ func (s *xdcSyncer) runSnapHistoryBackfill() {
 			log.Warn("xdcSyncer: SYNC-06 history backfill — empty body write failed", "err", err)
 		}
 
-		// Bodies: collect blocks that still need body and/or receipts. Use
-		// snapBlockComplete (not just !HasBody) so blocks whose body was already
-		// written but whose receipts are still missing stay in the retry queue.
-		bodyPending := make([]*types.Header, 0, len(toWrite))
-		for _, h := range toWrite {
-			if h.TxHash != types.EmptyTxsHash && !snapBlockComplete(db, h.Hash(), h.Number.Uint64(), h.TxHash) {
-				bodyPending = append(bodyPending, h)
-			}
-		}
-
-		// reqSize starts at the full batch and halves whenever the peer returns
-		// fewer bodies than requested.  For blocks whose body exceeds the peer's
-		// 2 MB soft response limit this drives reqSize to 1, ensuring at least one
-		// block is served per round-trip even when the body is very large.
-		reqSize := snapHistoryBatchSize
-
-		for attempt := 0; len(bodyPending) > 0 && attempt < snapHistoryMaxBodyRetry; attempt++ {
-			select {
-			case <-s.quitCh:
-				return
-			default:
-			}
-
-			peers = s.rankedPeers()
-
-			// SYNC-10: modern (request-ID) peer path.  Fan out body+receipt requests
-			// to up to snapHistoryMaxModernPeers peers concurrently; each peer owns a
-			// non-overlapping chunk so several requests are in flight simultaneously.
-			// Falls through to the XDPOS2 legacy path when no modern peers are available
-			// or when modern peers deliver no new data this round.
-			peers = hp.order(peers)
-			var modern []*eth.Peer
-			for _, p := range peers {
-				if peerHasRequestID(p) {
-					modern = append(modern, p)
-				}
-			}
-			if len(modern) > 0 {
-				n := min(len(modern), snapHistoryMaxModernPeers)
-				chunkSize := max(1, min(reqSize, (len(bodyPending)+n-1)/n))
-				prevPending := len(bodyPending)
-				var wg sync.WaitGroup
-				var mu sync.Mutex
-				offset := 0
-				for i := 0; i < n && offset < len(bodyPending); i++ {
-					end := min(offset+chunkSize, len(bodyPending))
-					chunk := bodyPending[offset:end]
-					p := modern[i]
-					wg.Add(1)
-					go func(peer *eth.Peer, headers []*types.Header) {
-						defer wg.Done()
-						if s.backfillBodyReceiptChunkModern(peer, headers, db) {
-							s.taintPeer(peer)
-						}
-						done := 0
-						for _, h := range headers {
-							if snapBlockComplete(db, h.Hash(), h.Number.Uint64(), h.TxHash) {
-								done++
-							}
-						}
-						mu.Lock()
-						hp.record(peer.ID(), done)
-						mu.Unlock()
-					}(p, chunk)
-					offset = end
-				}
-				wg.Wait()
-				var stillPending []*types.Header
-				for _, h := range bodyPending {
-					if !snapBlockComplete(db, h.Hash(), h.Number.Uint64(), h.TxHash) {
-						stillPending = append(stillPending, h)
-					}
-				}
-				bodyPending = stillPending
-				if len(bodyPending) < prevPending {
-					// Made progress; brief backoff then next attempt.
-					if len(bodyPending) > 0 {
-						select {
-						case <-time.After(time.Second):
-						case <-s.quitCh:
-							return
-						}
-					}
-					continue
-				}
-				// No progress from modern peers; fall through to XDPOS2 legacy path.
-			}
-
-			// XDPOS2 legacy path (pre-SYNC-10).
-			if len(peers) == 0 {
-				select {
-				case <-time.After(2 * time.Second):
-				case <-s.quitCh:
-					return
-				}
-				continue
-			}
-
-			// Request at most reqSize bodies to stay within the peer's response limit.
-			// Walk the ordered peers (at most 3) until one answers: a peer with no
-			// history this deep replies empty and is parked, not asked again at once.
-			sendN := min(reqSize, len(bodyPending))
-			hashes := make([]common.Hash, sendN)
-			for i, h := range bodyPending[:sendN] {
-				hashes[i] = h.Hash()
-			}
-			var activePeer *eth.Peer
-			var rawBodies []eth.BlockBody
-			for _, p := range peers[:min(3, len(peers))] {
-				activePeer = p
-				if rawBodies = s.fetchBodiesBatch(p, hashes); len(rawBodies) > 0 {
-					break
-				}
-				hp.record(p.ID(), 0)
-			}
-			if len(rawBodies) == 0 {
-				// Peer returned nothing — halve the request size so the next attempt
-				// asks for fewer (possibly oversized) blocks at once.
-				if reqSize > 1 {
-					reqSize = max(1, reqSize/2)
-				}
-				select {
-				case <-time.After(time.Second):
-				case <-s.quitCh:
-					return
-				}
-				continue
-			}
-			if len(rawBodies) < sendN {
-				// Short reply: adapt down so we never over-request again.
-				reqSize = max(1, len(rawBodies))
-			}
-
-			pairCount := min(len(rawBodies), len(bodyPending))
-
-			// Write each verified body, then its receipts. Direct rawdb writes avoid
-			// PrimeAncestorBodies's hard requirement
-			// that receipts and headers have equal lengths, which breaks silently when
-			// fetchReceiptsBatch returns an empty-but-non-nil slice for an oversized
-			// receipt response.
-			batch := db.NewBatch()
-			badPeer := false
-			var rcptHeaders []*types.Header
-			for i := 0; i < pairCount && !badPeer; i++ {
-				rb := rawBodies[i]
-				h := bodyPending[i]
-				hash := h.Hash()
-				num := h.Number.Uint64()
-
-				txs, err := rb.Transactions.Items()
-				if err != nil {
-					continue
-				}
-				uncles, err := rb.Uncles.Items()
-				if err != nil {
-					continue
-				}
-				body := &types.Body{Transactions: txs, Uncles: uncles}
-				if rb.Withdrawals != nil {
-					if wd, err2 := rb.Withdrawals.Items(); err2 == nil {
-						body.Withdrawals = wd
-					}
-				}
-				if !verifyBodyAgainstHeader(h, body) {
-					log.Warn("xdcSyncer: SYNC-06 history backfill — body hash mismatch; tainting peer",
-						"block", num, "peer", activePeer.ID())
-					badPeer = true
-					break
-				}
-
-				// Write the body (overwrite any 0-tx placeholder left by snap sync).
-				needsBody := !rawdb.HasBody(db, hash, num)
-				if !needsBody {
-					if ex := rawdb.ReadBody(db, hash, num); ex != nil && len(ex.Transactions) == 0 {
-						needsBody = true
-					}
-				}
-				if needsBody {
-					rawdb.WriteBody(batch, hash, num, body)
-				}
-				// Write the header and canonical-hash mapping to LDB so that
-				// ReadCanonicalHash / ReadHeader fall through from the freezer
-				// zero-hash placeholder (written by A.85 for pre-pivot fast-sync
-				// blocks) to the correct entry here.  Without these, the startup
-				// tx-indexer records tail=0 before bodies exist, and subsequent
-				// eth_getTransactionByHash / eth_getTransactionReceipt calls return
-				// null because ReadCanonicalHash returns zero and ReadCanonicalBodyRLP
-				// returns the 1-byte invalid-RLP placeholder instead of the body
-				// written above.  Refs #1927.
-				rawdb.WriteHeader(batch, h)
-				rawdb.WriteCanonicalHash(batch, hash, num)
-				// Index the transactions so eth_getTransactionByHash/Receipt find
-				// them; the tx indexer already ran before this backfill.
-				writeBackfillTxLookups(db, num, body)
-
-				if !rawdb.HasReceipts(db, hash, num) || needsBody {
-					rcptHeaders = append(rcptHeaders, h)
-				}
-			}
-			// Request receipts for every verified block that needs them, as many per
-			// round trip as the peer will give (#1886: one request per block made a
-			// 128-block batch take seconds). A short reply is a verified prefix and
-			// the remainder is asked for again; a peer that answers a multi-block
-			// request with nothing (response too large) is asked for one block.
-			for rest := rcptHeaders; len(rest) > 0 && !badPeer; {
-				rcpts := s.fetchReceiptsBatch(activePeer, rest)
-				if len(rcpts) == 0 && len(rest) > 1 {
-					rcpts = s.fetchReceiptsBatch(activePeer, rest[:1])
-				}
-				n := min(len(rcpts), len(rest))
-				for i := 0; i < n; i++ {
-					h := rest[i]
-					if rcpts[i] == nil {
-						n = i
-						break
-					}
-					if types.DeriveSha(rcpts[i], trie.NewStackTrie(nil)) != h.ReceiptHash {
-						log.Warn("xdcSyncer: SYNC-06 history backfill — receipt hash mismatch; tainting peer",
-							"block", h.Number.Uint64(), "peer", activePeer.ID())
-						badPeer = true
-						n = i
-						break
-					}
-					rawdb.WriteReceipts(batch, h.Hash(), h.Number.Uint64(), rcpts[i])
-				}
-				if n == 0 {
-					break // peer cannot serve these receipts now; retry next attempt
-				}
-				rest = rest[n:]
-			}
-			if err := batch.Write(); err != nil {
-				log.Warn("xdcSyncer: SYNC-06 history backfill — batch write failed", "err", err)
-			}
-			if badPeer {
-				s.taintPeer(activePeer)
-			}
-
-			// Re-check which blocks still lack body+receipts.
-			var stillPending []*types.Header
-			for _, h := range bodyPending {
-				if !snapBlockComplete(db, h.Hash(), h.Number.Uint64(), h.TxHash) {
-					stillPending = append(stillPending, h)
-				}
-			}
-			hp.record(activePeer.ID(), len(bodyPending)-len(stillPending))
-			bodyPending = stillPending
-			if len(bodyPending) > 0 {
-				select {
-				case <-time.After(time.Second):
-				case <-s.quitCh:
-					return
-				}
-			}
-		}
-
-		if len(bodyPending) > 0 {
-			log.Warn("xdcSyncer: SYNC-06 history backfill — bodies still incomplete after retries; will resume later",
-				"remaining", len(bodyPending), "lo", lo, "hi", nextTop,
-				"peers", len(peers), "servers", len(hp.served), "emptyReplies", hp.nEmpty)
-			// Do NOT advance nextTop — the outer loop will revisit this batch on
-			// the next iteration (headers already present, PrimeAncestorHeaders is
-			// idempotent, and the skip check will push toWrite past the complete prefix).
-			select {
-			case <-time.After(5 * time.Second):
-			case <-s.quitCh:
-				return
-			}
-			continue
-		}
-
-		// If this batch covered the V2 gap header, trigger engine re-init.
-		if !engineReinitDone && lastGapNum > 0 && lo <= lastGapNum && lastGapNum <= nextTop {
+		// V2 gap header: trigger engine re-init as soon as headers are written.
+		if !engineReinitDone && lastGapNum > 0 && lo <= lastGapNum && lastGapNum <= hi {
 			s.triggerReinitBFT(lastGapNum)
 			engineReinitDone = true
 		}
 
-		// Advance to the next (lower) batch.
+		// Advance topHash and slide the window forward before launching the
+		// body/receipt goroutine so the next dispatch starts immediately.
 		topHash = headers[0].ParentHash
-		if lo <= loBound {
-			break
-		}
-		nextTop = lo - 1
+		window = window[1:]
+		dispatch()
+
+		// Launch the body+receipt goroutine for this range, bounded by brSem.
+		capturedToWrite := toWrite
+		brSem <- struct{}{}
+		brWg.Add(1)
+		go doBodyReceipt(capturedToWrite)
 	}
+
+	// Drain all body+receipt goroutines before computing the tail advance.
+	brWg.Wait()
 
 	// Advance the freezer block-data tail to min(frozen, cutoff) so that a
 	// restart with --history.chain does not need to scan the placeholder range

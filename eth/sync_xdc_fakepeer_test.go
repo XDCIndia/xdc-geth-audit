@@ -43,12 +43,16 @@ import (
 // way legacy XDPoSChain peers do (192 headers / 128 bodies per request).
 type fakeXDCPeer struct {
 	*eth.Peer
-	headersFor func(origin uint64, amount int) []*types.Header
-	blocks     map[common.Hash]*types.Block
-	receipts   map[common.Hash]types.Receipts // nil means "no receipts available"
-	bodyCap    int
-	corrupt    bool          // if true, serve empty bodies (wrong hash) for every body request
-	bodyDelay  time.Duration // SYNC-12: if > 0, sleep before sending body response
+	headersFor  func(origin uint64, amount int) []*types.Header
+	blocks      map[common.Hash]*types.Block
+	receipts    map[common.Hash]types.Receipts // nil means "no receipts available"
+	bodyCap     int
+	corrupt     bool          // if true, serve empty bodies (wrong hash) for every body request
+	bodyDelay   time.Duration // SYNC-12: if > 0, sleep before sending body response
+	headerDelay time.Duration // if > 0, sleep before sending header response (#1938)
+	// emptyOverCap: answer a GetBlockBodies for more than bodyCap blocks with no
+	// bodies at all, like a peer whose reply would exceed its response size limit.
+	emptyOverCap bool
 
 	mu         sync.Mutex
 	headerReqs []uint64 // origins of every GetBlockHeaders received
@@ -70,6 +74,10 @@ func (f *fakeXDCPeer) serve(rw p2p.MsgReadWriter) {
 			f.headerReqs = append(f.headerReqs, req.Origin.Number)
 			f.mu.Unlock()
 			amount := min(int(req.Amount), xdpos2MaxHeaderFetch)
+			// #1938: simulate header-fetch latency for pipeline speed tests.
+			if f.headerDelay > 0 {
+				time.Sleep(f.headerDelay)
+			}
 			select {
 			case f.XDCHeaderResp <- f.headersFor(req.Origin.Number, amount):
 			default:
@@ -81,6 +89,9 @@ func (f *fakeXDCPeer) serve(rw p2p.MsgReadWriter) {
 			}
 			var bodies []eth.BlockBody
 			for _, h := range hashes {
+				if f.emptyOverCap && len(hashes) > f.bodyCap {
+					break
+				}
 				if len(bodies) == f.bodyCap {
 					break
 				}
