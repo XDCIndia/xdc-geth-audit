@@ -37,24 +37,34 @@ import (
 	"github.com/ethereum/go-ethereum/trie"
 )
 
-// snapsyncExperimentalEnv is the double-opt-in env var. Even with
-// --syncmode snap set, BeaconSync is invoked only when this env var
-// is exactly "1". Without it, SNAP_RUNNING logs + falls back to
-// FULL_SYNC (Phase 3b.2 behavior). Refs #807 Phase 3b.3.
+// snapsyncExperimentalEnv is the transitional kill switch for the real snap
+// sync path (skeleton terminate floor, anchor prime, BeaconSync state download).
+// Snap sync is the default, as upstream: it engages when the node runs
+// --syncmode snap (the default) on a fresh database, and --syncmode full opts
+// out. Setting this variable to 0, false, off or no disables it for a process
+// (SNAP_RUNNING then stays in FULL_SYNC); any other value, or unset, leaves it
+// on. Refs #807 Phase 3b.3.
 //
-// This guards against accidental engagement in production: snap-sync
-// writes chaindata via the downloader, and the gossip-handler race
-// (NewBlockMsg arriving mid-snap) has not been fully tested. Operators
-// who want to try snap-sync must explicitly set both flags.
+// Why the gate was lifted: the concern was a NewBlockMsg gossip block racing
+// the downloader mid-snap. It cannot corrupt: the chain head stays at genesis
+// until SnapSyncComplete (which takes chainmu and requires the pivot state to
+// exist), so a gossiped tip block is deferred, never inserted (see
+// TestSnapSyncGossipDeferred), and a wrong or partial download stalls instead
+// of committing.
 const snapsyncExperimentalEnv = "XDC_EXPERIMENTAL_SNAPSYNC"
 
 func snapsyncExperimentalEnabled() bool {
-	return os.Getenv(snapsyncExperimentalEnv) == "1"
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(snapsyncExperimentalEnv))) {
+	case "0", "false", "off", "no":
+		return false
+	}
+	return true
 }
 
 // snapHealEnv is the opt-in env var for A.97.2 snap-heal-at-tip. Default off
 // so first-rollout operators are unaffected. Set XDC_SNAP_HEAL=1 to enable.
-// Distinct from XDC_EXPERIMENTAL_SNAPSYNC which gates the (dead) range path.
+// Distinct from XDC_EXPERIMENTAL_SNAPSYNC, the snap-sync kill switch. Not needed
+// for --syncmode snap, which downloads and heals state in the downloader.
 // Refs #894.
 const snapHealEnv = "XDC_SNAP_HEAL"
 
@@ -455,6 +465,14 @@ type xdcSyncer struct {
 	// When it reaches xdcSnapSelectMaxRetries, snapPermanentFullFallback is set.
 	snapSelectFailures int
 
+	// snapPeerHeadWaitSince is when snapSelectOnce first found no usable snap
+	// peer head this engagement (zero when not waiting). Sync goroutine only.
+	snapPeerHeadWaitSince time.Time
+
+	// snapNoStateStalls counts stall windows in which no state byte was ever
+	// downloaded (no connected peer serves snap state). Sync goroutine only.
+	snapNoStateStalls int
+
 	// snapPermanentFullFallback, when true, causes maybeEngageSnap() to
 	// return immediately so fullSyncOnce runs. Set after xdcSnapSelectMaxRetries
 	// conclusive failures or when structural conditions (V1-only chain, V2 not
@@ -462,7 +480,7 @@ type xdcSyncer struct {
 	snapPermanentFullFallback atomic.Bool
 
 	// snapExpWarnOnce gates the one-shot WARN emitted when --syncmode snap is
-	// set but XDC_EXPERIMENTAL_SNAPSYNC=1 is not. Prevents log spam at the
+	// set but XDC_EXPERIMENTAL_SNAPSYNC=0 disables it. Prevents log spam at the
 	// 500ms tick cadence.
 	snapExpWarnOnce atomic.Bool
 
@@ -939,15 +957,15 @@ func (s *xdcSyncer) maybeEngageSnap() {
 		return // operator did not opt in
 	}
 
-	// Issue #1045 (primary fix): if the experimental env var is not set,
+	// Issue #1045 (primary fix): if the kill switch is set,
 	// snap-sync cannot run — snapRunningCheck() will immediately fall back to
 	// phaseFullSync, re-triggering this function every 500ms and preventing
 	// fullSyncOnce from ever being dispatched. Return early and let
 	// fullSyncOnce handle the chain. One-shot WARN on first suppression.
 	if !snapsyncExperimentalEnabled() {
 		if s.snapExpWarnOnce.CompareAndSwap(false, true) {
-			log.Warn("xdcSyncer: --syncmode snap requested but XDC_EXPERIMENTAL_SNAPSYNC=1 not set; running full-sync instead",
-				"hint", "set XDC_EXPERIMENTAL_SNAPSYNC=1 to enable experimental snap sync")
+			log.Warn("xdcSyncer: --syncmode snap requested but XDC_EXPERIMENTAL_SNAPSYNC=0 disables it; running full-sync instead",
+				"hint", "unset XDC_EXPERIMENTAL_SNAPSYNC (or use --syncmode full to opt out)")
 		}
 		return // stay in FULL_SYNC
 	}
@@ -1852,103 +1870,62 @@ func (s *xdcSyncer) snapSelectOnce() {
 	}
 	cfg := s.handler.chain.Config()
 
-	// Primary path: pick highest V2-era TrustedSyncCheckpoint with
-	// embedded Masternodes.
-	if cfg != nil && cfg.XDPoS != nil && cfg.XDPoS.V2 != nil && cfg.XDPoS.V2.SwitchBlock != nil {
-		v2Switch := cfg.XDPoS.V2.SwitchBlock.Uint64()
-		var best *params.TrustedSyncCheckpoint
-		for _, cp := range cfg.TrustedSyncCheckpoints {
-			if cp.Number >= v2Switch && len(cp.Masternodes) > 0 {
-				if best == nil || cp.Number > best.Number {
-					best = cp
-				}
-			}
+	// Primary path (#807 Phase 8): pivot on the head of a CURRENT snap-capable
+	// peer. A peer holds snap-servable state only for its recent blocks, so the
+	// pivot must come from a live peer head, never from a baked-in checkpoint
+	// (whose state is long gone; the deprecated TrustedSyncCheckpoint pivot,
+	// #894, is no longer a pivot source). This needs no checkpoint, so it also
+	// works on private nets that have none.
+	if peerHeadHdr := s.fetchPeerHeadHeader(); peerHeadHdr != nil {
+		// Where checkpoints exist they remain an optional chain-identity check
+		// (some peer must serve the checkpoint header); they never pick the
+		// pivot or its root.
+		if !s.snapCheckpointIdentityOK(cfg) {
+			return // retry next tick
 		}
-		if best != nil {
-			// Fetch the REAL header at best.Number from a peer. We need
-			// the full header (not just Number+Root) because
-			// types.Header.Hash() recomputes from all fields — passing
-			// a synthesised header with only Number+Root set would
-			// produce a hash that doesn't match best.Hash, causing
-			// BeaconSync's skeleton-sync requests to peers to fail
-			// (peer has no block with the synthesised hash).
-			//
-			// Refs #807 Phase 7+. Fetch + verify the header matches
-			// the checkpoint Hash before using it as a pivot.
-			// Use rankedPeersNoCD so cooldown never blocks pivot selection. (#1872)
-			candidates := s.rankedPeersNoCD()
-			if len(candidates) == 0 {
-				return // stay in SNAP_SELECTING; retry next tick
-			}
-			var hdr *types.Header
-			for _, p := range candidates {
-				hdrs := s.fetchHeaderBatch(p, best.Number, 1)
-				if len(hdrs) == 1 && hdrs[0] != nil && hdrs[0].Hash() == best.Hash {
-					hdr = hdrs[0]
-					break
-				}
-			}
-			if hdr == nil {
-				log.Info("xdcSyncer: no peer served a header matching the checkpoint hash; retrying next tick",
-					"block", best.Number, "expectedHash", best.Hash.Hex())
-				return
-			}
-			// Phase 8: state at the checkpoint Number (e.g. 82,293,750)
-			// may already be outside peers' state-history retention
-			// window (~90k blocks on path-scheme). If we pin the pivot
-			// to the checkpoint, snap state download fails because no
-			// peer has that root. Instead, prefer the peer's CURRENT
-			// head as the pivot — peers always have state at their
-			// own head (under both path and hash scheme). The
-			// checkpoint hdr we already fetched anchors the
-			// masternodes for QC verification (future ADR-807 use).
-			//
-			// Fetch peer's current head header by their announced
-			// BlockRange.LatestBlockHash. Use that header as the
-			// snap pivot.
-			if peerHeadHdr := s.fetchPeerHeadHeader(); peerHeadHdr != nil {
-				s.snapPivotMu.Lock()
-				s.snapPivot = &engine_v2.PivotResult{
-					Block: peerHeadHdr,
-					Root:  peerHeadHdr.Root,
-					Depth: peerHeadHdr.Number.Uint64() - cur.Number.Uint64(),
-				}
-				s.snapPivotMu.Unlock()
-				log.Info("xdcSyncer: snap pivot selected from PEER HEAD (#807 Phase 8)",
-					"block", peerHeadHdr.Number.Uint64(),
-					"hash", peerHeadHdr.Hash().Hex(),
-					"root", peerHeadHdr.Root.Hex(),
-					"anchor_checkpoint", best.Number)
-				// DEPRECATION (A.97 / #894): this pivot was anchored to a baked-in
-				// TrustedSyncCheckpoint to source the V2 masternode set. Trusted
-				// checkpoints are deprecated and will be removed once the dynamic,
-				// header-derived QC-verified pivot (SelectSnapPivot bootstrapped from
-				// the epoch-switch header) is validated on mainnet. Logged once per
-				// engagement for operator visibility.
-				log.Warn("xdcSyncer: snap pivot used a DEPRECATED TrustedSyncCheckpoint anchor — migration tracked in #894",
-					"anchor_checkpoint", best.Number)
-				s.snapSelectFailures = 0 // success — reset failure counter
-				s.snapPhase.Store(int32(phaseSnapRunning))
-				return
-			}
-			// Peer-head fetch failed; fall back to the (stale) checkpoint pivot.
-			// State download will likely fail, but we get further in the pipeline.
-			s.snapPivotMu.Lock()
-			s.snapPivot = &engine_v2.PivotResult{
-				Block: hdr,
-				Root:  best.Root,
-				Depth: best.Number - cur.Number.Uint64(),
-			}
-			s.snapPivotMu.Unlock()
-			log.Info("xdcSyncer: snap pivot fell back to TrustedSyncCheckpoint (peer-head fetch failed)",
-				"block", best.Number,
-				"hash", hdr.Hash().Hex(),
-				"root", best.Root.Hex(),
-				"masternodes", len(best.Masternodes))
-			s.snapSelectFailures = 0 // success — reset failure counter
-			s.snapPhase.Store(int32(phaseSnapRunning))
-			return
+		s.snapPivotMu.Lock()
+		s.snapPivot = &engine_v2.PivotResult{
+			Block: peerHeadHdr,
+			Root:  peerHeadHdr.Root,
+			Depth: peerHeadHdr.Number.Uint64() - cur.Number.Uint64(),
 		}
+		s.snapPivotMu.Unlock()
+		log.Info("xdcSyncer: snap pivot selected from PEER HEAD (#807 Phase 8)",
+			"block", peerHeadHdr.Number.Uint64(),
+			"hash", peerHeadHdr.Hash().Hex(),
+			"root", peerHeadHdr.Root.Hex())
+		s.snapSelectFailures = 0 // success — reset failure counter
+		s.snapPeerHeadWaitSince = time.Time{}
+		s.snapPhase.Store(int32(phaseSnapRunning))
+		return
+	}
+	// No usable snap peer head yet (peers still connecting / registering snap,
+	// or all still syncing). Wait for one rather than falling through to the QC
+	// path, which counts toward the permanent full-sync fallback within a few
+	// ticks. After snapPeerHeadWait, fall through to the QC-verify path so a
+	// chain with no snap-capable peers still reaches FULL_SYNC.
+	if s.snapPeerHeadWaitSince.IsZero() {
+		s.snapPeerHeadWaitSince = time.Now()
+	}
+	if time.Since(s.snapPeerHeadWaitSince) < snapPeerHeadWait {
+		return // stay in SNAP_SELECTING; retry next tick
+	}
+	// Still no usable snap peer head. With no snap-capable peer at all, full
+	// sync instead, BEFORE BeaconSync touches the database: once state sync
+	// starts the path-scheme trie database is disabled and a later fallback to
+	// full sync cannot execute blocks (it wedges at the first gap block).
+	snapPeers := 0
+	for _, ep := range s.handler.peers.all() {
+		if ep.snapExt != nil {
+			snapPeers++
+		}
+	}
+	if snapPeers == 0 {
+		log.Warn("xdcSyncer: no snap-capable peer after waiting; running full-sync",
+			"waited", snapPeerHeadWait, "peers", s.handler.peers.len())
+		s.snapPermanentFullFallback.Store(true)
+		s.snapPhase.Store(int32(phaseFullSync))
+		return
 	}
 
 	// Fallback path: ADR-807 QC-verification helper.
@@ -2037,7 +2014,54 @@ func (s *xdcSyncer) snapSelectOnce() {
 		"depth", pivot.Depth,
 		"peerID", peer.ID()[:12])
 	s.snapSelectFailures = 0 // success — reset failure counter
+	s.snapPeerHeadWaitSince = time.Time{}
 	s.snapPhase.Store(int32(phaseSnapRunning))
+}
+
+// snapNoStateWarnEvery is how many zero-byte stall windows pass between ERROR
+// logs telling the operator that no peer serves snap state.
+const snapNoStateWarnEvery = 3
+
+// snapRepivotEvery is how often a running snap sync is re-pivoted on a fresh
+// peer head, so the state root being fetched stays inside what peers still
+// serve (see snapRunningCheck).
+const snapRepivotEvery = 60 * time.Second
+
+// snapPeerHeadWait bounds how long snapSelectOnce waits for a usable snap peer
+// head before falling through to the QC-verify path.
+const snapPeerHeadWait = 5 * time.Minute
+
+// snapCheckpointIdentityOK reports whether the chain's optional V2-era
+// TrustedSyncCheckpoint (highest one, if any) is served by some peer with the
+// expected hash — a cheap check that peers are on the canonical chain. It is
+// advisory only: it never picks the pivot or its root. Chains without
+// checkpoints (private nets) always pass.
+func (s *xdcSyncer) snapCheckpointIdentityOK(cfg *params.ChainConfig) bool {
+	if cfg == nil || cfg.XDPoS == nil || cfg.XDPoS.V2 == nil || cfg.XDPoS.V2.SwitchBlock == nil {
+		return true
+	}
+	v2Switch := cfg.XDPoS.V2.SwitchBlock.Uint64()
+	var best *params.TrustedSyncCheckpoint
+	for _, cp := range cfg.TrustedSyncCheckpoints {
+		if cp.Number >= v2Switch && len(cp.Masternodes) > 0 {
+			if best == nil || cp.Number > best.Number {
+				best = cp
+			}
+		}
+	}
+	if best == nil {
+		return true
+	}
+	// Use rankedPeersNoCD so cooldown never blocks pivot selection. (#1872)
+	for _, p := range s.rankedPeersNoCD() {
+		hdrs := s.fetchHeaderBatch(p, best.Number, 1)
+		if len(hdrs) == 1 && hdrs[0] != nil && hdrs[0].Hash() == best.Hash {
+			return true
+		}
+	}
+	log.Info("xdcSyncer: no peer served a header matching the checkpoint hash; retrying next tick",
+		"block", best.Number, "expectedHash", best.Hash.Hex())
+	return false
 }
 
 // snapPivotBlock returns the selected pivot block number, or 0 if
@@ -2051,14 +2075,12 @@ func (s *xdcSyncer) snapPivotBlock() uint64 {
 	return s.snapPivot.Block.Number.Uint64()
 }
 
-// snapRunningCheck dispatches the SNAP_RUNNING phase action. With the
-// experimental env var set: invokes downloader.BeaconSync for the
-// stored pivot exactly once, then waits for SyncEvent completion to
-// transition the phase. Without the env var: logs + falls back to
-// FULL_SYNC (Phase 3b.2 behavior).
+// snapRunningCheck dispatches the SNAP_RUNNING phase action. Unless the kill
+// switch XDC_EXPERIMENTAL_SNAPSYNC=0 is set: invokes downloader.BeaconSync for
+// the stored pivot, then waits for SyncEvent completion to transition the
+// phase. With the kill switch: logs + falls back to FULL_SYNC.
 //
-// Refs #807 Phase 3b.3 + Phase 7 (keep-alive). The double-opt-in
-// guards against accidental engagement.
+// Refs #807 Phase 3b.3 + Phase 7 (keep-alive).
 //
 // Phase 7: each tick (after BeaconSync is kicked off) we also issue a
 // xdcSyncer-style fetchHeaderBatch to all peers. This keeps the eth
@@ -2069,7 +2091,7 @@ func (s *xdcSyncer) snapPivotBlock() uint64 {
 // timeout fires and the skeleton can't extend.
 func (s *xdcSyncer) snapRunningCheck() {
 	if !snapsyncExperimentalEnabled() {
-		log.Info("xdcSyncer: SNAP_RUNNING — BeaconSync gated by XDC_EXPERIMENTAL_SNAPSYNC=1; falling back to FULL_SYNC",
+		log.Info("xdcSyncer: SNAP_RUNNING — disabled by XDC_EXPERIMENTAL_SNAPSYNC=0; falling back to FULL_SYNC",
 			"pivot", s.snapPivotBlock())
 		s.snapPhase.Store(int32(phaseFullSync))
 		return
@@ -2091,8 +2113,7 @@ func (s *xdcSyncer) snapRunningCheck() {
 		// synced after the grace window, snap-sync is not progressing — either
 		// state download was never reached (the B1 skeleton-floor bug fixed in
 		// this file forced a ~104M-header genesis walk first) or peers served
-		// empty GetAccountRange. Detect this and fall back to FULL_SYNC so the
-		// node still catches up.
+		// empty GetAccountRange. Detect this and re-pivot (see below).
 		//
 		// NOTE: the correct cross-refs are #810 (stand up a snap-serving peer)
 		// and #836 (real snap-sync acceptance / pivot-root coherence). The
@@ -2103,30 +2124,65 @@ func (s *xdcSyncer) snapRunningCheck() {
 		// empty AccountSynced after the B1 fix most likely means state download
 		// was reached but the requested pivot root has no serving peer / drifted.
 		//
-		// #1884: judge progress, not elapsed time. The pivot is frozen, and a
-		// serving peer keeps state for its recent blocks only, so after a few
-		// minutes it answers the old root with empty ranges. A fixed 10-minute
-		// "AccountSynced still 0" check never fired once progress was kept, yet
-		// a node could sit stalled for the whole window. Restart (and re-pivot,
-		// keeping the downloaded state) after snapStallGrace without new bytes.
+		// #1884: judge progress, not elapsed time. A serving peer keeps state
+		// for only its last ~128 blocks (~4 min at 2s blocks) and the pivot is
+		// head-64 at selection, so a pivot is servable for roughly two more
+		// minutes. Nothing extends the skeleton head while state downloads, so
+		// the downloader's own pivot mover never fires in that window. Re-pivot
+		// deliberately instead: every snapRepivotEvery, or sooner after
+		// snapStallGrace without new bytes, re-issue BeaconSync with a fresh peer
+		// head (downloaded state is kept; the snap syncer retargets the new
+		// root). Only the BeaconSync trigger is re-armed: the phase and the
+		// selected pivot are kept, so no snap-peer header round-trip is needed.
+		//
+		// Progress must come from the syncer the downloader drives (SnapProgress),
+		// not the exported SnapSyncer field, which is a separate, idle instance
+		// that always reads zero and made this watchdog fire on every cycle.
 		const snapStallGrace = 3 * time.Minute
 		startNS := s.snapBeaconStartedAt.Load()
 		if startNS > 0 {
-			p := s.handler.downloader.SnapSyncer.Progress()
+			p := s.handler.downloader.SnapProgress()
 			done := float64(p.AccountBytes + p.BytecodeBytes + p.StorageBytes + p.TrienodeHealBytes + p.BytecodeHealBytes)
 			now := time.Now()
-			if done > s.snapLastProgressBytes {
+			// Any change counts as progress: the counters can restart lower
+			// when a new cycle reloads the persisted sync status.
+			if done != s.snapLastProgressBytes {
 				s.snapLastProgressBytes, s.snapLastProgressAt = done, now
 			}
 			since := s.snapLastProgressAt
 			if since.UnixNano() < startNS {
 				since = time.Unix(0, startNS)
 			}
-			if now.Sub(since) > snapStallGrace {
-				log.Warn("xdcSyncer: snap-sync stalled — no state progress; restarting with a fresh pivot",
-					"for", now.Sub(since).Round(time.Second), "downloaded", common.StorageSize(done),
-					"hint", "pivot root no longer served (refs #810/#836/#1884)")
-				s.snapPhase.Store(int32(phaseFullSync))
+			reason := ""
+			switch {
+			case now.Sub(since) > snapStallGrace:
+				reason = "no state progress"
+			case done > 0 && now.Sub(time.Unix(0, startNS)) > snapRepivotEvery:
+				// Only once state is flowing: a cycle spends its first ~30s
+				// priming the anchor window, and re-pivoting before state
+				// download starts would never let it begin.
+				reason = "pivot refresh"
+			}
+			if done > 0 {
+				s.snapNoStateStalls = 0
+			}
+			if reason == "no state progress" && done == 0 {
+				// Do NOT fall back to FULL_SYNC here. Once state sync has started
+				// the path-scheme trie database is disabled ("Disabled trie
+				// database due to state sync"), so full sync would import blocks
+				// without executing them and wedge at the first epoch gap block.
+				// Keep retrying (a snap peer may appear) and tell the operator.
+				s.snapNoStateStalls++
+				if s.snapNoStateStalls%snapNoStateWarnEvery == 0 {
+					log.Error("xdcSyncer: snap sync has downloaded no state; no connected peer serves it",
+						"stalls", s.snapNoStateStalls, "window", snapStallGrace,
+						"hint", "connect a snap-serving peer, or wipe the datadir and restart with --syncmode full")
+				}
+			}
+			if reason != "" {
+				log.Info("xdcSyncer: snap-sync re-pivoting on a fresh peer head",
+					"reason", reason, "downloaded", common.StorageSize(done),
+					"sinceProgress", now.Sub(since).Round(time.Second))
 				s.snapBeaconStarted.Store(false)
 				s.snapBeaconStartedAt.Store(0)
 			}
@@ -2210,13 +2266,13 @@ func (s *xdcSyncer) snapRunningCheck() {
 		rawdb.WriteSnapshotSyncStatus(s.handler.database, []byte("xdc-pivot-changed-invalidated"))
 	}
 
-	log.Warn("xdcSyncer: invoking experimental snap-sync via downloader.BeaconSync",
+	log.Warn("xdcSyncer: invoking snap-sync via downloader.BeaconSync",
 		"head", headHdr.Number.Uint64(),
 		"head_root", headHdr.Root.Hex(),
 		"final_pivot", pivot.Block.Number.Uint64(),
 		"final_root", pivot.Root.Hex(),
 		"depth", pivot.Depth,
-		"warning", "experimental — chaindata writes; rollback may be needed if BeaconSync mishandles XDPoS V2 finality semantics")
+		"mode", "snap")
 
 	// #807/#810 B1 fix: install the skeleton terminate-floor for the snap path
 	// BEFORE kicking BeaconSync. Without it the snap skeleton has no floor
@@ -2230,7 +2286,7 @@ func (s *xdcSyncer) snapRunningCheck() {
 	// newDownloaderPivot-1 (= head-64-1) mirrors SetFastSyncPivot's
 	// SetTerminateFloor(number-1): it stops the walk at the state-download pivot
 	// while retaining the pivot header [pivot..head] the downloader needs for the
-	// state root. Reached only under XDC_EXPERIMENTAL_SNAPSYNC=1 (checked at the
+	// state root. Reached only when snap sync is enabled (checked at the
 	// top of this function), so default/full/fast/archive sync are unaffected.
 	// #807/#810 B1+linkup fix: install the skeleton terminate-floor AND prime the
 	// anchor window before BeaconSync — mirroring the dynamic Fast Sync path
@@ -2249,7 +2305,7 @@ func (s *xdcSyncer) snapRunningCheck() {
 	//      FULL_SYNC. This is the missing companion to the floor — the FastSync
 	//      path has it (fastRunningCheck), the snap path did not.
 	//
-	// All reached only under XDC_EXPERIMENTAL_SNAPSYNC=1, so default/full/fast/
+	// All reached only when snap sync is enabled, so full/fast/
 	// archive sync are unaffected.
 	dl := s.handler.downloader
 	pivotDist := dl.FastSyncPivotDistance()
@@ -2376,6 +2432,22 @@ func (s *xdcSyncer) snapEventLoop() {
 					// runSnapHistoryBackfill carries its own one-shot CAS guard.
 					s.spawn(s.runSnapHistoryBackfill)
 				case downloader.SyncFailed:
+					// A "canceled" failure is the downloader suspending the
+					// previous backfill cycle because the skeleton restarted on
+					// a newer head (our own BeaconSync re-issue). It is not a
+					// failure of the current attempt: the skeleton relaunches the
+					// backfill itself with the downloaded state kept. Treating it
+					// as a failure reset the phase, which re-issued BeaconSync
+					// with an even newer (gapped) head, which cancelled the cycle
+					// again — a ~20s restart loop that kept re-priming the anchor
+					// window and logged a false "falling back to FULL_SYNC".
+					// Genuine stalls are caught by the progress watchdog in
+					// snapRunningCheck. Any other error still falls back.
+					if downloader.IsSyncCanceled(ev.Err) {
+						log.Debug("xdcSyncer: snap-sync cycle superseded by a newer head; downloader resuming",
+							"pivot", s.snapPivotBlock())
+						continue
+					}
 					log.Warn("xdcSyncer: snap-sync failed; falling back to FULL_SYNC",
 						"pivot", s.snapPivotBlock(), "err", ev.Err)
 					s.snapPhase.Store(int32(phaseFullSync))
@@ -4155,6 +4227,7 @@ func (s *xdcSyncer) fetchPeerHeadHeader() *types.Header {
 		p := ep.Peer
 		rng := p.BlockRange()
 		if rng == nil || rng.LatestBlockHash == (common.Hash{}) {
+			log.Debug("xdcSyncer.fetchPeerHeadHeader: peer no block range", "peer", p.ID()[:12])
 			continue
 		}
 		// Phase 13: prefer snap-capable peers — those are the only ones
@@ -4165,6 +4238,7 @@ func (s *xdcSyncer) fetchPeerHeadHeader() *types.Header {
 		}
 		headHdr := s.fetchPeerTip(p, rng.LatestBlockHash)
 		if headHdr == nil {
+			log.Debug("xdcSyncer.fetchPeerHeadHeader: snap peer tip fetch failed", "peer", p.ID()[:12], "hash", rng.LatestBlockHash)
 			continue
 		}
 		heads = append(heads, peerHead{peer: p, hdr: headHdr})
@@ -4185,6 +4259,7 @@ func (s *xdcSyncer) fetchPeerHeadHeader() *types.Header {
 		heads = kept
 	}
 	if len(heads) == 0 {
+		log.Debug("xdcSyncer.fetchPeerHeadHeader: no usable snap heads")
 		return nil
 	}
 	// Step 2: pick the LOWEST head among snap-capable peers. Archive
@@ -4203,6 +4278,7 @@ func (s *xdcSyncer) fetchPeerHeadHeader() *types.Header {
 	pivotNum := lowest.hdr.Number.Uint64() - snapPivotBackoff
 	pivotHdrs := s.fetchHeaderBatch(lowest.peer, pivotNum, 1)
 	if len(pivotHdrs) == 0 || pivotHdrs[0] == nil {
+		log.Debug("xdcSyncer.fetchPeerHeadHeader: pivot batch fetch failed", "peer", lowest.peer.ID()[:12], "pivotNum", pivotNum)
 		return nil
 	}
 	log.Info("xdcSyncer: peer head selection",

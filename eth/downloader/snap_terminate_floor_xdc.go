@@ -44,10 +44,10 @@ package downloader
 // upstream-owned eth/downloader/ files stay byte-identical (refs #807
 // upstream-alignment principle).
 //
-// SAFETY: this changes NO default-path behavior. Its only caller is
-// snapRunningCheck in eth/sync_xdc.go, which returns early unless
-// XDC_EXPERIMENTAL_SNAPSYNC=1 (the experimental double-opt-in gate). Default,
-// full, fast and archive sync never reach it.
+// SAFETY: its only caller is snapRunningCheck in eth/sync_xdc.go, which runs
+// only for a fresh node on --syncmode snap with the kill switch
+// XDC_EXPERIMENTAL_SNAPSYNC unset (or not 0). Full, fast and archive sync never
+// reach it.
 func (d *Downloader) SetSnapTerminateFloor(floor uint64) {
 	// floor==0 is treated as "unset"; refuse to clobber an existing floor with
 	// a no-op value (SetTerminateFloor uses 0 as the sentinel for "no floor",
