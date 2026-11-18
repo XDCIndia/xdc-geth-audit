@@ -44,7 +44,7 @@ func handleGetBlockHeaders(backend Backend, msg Decoder, peer *Peer) error {
 			return err
 		}
 		response := ServiceGetBlockHeadersQuery(backend.Chain(), &legacyQuery, peer)
-		log.Info("XDPOS2 GetBlockHeaders RECEIVED (serving)",
+		log.Debug("XDPOS2 GetBlockHeaders RECEIVED (serving)",
 			"peer", peer.ID()[:8],
 			"origin", legacyQuery.Origin,
 			"amount", legacyQuery.Amount,
