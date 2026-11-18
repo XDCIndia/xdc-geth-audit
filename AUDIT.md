@@ -13,19 +13,62 @@ incident when "corrected".
 
 ## Provenance
 
+This `main` cut is **r14**. It is a filtered snapshot of the work repository, not a
+fork of it. r14 equals work `main` at `6fc8e8c2088b7f18264f5663036669d04fa7becf`.
+
 | | |
 |---|---|
-| Upstream base | `ethereum/go-ethereum` **v1.17.8** = `a579077007b98217c3e253a66e4b452ca0c32b96` |
+| Work repository | `XDCIndia/go-ethereum` |
+| Work source of this cut | `6fc8e8c2088b7f18264f5663036669d04fa7becf` (`main`) |
+| Work release in this cut | **`v1.17.10-xdc.21`** = `58b2b042b1caa34cc8d2ee73f054cb98112c4505` |
+| Fixes after that tag, included | `5d6ba3664758643a0f96487dee8177ba789cd6e3`, `6fc8e8c2088b7f18264f5663036669d04fa7becf` |
+| Client version in this tree | `v1.17.10-xdc.21` (`version/version.go`, `Meta = "xdc.21"`) |
+| Previous public cut | r13 `6dc4de6202a19ecd672acd74e1552f0476fd88a6`, equal to work `v1.17.10-xdc.20` (`08d25cafd425d249cf213ea68e05866434399f0a`) |
+| Upstream geth | `ethereum/go-ethereum` **v1.17.10** |
+
+In-scope paths match that work commit byte for byte. Paths left out are the same set
+as r13: new XDC test files, operator documentation and scripts, `CHANGELOG.md`, CI
+workflow files, and the private tooling and vendor reports named under
+[Disclosure](#disclosure-status--partial-stated-honestly). `.gitattributes`,
+`.golangci.yml`, `Dockerfile` and `.dockerignore` stay in their audit form. Work
+pull requests 1958 and 1959 are not on this commit and are not in r14.
+
+```sh
+git fetch <source-remote> 6fc8e8c2088b7f18264f5663036669d04fa7becf
+git diff --stat FETCH_HEAD HEAD
+```
+
+### Reproducibility limit — read this
+
+You get **tree equality, not binary reproduction.** `internal/version/vcs_buildinfo.go`
+calls `debug.ReadBuildInfo()` and stamps the building repository's VCS SHA into the
+binary, so a build from *this* repository will not byte-match a binary built
+from `XDCIndia/go-ethereum`. The source trees can be compared; the binaries cannot be
+bit-compared.
+
+`XDCIndia/go-ethereum` is **private**, so `6fc8e8c2088b7f18264f5663036669d04fa7becf`
+cannot be resolved externally without being granted read access. This cut does not
+record a published binary hash.
+
+### Earlier review stack (not the current source)
+
+The commits described from [The v1.17.8 uplift](#the-v1178-uplift) downward were cut
+against an older source. Those refs are still published. They are not r14.
+
+| | |
+|---|---|
+| Upstream base of that stack | `ethereum/go-ethereum` **v1.17.8** = `a579077007b98217c3e253a66e4b452ca0c32b96` |
 | Upstream tree SHA | `41025bb76ac5e943973403358dafa0a72dde68fc` |
 | Upstream commits below the base | 17,412, with their **original SHAs** |
-| XDC source reviewed | `XDCIndia/go-ethereum` @ `9cc06cf85d812d27b3f8d49900310a5b2dca080a` |
-| Corresponding release | **`v1.17.8-xdc.13`** — the source is exactly that tag |
-| Published binary sha256 | linux-amd64 `927f02f03dc51006429a2e1190d8f00f772878534180c47bd3863f7a1094f6b8`, linux-arm64 `31c4028c18a39e9c0549720f7fdb87c3e3e0e199bb518955800f447e2125a6b7` |
+| XDC source of that stack | `XDCIndia/go-ethereum` @ `9cc06cf85d812d27b3f8d49900310a5b2dca080a` |
+| Release of that stack | `v1.17.8-xdc.13` |
+| Published binary sha256 of that release | linux-amd64 `927f02f03dc51006429a2e1190d8f00f772878534180c47bd3863f7a1094f6b8`, linux-arm64 `31c4028c18a39e9c0549720f7fdb87c3e3e0e199bb518955800f447e2125a6b7` |
 
 ### Integrity check
 
-The base is unmodified upstream. Verify it yourself — these use explicit SHAs rather
-than relative refs like `~11`, which drift whenever the review history is re-cut:
+The base of that older stack is unmodified upstream. Verify it yourself — these use
+explicit SHAs rather than relative refs like `~11`, which drift whenever the review
+history is re-cut:
 
 ```sh
 UP=a579077007b98217c3e253a66e4b452ca0c32b96
@@ -45,7 +88,7 @@ Actions workflow files — the token used to publish this repository lacks the `
 scope, so those files cannot be pushed — and above that the XDC delta, split across the
 review commits below.
 
-To confirm the split changed no content, compare against the audited source directly.
+To confirm that older split changed no content, compare it against its own source.
 Only the 3 workflow paths, this file, `.gitattributes`, `CHANGELOG.md` (on
 `audit/code-only-1178` only), and the dropped detritus listed under [Disclosure](#disclosure-status--partial-stated-honestly) may differ:
 
@@ -54,23 +97,11 @@ git fetch <source-remote> 9cc06cf85d812d27b3f8d49900310a5b2dca080a
 git diff --name-only FETCH_HEAD audit/v2-1178
 ```
 
-### Reproducibility limit — read this
-
-You get **tree equality, not binary reproduction.** `internal/version/vcs_buildinfo.go`
-calls `debug.ReadBuildInfo()` and stamps the building repository's VCS SHA into the
-binary, so a build from *this* repository will not byte-match the published binary built
-from `XDCIndia/go-ethereum`. The source trees can be compared; the binaries cannot be
-bit-compared. Treat the sha256 above as identifying what shipped, not as something you
-can regenerate here.
-
-Two further limits on independent verification:
-
-- `XDCIndia/go-ethereum` is **private**, so `9cc06cf85` cannot be resolved externally
-  without being granted read access.
-- The release `v1.17.8-xdc.13` has **no assets attached on GitHub**. Its binaries
-  are served from `https://xdc.network/snapshots/bin/` (`geth-linux-amd64`,
-  `geth-linux-arm64`), an unversioned, mutable, unsigned URL. The sha256 values above
-  were taken when those files were published on 2026-10-14; a later download may differ.
+That older release has **no assets attached on GitHub**. Its binaries were served from
+`https://xdc.network/snapshots/bin/` (`geth-linux-amd64`, `geth-linux-arm64`), an
+unversioned, mutable, unsigned URL. The sha256 values above were taken when those
+files were published on 2026-10-14; a later download may differ. Treat them as
+identifying what shipped then, not as something you can regenerate here.
 
 ---
 
