@@ -90,11 +90,11 @@ func TestXdcSnapPhase_PivotBlockWithResult(t *testing.T) {
 	}
 }
 
-func TestSnapsyncExperimentalEnv_DefaultDisabled(t *testing.T) {
-	// Without the env var: experimental BeaconSync invocation is gated off.
+func TestSnapsyncExperimentalEnv_DefaultEnabled(t *testing.T) {
+	// Snap sync is the default: unset (or empty) leaves it on.
 	t.Setenv(snapsyncExperimentalEnv, "")
-	if snapsyncExperimentalEnabled() {
-		t.Fatal("env var unset → snapsyncExperimentalEnabled() = true, want false")
+	if !snapsyncExperimentalEnabled() {
+		t.Fatal("env var unset → snapsyncExperimentalEnabled() = false, want true")
 	}
 }
 
@@ -105,14 +105,12 @@ func TestSnapsyncExperimentalEnv_EnabledWhenOne(t *testing.T) {
 	}
 }
 
-func TestSnapsyncExperimentalEnv_RejectsOtherValues(t *testing.T) {
-	// "true", "yes", "0", "on" all disable. Only the literal "1" enables.
-	// This forces operators to read the docs rather than guessing the
-	// activation string from common conventions.
-	for _, v := range []string{"true", "yes", "0", "on", "TRUE", "enabled", " 1 "} {
+func TestSnapsyncExperimentalEnv_KillSwitch(t *testing.T) {
+	// 0/false/off/no (any case, surrounding space ignored) disable snap sync.
+	for _, v := range []string{"0", "false", "off", "no", "FALSE", " 0 ", "Off"} {
 		t.Setenv(snapsyncExperimentalEnv, v)
 		if snapsyncExperimentalEnabled() {
-			t.Errorf("env var = %q should NOT enable; got enabled=true", v)
+			t.Errorf("env var = %q should disable snap sync; got enabled=true", v)
 		}
 	}
 }
