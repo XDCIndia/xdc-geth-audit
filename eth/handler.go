@@ -518,8 +518,13 @@ func (h *handler) runEthPeer(peer *eth.Peer, handler eth.Handler) error {
 	// challenge timeout once here, not in each goroutine.
 	challengeTimeout := syncChallengeTimeout
 	for number, hash := range h.requiredBlocks {
-		resCh := make(chan *eth.Response)
-
+		// Version 100 has no request id. Send the challenge without a
+		// response channel and match the shared-channel reply by number.
+		// Version 101 and every other version wait on the request channel.
+		var resCh chan *eth.Response
+		if peer.Version() != eth.XDPOS2 {
+			resCh = make(chan *eth.Response)
+		}
 		req, err := peer.RequestHeadersByNumber(number, 1, 0, false, resCh)
 		if err != nil {
 			return err
@@ -534,15 +539,18 @@ func (h *handler) runEthPeer(peer *eth.Peer, handler eth.Handler) error {
 			// bounded timeout; on timeout keep the peer — silence on legacy
 			// wire is not evidence of misbehaviour. Only an explicit hash
 			// mismatch at the requested number warrants a drop.
-			if eth.IsXDPOS2Family(peer.Version()) {
+			if peer.Version() == eth.XDPOS2 {
 				timeout := time.NewTimer(challengeTimeout)
 				defer timeout.Stop()
 				select {
 				case headers := <-peer.XDCHeaderResp:
 					if len(headers) == 0 || headers[0].Number.Uint64() != number {
-						// Empty response or a different number than we asked for:
-						// this response is not ours (could belong to xdcSyncer).
-						// Do not steal more reads; keep the peer.
+						// A different number belongs to the syncer. Put it
+						// back and keep the peer.
+						select {
+						case peer.XDCHeaderResp <- headers:
+						default:
+						}
 						return
 					}
 					if headers[0].Hash() != hash {

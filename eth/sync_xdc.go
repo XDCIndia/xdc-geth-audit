@@ -4162,6 +4162,12 @@ func (s *xdcSyncer) onCanonicalBranch(p *eth.Peer, head *types.Header) bool {
 	return known && canonical // no answer: not cached, the peer may answer next time
 }
 
+// guardHeaderMatches reports whether the first header is the guard block.
+// A batch that starts at another number is not a verdict.
+func guardHeaderMatches(hdrs []*types.Header, num uint64) bool {
+	return len(hdrs) > 0 && hdrs[0] != nil && hdrs[0].Number != nil && hdrs[0].Number.Uint64() == num
+}
+
 // guardCheck asks p for the fork-guard block and caches whether p is on the
 // canonical branch; known is false when p did not answer (nothing cached).
 func (s *xdcSyncer) guardCheck(p *eth.Peer, num uint64, want common.Hash) (canonical, known bool) {
@@ -4169,7 +4175,7 @@ func (s *xdcSyncer) guardCheck(p *eth.Peer, num uint64, want common.Hash) (canon
 		return v.(bool), true
 	}
 	hdrs := s.fetchHeaderBatchTimeout(p, num, 1, xdcBulkReqTimeout)
-	if len(hdrs) == 0 {
+	if !guardHeaderMatches(hdrs, num) {
 		return false, false
 	}
 	canonical = hdrs[0].Hash() == want

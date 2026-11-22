@@ -469,11 +469,16 @@ func handleBlockHeaders(backend Backend, msg Decoder, peer *Peer) error {
 		}
 		log.Info("XDPOS2 BlockHeaders received (pre-req)", "peer", peer.ID()[:8], "count", len(headers))
 
-		// Route 1: push to peer.XDCHeaderResp where xdcSyncer waits.
-		// Non-blocking — if reader isn't ready, drop.
-		select {
-		case peer.XDCHeaderResp <- headers:
-		default:
+		// Pop before deciding the shared channel. A caller waiting on its
+		// own response channel must not also have the batch copied onto
+		// XDCHeaderResp, or a required-block challenge and the syncer take
+		// each other's reply.
+		req := peer.popLegacyHeaderReq()
+		if !req.hasSink {
+			select {
+			case peer.XDCHeaderResp <- headers:
+			default:
+			}
 		}
 
 		// Route 2 (#807 Phase 9): also bridge to the standard dispatcher
@@ -493,7 +498,6 @@ func handleBlockHeaders(backend Backend, msg Decoder, peer *Peer) error {
 		// requests in roughly FIFO order. Phase 9.3 / Phase 10 also
 		// handles the XDPOS2 server-side quirk where the peer anchors
 		// its response at a different block than what was requested.
-		req := peer.popLegacyHeaderReq()
 		log.Info("XDPOS2 BlockHeaders received",
 			"peer", peer.ID()[:8],
 			"count", len(headers),
