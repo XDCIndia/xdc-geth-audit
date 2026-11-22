@@ -289,8 +289,10 @@ func (p *StateProcessor) Process(ctx context.Context, block *types.Block, stated
 	blockAccessList.Merge(bal)
 
 	// XDC: Set parentState on the engine for reward calculation.
-	if xdposEngine, ok := p.chain.Engine().(interface{ SetParentState(*state.StateDB) }); ok {
-		xdposEngine.SetParentState(parentState)
+	if xdposEngine, ok := p.chain.Engine().(interface {
+		SetParentState(post, pre *state.StateDB)
+	}); ok {
+		xdposEngine.SetParentState(statedb, parentState)
 	}
 
 	// Finalize the block, applying any consensus engine specific extras
