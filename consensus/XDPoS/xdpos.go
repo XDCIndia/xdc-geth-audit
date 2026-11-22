@@ -1676,7 +1676,13 @@ func (c *XDPoS) Finalize(chain consensus.ChainHeaderReader, header *types.Header
 	if c.IsV2Block(header) && c.EngineV2 != nil {
 		isEpochSwitch, _, err := c.EngineV2.IsEpochSwitch(header)
 		if err != nil {
-			panic(fmt.Sprintf("[Finalize] IsEpochSwitch failed at block %d: %v", number, err))
+			// A header-only reader (eth_simulateV1) is not a ChainReader and its
+			// simulated header carries no V2 extra field: there is no epoch switch
+			// and no reward step. A real chain keeps the panic, as before.
+			if _, ok := chain.(consensus.ChainReader); ok {
+				panic(fmt.Sprintf("[Finalize] IsEpochSwitch failed at block %d: %v", number, err))
+			}
+			log.Debug("[Finalize] simulated V2 header, skipping rewards", "block", number, "err", err)
 		}
 		shouldApplyReward = isEpochSwitch
 	} else {
