@@ -612,6 +612,11 @@ func (x *XDPoS_v2) Author(header *types.Header) (common.Address, error) {
 	return ecrecover(header, x.signatures)
 }
 
+// SigningHash is the digest a V2 proposer signs.
+func (x *XDPoS_v2) SigningHash(header *types.Header) common.Hash {
+	return sigHash(header)
+}
+
 // VerifyHeader verifies a header for V2 consensus
 func (x *XDPoS_v2) VerifyHeader(chain consensus.ChainReader, header *types.Header, fullVerify bool) error {
 	err := x.verifyHeader(chain, header, nil, fullVerify)

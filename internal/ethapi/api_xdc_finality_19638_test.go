@@ -14,8 +14,10 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/consensus"
 	"github.com/ethereum/go-ethereum/consensus/XDPoS"
+	"github.com/ethereum/go-ethereum/consensus/XDPoS/engines/engine_v2"
 	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/rpc"
 )
@@ -53,10 +55,41 @@ func TestFindFinalityOfBlockCommittedV2(t *testing.T) {
 	if f, err := api.findFinalityOfBlock(context.Background(), committed, masternodes); err != nil || f != 100 {
 		t.Errorf("committed V2 block: finality %d (err %v), want 100", f, err)
 	}
-	if api.isCommittedV2Block(context.Background(), fork) {
+	if api.isAtOrBelowFinalized(context.Background(), fork) {
 		t.Error("block on a fork at a committed height reported as committed")
 	}
-	if api.isCommittedV2Block(context.Background(), recent) {
+	if api.isAtOrBelowFinalized(context.Background(), recent) {
 		t.Error("block above the finalized block reported as committed")
+	}
+	key, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	proposer := crypto.PubkeyToAddress(key.PublicKey)
+	cfg := &params.ChainConfig{ChainID: big.NewInt(551), XDPoS: &params.XDPoSConfig{
+		Epoch: 900, Gap: 450,
+		V2: &params.V2{SwitchBlock: big.NewInt(0), CurrentConfig: &params.V2Config{MinePeriod: 2}},
+	}}
+	v2 := engine_v2.New(cfg, rawdb.NewMemoryDatabase(), nil, nil)
+	xdpos := XDPoS.New(cfg.XDPoS, rawdb.NewMemoryDatabase())
+	xdpos.SetEngineV2(v2)
+	v2Header := &types.Header{Number: big.NewInt(1), Difficulty: big.NewInt(1), Coinbase: proposer, UncleHash: types.EmptyUncleHash}
+	sig, err := crypto.Sign(v2.SigningHash(v2Header).Bytes(), key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	v2Header.Validator = sig
+	signers, err := (&BlockChainAPI{b: &finalityBackend{engine: xdpos}}).rpcOutputBlockSigners(types.NewBlockWithHeader(v2Header), context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(signers) != 1 || signers[0] != proposer {
+		t.Fatalf("V2 proposer = %v, want %s", signers, proposer.Hex())
+	}
+
+	v1 := mk(500, 3)
+	be.canonical[500] = v1.Header()
+	if f, err := api.findFinalityOfBlock(context.Background(), v1, masternodes); err != nil || f != 100 {
+		t.Errorf("V1 block below finalized: finality %d (err %v), want 100", f, err)
 	}
 }
