@@ -422,9 +422,13 @@ func AttachConsensusV2Hooks(adaptor *XDPoS.XDPoS, bc *core.BlockChain, chainConf
 						signingTxs, ok := adaptor.GetCachedSigningTxs(bhash)
 						if !ok {
 							block := rawdb.ReadBlock(adaptor.GetDb(), bhash, blockNumber)
-							if block != nil {
-								signingTxs = adaptor.CacheSigner(bhash, block.Transactions())
+							if block == nil {
+								// A missing body must not count as zero signing txs
+								// (#2081): return the retryable error, as the
+								// post-upgrade branch below does.
+								return nil, fmt.Errorf("%w: no block body at %d", XDPoS.ErrPenaltyDataUnavailable, blockNumber)
 							}
+							signingTxs = adaptor.CacheSigner(bhash, block.Transactions())
 						}
 						signer := types.MakeSigner(chainConfig, big.NewInt(int64(blockNumber)), 0)
 						for _, tx := range signingTxs {
@@ -511,9 +515,10 @@ func AttachConsensusV2Hooks(adaptor *XDPoS.XDPoS, bc *core.BlockChain, chainConf
 						signingTxs, ok := adaptor.GetCachedSigningTxs(bhash)
 						if !ok {
 							blk := chain.GetBlock(bhash, blockNumber)
-							if blk != nil {
-								signingTxs = adaptor.CacheSigner(bhash, blk.Transactions())
+							if blk == nil {
+								return nil, fmt.Errorf("%w: no block body at %d", XDPoS.ErrPenaltyDataUnavailable, blockNumber)
 							}
+							signingTxs = adaptor.CacheSigner(bhash, blk.Transactions())
 						}
 						signer := types.MakeSigner(chainConfig, big.NewInt(int64(blockNumber)), 0)
 						for _, tx := range signingTxs {
@@ -748,7 +753,9 @@ func GetSigningTxCount(c *XDPoS.XDPoS, chain *core.BlockChain, header *types.Hea
 			var found bool
 			signingTxs, totalTxsInBlock, found = resolveMissedSigningTxs(c, h.Hash(), i)
 			if !found {
+				// A missing body must not count as zero signing txs (#2081).
 				log.Warn("[V2-SIG] block not found in rawdb", "number", i, "hash", h.Hash())
+				return nil, fmt.Errorf("%w: no block body at %d", XDPoS.ErrPenaltyDataUnavailable, i)
 			}
 		}
 		// V2-SIG diagnostic: log EVERY block in V2 era so we can see whether
@@ -1004,7 +1011,12 @@ func GetSigningTxCountTiered(c *XDPoS.XDPoS, chain *core.BlockChain, header *typ
 			// signing tx (raw receipts carry no TxHash), so a restart near the
 			// tip paid no rewards and wedged on "invalid merkle root". Live
 			// since TIPUpgradeReward is scheduled on apothem (#1366).
-			signingTxs, _, _ = resolveMissedSigningTxs(c, h.Hash(), i)
+			var found bool
+			signingTxs, _, found = resolveMissedSigningTxs(c, h.Hash(), i)
+			if !found {
+				// A missing body must not count as zero signing txs (#2081).
+				return nil, 0, burnedInOneEpoch, fmt.Errorf("%w: no block body at %d", XDPoS.ErrPenaltyDataUnavailable, i)
+			}
 		}
 		signer := types.MakeSigner(chainConfig, h.Number, h.Time)
 		for _, tx := range signingTxs {
