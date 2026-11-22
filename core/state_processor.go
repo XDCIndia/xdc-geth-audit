@@ -198,9 +198,25 @@ func (p *StateProcessor) Process(ctx context.Context, block *types.Block, stated
 		// canonical XDPoSChain (TransactionToMessage, then routeTransaction
 		// inside ApplyTransactionWithEVM), so a tx with a bad signature is
 		// rejected on every route, the 0x91-0x94 empty route included.
-		msg, err := TransactionToMessage(tx, signer, header.BaseFee)
-		if err != nil {
-			return nil, fmt.Errorf("could not apply tx %d [%v]: %w", i, tx.Hash().Hex(), err)
+		//
+		// The 256-bit width checks of TransactionToMessage apply to the EVM
+		// route only. Canonical has no width check on its message conversion
+		// (core/state_transition.go:170-206) and the signing and empty routes
+		// never read the fee or value fields, so a 0x89 tx with a 257-bit gas
+		// price is valid there. Only the sender is recovered for those routes.
+		route := RouteTransaction(config, blockNumber, tx)
+		var msg *Message
+		if route == TxRouteEVM {
+			var err error
+			if msg, err = TransactionToMessage(tx, signer, header.BaseFee); err != nil {
+				return nil, fmt.Errorf("could not apply tx %d [%v]: %w", i, tx.Hash().Hex(), err)
+			}
+		} else {
+			from, err := types.Sender(signer, tx)
+			if err != nil {
+				return nil, fmt.Errorf("could not apply tx %d [%v]: %w", i, tx.Hash().Hex(), err)
+			}
+			msg = &Message{From: from}
 		}
 		// XDC: reject transactions from or to blacklisted addresses once the
 		// chain has passed BlackListHFNumber.  Canonical XDPoSChain enforces
@@ -222,7 +238,7 @@ func (p *StateProcessor) Process(ctx context.Context, block *types.Block, stated
 		// (0x91-0x94, in the TIPXDCXReceiver window) bypass the EVM; see
 		// RouteTransaction. Canonical XDPoSChain produces byte-identical
 		// receipts on these paths and the parity gates depend on it.
-		switch RouteTransaction(config, blockNumber, tx) {
+		switch route {
 		case TxRouteSign:
 			receipt, err := ApplySigningTransaction(config, statedb, blockNumber, blockHash, tx, gp.Used())
 			if err != nil {
