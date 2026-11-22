@@ -241,30 +241,12 @@ func (x *XDPoS_v2) verifyHeader(chain consensus.ChainReader, header *types.Heade
 			// (#1415). The fallback below derives the list from the header being
 			// verified, so it is only safe when the caller trusts the header (!fullVerify).
 			if fullVerify {
-				// SYNC-11 (#1863): if the failure is a missing gap snapshot AND the gap
-				// is below the snap pivot, use sync11ShouldRelax to decide whether to
-				// fall through to the bulk-sync path. The actual seeding happens in the
-				// deferred call to sync11SeedGap (only when retErr == nil).
-				if relax, gapN := x.sync11ShouldRelax(err, header.Number.Uint64()); relax {
-					seedGapFromSwitch = true
-					seedGapNum = gapN
-					log.Warn("[verifyHeader] SYNC-11: gap below snap pivot, deferring seed to after all checks",
-						"switch", header.Number, "gap", gapN)
-				} else if errors.Is(err, utils.ErrPenaltyAncestorMissing) {
-					// #1925: A.68.2 ancestor-header priming is incomplete (or its
-					// depth < penalty lookback window). HookPenalty cannot compute
-					// the correct penalty set without the missing epoch-switch headers.
-					// Fall through to the bulk-sync trust path (header.Validators /
-					// header.Penalties are trusted, proposer-signature check still
-					// enforces signer membership). XDC-10 deferred recheck will
-					// re-verify once all needed ancestor headers are in the DB.
-					// seedGapFromSwitch stays false → the existing bulk-sync fallback applies.
-					log.Warn("[verifyHeader] #1925: penalty ancestor not in DB under fullVerify, deferring to XDC-10 recheck",
-						"block", header.Number, "hash", header.Hash(), "err", err)
-				} else {
-					log.Error("[verifyHeader] calcMasternodes failed under fullVerify", "Number", header.Number, "Hash", header.Hash(), "err", err)
-					return err
-				}
+				// A missing snapshot or a missing penalty ancestor is not a reason
+				// to treat header.Validators and header.Penalties as the local
+				// lists. That includes the snap-pivot carve-out: the header would
+				// be checked against itself and then stored as the gap snapshot.
+				log.Error("[verifyHeader] calcMasternodes failed under fullVerify", "Number", header.Number, "Hash", header.Hash(), "err", err)
+				return err
 			}
 			if seedGapFromSwitch {
 				// SYNC-11: gap is below snap pivot — trust header.Validators directly.
