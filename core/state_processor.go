@@ -962,11 +962,38 @@ func ApplySigningTransaction(config *params.ChainConfig, statedb *state.StateDB,
 // reports non-zero gas, and the state root + receipts root diverge starting
 // at the very first TIPXDCX block.
 func ApplyEmptyTransaction(config *params.ChainConfig, statedb *state.StateDB, blockNumber *big.Int, blockHash common.Hash, tx *types.Transaction, cumulativeGasUsed uint64) (*types.Receipt, error) {
+	// Chain IDs 5151, 5050 and 5551 still have the empty-tx route open.
+	// Mainnet and Apothem keep the historical zero-gas receipt with no nonce change.
+	// The checks run before Finalise: Finalise drops every state snapshot, and a
+	// caller (the miner) must be able to revert to its pre-tx snapshot on error.
+	var (
+		from    common.Address
+		nonce   uint64
+		tracked = emptyRouteTracksNonce(config)
+	)
+	if tracked {
+		var err error
+		from, err = types.Sender(types.MakeSigner(config, blockNumber, 0), tx)
+		if err != nil {
+			return nil, err
+		}
+		nonce = statedb.GetNonce(from)
+		if tx.Nonce() < nonce {
+			return nil, fmt.Errorf("%w: empty tx nonce %d, state %d", ErrNonceTooLow, tx.Nonce(), nonce)
+		}
+		if tx.Nonce() > nonce {
+			return nil, fmt.Errorf("%w: empty tx nonce %d, state %d", ErrNonceTooHigh, tx.Nonce(), nonce)
+		}
+	}
+
 	var root []byte
 	if config.IsByzantium(blockNumber) {
 		statedb.Finalise(params.Rules{IsEIP158: true})
 	} else {
 		root = statedb.IntermediateRoot(params.Rules{IsEIP158: config.IsEIP158(blockNumber)}).Bytes()
+	}
+	if tracked {
+		statedb.SetNonce(from, nonce+1, tracing.NonceChangeUnspecified)
 	}
 
 	emptyLog := &types.Log{
@@ -999,6 +1026,18 @@ func ApplyEmptyTransaction(config *params.ChainConfig, statedb *state.StateDB, b
 // token registered in the TRC21 issuer: the fee is then paid from the token's
 // capacity, at the TRC21 gas price of the block (XDPoSChain tx.AsMessage). It
 // reports whether msg is one. Call it on the normal (non special-tx) path only.
+func emptyRouteTracksNonce(config *params.ChainConfig) bool {
+	if config == nil || config.ChainID == nil {
+		return false
+	}
+	switch config.ChainID.Uint64() {
+	case 5151, 5050, 5551:
+		return true
+	default:
+		return false
+	}
+}
+
 func ApplyTRC21TokenFee(config *params.ChainConfig, msg *Message, tokensFee map[common.Address]*big.Int, tx *types.Transaction, blockNumber *big.Int) bool {
 	to := tx.To()
 	if to == nil {
