@@ -553,6 +553,13 @@ func (miner *Miner) applyTransaction(ctx context.Context, env *environment, tx *
 	return receipt, txBAL, nil
 }
 
+func minerSkipsBlacklisted(number uint64, from common.Address, to *common.Address) bool {
+	if number < common.BlackListHFNumber {
+		return false
+	}
+	return common.IsInBlacklist(&from) || common.IsInBlacklist(to)
+}
+
 func (miner *Miner) commitTransactions(ctx context.Context, env *environment, plainTxs, blobTxs *txorder.TransactionsByPriceAndNonce, interrupt *atomic.Int32) error {
 	ctx, _, spanEnd := telemetry.StartSpan(ctx, "miner.commitTransactions")
 	defer spanEnd(nil)
@@ -649,6 +656,11 @@ func (miner *Miner) commitTransactions(ctx context.Context, env *environment, pl
 		// Error may be ignored here. The error has already been checked
 		// during transaction acceptance in the transaction pool.
 		from, _ := types.Sender(env.signer, tx)
+		if minerSkipsBlacklisted(env.header.Number.Uint64(), from, tx.To()) {
+			log.Trace("Skipping blacklisted transaction", "hash", ltx.Hash, "from", from)
+			txs.Pop()
+			continue
+		}
 
 		// Check whether the tx is replay protected. If we're not in the EIP155 hf
 		// phase, start ignoring the sender until we do.
