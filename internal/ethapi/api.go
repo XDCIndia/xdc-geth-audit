@@ -756,6 +756,9 @@ func (context *ChainContext) GetHeaderByHash(hash common.Hash) *types.Header {
 
 func doCall(ctx context.Context, b Backend, args TransactionArgs, state *state.StateDB, header *types.Header, overrides *override.StateOverride, blockOverrides *override.BlockOverrides, timeout time.Duration, globalGasCap uint64) (*core.ExecutionResult, error) {
 	blockCtx := core.NewEVMBlockContext(header, NewChainContext(ctx, b), nil)
+	stateNumber := new(big.Int).Set(header.Number)
+	stateTime := header.Time
+	stateMerge := blockCtx.Random != nil
 	if blockOverrides != nil {
 		if err := blockOverrides.Apply(&blockCtx); err != nil {
 			return nil, err
@@ -767,6 +770,7 @@ func doCall(ctx context.Context, b Backend, args TransactionArgs, state *state.S
 	}
 	rules := b.ChainConfig().Rules(blockCtx.BlockNumber, blockCtx.Random != nil, blockCtx.Time)
 	precompiles := vm.ActivePrecompiledContracts(rules)
+	precompiles = limitPrivacyPrecompiles(b.ChainConfig(), precompiles, stateNumber, stateMerge, stateTime, blockCtx.BlockNumber, blockCtx.Random != nil, blockCtx.Time)
 	if err := overrides.Apply(state, precompiles); err != nil {
 		return nil, err
 	}
@@ -930,6 +934,9 @@ func DoEstimateGas(ctx context.Context, b Backend, args TransactionArgs, blockNr
 		return 0, err
 	}
 	blockCtx := core.NewEVMBlockContext(header, NewChainContext(ctx, b), nil)
+	stateNumber := new(big.Int).Set(header.Number)
+	stateTime := header.Time
+	stateMerge := blockCtx.Random != nil
 	if blockOverrides != nil {
 		if err := blockOverrides.Apply(&blockCtx); err != nil {
 			return 0, err
@@ -938,6 +945,7 @@ func DoEstimateGas(ctx context.Context, b Backend, args TransactionArgs, blockNr
 	}
 	rules := b.ChainConfig().Rules(blockCtx.BlockNumber, blockCtx.Random != nil, blockCtx.Time)
 	precompiles := vm.ActivePrecompiledContracts(rules)
+	precompiles = limitPrivacyPrecompiles(b.ChainConfig(), precompiles, stateNumber, stateMerge, stateTime, blockCtx.BlockNumber, blockCtx.Random != nil, blockCtx.Time)
 	if err := overrides.Apply(state, precompiles); err != nil {
 		return 0, err
 	}
@@ -953,6 +961,7 @@ func DoEstimateGas(ctx context.Context, b Backend, args TransactionArgs, blockNr
 		State:       state,
 		BlobBaseFee: blobBaseFee,
 		ErrorRatio:  estimateGasErrorRatio,
+		Precompiles: precompiles,
 	}
 	// Set any required transaction default, but make sure the gas cap itself is not messed with
 	// if it was not specified in the original argument list.

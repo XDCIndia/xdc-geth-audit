@@ -15,6 +15,7 @@ import (
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/log"
+	"github.com/ethereum/go-ethereum/params"
 
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/crypto/secp256k1"
@@ -1174,14 +1175,29 @@ func MRPProve(values []*big.Int) (MultiRangeProof, error) {
 MultiRangeProof Verify
 Takes in a MultiRangeProof and verifies its correctness
 */
-func MRPVerify(mrp *MultiRangeProof) bool {
+func proofAborted(abort []func() bool) bool {
+	return len(abort) > 0 && abort[0] != nil && abort[0]()
+}
+
+func MRPVerify(mrp *MultiRangeProof, abort ...func() bool) bool {
 	m := len(mrp.Comms)
 	if m == 0 {
 		return false
 	}
+	// A commitment is 33 bytes on the wire. A count that cannot fit in a
+	// block was not an accepted proof. Reject it before the generator table.
+	if m*PubKeyBytesLenCompressed > params.MaxBlockSize {
+		return false
+	}
 	ecMu.Lock()
 	defer ecMu.Unlock()
-	EC = genECPrimeGroupKey(m * bitsPerValue)
+	if proofAborted(abort) {
+		return false
+	}
+	EC = genECPrimeGroupKey(m*bitsPerValue, abort...)
+	if proofAborted(abort) || EC.N == nil {
+		return false
+	}
 
 	//changes:
 	// check 1 changes since it includes all commitments
@@ -1348,7 +1364,7 @@ func NewECPrimeGroupKey(n int) CryptoParams {
 		ch}
 }
 
-func genECPrimeGroupKey(n int) CryptoParams {
+func genECPrimeGroupKey(n int, abort ...func() bool) CryptoParams {
 	// curValue := secp256k1.S256().Gx
 	// s256 := sha256.New()
 	gen1Vals := make([]ECPoint, n)
@@ -1364,6 +1380,9 @@ func genECPrimeGroupKey(n int) CryptoParams {
 
 	i := 0
 	for i < n {
+		if i&31 == 0 && proofAborted(abort) {
+			return CryptoParams{}
+		}
 		gen2Vals[i] = ch.Mult(
 			big.NewInt(int64(i*2 + 1)),
 		)

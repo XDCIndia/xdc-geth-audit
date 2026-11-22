@@ -319,7 +319,13 @@ func ActivePrecompiles(rules params.Rules) []common.Address {
 // - the returned bytes,
 // - the remaining gas budget,
 // - any error that occurred
-func RunPrecompiledContract(stateDB StateDB, p PrecompiledContract, address common.Address, input []byte, gas GasBudget, logger *tracing.Hooks, rules params.Rules, cache *PrecompileCache) (ret []byte, remaining GasBudget, err error) {
+// precompileAbort is implemented by the privacy precompiles so an RPC
+// timeout can stop verification and drop the curve lock.
+type precompileAbort interface {
+	RunAbort(input []byte, abort func() bool) ([]byte, error)
+}
+
+func RunPrecompiledContract(stateDB StateDB, p PrecompiledContract, address common.Address, input []byte, gas GasBudget, logger *tracing.Hooks, rules params.Rules, cache *PrecompileCache, abort func() bool) (ret []byte, remaining GasBudget, err error) {
 	gasCost := p.RequiredGas(input)
 	prior, ok := gas.ChargeExecution(gasCost)
 	if !ok {
@@ -342,15 +348,24 @@ func RunPrecompiledContract(stateDB StateDB, p PrecompiledContract, address comm
 			if output, ok := cache.load(scope, key); ok {
 				return output, gas, nil
 			}
-			output, err := p.Run(input)
+			output, err := runPrecompile(p, input, abort)
 			if err == nil && len(output) <= maxCacheablePrecompileOutput {
 				cache.store(scope, key, output)
 			}
 			return output, gas, err
 		}
 	}
-	output, err := p.Run(input)
+	output, err := runPrecompile(p, input, abort)
 	return output, gas, err
+}
+
+func runPrecompile(p PrecompiledContract, input []byte, abort func() bool) ([]byte, error) {
+	if abort != nil {
+		if a, ok := p.(precompileAbort); ok {
+			return a.RunAbort(input, abort)
+		}
+	}
+	return p.Run(input)
 }
 
 // ecrecover implemented as a native contract.
@@ -1728,6 +1743,17 @@ func (c *ringSignatureVerifier) Run(proof []byte) ([]byte, error) {
 	return []byte{}, nil
 }
 
+func (c *ringSignatureVerifier) RunAbort(proof []byte, abort func() bool) ([]byte, error) {
+	der, err := privacy.Deserialize(proof)
+	if err != nil {
+		return []byte{}, errors.New("fail to deserialize proof")
+	}
+	if !privacy.Verify(der, false, abort) {
+		return []byte{}, errors.New("fail to verify ring signature")
+	}
+	return []byte{}, nil
+}
+
 func (c *ringSignatureVerifier) Name() string { return "RING_SIG_VERIFY" }
 
 // bulletproofVerifier is precompile 0x28. It costs 100,000 gas and verifies a
@@ -1744,6 +1770,17 @@ func (c *bulletproofVerifier) Run(proof []byte) ([]byte, error) {
 		return []byte{}, errors.New("failed to deserialize bulletproofs")
 	}
 	if !privacy.MRPVerify(mrp) {
+		return []byte{}, errors.New("failed to verify bulletproof")
+	}
+	return []byte{}, nil
+}
+
+func (c *bulletproofVerifier) RunAbort(proof []byte, abort func() bool) ([]byte, error) {
+	mrp := new(privacy.MultiRangeProof)
+	if mrp.Deserialize(proof) != nil {
+		return []byte{}, errors.New("failed to deserialize bulletproofs")
+	}
+	if !privacy.MRPVerify(mrp, abort) {
 		return []byte{}, errors.New("failed to verify bulletproof")
 	}
 	return []byte{}, nil
