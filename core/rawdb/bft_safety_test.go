@@ -68,6 +68,32 @@ func TestBFTSafetyState_RoundTrip(t *testing.T) {
 	}
 }
 
+// TestBFTSafetyState_LockNotLowered verifies a later write of an equal or
+// lower round does not replace the stored lock.
+func TestBFTSafetyState_LockNotLowered(t *testing.T) {
+	db := NewMemoryDatabase()
+	higher := &types.QuorumCert{
+		ProposedBlockInfo: &types.BlockInfo{Round: 2, Number: big.NewInt(20), Hash: common.Hash{0x02}},
+	}
+	lower := &types.QuorumCert{
+		ProposedBlockInfo: &types.BlockInfo{Round: 1, Number: big.NewInt(10), Hash: common.Hash{0x01}},
+	}
+	WriteBFTLockQC(db, higher)
+	WriteBFTLockQC(db, lower)
+	got := ReadBFTLockQC(db)
+	if got == nil || got.ProposedBlockInfo.Round != 2 {
+		t.Fatalf("stored lock round = %v, want 2", got)
+	}
+	same := &types.QuorumCert{
+		ProposedBlockInfo: &types.BlockInfo{Round: 2, Number: big.NewInt(21), Hash: common.Hash{0x03}},
+	}
+	WriteBFTLockQC(db, same)
+	got = ReadBFTLockQC(db)
+	if got.ProposedBlockInfo.Hash != higher.ProposedBlockInfo.Hash {
+		t.Fatalf("equal round replaced the stored lock hash: got %s", got.ProposedBlockInfo.Hash)
+	}
+}
+
 // TestBFTSafetyState_NilLockQC verifies WriteBFTLockQC is a no-op for nil.
 func TestBFTSafetyState_NilLockQC(t *testing.T) {
 	db := NewMemoryDatabase()

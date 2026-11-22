@@ -164,10 +164,18 @@ func ReadBFTLockQC(db ethdb.Reader) *types.QuorumCert {
 	return &qc
 }
 
-// WriteBFTLockQC persists the lock quorum certificate.
+// WriteBFTLockQC persists the lock quorum certificate. A stored lock whose
+// round is greater than or equal to the new one is kept: a restart must not
+// replace it with an older certificate.
 func WriteBFTLockQC(db ethdb.KeyValueWriter, qc *types.QuorumCert) {
-	if qc == nil {
+	if qc == nil || qc.ProposedBlockInfo == nil {
 		return
+	}
+	if reader, ok := db.(ethdb.Reader); ok {
+		if stored := ReadBFTLockQC(reader); stored != nil && stored.ProposedBlockInfo != nil &&
+			stored.ProposedBlockInfo.Round >= qc.ProposedBlockInfo.Round {
+			return
+		}
 	}
 	data, err := rlp.EncodeToBytes(qc)
 	if err != nil {

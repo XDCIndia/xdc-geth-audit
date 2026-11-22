@@ -376,6 +376,12 @@ func (x *XDPoS_v2) initial(chain consensus.ChainReader, header *types.Header) er
 		return nil
 	}
 
+	// Restore the persisted vote lock before processQC. The in-memory lock is
+	// nil on startup, and processQC would otherwise replace the stored lock
+	// with the head parent's certificate even when that certificate's round
+	// is lower or equal.
+	x.loadBFTSafetyState()
+
 	var quorumCert *types.QuorumCert
 	var err error
 
