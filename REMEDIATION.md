@@ -2,6 +2,63 @@
 
 Report: Hacken final report, 2026-10-13. Audited commit: `45e2b6ee`.
 
+## Seventh hand-over (22 November 2026): Hacken report 3 remediation on `main` at `56436982f82e641df0d9e4e8d8e0373a50dd6661`
+
+### Scope
+
+| Item | Value |
+|---|---|
+| Repository | XDCIndia/xdc-geth-audit |
+| Final commit (`main`) | **`56436982f82e641df0d9e4e8d8e0373a50dd6661`**: merge of the branch below into `main`; its tree equals the branch head |
+| Branch / code head | `hacken/r3-remediation` / **`f7fa344c3061`** |
+| Range | `23a5bb5bb..f7fa344c3061` (18 commits, no merges) |
+| Base | `23a5bb5bb` (r14, source XDCIndia/go-ethereum `6fc8e8c2088b`, v1.17.10-xdc.21) |
+| Findings | the 21 new findings of the updated preliminary report (1 High, 12 Medium, 8 Low) |
+
+### Structure: one commit per finding
+
+Each commit fixes one finding; a change that fixes several findings with one root cause is one commit that lists every ID. Every commit has a test, its source commit (`Source: XDCIndia/go-ethereum <sha>`) and the original message. No other changes are in the range: no upstream updates, features or other audit fixes.
+
+| Commit | Finding(s) | Test file(s) | Source commit |
+|---|---|---|---|
+| `4426cbc4615e5070d5111f08b81f21596c96546e` | F-2026-20477: reject non-zero-cost signing tx in pool promotion | `core/txpool/legacypool/legacypool_20477_test.go` | `2225c42e4737d42230a567c7f76922cf582e20bc` |
+| `b0feb28eae5b0911beda6f6e697503db956a8baf` | F-2026-20608: reject high-S signatures before pooling | `consensus/XDPoS/engines/engine_v2/high_s_20608_test.go` | `3796012cc4260d9c41d9a765bebe04df5bfdff77` |
+| `3f22c16d0981f27a98c1e384b79e9d1155d788fd` | F-2026-20607: store a certificate epoch only after verifyQC accepts | `consensus/XDPoS/engines/engine_v2/qc_epoch_cache_20607_test.go` | `0193207a41dbb8c3de138e0f83c517ec039f9dd8` |
+| `21cbf1a71a1b5473426ec8f7358b73807dbc1220` | F-2026-20636, F-2026-19774: keep the persisted vote lock across a restart | `consensus/XDPoS/engines/engine_v2/lock_restart_20636_test.go` `core/rawdb/bft_safety_test.go` | `1c693e17a46e3013a02f7566393eaabedf61b5d8` |
+| `1cb5ddddb0725b0eb05361efb69bf0a02aec97cc` | F-2026-20590: keep one vote per signer per round in the vote pool | `consensus/XDPoS/engines/engine_v2/vote_pool_20590_test.go` `consensus/XDPoS/utils/pool_20590_test.go` | `0bcaff1825578a22b9123073629c61f2acfcabf6` |
+| `892ad214bd90c6d2791d7205ed0d08da4aae07d6` | F-2026-19460, F-2026-20592: bound per-peer bft sends | `eth/handler_xdc_20592_test.go` | `83a08c922675a07808333e1c3d33256b92be154c` |
+| `8ed39e02f56b8038ab7c9eb9de7441d15e2ecf96` | F-2026-20612: taint the header-race winner when bodies do not extend the head | `eth/sync_xdc_20612_test.go` | `8ff96db5519418586356158a239626f8e8afa1b3` |
+| `aa8f95f8fe27abc39bd7d36a03b46dfa2af1c324` | F-2026-20637, F-2026-20613: check prefetched bodies and receipts against the header before the write | `eth/downloader/prime_ancestor_bodies_test.go` | `1a13ca126d58b39fbf7ee1b96d8ebfa77a4cac8c` |
+| `cdfd3198939df957b962008de2425971085aeb64` | F-2026-20610: do not count fast-sync anchor placeholders as a finished block | `eth/sync_xdc_20610_test.go` | `38f5ea7038209047e5d61ca27a0d68819d78d85c` |
+| `633e6df0a969233f29906e7179d2bfd4371ee438` | F-2026-20639, F-2026-19805: report signer and holder rewards separately | `consensus/XDPoS/api_helpers_20639_test.go` `consensus/XDPoS/reward_file_20639_test.go` `internal/ethapi/api_test.go` `internal/ethapi/transaction_args_test.go` | `174eb0b7d34d8a21e6b2cddc21db23a69e54da37` |
+| `d7058d6daf6f7d410654f1100bab3563357a6c1e` | F-2026-20603: include TRC21 fee-capacity accounts in the scoped pool reset | `core/txpool/legacypool/legacypool_20603_test.go` | `8dc4dd851d0dd7ff47874a8efa46513b0251d7cd` |
+| `409803b6f8a5085e989756693786f443a48a001e` | F-2026-20640, F-2026-19639: resolve candidate RPCs with the epoch checkpoint | `internal/ethapi/api_xdc_test.go` | `b830d7010126de062c5aad894fddf324d2b147aa` |
+| `5067335b86c4594e0a1ecb8bde6ace26e02e4e9c` | F-2026-20597, F-2026-20609: check the required-block challenge without taking the syncer's header | `eth/sync_xdc_20609_test.go` | `ab9d7bba2ce58d380331779e794340fedef36bd3` |
+| `75c149452881d58420c1bc6772078882bd8b0698` | F-2026-20596: run checkBodyItemCounts on version-100 bodies before hashing | `eth/protocols/eth/handler_test.go` | `179f642c72ae55b0dcb209e8e1a3c219407cbc41` |
+| `cbe108bcbcd669a998ea98a4ba1f99b6d6d3b947` | F-2026-20638: treat a stale signing-transaction nonce as ErrNonceTooLow | `core/signing_nonce_20638_test.go` | `ccdbc194f9f14763b38c09ca7d4268a07a8e7600` |
+| `f74c44a4a16627765c25e1cf50ef0f392a0a4dc5` | F-2026-20611: cache a fork-guard verdict only when the reply number matches | `eth/sync_xdc_20609_test.go` | `6ae00fe7ebec9750b005d60b412941cafe8e9492` |
+| `78328eb4e80544c6abd84cb7d77a47e40b9f5725` | F-2026-20591: keep privacy precompiles inside the loaded state's window | `core/vm/contracts_fuzz_test.go` `core/vm/contracts_test.go` `core/vm/precompile_cache_test.go` `core/vm/privacy/bulletproof_20591_test.go` `internal/ethapi/privacy_window_test.go` | `9969d925e64f3f4c1acab471ce886955568d2deb` |
+| `f7fa344c306162605b8555cdee2dbaf25aca45e8` | F-2026-20641: read the fee owner for each transaction | `core/hunt35_fee_owner_per_tx_test.go` | `f6cce2146a57c08db8674fa75f5273e27598bdb5` |
+
+### Decisions
+
+- **F-2026-20606:** Accepted, no commit. The XDCx price precompiles only executed before TIPXDCXMinerDisable, which is active on all networks; changing the result would alter historical execution.
+- **F-2026-20641:** fixed (previously Accepted as needing a hard fork). Canonical XDPoSChain v3.0.0-testnet-2 already reads the fee owner per transaction (`core/state_processor.go:442-443`, `:652`). The only validator-contract paths that change a candidate's owner are `propose` (never the block's own validator) and the `voteInvalidKYC` delete, so no fork block is needed.
+
+### Test files
+
+The audit tree leaves out new XDC test files. For this range each fix brings its test. Where the source test was in a file that is not in the audit tree, the test and the helpers it needs are in a new finding-named file, as the commit body says.
+
+### Verify
+
+```sh
+git log --reverse --format='%h %s' 23a5bb5bb..f7fa344c3061
+go build ./... && go vet ./...
+go test -count=1 -timeout 120m ./consensus/XDPoS/... ./core/... ./eth/... ./internal/ethapi ./miner
+```
+
+All 45 packages pass on `f7fa344c3061` (`core` 970 s).
+
 ## Sixth hand-over (28 October 2026): revalidate `main` at `6dc4de6202a19ecd672acd74e1552f0476fd88a6`
 
 ### Scope
