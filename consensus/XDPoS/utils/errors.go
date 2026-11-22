@@ -29,6 +29,7 @@ var (
 	ErrInvalidQuorumCert             = errors.New("invalid quorum certificate")
 	ErrInvalidTimestamp              = errors.New("invalid timestamp")
 	ErrRoundInvalid                  = errors.New("invalid round")
+	ErrRoundSkipWithoutTimeout       = errors.New("round skips ahead without a timeout certificate")
 	ErrInvalidCheckpointVote         = errors.New("invalid checkpoint vote")
 	ErrEmptyEpochSwitchValidators    = errors.New("empty epoch switch validators")
 	ErrInvalidCheckpointSigners      = errors.New("invalid checkpoint signers")

@@ -2397,9 +2397,21 @@ type V2 struct {
 	// BALSealBlock is the first block whose V2 proposer seal binds
 	// BlockAccessListHash (Hacken F-2026-19601). Nil means never.
 	BALSealBlock *big.Int `json:"balSealBlock,omitempty"`
+	// RoundSkipTCBlock is the first block at which a header whose round is
+	// more than one past its parent certificate must carry a timeout
+	// certificate for the skipped rounds (Hacken F-2026-19608). Nil means
+	// the historical rule stays in force: the round only has to be higher.
+	// Every shipped network leaves this unset.
+	RoundSkipTCBlock *big.Int `json:"roundSkipTCBlock,omitempty"`
 
 	mu          sync.RWMutex `json:"-"` // Protects CurrentConfig from concurrent read/write (#74)
 	configIndex []uint64     `json:"-"` // Descending-sorted round keys for O(n) lookup (#117)
+}
+
+// IsRoundSkipTC reports whether block num must carry a timeout certificate
+// when its round skips past the parent certificate. A nil block disables it.
+func (v *V2) IsRoundSkipTC(num *big.Int) bool {
+	return v != nil && v.RoundSkipTCBlock != nil && num != nil && num.Cmp(v.RoundSkipTCBlock) >= 0
 }
 
 // IsBALSeal reports whether the V2 seal of block num binds BlockAccessListHash.

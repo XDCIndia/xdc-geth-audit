@@ -153,6 +153,13 @@ func (x *XDPoS_v2) verifyHeader(chain consensus.ChainReader, header *types.Heade
 	if round <= quorumCert.ProposedBlockInfo.Round {
 		return utils.ErrRoundInvalid
 	}
+	// F-2026-19608: a round more than one past the parent certificate is a
+	// skipped round. Until roundSkipTCBlock, that header is still valid, which
+	// is what every current block relies on. From the fork block it needs a
+	// timeout certificate for the round immediately before it.
+	if err := x.verifyRoundSkip(chain, header, parent, parents, round, quorumCert); err != nil {
+		return err
+	}
 
 	// A.97.5: QC verification always runs. The masternode set is 100% header-derived
 	// via getEpochSwitchInfoWithParents → GetMasternodesFromEpochSwitchHeader →
@@ -512,6 +519,50 @@ func (x *XDPoS_v2) verifyHeader(chain consensus.ChainReader, header *types.Heade
 	// later fullVerify pass accept it unchecked (canonical verifyHeader.go:206-212).
 	if fullVerify {
 		x.verifiedHeaders.Add(header.Hash(), struct{}{})
+	}
+	return nil
+}
+
+// verifyRoundSkip applies the F-2026-19608 round bound.
+//
+// With the gate unset, a header is valid under today's rule (round higher
+// than the parent certificate) and a third extra field is rejected, matching
+// a decoder that has no timeout-certificate field. With the gate set, a
+// consecutive round stays a two-field extra, and a skip must carry a timeout
+// certificate whose round is the one immediately before the header and newer
+// than the parent certificate. Signature checks follow the same catch-up
+// exception as the quorum certificate: the parent-hash link to the trusted
+// pivot authenticates the bytes until the epoch headers exist locally.
+func (x *XDPoS_v2) verifyRoundSkip(chain consensus.ChainReader, header, parent *types.Header, parents []*types.Header, round types.Round, quorumCert *types.QuorumCert) error {
+	var extra types.ExtraFields_v2
+	if err := DecodeExtraFields(header.Extra, &extra); err != nil {
+		return utils.ErrInvalidV2Extra
+	}
+	active := x.config != nil && x.config.V2.IsRoundSkipTC(header.Number)
+	if !active {
+		if extra.TimeoutCert != nil {
+			return utils.ErrInvalidV2Extra
+		}
+		return nil
+	}
+	qcRound := quorumCert.ProposedBlockInfo.Round
+	if round == qcRound+1 {
+		if extra.TimeoutCert != nil {
+			return utils.ErrInvalidV2Extra
+		}
+		return nil
+	}
+	tc := extra.TimeoutCert
+	if tc == nil || tc.Round+1 != round || tc.Round <= qcRound {
+		return utils.ErrRoundSkipWithoutTimeout
+	}
+	if x.inCheckpointCatchup(chain, header.Number.Uint64()) {
+		return nil
+	}
+	// The certificate is checked against the ancestors of this header, not the
+	// local head, so the verdict does not depend on where the head is (#2113).
+	if err := x.verifyTCAt(chain, tc, parent, parents); err != nil {
+		return err
 	}
 	return nil
 }

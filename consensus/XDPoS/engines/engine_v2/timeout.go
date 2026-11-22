@@ -398,8 +398,43 @@ func (x *XDPoS_v2) getTCEpochInfo(chain consensus.ChainReader, timeoutCert *type
 	return epochInfo, nil
 }
 
+// getTCEpochInfoAt is getTCEpochInfo for a certificate carried by the child of
+// parent: the epoch of the certificate round is found from the ancestors of the
+// header being verified, never from the local head, so every node gives the
+// same verdict for the same header. The walk goes back through the
+// epoch-switch parent links from the epoch of parent, like getTCEpochInfo goes
+// back from the head epoch; a round past the epoch of parent uses that epoch
+// (the certified round opens a new epoch whose switch block does not exist yet).
+func (x *XDPoS_v2) getTCEpochInfoAt(chain consensus.ChainReader, timeoutCert *types.TimeoutCert, parent *types.Header, parents []*types.Header) (*types.EpochSwitchInfo, error) {
+	info, err := x.getEpochSwitchInfoWithParents(chain, parent, parent.Hash(), parents)
+	if err != nil {
+		return nil, fmt.Errorf("[getTCEpochInfoAt] failed to get epoch switch info: %s", err)
+	}
+	for info.EpochSwitchBlockInfo.Round > timeoutCert.Round {
+		parentHash, ok, err := x.epochSwitchParentHashOrErr(chain, info)
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			break // no earlier epoch
+		}
+		if info, err = x.getEpochSwitchInfoWithParents(chain, nil, parentHash, parents); err != nil {
+			return nil, fmt.Errorf("[getTCEpochInfoAt] failed to get epoch switch info: %s", err)
+		}
+	}
+	return info, nil
+}
+
 // verifyTC verifies a timeout certificate
 func (x *XDPoS_v2) verifyTC(chain consensus.ChainReader, timeoutCert *types.TimeoutCert) error {
+	return x.verifyTCAt(chain, timeoutCert, nil, nil)
+}
+
+// verifyTCAt verifies a timeout certificate. With parent nil the epoch of the
+// certificate and the gap rule are taken from the local head (the normal path,
+// as canonical). With parent set they are taken from that header and the
+// in-batch parents, for the certificate inside a header (verifyRoundSkip).
+func (x *XDPoS_v2) verifyTCAt(chain consensus.ChainReader, timeoutCert *types.TimeoutCert, parent *types.Header, parents []*types.Header) error {
 	if timeoutCert == nil || timeoutCert.Signatures == nil {
 		log.Warn("[verifyTC] TC or signatures is nil")
 		return utils.ErrInvalidTC
@@ -431,12 +466,23 @@ func (x *XDPoS_v2) verifyTC(chain consensus.ChainReader, timeoutCert *types.Time
 	// byte-distinct encoding of the SAME signer's timeout vote, so
 	// byte-dedup lets one masternode key inflate the counted total toward
 	// the 2/3 threshold — a BFT safety violation.
-	epochInfo, err := x.getTCEpochInfo(chain, timeoutCert)
+	var epochInfo *types.EpochSwitchInfo
+	if parent == nil {
+		epochInfo, err = x.getTCEpochInfo(chain, timeoutCert)
+	} else {
+		epochInfo, err = x.getTCEpochInfoAt(chain, timeoutCert, parent, parents)
+	}
 	if err != nil {
 		log.Error("[verifyTC] Failed to get TC epoch info", "tcRound", timeoutCert.Round, "error", err)
 		return err
 	}
-	if err := x.timeoutGapMatchesEpoch(chain, epochInfo, timeoutCert.Round, timeoutCert.GapNumber); err != nil {
+	ref := (*types.Header)(nil)
+	if parent == nil {
+		ref = chain.CurrentHeader()
+	} else {
+		ref = parent
+	}
+	if err := x.timeoutGapMatchesEpochAt(chain, ref, epochInfo, timeoutCert.Round, timeoutCert.GapNumber); err != nil {
 		return err
 	}
 

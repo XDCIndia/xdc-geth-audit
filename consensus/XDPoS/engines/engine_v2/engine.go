@@ -719,6 +719,7 @@ func (x *XDPoS_v2) Prepare(chain consensus.ChainReader, header *types.Header) er
 	x.lock.RLock()
 	currentRound := x.currentRound
 	highestQC := x.highestQuorumCert
+	highestTC := x.highestTimeoutCert
 	x.lock.RUnlock()
 
 	// A.99: If highestQC is still at zero (engine bootstrapped but QC never seeded
@@ -740,6 +741,7 @@ func (x *XDPoS_v2) Prepare(chain consensus.ChainReader, header *types.Header) er
 			}
 			currentRound = x.currentRound
 			highestQC = x.highestQuorumCert
+			highestTC = x.highestTimeoutCert
 			x.lock.Unlock()
 		}
 	}
@@ -753,10 +755,20 @@ func (x *XDPoS_v2) Prepare(chain consensus.ChainReader, header *types.Header) er
 		return utils.ErrNotReadyToPropose
 	}
 
-	// Set extra fields
+	// Set extra fields. A timeout certificate is written only once
+	// roundSkipTCBlock is active and this round actually skips. Otherwise the
+	// extra stays the two-field encoding current nodes seal and accept.
 	extra := types.ExtraFields_v2{
 		Round:      currentRound,
 		QuorumCert: highestQC,
+	}
+	if x.config.V2.IsRoundSkipTC(header.Number) && highestQC != nil && highestQC.ProposedBlockInfo != nil &&
+		currentRound > highestQC.ProposedBlockInfo.Round+1 {
+		qcRound := highestQC.ProposedBlockInfo.Round
+		if highestTC == nil || highestTC.Round+1 != currentRound || highestTC.Round <= qcRound {
+			return utils.ErrRoundSkipWithoutTimeout
+		}
+		extra.TimeoutCert = highestTC.DeepCopy()
 	}
 	extraBytes, err := extra.EncodeToBytes()
 	if err != nil {
