@@ -105,6 +105,7 @@ type Peer struct {
 	legacyHeaderQueue   []legacyHeaderReq
 
 	legacyBodyReqID     atomic.Uint64
+	legacyBodyReqCount  atomic.Uint64
 	legacyReceiptsReqID atomic.Uint64
 
 	// XDC: dedicated response channels for XDPOS2 legacy data-plane messages.
@@ -703,6 +704,7 @@ func (p *Peer) RequestBodies(hashes []common.Hash, sink chan *Response) (*Reques
 		// Bare hash list — eth/63 wire shape used by production XDC peers.
 		data = GetBlockBodiesRequest(hashes)
 		p.legacyBodyReqID.Store(id)
+		p.legacyBodyReqCount.Store(uint64(len(hashes)))
 	} else {
 		data = &GetBlockBodiesPacket{
 			RequestId:             id,

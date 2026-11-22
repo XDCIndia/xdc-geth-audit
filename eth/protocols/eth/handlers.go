@@ -627,6 +627,9 @@ func handleBlockBodies(backend Backend, msg Decoder, peer *Peer) error {
 			return err
 		}
 		log.Info("XDPOS2 BlockBodies received", "peer", peer.ID()[:8], "count", len(bodies))
+		if err := xdpos2BodiesFitRequest(bodies, peer.legacyBodyReqCount.Load()); err != nil {
+			return fmt.Errorf("XDPOS2 BlockBodies: %w", err)
+		}
 		// BlockBodiesResponse is []BlockBody — bodies already decoded, no
 		// re-encoding needed. Just wrap and dispatch.
 		reqID := peer.LastXDCBodyReqID()
@@ -680,6 +683,19 @@ const (
 	minWithdrawalEncodedSize = 1 + 3 + 21 // Min size for RLP encoded withdrawal
 	minReceiptEncodedSize    = 1 + 4      // Min size for RLP encoded receipt
 )
+
+// xdpos2BodiesFitRequest checks a version-100 body batch before it is hashed.
+func xdpos2BodiesFitRequest(bodies []BlockBody, requested uint64) error {
+	if requested > 0 && uint64(len(bodies)) > requested {
+		return fmt.Errorf("%d bodies for a request of %d", len(bodies), requested)
+	}
+	for i := range bodies {
+		if err := checkBodyItemCounts(&bodies[i]); err != nil {
+			return fmt.Errorf("body %d: %w", i, err)
+		}
+	}
+	return nil
+}
 
 // checkBodyItemCounts rejects bodies containing more transactions or withdrawals
 // than can fit in their encoded size.
