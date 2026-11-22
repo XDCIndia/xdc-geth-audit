@@ -211,7 +211,7 @@ func (api *API) masternodesStatus(number *rpc.BlockNumber) MasternodesStatus {
 					switchHdr = h
 				}
 			}
-			standby = api.xdpos.EngineV2.GetStandbynodes(cr, switchHdr)
+			standby, _ = api.xdpos.EngineV2.GetStandbynodes(cr, switchHdr)
 		}
 	}
 	if st.Masternodes == nil {

@@ -355,7 +355,7 @@ type EngineV2Iface interface {
 	GetMasternodesByHash(chain consensus.ChainReader, hash common.Hash) []common.Address                                     // (#402) post-penalty active masternodes
 	GetPreviousPenaltyByHash(chain consensus.ChainReader, hash common.Hash, limitPenaltyEpoch int) ([]common.Address, error) // (#412) comeback seeding; returns ErrPenaltyAncestorMissing when A.68.2 priming is incomplete
 	GetMasternodesFromEpochSwitchHeader(chain consensus.ChainReader, header *types.Header) []common.Address                  // V2 era epoch-switch masternode list (reads header.Validators, falls back to Extra at switch block)
-	GetStandbynodes(chain consensus.ChainReader, header *types.Header) []common.Address                                      // Reward 2.0 standby pool of an epoch, from its historical snapshot (#2612)
+	GetStandbynodes(chain consensus.ChainReader, header *types.Header) ([]common.Address, error)                             // Reward 2.0 standby pool of an epoch, from its historical snapshot (#2612)
 	GetMasternodesV2(chain consensus.ChainReader, header *types.Header) []common.Address                                     // active masternode set for any V2-era header via getEpochSwitchInfo
 
 	// Mining-side wrapper dispatch surface (audit IDs M-1..M-7).
@@ -2098,11 +2098,11 @@ func (c *XDPoS) GetMasternodesWithParents(chain consensus.ChainHeaderReader, hea
 // switch) header: stake-sorted and already filtered of that epoch's masternodes
 // and penalties. V1 has no standby tier, so it returns empty. Mirrors
 // XinFinOrg/XDPoSChain XDPoS.GetStandbynodes (#2612).
-func (c *XDPoS) GetStandbynodes(chain consensus.ChainReader, header *types.Header) []common.Address {
+func (c *XDPoS) GetStandbynodes(chain consensus.ChainReader, header *types.Header) ([]common.Address, error) {
 	if c.IsV2Block(header) && c.EngineV2 != nil {
 		return c.EngineV2.GetStandbynodes(chain, header)
 	}
-	return []common.Address{}
+	return []common.Address{}, nil
 }
 
 // GetMasternodesFromCheckpointHeader extracts masternode list from checkpoint header
