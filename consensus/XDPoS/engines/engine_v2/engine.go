@@ -279,10 +279,27 @@ func (x *XDPoS_v2) UpdateParams(header *types.Header) {
 	// Without this guard the goroutine blocks forever on a nil channel — a goroutine
 	// leak under round churn. With real channels wired (eth/backend.go), the
 	// buffered send succeeds immediately when the worker drains.
-	if x.minePeriodCh != nil {
-		go func() {
-			x.minePeriodCh <- x.config.V2.CurrentConfig.MinePeriod
-		}()
+	x.notifyMinePeriod(x.config.V2.CurrentConfig.MinePeriod)
+}
+
+// notifyMinePeriod hands the latest mine period to the worker without
+// blocking and without a goroutine. A node that does not mine has no reader on
+// minePeriodCh, so a blocking send would leak one goroutine per call (#2102).
+// The channel holds one value; when it is full the stale value is replaced.
+func (x *XDPoS_v2) notifyMinePeriod(period int) {
+	if x.minePeriodCh == nil {
+		return
+	}
+	for {
+		select {
+		case x.minePeriodCh <- period:
+			return
+		default:
+		}
+		select {
+		case <-x.minePeriodCh:
+		default:
+		}
 	}
 }
 
@@ -3371,9 +3388,7 @@ func (x *XDPoS_v2) setNewRound(chain consensus.ChainReader, round types.Round) {
 		log.Error("[setNewRound] timeoutWorker.SetParams failed", "round", round, "err", err)
 	}
 	// Notify the miner of the updated mine period for this config row.
-	if x.minePeriodCh != nil {
-		go func() { x.minePeriodCh <- cfg.MinePeriod }()
-	}
+	x.notifyMinePeriod(cfg.MinePeriod)
 
 	x.timeoutWorker.Reset(chain, uint64(x.currentRound), uint64(x.highestQuorumCert.ProposedBlockInfo.Round))
 	x.timeoutPool.Clear()
