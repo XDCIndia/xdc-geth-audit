@@ -887,10 +887,12 @@ func (c *XDPoS) verifyHeader(chain consensus.ChainHeaderReader, header *types.He
 	// F-2026-19615 (Info): this matches canonical XDPoSChain v2.9.3-testnet
 	// (consensus/XDPoS/engines/engine_v1/engine.go:173 and :238 have no gas
 	// checks; only V2 calls misc.VerifyGaslimit). All V1 blocks are historical
-	// (mainnet V2 from 80,370,000; Apothem from 56,828,700). Adding a bound
-	// here would reject old blocks that canonical accepts — do not add without
-	// a full V1 history scan gated on replay-parity returning 0 rejections.
-	// Execution still enforces GasUsed ≤ GasLimit via ValidateState.
+	// (mainnet V2 from 80,370,000; Apothem from 56,828,700). A parent-bound
+	// added here, or behind a fork inside that range, can reject a canonical
+	// block whose gas limit moved by more than 1/1024. A fork after the V2
+	// switch never runs on a V1 header. No full-history scan is in this
+	// change, so the bound stays absent and a header current-main accepts is
+	// still accepted. The V2 check in engine_v2/verifyHeader.go is unchanged.
 
 	// All basic checks passed, verify cascading fields
 	return c.verifyCascadingFields(chain, header, parents)
