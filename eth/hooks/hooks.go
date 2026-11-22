@@ -63,6 +63,16 @@ func AttachConsensusV1Hooks(adaptor *XDPoS.XDPoS, bc *core.BlockChain, chainConf
 		return validators, nil
 	}
 
+	// Signer lists for checkpoints whose parent header was not in the database
+	// during header verification. Body validation replays them after the parent
+	// is written. A checkpoint-synced node that never has the parent state still
+	// skips: the randomize values cannot be read, and rejecting would drop
+	// canonical history. Apothem (chain 51) stays skipped for every V1
+	// checkpoint, through the V2 switch at block 56,828,700, because canonical
+	// never enforced this field there.
+	deferredSigners := make(map[common.Hash][]common.Address)
+	var deferredMu sync.Mutex
+
 	// HookVerifyMNs: verifies the Validators field at epoch checkpoints against
 	// the M2 list recomputed from the 0x90 randomize values in the parent's
 	// state. Port of canonical XDPoSChain eth/hooks/engine_v1_hooks.go
@@ -97,8 +107,13 @@ func AttachConsensusV1Hooks(adaptor *XDPoS.XDPoS, bc *core.BlockChain, chainConf
 		// randomize values cannot be read (e.g. a checkpoint-synced node).
 		parent := bc.GetHeaderByHash(header.ParentHash)
 		if parent == nil {
-			log.Warn("[V1 HookVerifyMNs] parent header unknown, skipping validator check", "number", number)
+			log.Warn("[V1 HookVerifyMNs] parent header unknown, deferring validator check", "number", number)
 			hookVerifyMNsMissingStateSkips.Inc(1)
+			deferredMu.Lock()
+			if len(deferredSigners) < 32 {
+				deferredSigners[header.Hash()] = append([]common.Address(nil), signers...)
+			}
+			deferredMu.Unlock()
 			return nil
 		}
 		statedb, err := bc.StateAt(parent.Root, parent.Number, parent.Time)
@@ -115,6 +130,18 @@ func AttachConsensusV1Hooks(adaptor *XDPoS.XDPoS, bc *core.BlockChain, chainConf
 			return XDPoS.ErrInvalidCheckpointValidators
 		}
 		return nil
+	}
+	adaptor.HookRecheckV1Validators = func(header *types.Header) error {
+		deferredMu.Lock()
+		signers, ok := deferredSigners[header.Hash()]
+		if ok {
+			delete(deferredSigners, header.Hash())
+		}
+		deferredMu.Unlock()
+		if !ok {
+			return nil
+		}
+		return adaptor.HookVerifyMNs(header, signers)
 	}
 
 	// HookPenalty (before TIPSigning): masternodes of the previous epoch that

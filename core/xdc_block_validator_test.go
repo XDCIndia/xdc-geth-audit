@@ -5,13 +5,26 @@
 package core
 
 import (
+	"errors"
 	"math/big"
 	"testing"
 
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/consensus"
+	"github.com/ethereum/go-ethereum/consensus/ethash"
+	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/params"
 )
+
+// recheckEngine wraps an engine so ValidateBody's deferred V1 validator
+// replay can be observed without a full XDPoS chain.
+type recheckEngine struct {
+	consensus.Engine
+	err error
+}
+
+func (e recheckEngine) RecheckV1Validators(*types.Header) error { return e.err }
 
 // TestXDCBloomBypass verifies that bloom mismatch is bypassed for XDC chains (chainId 50/51)
 // but NOT for non-XDC chains. This prevents peer drops due to signing tx receipt divergence.
@@ -109,8 +122,8 @@ func (e *bloomMismatchError) Error() string {
 // TestXDCReceiptHashBypass verifies that receipt hash mismatch is bypassed for XDC chains.
 func TestXDCReceiptHashBypass(t *testing.T) {
 	tests := []struct {
-		name      string
-		chainID   int64
+		name       string
+		chainID    int64
 		wantBypass bool
 	}{
 		{name: "XDC mainnet (50) bypasses receipt mismatch", chainID: 50, wantBypass: true},
@@ -208,4 +221,37 @@ func TestSigningTxBypassRemoved(t *testing.T) {
 	t.Log("Confirmed: ApplySignTransaction bypass removed; signing txs use EVM execution")
 	t.Log("Confirmed: BlockSigners contract NOT destroyed at TIPSigning block")
 	t.Log("Fix: receipt/bloom hash mismatch bypasses added for XDC chains 50/51")
+}
+
+// TestValidateBodyReplaysDeferredV1Validators: body validation must surface a
+// validator check that header verification deferred (F-2026-19462).
+func TestValidateBodyReplaysDeferredV1Validators(t *testing.T) {
+	want := errors.New("deferred validators")
+	engine := recheckEngine{Engine: ethash.NewFaker(), err: want}
+	gspec := &Genesis{
+		Config:     params.AllEthashProtocolChanges,
+		Difficulty: common.Big1,
+		GasLimit:   8_000_000,
+	}
+	db := rawdb.NewMemoryDatabase()
+	bc, err := NewBlockChain(db, gspec, engine, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer bc.Stop()
+
+	header := &types.Header{
+		ParentHash: bc.Genesis().Hash(),
+		UncleHash:  types.EmptyUncleHash,
+		TxHash:     types.EmptyTxsHash,
+		Number:     big.NewInt(1),
+		Time:       bc.Genesis().Time() + 1,
+		Difficulty: common.Big1,
+		GasLimit:   8_000_000,
+	}
+	block := types.NewBlockWithHeader(header)
+	err = NewBlockValidator(gspec.Config, bc).ValidateBody(block)
+	if !errors.Is(err, want) {
+		t.Fatalf("ValidateBody: got %v, want %v", err, want)
+	}
 }

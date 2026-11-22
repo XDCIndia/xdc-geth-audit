@@ -322,6 +322,10 @@ type XDPoS struct {
 	HookPenaltyTIPSigning func(chain consensus.ChainHeaderReader, header *types.Header, candidate []common.Address, parents []*types.Header) ([]common.Address, error)
 	HookValidator         func(header *types.Header, signers []common.Address) ([]byte, error)
 	HookVerifyMNs         func(header *types.Header, signers []common.Address) error
+	// HookRecheckV1Validators replays a V1 checkpoint validator check that was
+	// skipped because the parent header was not in the database yet
+	// (F-2026-19462). Body validation calls it after the parent has been written.
+	HookRecheckV1Validators func(header *types.Header) error
 
 	// HookGetSignersFromContract returns the signers from the state of a V1 gap
 	// block. A checkpoint whose list fails the snapshot check is checked again
@@ -1365,6 +1369,15 @@ func (c *XDPoS) verifySeal(chain consensus.ChainHeaderReader, header *types.Head
 	}
 
 	return nil
+}
+
+// RecheckV1Validators replays a deferred V1 checkpoint validator check.
+// A nil hook means the chain has no V1 validator hook, and the check is a no-op.
+func (c *XDPoS) RecheckV1Validators(header *types.Header) error {
+	if c == nil || c.HookRecheckV1Validators == nil || header == nil {
+		return nil
+	}
+	return c.HookRecheckV1Validators(header)
 }
 
 // v1DoubleValidation reports whether V1 blocks past the first epoch must carry
