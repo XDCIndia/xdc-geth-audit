@@ -178,8 +178,11 @@ func (v *BlockValidator) ValidateBody(block *types.Block) error {
 			// XDC: during genesis sync with legacy peers (no snap sync), parent
 			// state may not be available even though the block exists. Within
 			// the first 10000 blocks from genesis, allow missing state and let
-			// ProcessBlock create empty state incrementally.
-			if v.config.XDPoS != nil && parentNum < 10000 {
+			// ProcessBlock create empty state incrementally. Only where
+			// ProcessBlock may mask missing state (bulk sync, not archive, not
+			// a producer): anywhere else it returns the missing-state error
+			// later, with a message that does not show the cause (#2109).
+			if v.config.XDPoS != nil && parentNum < 10000 && v.bc.canMaskMissingState() {
 				log.Debug("ValidateBody: genesis sync early block, allowing missing parent state",
 					"block", block.NumberU64(), "parent", parentHash.Hex()[:16], "parentNum", parentNum)
 			} else {
