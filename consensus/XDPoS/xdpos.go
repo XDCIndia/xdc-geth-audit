@@ -758,6 +758,9 @@ func (c *XDPoS) verifyHeaderLightV1(chain consensus.ChainHeaderReader, header *t
 	if parent.Time+c.config.Period > header.Time {
 		return ErrInvalidTimestamp
 	}
+	if err := verifyV1BaseFee(chain.Config(), parent, header); err != nil {
+		return err
+	}
 
 	// #951 Defect 1c: reject empty header.Validator past the first epoch (V1 double
 	// validation requires the assigned-M2 co-signature). Canonical v2.9.3 rejects it
@@ -847,6 +850,33 @@ func verifyNoUnsealedFields(config *params.ChainConfig, header *types.Header) er
 		header.ParentBeaconRoot != nil || header.RequestsHash != nil ||
 		header.BlockAccessListHash != nil || header.SlotNumber != nil {
 		return errUnsealedHeaderFields
+	}
+	return nil
+}
+
+// verifyV1BaseFee is the base-fee rule canonical applies to every V1 header:
+// engine_v1/engine.go:258 calls eip1559.VerifyEip1559Header in
+// verifyCascadingFields. Before the EIP-1559 block the header must carry no
+// base fee; from it the header must carry the exact tier price of its block
+// (canonical CalcBaseFee, consensus/misc/eip1559/eip1559.go:58-75). Canonical's
+// function has no gas limit check, so none is made here either (#2041).
+// BaseFee is part of the V1 seal hash, so a producer could otherwise sign any
+// value.
+func verifyV1BaseFee(config *params.ChainConfig, parent, header *types.Header) error {
+	if !config.IsEIP1559(header.Number) {
+		if header.BaseFee != nil {
+			return fmt.Errorf("invalid baseFee: have %s, want <nil>", header.BaseFee)
+		}
+		return nil
+	}
+	if header.BaseFee == nil {
+		return errors.New("header is missing baseFee")
+	}
+	if parent != nil && config.IsEIP1559(parent.Number) && parent.BaseFee == nil {
+		return errors.New("parent header is missing baseFee")
+	}
+	if want := params.XDCBaseFeeForBlock(config, header.Number); header.BaseFee.Cmp(want) != 0 {
+		return fmt.Errorf("invalid baseFee: have %s, want %s", header.BaseFee, want)
 	}
 	return nil
 }
@@ -1029,6 +1059,9 @@ func (c *XDPoS) verifyCascadingFields(chain consensus.ChainHeaderReader, header 
 	}
 	if parent.Time+c.config.Period > header.Time {
 		return ErrInvalidTimestamp
+	}
+	if err := verifyV1BaseFee(chain.Config(), parent, header); err != nil {
+		return err
 	}
 
 	// Retrieve the snapshot needed to verify this header and cache it
