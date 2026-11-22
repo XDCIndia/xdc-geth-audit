@@ -498,6 +498,7 @@ func (x *XDPoS_v2) initial(chain consensus.ChainReader, header *types.Header) er
 				}()
 			}
 			// Start countdown timer
+			x.applyTimeoutParamsForHeader(header)
 			x.timeoutWorker.Reset(chain, 0, 0)
 			log.Warn("[initial] finish initialisation (deferred snapshot)")
 			return nil
@@ -546,6 +547,7 @@ func (x *XDPoS_v2) initial(chain consensus.ChainReader, header *types.Header) er
 						x.minePeriodCh <- minePeriod
 					}()
 				}
+				x.applyTimeoutParamsForHeader(header)
 				x.timeoutWorker.Reset(chain, 0, 0)
 				log.Warn("[initial] finish initialisation (deferred snapshot)")
 				return nil
@@ -587,7 +589,10 @@ func (x *XDPoS_v2) initial(chain consensus.ChainReader, header *types.Header) er
 		}()
 	}
 
-	// Start countdown timer
+	// Start countdown timer with the head's round config, not the round-zero
+	// values left from engine construction. processQC may be skipped on this
+	// path, so setNewRound is not guaranteed to run first.
+	x.applyTimeoutParamsForHeader(header)
 	x.timeoutWorker.Reset(chain, 0, 0)
 	// F-2026-19774: restore persisted local safety state before marking ready.
 	x.loadBFTSafetyState()
@@ -595,6 +600,32 @@ func (x *XDPoS_v2) initial(chain consensus.ChainReader, header *types.Header) er
 
 	log.Warn("[initial] finish initialisation")
 	return nil
+}
+
+// applyTimeoutParamsForHeader selects the V2 timeout config for the header's
+// round and installs it on the countdown before the first Reset.
+func (x *XDPoS_v2) applyTimeoutParamsForHeader(header *types.Header) {
+	if x.config == nil || x.config.V2 == nil || x.timeoutWorker == nil {
+		return
+	}
+	var round types.Round
+	if header != nil {
+		if _, decoded, err := x.getExtraFieldsNoChain(header); err == nil {
+			round = decoded
+		}
+	}
+	x.config.V2.UpdateConfig(uint64(round))
+	cfg := x.config.V2.CurrentConfig
+	if cfg == nil {
+		return
+	}
+	if err := x.timeoutWorker.SetParams(
+		time.Duration(cfg.TimeoutPeriod)*time.Second,
+		cfg.ExpTimeoutConfig.Base,
+		int(cfg.ExpTimeoutConfig.MaxExponent),
+	); err != nil {
+		log.Error("[initial] timeoutWorker.SetParams failed", "round", round, "err", err)
+	}
 }
 
 // loadBFTSafetyState reads the persisted equivocation-guard values from the DB
