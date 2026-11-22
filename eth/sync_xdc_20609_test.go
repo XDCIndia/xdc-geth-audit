@@ -9,6 +9,16 @@ import (
 	"github.com/ethereum/go-ethereum/core/types"
 )
 
+func TestF202620611MisalignedGuardIsNotAVerdict(t *testing.T) {
+	if guardHeaderMatches(nil, 20) {
+		t.Fatal("an empty reply was a verdict")
+	}
+	late := &types.Header{Number: big.NewInt(21)}
+	if guardHeaderMatches([]*types.Header{late}, 20) {
+		t.Fatal("a misaligned reply was a verdict")
+	}
+}
+
 func TestF202620609GuardIgnoresADifferentNumber(t *testing.T) {
 	other := &types.Header{Number: big.NewInt(10)}
 	if guardHeaderMatches([]*types.Header{other}, 20) {
