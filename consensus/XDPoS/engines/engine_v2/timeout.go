@@ -203,7 +203,7 @@ func (x *XDPoS_v2) onTimeoutPoolThresholdReached(chain consensus.ChainReader, po
 		Round:     current.Round,
 		GapNumber: current.GapNumber,
 	})
-	accepted, _, err := recoverUniqueSigners(signedHash, signatures, epochInfo.Masternodes)
+	accepted, _, err := recoverUniqueSigners(signedHash, lowSSignatures(signatures), epochInfo.Masternodes)
 	if err != nil || float64(len(accepted)) < float64(epochInfo.MasternodesLen)*certThreshold {
 		log.Warn("[onTimeoutPoolThresholdReached] certificate signatures rejected",
 			"accepted", len(accepted), "err", err, "tcRound", timeoutRound)

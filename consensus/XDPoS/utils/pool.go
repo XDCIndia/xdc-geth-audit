@@ -4,6 +4,7 @@
 package utils
 
 import (
+	"strings"
 	"sync"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -23,13 +24,32 @@ type Pool struct {
 	// Key: PoolKey (round:gapNumber:number:hash for votes, round:gapNumber for timeouts)
 	// Value: map of message hash -> PoolObj
 	pool map[string]map[common.Hash]PoolObj
+	// signerRound keeps one message per recovered signer per round, across
+	// every block hash, gap and block number. The map value is the pool key
+	// that holds that signer's entry.
+	signerRound map[string]string
 }
 
 // NewPool creates a new Pool
 func NewPool() *Pool {
 	return &Pool{
-		pool: make(map[string]map[common.Hash]PoolObj),
+		pool:        make(map[string]map[common.Hash]PoolObj),
+		signerRound: make(map[string]string),
 	}
+}
+
+// roundOfPoolKey returns the round field, which is the first ':'-separated
+// component of a vote or timeout pool key.
+func roundOfPoolKey(key string) (string, bool) {
+	round, _, ok := strings.Cut(key, ":")
+	if !ok || round == "" {
+		return "", false
+	}
+	return round, true
+}
+
+func signerRoundID(signer common.Address, round string) string {
+	return signer.Hex() + ":" + round
 }
 
 // Add adds an object to the pool
@@ -52,14 +72,25 @@ func (p *Pool) Add(obj PoolObj) (int, map[common.Hash]PoolObj) {
 		p.pool[key] = make(map[common.Hash]PoolObj)
 	}
 
-	// Signer dedup: if the incoming object has a recovered signer (non-zero),
-	// check whether this signer already occupies a slot for this pool key.
-	// Drop the duplicate rather than growing pool memory unboundedly (XDC-07).
+	// One recovered signer may occupy one slot per round, whichever block hash,
+	// gap or number the message carries. A later message from that signer in
+	// the same round is dropped (XDC-07, F-2026-20590).
 	incomingSigner := obj.GetSigner()
 	if incomingSigner != (common.Address{}) {
+		if round, ok := roundOfPoolKey(key); ok {
+			if _, held := p.signerRound[signerRoundID(incomingSigner, round)]; held {
+				if len(p.pool[key]) == 0 {
+					delete(p.pool, key)
+				}
+				result := make(map[common.Hash]PoolObj)
+				for k, v := range p.pool[key] {
+					result[k] = v
+				}
+				return len(result), result
+			}
+		}
 		for _, existing := range p.pool[key] {
 			if existing.GetSigner() == incomingSigner {
-				// Already have an entry for this signer; return current state.
 				result := make(map[common.Hash]PoolObj)
 				for k, v := range p.pool[key] {
 					result[k] = v
@@ -72,6 +103,11 @@ func (p *Pool) Add(obj PoolObj) (int, map[common.Hash]PoolObj) {
 	// Only add if not already present by hash
 	if _, exists := p.pool[key][hash]; !exists {
 		p.pool[key][hash] = obj
+		if incomingSigner != (common.Address{}) {
+			if round, ok := roundOfPoolKey(key); ok {
+				p.signerRound[signerRoundID(incomingSigner, round)] = key
+			}
+		}
 	}
 
 	// Return a copy of the pool content for this key
@@ -131,12 +167,25 @@ func (p *Pool) Clear() {
 	p.lock.Lock()
 	defer p.lock.Unlock()
 	p.pool = make(map[string]map[common.Hash]PoolObj)
+	p.signerRound = make(map[string]string)
 }
 
 // ClearByPoolKey clears objects for a specific pool key
 func (p *Pool) ClearByPoolKey(key string) {
 	p.lock.Lock()
 	defer p.lock.Unlock()
+	if objs := p.pool[key]; objs != nil {
+		if round, ok := roundOfPoolKey(key); ok {
+			for _, obj := range objs {
+				if signer := obj.GetSigner(); signer != (common.Address{}) {
+					id := signerRoundID(signer, round)
+					if p.signerRound[id] == key {
+						delete(p.signerRound, id)
+					}
+				}
+			}
+		}
+	}
 	delete(p.pool, key)
 }
 

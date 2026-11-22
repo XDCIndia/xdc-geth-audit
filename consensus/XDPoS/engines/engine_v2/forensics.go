@@ -542,9 +542,12 @@ func (f *Forensics) isVoteBlamed(chain consensus.ChainReader, highestCommittedQC
 func (f *Forensics) DetectEquivocationInVotePool(vote *types.Vote, votePool *utils.Pool) {
 	poolKey := vote.PoolKey()
 	votePoolKeys := votePool.PoolObjKeysList()
-	signer, err := GetVoteSignerAddresses(vote)
-	if err != nil {
-		log.Error("[detectEquivocationInVotePool]", "err", err)
+	// The vote handler recovers the signer before the vote is pooled. Compare
+	// those addresses. Recovering every same-round entry again is what let one
+	// key make the equivocation check quadratic in the number of hashes.
+	signer := vote.GetSigner()
+	if signer == (common.Address{}) {
+		return
 	}
 
 	for _, k := range votePoolKeys {
@@ -564,9 +567,8 @@ func (f *Forensics) DetectEquivocationInVotePool(vote *types.Vote, votePool *uti
 					log.Warn("[detectEquivocationInVotePool] obj type is not vote, potential a bug in votePool")
 					continue
 				}
-				signer2, err := GetVoteSignerAddresses(voteTransfered)
-				if err != nil {
-					log.Warn("[detectEquivocationInVotePool]", "err", err)
+				signer2 := voteTransfered.GetSigner()
+				if signer2 == (common.Address{}) {
 					continue
 				}
 				if signer == signer2 {

@@ -89,6 +89,20 @@ func (x *XDPoS_v2) verifyMsgSignature(signedHashToBeVerified common.Hash, signat
 	return false, signerAddress, nil
 }
 
+// lowSSignatures drops signatures that are not in canonical low-S form.
+// recoverUniqueSigners rejects a whole list when any one signature is high-S;
+// a certificate must be built from the signatures it would accept, so the
+// high-S ones are removed first.
+func lowSSignatures(sigs []types.Signature) []types.Signature {
+	out := make([]types.Signature, 0, len(sigs))
+	for _, sig := range sigs {
+		if hasLowS(sig) {
+			out = append(out, sig)
+		}
+	}
+	return out
+}
+
 // hasLowS reports whether the signature's S value is in the lower half of the
 // secp256k1 curve order, the canonical low-S form that prevents
 // (r, s) -> (r, N-s) malleability. Matches legacy XDPoSChain utils.go:479.

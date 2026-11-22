@@ -131,8 +131,67 @@ func (x *XDPoS_v2) VoteHandler(chain consensus.ChainReader, voteMsg *types.Vote)
 // unchanged once the block arrives, and hygieneVotePool prunes stale rounds.
 const voteRoundLookahead = 5
 
+// maxUnstoredVotesPerSigner bounds how many votes one signer may hold for
+// block hashes that are not yet in the local chain.
+const maxUnstoredVotesPerSigner = voteRoundLookahead + 1
+
 func voteRoundInRange(vote, current types.Round) bool {
 	return vote >= current && vote <= current+voteRoundLookahead
+}
+
+// gapFromSwitch is the snapshot gap number of the epoch that opens at switchNum.
+func (x *XDPoS_v2) gapFromSwitch(switchNum uint64) uint64 {
+	if x.config == nil || x.config.Epoch == 0 {
+		return 0
+	}
+	gap := switchNum - switchNum%x.config.Epoch
+	if gap > x.config.Gap {
+		return gap - x.config.Gap
+	}
+	return 0
+}
+
+// voteGapAllowed reports whether gap is the gap of the head's epoch or of the
+// next epoch. It returns true when the head epoch cannot be resolved.
+func (x *XDPoS_v2) voteGapAllowed(chain consensus.ChainReader, gap uint64) bool {
+	if x.config == nil || x.config.Epoch == 0 || chain == nil {
+		return true
+	}
+	head := chain.CurrentHeader()
+	if head == nil {
+		return true
+	}
+	info, err := x.getEpochSwitchInfo(chain, nil, head.Hash())
+	if err != nil || info == nil || info.EpochSwitchBlockInfo == nil || info.EpochSwitchBlockInfo.Number == nil {
+		return true
+	}
+	cur := x.gapFromSwitch(info.EpochSwitchBlockInfo.Number.Uint64())
+	next := x.gapFromSwitch(info.EpochSwitchBlockInfo.Number.Uint64() + x.config.Epoch)
+	return gap == cur || gap == next
+}
+
+// unstoredVotesForSigner counts this signer's pooled votes whose block hash is
+// not in the local chain.
+func (x *XDPoS_v2) unstoredVotesForSigner(chain consensus.ChainReader, signer common.Address) int {
+	if signer == (common.Address{}) || chain == nil {
+		return 0
+	}
+	n := 0
+	for _, objs := range x.votePool.Get() {
+		for _, obj := range objs {
+			if obj.GetSigner() != signer {
+				continue
+			}
+			v, ok := obj.(*types.Vote)
+			if !ok || v.ProposedBlockInfo == nil {
+				continue
+			}
+			if chain.GetHeaderByHash(v.ProposedBlockInfo.Hash) == nil {
+				n++
+			}
+		}
+	}
+	return n
 }
 
 func (x *XDPoS_v2) voteHandler(chain consensus.ChainReader, voteMsg *types.Vote) error {
@@ -148,6 +207,21 @@ func (x *XDPoS_v2) voteHandler(chain consensus.ChainReader, voteMsg *types.Vote)
 	if x.votePoolCollectionTime.IsZero() {
 		log.Info("[voteHandler] set vote pool time", "round", x.currentRound)
 		x.votePoolCollectionTime = time.Now()
+	}
+
+	// A vote whose gap is neither the head epoch nor the next epoch is not a
+	// vote this node can turn into a certificate. Reject it before it occupies
+	// a pool slot. When the head epoch cannot be resolved the check is skipped
+	// so a node that is still starting does not drop every vote.
+	if !x.voteGapAllowed(chain, voteMsg.GapNumber) {
+		return fmt.Errorf("vote gap %d is outside the head epoch and the next epoch", voteMsg.GapNumber)
+	}
+	// One signer may park only a bounded number of votes on block hashes that
+	// are not in the local chain. The block may arrive later; further unknown
+	// hashes from the same signer are dropped.
+	if voteMsg.ProposedBlockInfo != nil && chain.GetHeaderByHash(voteMsg.ProposedBlockInfo.Hash) == nil &&
+		x.unstoredVotesForSigner(chain, voteMsg.GetSigner()) >= maxUnstoredVotesPerSigner {
+		return errors.New("vote for an unknown block exceeds the per-signer cap")
 	}
 
 	// Add to pool — only reachable after signature is confirmed valid.
@@ -386,7 +460,7 @@ func (x *XDPoS_v2) onVotePoolThresholdReached(chain consensus.ChainReader, poole
 		ProposedBlockInfo: vote.ProposedBlockInfo,
 		GapNumber:         vote.GapNumber,
 	})
-	accepted, _, err := recoverUniqueSigners(signedHash, validSignatures, epochInfo.Masternodes)
+	accepted, _, err := recoverUniqueSigners(signedHash, lowSSignatures(validSignatures), epochInfo.Masternodes)
 	if err != nil || float64(len(accepted)) < float64(epochInfo.MasternodesLen)*certThreshold {
 		log.Warn("[onVotePoolThresholdReached] certificate signatures rejected",
 			"accepted", len(accepted), "err", err)
