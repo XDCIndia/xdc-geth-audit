@@ -91,9 +91,10 @@ func CompareSignersLists(list1 []common.Address, list2 []common.Address) bool {
 // pass first; call this only when the sets are known equal.
 //
 // Canonical XDPoSChain v2.9.3-testnet uses the same sorted CompareSignersLists
-// at epoch switch (no ordered check). This function is diagnostic: callers log
-// a WARN but do not reject blocks. Gate before promoting to rejection: replay-
-// parity over mainnet V2 epoch switches (80,370,000 → tip) must fire 0 WARNs.
+// at epoch switch (no ordered check). Callers reject only when
+// ChainConfig.IsValidatorOrder is active. Shipped networks leave that block
+// at the far-future placeholder or nil, so a reordered list stays valid and
+// this node still accepts a header current-main accepts (F-2026-19815).
 func ValidatorsOrderMatches(expected, actual []common.Address) bool {
 	if len(expected) != len(actual) {
 		return false
