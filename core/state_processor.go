@@ -467,6 +467,10 @@ func applyTransactionWithEVM(ctx context.Context, msg *Message, gp *GasPool, sta
 			defer func() { hooks.OnTxEnd(receipt, err) }()
 		}
 	}
+	// XDC: canonical sets the sender balance of 60 mainnet blocks to a fixed
+	// value before it applies the tx (core/state_processor.go:439 and :650 in
+	// XDPoSChain v3.0.0-testnet-2). Non-EVM routes never reach this point.
+	applyHistoricalBalanceBypass(statedb, blockNumber, msg.From)
 	// Apply the transaction to the current state (included in the env).
 	// Thread the optional owner through to ApplyMessage for TRC21 fee routing.
 	result, err := ApplyMessage(evm, msg, gp, owner...)
