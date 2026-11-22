@@ -3502,8 +3502,8 @@ func (s *xdcSyncer) repairAnchorGapBodies(peer *eth.Peer) {
 	if pairCount > len(hdrSlice) {
 		pairCount = len(hdrSlice)
 	}
-	batch := db.NewBatch()
-	written := 0
+	var okHeaders []*types.Header
+	var okBodies []*types.Body
 	for i := 0; i < pairCount; i++ {
 		txs, err := bodies[i].Transactions.Items()
 		if err != nil || len(txs) == 0 {
@@ -3519,7 +3519,36 @@ func (s *xdcSyncer) repairAnchorGapBodies(peer *eth.Peer) {
 				body.Withdrawals = wd
 			}
 		}
-		rawdb.WriteBody(batch, hdrSlice[i].Hash(), hdrSlice[i].Number.Uint64(), body)
+		if !verifyBodyAgainstHeader(hdrSlice[i], body) {
+			log.Warn("xdcSyncer: A.74 gap repair — body does not match header",
+				"block", hdrSlice[i].Number, "peer", peer.ID())
+			s.taintPeer(peer)
+			return
+		}
+		okHeaders = append(okHeaders, hdrSlice[i])
+		okBodies = append(okBodies, body)
+	}
+	if len(okHeaders) == 0 {
+		return
+	}
+	receipts := s.fetchReceiptsBatch(peer, okHeaders)
+	if len(receipts) < len(okHeaders) {
+		log.Warn("xdcSyncer: A.74 gap repair — receipts missing, will retry",
+			"have", len(receipts), "want", len(okHeaders))
+		return
+	}
+	batch := db.NewBatch()
+	written := 0
+	for i, hdr := range okHeaders {
+		if types.DeriveSha(receipts[i], trie.NewStackTrie(nil)) != hdr.ReceiptHash {
+			log.Warn("xdcSyncer: A.74 gap repair — receipts do not match header",
+				"block", hdr.Number, "peer", peer.ID())
+			s.taintPeer(peer)
+			return
+		}
+		rawdb.WriteBody(batch, hdr.Hash(), hdr.Number.Uint64(), okBodies[i])
+		rawdb.WriteReceipts(batch, hdr.Hash(), hdr.Number.Uint64(), receipts[i])
+		writeBackfillTxLookups(db, hdr.Number.Uint64(), okBodies[i])
 		written++
 	}
 	if err := batch.Write(); err != nil {
@@ -6289,11 +6318,28 @@ func (s *xdcSyncer) prefetchAncestorBodiesAndReceipts(peer *eth.Peer, allHeaders
 					body.Withdrawals = wd
 				}
 			}
+			if !verifyBodyAgainstHeader(batchHeaders[i], body) {
+				log.Warn("xdcSyncer: A.72 body does not match header; stopping",
+					"block", batchHeaders[i].Number, "peer", activePeer.ID())
+				s.taintPeer(activePeer)
+				return
+			}
 			typeBodies[i] = body
 		}
 		var typedReceipts []types.Receipts
 		if len(receipts) >= pairCount {
 			typedReceipts = receipts[:pairCount]
+			for i := 0; i < pairCount; i++ {
+				if typedReceipts[i] == nil {
+					continue
+				}
+				if types.DeriveSha(typedReceipts[i], trie.NewStackTrie(nil)) != batchHeaders[i].ReceiptHash {
+					log.Warn("xdcSyncer: A.72 receipts do not match header; stopping",
+						"block", batchHeaders[i].Number, "peer", activePeer.ID())
+					s.taintPeer(activePeer)
+					return
+				}
+			}
 		}
 		// Trim headers to pairCount so PrimeAncestorBodies validation succeeds.
 		hdrSlice := batchHeaders[:pairCount]

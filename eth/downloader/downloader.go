@@ -38,6 +38,7 @@ import (
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/rlp"
+	"github.com/ethereum/go-ethereum/trie"
 	"github.com/ethereum/go-ethereum/triedb"
 )
 
@@ -733,6 +734,12 @@ func (d *Downloader) PrimeAncestorBodies(headers []*types.Header, bodies []*type
 		}
 		hash := h.Hash()
 		num := h.Number.Uint64()
+		if !ancestorBodyMatchesHeader(h, bodies[i]) {
+			return fmt.Errorf("prime ancestor bodies: body does not match header %d", num)
+		}
+		if receipts != nil && !ancestorReceiptsMatchHeader(h, receipts[i]) {
+			return fmt.Errorf("prime ancestor bodies: receipts do not match header %d", num)
+		}
 		// A.74: overwrite placeholder (0-tx) bodies when the canonical header
 		// declares non-empty txs (TxHash != EmptyTxsHash) but the stored body
 		// has 0 txs. PrimeFastSyncAnchor writes &types.Body{} for every header
@@ -776,6 +783,32 @@ func (d *Downloader) PrimeAncestorBodies(headers []*types.Header, bodies []*type
 		"lo", headers[0].Number.Uint64(),
 		"hi", headers[len(headers)-1].Number.Uint64())
 	return nil
+}
+
+func ancestorBodyMatchesHeader(h *types.Header, body *types.Body) bool {
+	if h == nil || body == nil {
+		return false
+	}
+	if types.DeriveSha(types.Transactions(body.Transactions), trie.NewStackTrie(nil)) != h.TxHash {
+		return false
+	}
+	if types.CalcUncleHash(body.Uncles) != h.UncleHash {
+		return false
+	}
+	if h.WithdrawalsHash != nil && types.DeriveSha(types.Withdrawals(body.Withdrawals), trie.NewStackTrie(nil)) != *h.WithdrawalsHash {
+		return false
+	}
+	return true
+}
+
+func ancestorReceiptsMatchHeader(h *types.Header, receipts types.Receipts) bool {
+	if h == nil {
+		return false
+	}
+	if receipts == nil {
+		receipts = types.Receipts{}
+	}
+	return types.DeriveSha(receipts, trie.NewStackTrie(nil)) == h.ReceiptHash
 }
 
 // Progress retrieves the synchronisation boundaries, specifically the origin

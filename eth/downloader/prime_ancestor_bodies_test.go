@@ -25,10 +25,13 @@ func makeContiguousHeaders(start uint64, count int) []*types.Header {
 	var parentHash common.Hash
 	for i := 0; i < count; i++ {
 		h := &types.Header{
-			Number:     new(big.Int).SetUint64(start + uint64(i)),
-			ParentHash: parentHash,
-			Difficulty: big.NewInt(1),
-			GasLimit:   8_000_000,
+			Number:      new(big.Int).SetUint64(start + uint64(i)),
+			ParentHash:  parentHash,
+			Difficulty:  big.NewInt(1),
+			GasLimit:    8_000_000,
+			TxHash:      types.EmptyTxsHash,
+			UncleHash:   types.EmptyUncleHash,
+			ReceiptHash: types.EmptyReceiptsHash,
 		}
 		headers[i] = h
 		parentHash = h.Hash()
@@ -78,6 +81,28 @@ func TestPrimeAncestorBodies_WritesBodiesAndReceipts(t *testing.T) {
 		if block == nil {
 			t.Errorf("idx %d (num=%d): ReadBlock returned nil", i, num)
 		}
+	}
+}
+
+func TestF202620637PrimeRefusesMismatchedBodyAndReceipts(t *testing.T) {
+	db := rawdb.NewMemoryDatabase()
+	d := &Downloader{stateDB: db}
+	headers := makeContiguousHeaders(10, 1)
+	headers[0].TxHash = common.HexToHash("0x1111")
+	if err := d.PrimeAncestorBodies(headers, []*types.Body{{}}, nil); err == nil {
+		t.Fatal("body whose tx root is not the header tx hash was written")
+	}
+	if rawdb.HasBody(db, headers[0].Hash(), 10) {
+		t.Fatal("mismatched body was persisted")
+	}
+
+	headers = makeContiguousHeaders(11, 1)
+	headers[0].ReceiptHash = common.HexToHash("0x2222")
+	if err := d.PrimeAncestorBodies(headers, []*types.Body{{}}, []types.Receipts{{}}); err == nil {
+		t.Fatal("receipts whose root is not the header receipt hash were written")
+	}
+	if rawdb.HasReceipts(db, headers[0].Hash(), 11) {
+		t.Fatal("mismatched receipts were persisted")
 	}
 }
 
