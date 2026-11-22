@@ -404,6 +404,12 @@ func (x *XDPoS_v2) sendVote(chain consensus.ChainReader, blockInfo *types.BlockI
 	x.highestVotedRound = blockInfo.Round
 	// F-2026-19774: persist so a restart inside a round cannot produce a second vote.
 	rawdb.WriteBFTHighestVotedRound(x.db, x.highestVotedRound)
+	// XDC-HUNT-30: the write above is not synced. Flush it before the vote
+	// leaves the node, or a power loss can forget a vote that is already out.
+	if err := x.db.SyncKeyValue(); err != nil {
+		log.Error("[sendVote] Failed to sync highestVotedRound, vote not broadcast", "err", err)
+		return err
+	}
 
 	// Broadcast
 	x.broadcastToBftChannel(voteMsg)

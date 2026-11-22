@@ -551,6 +551,11 @@ func (x *XDPoS_v2) processQC(chain consensus.ChainReader, incomingQuorumCert *ty
 			// F-2026-19774: persist so a restart cannot lower the lock below what
 			// was committed before shutdown.
 			rawdb.WriteBFTLockQC(x.db, x.lockQuorumCert)
+			// XDC-HUNT-30: the vote that follows must not outlive an unsynced lock.
+			if err := x.db.SyncKeyValue(); err != nil {
+				log.Error("[processQC] Failed to sync lock QC", "err", err)
+				return err
+			}
 		}
 
 		// Commit blocks (3-chain rule)
