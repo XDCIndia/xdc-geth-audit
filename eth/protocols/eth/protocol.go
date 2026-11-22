@@ -519,6 +519,11 @@ type GetNodeDataPacket []common.Hash
 // NodeDataPacket is the network packet for state trie node delivery (XDPOS2/eth-63 shape).
 type NodeDataPacket [][]byte
 
+// MaxNodeDataItems is the most items a NodeData message may carry. We never
+// request more than this many nodes (the downloader's MaxStateFetch, which
+// the legacy XDPoSChain server also caps its replies at).
+const MaxNodeDataItems = 384
+
 func (*GetNodeDataPacket) Name() string { return "GetNodeData" }
 func (*GetNodeDataPacket) Kind() byte   { return GetNodeDataMsg }
 

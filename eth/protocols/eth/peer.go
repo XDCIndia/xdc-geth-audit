@@ -108,6 +108,11 @@ type Peer struct {
 	legacyBodyReqID     atomic.Uint64
 	legacyBodyReqCount  atomic.Uint64
 	legacyReceiptsReqID atomic.Uint64
+	// legacyReceiptsReqCount is the number of blocks of the XDPOS2 receipts
+	// request in flight, zero when none is. unsolicitedReceipts counts Receipts
+	// messages that arrived with none in flight since the last request (XDC-HUNT-50).
+	legacyReceiptsReqCount atomic.Uint64
+	unsolicitedReceipts    atomic.Uint32
 
 	// XDC: dedicated response channels for XDPOS2 legacy data-plane messages.
 	// Bypasses the dispatcher's pending-map + tracker (which is incompatible
@@ -819,6 +824,8 @@ func (p *Peer) RequestReceipts(hashes []common.Hash, gasUsed []uint64, timestamp
 			data:     GetReceiptsRequest(hashes),
 		}
 		p.legacyReceiptsReqID.Store(id)
+		p.legacyReceiptsReqCount.Store(uint64(len(hashes)))
+		p.unsolicitedReceipts.Store(0)
 		if err := p.dispatchRequest(req); err != nil {
 			return nil, err
 		}

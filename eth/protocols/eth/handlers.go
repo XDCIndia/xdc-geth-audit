@@ -19,6 +19,7 @@ package eth
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 
@@ -876,6 +877,10 @@ func handleReceipts70(backend Backend, msg Decoder, peer *Peer) error {
 	return dispatchReceipts(res.RequestId, receiptLists, peer)
 }
 
+// maxUnsolicitedReceipts is how many XDPOS2 Receipts messages with no request in
+// flight a peer may send, after each request of ours, before it is disconnected.
+const maxUnsolicitedReceipts = 8
+
 // A.33+A.60.4: handleReceiptsXDPOS2 decodes the bare-list wire shape
 // receipts response sent by production XDPOS2 peers. No RequestId wrapper —
 // the in-flight request is matched via stashed legacyReceiptsReqID, set in
@@ -897,12 +902,21 @@ func handleReceipts70(backend Backend, msg Decoder, peer *Peer) error {
 // over `types.Receipts` then produces the receipt-trie root the block
 // header expects.
 func handleReceiptsXDPOS2(backend Backend, msg Decoder, peer *Peer) error {
+	// XDC-HUNT-50: decode only a reply to a request in flight. A message with
+	// none in flight is ignored undecoded; a peer that keeps sending them is
+	// disconnected.
+	if peer.legacyReceiptsReqCount.Swap(0) == 0 {
+		if peer.unsolicitedReceipts.Add(1) > maxUnsolicitedReceipts {
+			return errors.New("XDPOS2 Receipts: too many replies with no request in flight")
+		}
+		return nil
+	}
 	var enc rlp.RawValue
 	if err := msg.Decode(&enc); err != nil {
 		return err
 	}
 	// Accept both the consensus and the eth/69 receipt shapes (#1889).
-	raw, err := decodeReceiptsXDPOS2(enc)
+	raw, err := decodeReceiptsXDPOS2(enc, maxReceiptsServe)
 	if err != nil {
 		log.Info("XDPOS2 Receipts decode failed", "peer", peer.ID()[:8], "err", err)
 		return err
@@ -1177,10 +1191,20 @@ func answerGetNodeDataQuery(backend Backend, query GetNodeDataPacket, peer *Peer
 // downloader's per-peer stateIdle flag (cleared by SetNodeDataIdle on every
 // termination path, incl. the non-blocking drop in Downloader.DeliverNodeData).
 func handleNodeData(backend Backend, msg Decoder, peer *Peer) error {
-	var res NodeDataPacket
-	if err := msg.Decode(&res); err != nil {
+	// Count the items before decoding them: one slice header per item makes the
+	// decoded form many times the message size (XDC-HUNT-18).
+	var list rlp.RawList[[]byte]
+	if err := msg.Decode(&list); err != nil {
 		return fmt.Errorf("decode NodeData: %w", err)
 	}
+	if list.Len() > MaxNodeDataItems {
+		return fmt.Errorf("NodeData: %d items, limit %d", list.Len(), MaxNodeDataItems)
+	}
+	items, err := list.Items()
+	if err != nil {
+		return fmt.Errorf("decode NodeData: %w", err)
+	}
+	res := NodeDataPacket(items)
 	return backend.Handle(peer, &res)
 }
 
