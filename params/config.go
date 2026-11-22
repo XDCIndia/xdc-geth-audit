@@ -2394,9 +2394,17 @@ type V2 struct {
 	CurrentConfig *V2Config            `json:"config"`                // Current active V2 configuration (fix #96: match XDPoSChain v2.6.8 JSON tag "config")
 	AllConfigs    map[uint64]*V2Config `json:"allConfigs,omitempty"`  // Per-round config map (key = SwitchRound)
 	SwitchEpoch   uint64               `json:"switchEpoch,omitempty"` // Epoch number at V2 switch block
+	// BALSealBlock is the first block whose V2 proposer seal binds
+	// BlockAccessListHash (Hacken F-2026-19601). Nil means never.
+	BALSealBlock *big.Int `json:"balSealBlock,omitempty"`
 
 	mu          sync.RWMutex `json:"-"` // Protects CurrentConfig from concurrent read/write (#74)
 	configIndex []uint64     `json:"-"` // Descending-sorted round keys for O(n) lookup (#117)
+}
+
+// IsBALSeal reports whether the V2 seal of block num binds BlockAccessListHash.
+func (v *V2) IsBALSeal(num *big.Int) bool {
+	return v != nil && v.BALSealBlock != nil && num != nil && num.Cmp(v.BALSealBlock) >= 0
 }
 
 // BuildConfigIndex builds the descending-sorted config index from AllConfigs.

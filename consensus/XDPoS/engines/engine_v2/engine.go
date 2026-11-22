@@ -289,6 +289,14 @@ func (x *XDPoS_v2) UpdateParams(header *types.Header) {
 // Aligned with XDPoSChain v2.6.8: uses header.Extra directly (no seal stripping)
 // and includes Validators/Penalties inline to ensure identical RLP encoding.
 func sigHash(header *types.Header) common.Hash {
+	return sigHashWith(header, false)
+}
+
+// sigHashWith is sigHash, plus header.BlockAccessListHash when bindBAL is set.
+// bindBAL comes from V2.IsBALSeal, so the F-2026-19601 seal change only applies
+// from a configured activation block. Chains that already carry the field
+// (net2040 after Amsterdam) keep verifying seals made without it.
+func sigHashWith(header *types.Header, bindBAL bool) common.Hash {
 	hasher := sha3.NewLegacyKeccak256()
 
 	enc := []interface{}{
@@ -313,6 +321,11 @@ func sigHash(header *types.Header) common.Hash {
 	if header.BaseFee != nil {
 		enc = append(enc, header.BaseFee)
 	}
+	// BlockAccessListHash is outside the historical seal. It is bound only
+	// from the V2 balSealBlock activation, never by its mere presence.
+	if bindBAL && header.BlockAccessListHash != nil {
+		enc = append(enc, *header.BlockAccessListHash)
+	}
 	if err := rlp.Encode(hasher, enc); err != nil {
 		panic("rlp.Encode fail: " + err.Error())
 	}
@@ -323,13 +336,13 @@ func sigHash(header *types.Header) common.Hash {
 
 // ecrecover extracts the signer address from a signed header.
 // Aligned with XDPoSChain v2.6.8: signature is always in header.Validator for V2 blocks.
-func ecrecover(header *types.Header, sigcache *lru.Cache[common.Hash, common.Address]) (common.Address, error) {
+func ecrecover(header *types.Header, sigcache *lru.Cache[common.Hash, common.Address], bindBAL bool) (common.Address, error) {
 	hash := header.Hash()
 	if address, known := sigcache.Get(hash); known {
 		return address, nil
 	}
 
-	pubkey, err := crypto.Ecrecover(sigHash(header).Bytes(), header.Validator)
+	pubkey, err := crypto.Ecrecover(sigHashWith(header, bindBAL).Bytes(), header.Validator)
 	if err != nil {
 		return common.Address{}, err
 	}
@@ -342,7 +355,7 @@ func ecrecover(header *types.Header, sigcache *lru.Cache[common.Hash, common.Add
 
 // SignHash returns the hash for signing
 func (x *XDPoS_v2) SignHash(header *types.Header) common.Hash {
-	return sigHash(header)
+	return x.sealHash(header)
 }
 
 // Initial initializes V2 engine state from the current chain state
@@ -609,12 +622,17 @@ func (x *XDPoS_v2) loadBFTSafetyState() {
 
 // Author returns the signer of a block
 func (x *XDPoS_v2) Author(header *types.Header) (common.Address, error) {
-	return ecrecover(header, x.signatures)
+	return ecrecover(header, x.signatures, x.config.V2.IsBALSeal(header.Number))
 }
 
 // SigningHash is the digest a V2 proposer signs.
 func (x *XDPoS_v2) SigningHash(header *types.Header) common.Hash {
-	return sigHash(header)
+	return x.sealHash(header)
+}
+
+// sealHash is the V2 proposer seal digest for header under this chain's config.
+func (x *XDPoS_v2) sealHash(header *types.Header) common.Hash {
+	return sigHashWith(header, x.config.V2.IsBALSeal(header.Number))
 }
 
 // VerifyHeader verifies a header for V2 consensus
@@ -845,7 +863,7 @@ func (x *XDPoS_v2) Seal(chain consensus.ChainReader, block *types.Block, stop <-
 	}
 
 	// Sign the block
-	signature, err := signFn(accounts.Account{Address: signer}, sigHash(header).Bytes())
+	signature, err := signFn(accounts.Account{Address: signer}, x.sealHash(header).Bytes())
 	if err != nil {
 		return nil, err
 	}
