@@ -719,7 +719,7 @@ func (c *XDPoS) verifyHeaderLightV1(chain consensus.ChainHeaderReader, header *t
 	// must be rejected, forcing the xdcSyncer to re-fetch the co-signed canonical.
 	// (v2.7.x accepted it on custom chains through a verify-cache quirk that v2.9.3
 	// removed, so v2.7-era devnets such as 5151 can hold such blocks.)
-	if number > c.config.Epoch && len(header.Validator) == 0 && v1DoubleValidation(chain.Config()) {
+	if number > c.config.Epoch && len(header.Validator) == 0 && v1DoubleValidation(chain.Config(), number) {
 		return errNoValidatorSignature
 	}
 
@@ -1340,14 +1340,16 @@ func (c *XDPoS) verifySeal(chain consensus.ChainHeaderReader, header *types.Head
 	// xdcFullVerify(), closing the residual where a non-empty wrong co-signature
 	// was accepted on the bulk-sync light path (verifyHeaderLightV1 → verifySeal).
 	// Empirically backed: 530k mainnet V1 headers scanned, 0 M2 mismatches.
-	// On the bulk-sync light path only, the compare is skipped when the creator
-	// has no M2 assignment in the checkpoint set (ignore-listed epoch blocks,
-	// pre-TIPRandomize epochs), the blocks the scan classified as skip. Under full
-	// verification a missing assignment still fails, as in canonical XDPoSChain.
-	if v1DoubleValidation(chain.Config()) && number > c.config.Epoch && len(header.Validator) == 0 {
+	// On the bulk-sync light path, a creator with no M2 assignment is still
+	// accepted only before TIPRandomize and on ignore-listed checkpoints: that
+	// is the set the scan classified as skip, and those blocks are historical.
+	// After TIPRandomize a missing assignment fails on the light path too.
+	// Under full verification a missing assignment still fails, as in canonical
+	// XDPoSChain.
+	if v1DoubleValidation(chain.Config(), number) && number > c.config.Epoch && len(header.Validator) == 0 {
 		return errNoValidatorSignature
 	}
-	if v1DoubleValidation(chain.Config()) && number > c.config.Epoch {
+	if v1DoubleValidation(chain.Config(), number) && number > c.config.Epoch {
 		validator, err := c.RecoverValidator(header)
 		if err != nil {
 			return err
@@ -1356,7 +1358,7 @@ func (c *XDPoS) verifySeal(chain consensus.ChainHeaderReader, header *types.Head
 		if err != nil {
 			return err
 		}
-		if validator != assigned && (xdcFullVerify() || assigned != (common.Address{})) {
+		if validator != assigned && !v1LightPathSkipsUnassignedM2(chain, number, assigned) {
 			log.Debug("Bad block detected. Header contains wrong pair of creator-validator", "number", number, "creator", creator, "assigned validator", assigned, "wrong validator", validator)
 			return errFailedDoubleValidation
 		}
@@ -1367,9 +1369,43 @@ func (c *XDPoS) verifySeal(chain consensus.ChainHeaderReader, header *types.Head
 
 // v1DoubleValidation reports whether V1 blocks past the first epoch must carry
 // the assigned M2 co-signature. Canonical turns full verification off on Apothem
-// (chain 51) only (engine_v1/engine.go shouldDisableFullVerify).
-func v1DoubleValidation(cfg *params.ChainConfig) bool {
-	return cfg != nil && cfg.ChainID != nil && cfg.ChainID.Cmp(params.XDCApothemChainConfig.ChainID) != 0
+// (chain 51) for the whole V1 range (engine_v1/engine.go shouldDisableFullVerify).
+// That range ends at the V2 switch (Apothem block 56,828,700); a number past a
+// configured switch fails closed. A nil config or a nil chain ID also fails
+// closed. V1 verifySeal is not used for blocks past the switch.
+func v1DoubleValidation(cfg *params.ChainConfig, number uint64) bool {
+	if cfg == nil || cfg.ChainID == nil {
+		return true
+	}
+	if cfg.ChainID.Cmp(params.XDCApothemChainConfig.ChainID) != 0 {
+		return true
+	}
+	if cfg.XDPoS != nil && cfg.XDPoS.V2 != nil && cfg.XDPoS.V2.SwitchBlock != nil &&
+		number > cfg.XDPoS.V2.SwitchBlock.Uint64() {
+		return true
+	}
+	return false
+}
+
+// v1LightPathSkipsUnassignedM2 reports whether bulk sync may accept a co-signer
+// when the creator has no M2 assignment. Full verification never skips. The
+// 530k mainnet V1 scan found an unassigned creator only before TIPRandomize and
+// on ignore-listed checkpoints. Those blocks stay accepted so historical bulk
+// sync does not change. After TIPRandomize the light path rejects the gap.
+func v1LightPathSkipsUnassignedM2(chain consensus.ChainHeaderReader, number uint64, assigned common.Address) bool {
+	if xdcFullVerify() || assigned != (common.Address{}) {
+		return false
+	}
+	cfg := chain.Config()
+	if cfg == nil || !cfg.IsTIPRandomize(new(big.Int).SetUint64(number)) {
+		return true
+	}
+	var chainID uint64
+	if cfg.ChainID != nil {
+		chainID = cfg.ChainID.Uint64()
+	}
+	cp := number - number%EpocBlockRandomize
+	return IsIgnoreSignerCheckBlock(chainID, cp) || IsIgnoreSignerCheckBlock(chainID, number)
 }
 
 // VerifyUncles implements consensus.Engine, always returning an error for any
