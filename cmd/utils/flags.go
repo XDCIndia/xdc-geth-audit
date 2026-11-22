@@ -746,7 +746,7 @@ var (
 	}
 	RPCGlobalRangeLimitFlag = &cli.Uint64Flag{
 		Name:     "rpc.rangelimit",
-		Usage:    "Maximum block range (end - begin) allowed for range queries (0 = unlimited)",
+		Usage:    fmt.Sprintf("Maximum block range (end - begin) allowed for range queries such as eth_getLogs (default %d, 0 = unlimited)", ethconfig.Defaults.RangeLimit),
 		Value:    ethconfig.Defaults.RangeLimit,
 		Category: flags.APICategory,
 	}

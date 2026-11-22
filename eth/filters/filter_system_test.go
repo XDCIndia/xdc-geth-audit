@@ -49,6 +49,10 @@ type testBackend struct {
 	chainFeed       event.Feed
 	pendingBlock    *types.Block
 	pendingReceipts types.Receipts
+	// safeNum and finalizedNum, when set, are the canonical numbers returned
+	// for the safe and finalized tags.
+	safeNum      *uint64
+	finalizedNum *uint64
 }
 
 func (b *testBackend) ChainConfig() *params.ChainConfig {
@@ -100,6 +104,11 @@ func (b *testBackend) HeaderByNumber(ctx context.Context, blockNr rpc.BlockNumbe
 		}
 		num = number
 	case rpc.FinalizedBlockNumber:
+		if b.finalizedNum != nil {
+			num = *b.finalizedNum
+			hash = rawdb.ReadCanonicalHash(b.db, num)
+			break
+		}
 		hash = rawdb.ReadFinalizedBlockHash(b.db)
 		number, ok := rawdb.ReadHeaderNumber(b.db, hash)
 		if !ok {
@@ -107,6 +116,11 @@ func (b *testBackend) HeaderByNumber(ctx context.Context, blockNr rpc.BlockNumbe
 		}
 		num = number
 	case rpc.SafeBlockNumber:
+		if b.safeNum != nil {
+			num = *b.safeNum
+			hash = rawdb.ReadCanonicalHash(b.db, num)
+			break
+		}
 		return nil, errors.New("safe block not found")
 	default:
 		num = uint64(blockNr)

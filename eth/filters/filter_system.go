@@ -20,6 +20,7 @@ package filters
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math/big"
 	"sync"
@@ -45,7 +46,7 @@ type Config struct {
 	LogCacheSize  int           // maximum number of cached blocks (default: 32)
 	Timeout       time.Duration // how long filters stay active (default: 5min)
 	LogQueryLimit int           // maximum number of addresses allowed in filter criteria (default: 1000)
-	RangeLimit    uint64        // maximum block range allowed in filter criteria (default: 0)
+	RangeLimit    uint64        // maximum block range allowed in filter criteria (0 = unlimited; node default is ethconfig.Defaults.RangeLimit)
 }
 
 func (cfg Config) withDefaults() Config {
@@ -325,6 +326,26 @@ func (es *EventSystem) SubscribeLogs(crit ethereum.FilterQuery, logs chan []*typ
 	if from == rpc.PendingBlockNumber || to == rpc.PendingBlockNumber {
 		return nil, errPendingLogsUnsupported
 	}
+	// Cap the span after tags resolve to block numbers. latest is the head,
+	// not the MaxUint64 sentinel.
+	capped := false
+	if limit := es.sys.cfg.RangeLimit; limit != 0 {
+		begin, err := es.resolvedBlock(from)
+		if err != nil {
+			return nil, err
+		}
+		end, err := es.resolvedBlock(to)
+		if err != nil {
+			return nil, err
+		}
+		if end < begin {
+			return nil, errInvalidBlockRange
+		}
+		if end-begin > limit {
+			return nil, invalidParamsErr("exceed maximum block range %d", limit)
+		}
+		capped = true
+	}
 
 	// Resolve history cutoffs.
 	if from == rpc.EarliestBlockNumber {
@@ -336,8 +357,13 @@ func (es *EventSystem) SubscribeLogs(crit ethereum.FilterQuery, logs chan []*typ
 		crit.ToBlock = big.NewInt(int64(to))
 	}
 	// Queries beyond the pruning cutoff are not supported.
-	if uint64(from) < es.backend.HistoryPruningCutoff() {
+	if from >= 0 && uint64(from) < es.backend.HistoryPruningCutoff() {
 		return nil, &history.PrunedHistoryError{}
+	}
+	// The span was checked against resolved block numbers, including
+	// safe, finalized and latest.
+	if capped {
+		return es.subscribeLogs(crit, logs), nil
 	}
 
 	// only interested in new mined logs
@@ -353,6 +379,34 @@ func (es *EventSystem) SubscribeLogs(crit ethereum.FilterQuery, logs chan []*typ
 		return es.subscribeLogs(crit, logs), nil
 	}
 	return nil, errInvalidBlockRange
+}
+
+// resolvedBlock returns the canonical number for a subscription endpoint.
+// latest is the current head. safe, finalized and earliest are read from
+// the chain. A negative value that is not one of those tags is rejected.
+func (es *EventSystem) resolvedBlock(n rpc.BlockNumber) (uint64, error) {
+	switch n {
+	case rpc.LatestBlockNumber:
+		head := es.backend.CurrentHeader()
+		if head == nil {
+			return 0, errors.New("head block not available")
+		}
+		return head.Number.Uint64(), nil
+	case rpc.SafeBlockNumber, rpc.FinalizedBlockNumber, rpc.EarliestBlockNumber:
+		hdr, err := es.backend.HeaderByNumber(context.Background(), n)
+		if err != nil {
+			return 0, err
+		}
+		if hdr == nil {
+			return 0, errors.New("header not found")
+		}
+		return hdr.Number.Uint64(), nil
+	default:
+		if n < 0 {
+			return 0, errors.New("negative block number")
+		}
+		return uint64(n), nil
+	}
 }
 
 // subscribeLogs creates a subscription that will write all logs matching the
