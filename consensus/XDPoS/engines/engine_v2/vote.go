@@ -52,6 +52,14 @@ func (x *XDPoS_v2) VerifyVoteMessage(chain consensus.ChainReader, vote *types.Vo
 		return false, nil
 	}
 
+	// The gap number is chosen by the sender and is not signed-checked yet. A
+	// gap outside the head epoch and the next epoch cannot form a certificate
+	// here (voteHandler rejects it too), so refuse it before getSnapshot builds
+	// and stores a snapshot for a number the peer picked (#2062).
+	if !x.voteGapAllowed(chain, vote.GapNumber) {
+		return false, fmt.Errorf("vote gap %d is outside the head epoch and the next epoch", vote.GapNumber)
+	}
+
 	// Get snapshot for vote's gap number
 	snapshot, err := x.getSnapshot(chain, vote.GapNumber, true, nil)
 	if err != nil {
