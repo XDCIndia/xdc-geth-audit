@@ -72,8 +72,8 @@ func (f *comebackFakeV2) GetPreviousPenaltyByHash(_ consensus.ChainReader, _ com
 func (f *comebackFakeV2) GetMasternodesFromEpochSwitchHeader(_ consensus.ChainReader, _ *types.Header) []common.Address {
 	return nil
 }
-func (f *comebackFakeV2) GetStandbynodes(_ consensus.ChainReader, _ *types.Header) []common.Address {
-	return nil
+func (f *comebackFakeV2) GetStandbynodes(_ consensus.ChainReader, _ *types.Header) ([]common.Address, error) {
+	return nil, nil
 }
 func (f *comebackFakeV2) GetMasternodesV2(_ consensus.ChainReader, _ *types.Header) []common.Address {
 	return nil
@@ -115,7 +115,9 @@ func (c *comebackTestChain) CurrentHeader() *types.Header                    { r
 func (c *comebackTestChain) GetHeader(_ common.Hash, _ uint64) *types.Header { return c.parent }
 func (c *comebackTestChain) GetHeaderByNumber(_ uint64) *types.Header        { return nil }
 func (c *comebackTestChain) GetHeaderByHash(_ common.Hash) *types.Header     { return nil }
-func (c *comebackTestChain) GetBlock(_ common.Hash, _ uint64) *types.Block   { return nil }
+func (c *comebackTestChain) GetBlock(_ common.Hash, n uint64) *types.Block {
+	return types.NewBlockWithHeader(&types.Header{Number: new(big.Int).SetUint64(n)})
+}
 
 // addrIn reports whether target appears in addrs.
 func addrIn(addrs []common.Address, target common.Address) bool {
@@ -246,7 +248,6 @@ func TestHookPenaltyV2PostUpgradeComeback(t *testing.T) {
 		t.Fatalf("fail case: signerA penalised in 1/%d epochs with 0 signing txs must remain penalised; got %v, want [...%v...]",
 			limitPenaltyEpoch, pensFail, signerA)
 	}
-
 	// --- PASS case (comeback release) ---
 	//
 	// signerA penalised in all 2 consecutive epochs (penParoleeMap[A]=2=LimitPenaltyEpoch)

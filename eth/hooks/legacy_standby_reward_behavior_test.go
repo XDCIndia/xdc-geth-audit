@@ -37,8 +37,8 @@ func (f *rewardFakeV2) IsEpochSwitch(h *types.Header) (bool, uint64, error) {
 func (f *rewardFakeV2) GetMasternodesFromEpochSwitchHeader(consensus.ChainReader, *types.Header) []common.Address {
 	return f.mn
 }
-func (f *rewardFakeV2) GetStandbynodes(consensus.ChainReader, *types.Header) []common.Address {
-	return f.standby
+func (f *rewardFakeV2) GetStandbynodes(consensus.ChainReader, *types.Header) ([]common.Address, error) {
+	return f.standby, nil
 }
 
 // setCandidate writes candidates[i] = c, validatorsState[c].owner and .cap in

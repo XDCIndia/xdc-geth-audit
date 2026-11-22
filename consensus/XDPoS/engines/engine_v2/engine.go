@@ -3471,7 +3471,7 @@ func removeItemFromArray(array []common.Address, toRemove []common.Address) []co
 // The gap block is computed here, not left to getSnapshot: getSnapshot treats a
 // number that is itself a gap-block number as the gap block, and a V2 epoch
 // switch (round-driven) can land on such a number.
-func (x *XDPoS_v2) GetStandbynodes(chain consensus.ChainReader, header *types.Header) []common.Address {
+func (x *XDPoS_v2) GetStandbynodes(chain consensus.ChainReader, header *types.Header) ([]common.Address, error) {
 	number := header.Number.Uint64()
 	gapNumber := number - number%x.config.Epoch
 	if gapNumber > x.config.Gap {
@@ -3481,16 +3481,15 @@ func (x *XDPoS_v2) GetStandbynodes(chain consensus.ChainReader, header *types.He
 	}
 	snap, err := x.getSnapshot(chain, gapNumber, true, nil)
 	if err != nil {
-		log.Warn("[GetStandbynodes] getSnapshot has error, cannot get standbynodes", "number", number, "gap", gapNumber, "err", err)
-		return []common.Address{}
+		return nil, fmt.Errorf("standby snapshot at gap %d: %w", gapNumber, err)
 	}
 	masternodes := x.GetMasternodesFromEpochSwitchHeader(chain, header)
 	candidates := snap.NextEpochCandidates
 	if len(masternodes) == len(candidates) {
-		return []common.Address{}
+		return []common.Address{}, nil
 	}
 	standby := removeItemFromArray(candidates, masternodes)
-	return removeItemFromArray(standby, common.ExtractAddressFromBytes(header.Penalties))
+	return removeItemFromArray(standby, common.ExtractAddressFromBytes(header.Penalties)), nil
 }
 
 // GetMasternodesByHash retrieves the masternode list for a given block hash.
