@@ -1295,6 +1295,11 @@ func (c *XDPoS) verifySeal(chain consensus.ChainHeaderReader, header *types.Head
 	// Tightening the fallback (e.g., rejecting when creator is not in snap.Signers
 	// for non-ignore-listed, non-Apothem, full-verify checkpoints) would not improve
 	// security for cases 1–3 and risks wedging nodes with stale snapshots.
+	// V1 blocks on mainnet, Apothem and net 2040 are historical. A fork that
+	// limits this fallback inside that range can reject a canonical checkpoint
+	// whose sealer is only in the checkpoint extra, and a fork after the V2
+	// switch never runs. The fallback stays. Chain 50 full verification still
+	// rejects a forged signer list before this function (F-2026-19602).
 	masternodes := c.GetMasternodesWithParents(chain, header, parents)
 
 	// Check if creator is authorized
