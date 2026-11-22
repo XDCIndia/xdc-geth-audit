@@ -453,9 +453,13 @@ type xdcSyncer struct {
 	// A.97.2 snap-heal state. healStarted is a one-shot guard so
 	// maybeStartSnapHeal spawns at most one goroutine per AT_TIP transition.
 	// healStatusMu protects healStatus for concurrent RPC reads. Refs #894.
-	healStarted  atomic.Bool
-	healStatusMu sync.Mutex
-	healStatus   xdcHealStatus
+	healStarted atomic.Bool
+	// missingNodeBlock / missingNodeTries count consecutive MissingNodeError
+	// import failures at one block (XDC-HUNT-55). Only syncOnce touches them.
+	missingNodeBlock uint64
+	missingNodeTries int
+	healStatusMu     sync.Mutex
+	healStatus       xdcHealStatus
 
 	// Issue #1045: snap-sync live-lock prevention.
 	//
@@ -1548,7 +1552,36 @@ const healGateBBlocks = 128
 //
 // Called from maybeTransitionToAtTip AFTER core.XdcBulkSyncMode.Store(false).
 // Refs #894.
-func (s *xdcSyncer) maybeStartSnapHeal() {
+func (s *xdcSyncer) maybeStartSnapHeal() { s.startSnapHeal(true) }
+
+// missingNodeHealAfter is how many consecutive MissingNodeError import failures
+// at the same block start the snap heal (XDC-HUNT-55).
+const missingNodeHealAfter = 3
+
+// noteMissingTrieNode records the outcome of a failed import at block number and
+// reports whether the same block has now failed missingNodeHealAfter times in a
+// row with a missing trie node. Any other error or block resets the count.
+func (s *xdcSyncer) noteMissingTrieNode(number uint64, err error) bool {
+	var missing *trie.MissingNodeError
+	if !errors.As(err, &missing) {
+		s.missingNodeBlock, s.missingNodeTries = 0, 0
+		return false
+	}
+	if s.missingNodeTries > 0 && s.missingNodeBlock == number {
+		s.missingNodeTries++
+	} else {
+		s.missingNodeBlock, s.missingNodeTries = number, 1
+	}
+	if s.missingNodeTries < missingNodeHealAfter {
+		return false
+	}
+	s.missingNodeTries = 0
+	return true
+}
+
+// startSnapHeal is maybeStartSnapHeal; requireNoState false also heals a node
+// whose no-state flag is not set but whose head state has missing trie nodes.
+func (s *xdcSyncer) startSnapHeal(requireNoState bool) {
 	// Env-gate first: cheapest check, avoids dereferencing handler in tests.
 	if !snapHealEnabled() {
 		s.healStatusMu.Lock()
@@ -1561,7 +1594,7 @@ func (s *xdcSyncer) maybeStartSnapHeal() {
 		return // non-XDC chain
 	}
 	bc := s.handler.chain
-	if !bc.CheckpointSyncNoState() {
+	if requireNoState && !bc.CheckpointSyncNoState() {
 		// A.96 / default path: flag is false → nothing to heal.
 		log.Debug("A.97.2: snap-heal skipped — checkpointSyncNoState already false")
 		s.healStatusMu.Lock()
@@ -1734,7 +1767,9 @@ func (s *xdcSyncer) maybeStartSnapHeal() {
 
 		// Gate B passed: healed head state is provably the canonical state on
 		// disk — clear the flag so normal execution + state commit resumes.
-		bc.SetCheckpointSyncNoState(false)
+		if bc.CheckpointSyncNoState() {
+			bc.SetCheckpointSyncNoState(false)
+		}
 		log.Info("A.97.2: snap-heal completed",
 			"root", lastRoot.Hex(),
 			"head", func() uint64 {
@@ -2881,6 +2916,20 @@ func (s *xdcSyncer) fullSyncOnce() {
 	if err != nil {
 		log.Warn("xdcSyncer: InsertChain failed",
 			"from", fromBlock, "attempted", len(blocks), "inserted", n, "err", err)
+		// XDC-HUNT-55: the same block failing again and again on a missing trie
+		// node is our own incomplete state; start the snap heal instead of
+		// retrying forever. It needs XDC_SNAP_HEAL=1 and snap peers.
+		if blocks[min(n, len(blocks)-1)] != nil &&
+			s.noteMissingTrieNode(blocks[min(n, len(blocks)-1)].NumberU64(), err) {
+			if snapHealEnabled() {
+				log.Warn("xdcSyncer: block keeps failing on a missing trie node — starting snap heal",
+					"block", blocks[min(n, len(blocks)-1)].NumberU64())
+				s.startSnapHeal(false)
+			} else {
+				log.Error("xdcSyncer: block keeps failing on a missing trie node: local state is incomplete; set XDC_SNAP_HEAL=1 to heal it or resync",
+					"block", blocks[min(n, len(blocks)-1)].NumberU64())
+			}
+		}
 		// #1670 / #952: if the delivering peer's block fails with a definitive
 		// consensus error (not ErrUnknownAncestor — missing parent; not
 		// ErrFutureBlock — early; not a transient local error such as a missing
@@ -2957,6 +3006,7 @@ func (s *xdcSyncer) fullSyncOnce() {
 		}
 	}
 	// Successful import (or healed via co-signed-sibling adoption) — clear stuck state.
+	s.missingNodeBlock, s.missingNodeTries = 0, 0
 	if s.stuckFailures > 0 {
 		s.stuckFrom = 0
 		s.stuckFailures = 0

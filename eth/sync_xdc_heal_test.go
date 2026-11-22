@@ -5,6 +5,8 @@
 package eth
 
 import (
+	"errors"
+	"fmt"
 	"math/big"
 	"os"
 	"testing"
@@ -16,6 +18,7 @@ import (
 	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/params"
+	"github.com/ethereum/go-ethereum/trie"
 )
 
 // --- helpers ---
@@ -309,3 +312,33 @@ func TestGateBRunsWithBulkModeOff(t *testing.T) {
 
 // --- genesis-derived big.Int helpers (suppress unused import) ---
 var _ = big.NewInt(0)
+
+// TestNoteMissingTrieNode: the same block failing missingNodeHealAfter times in a
+// row with a MissingNodeError asks for the snap heal; another block, another
+// error or a success resets the count (XDC-HUNT-55).
+func TestNoteMissingTrieNode(t *testing.T) {
+	s := &xdcSyncer{}
+	miss := fmt.Errorf("invalid merkle root: %w", &trie.MissingNodeError{})
+	other := errors.New("some other failure")
+	for i := 1; i < missingNodeHealAfter; i++ {
+		if s.noteMissingTrieNode(10, miss) {
+			t.Fatalf("heal asked after %d failures", i)
+		}
+	}
+	if !s.noteMissingTrieNode(10, miss) {
+		t.Fatal("heal not asked after the 3rd consecutive failure")
+	}
+	// Different block restarts the count.
+	s.noteMissingTrieNode(10, miss)
+	s.noteMissingTrieNode(11, miss)
+	if s.noteMissingTrieNode(10, miss) {
+		t.Fatal("count survived a different block")
+	}
+	// Another error resets it.
+	s.noteMissingTrieNode(12, miss)
+	s.noteMissingTrieNode(12, miss)
+	s.noteMissingTrieNode(12, other)
+	if s.noteMissingTrieNode(12, miss) {
+		t.Fatal("count survived another error")
+	}
+}

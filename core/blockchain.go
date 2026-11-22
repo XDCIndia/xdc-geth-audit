@@ -1774,10 +1774,9 @@ func (bc *BlockChain) ClearCheckpointSyncNoState() {
 		"block", head.Number, "root", head.Root)
 }
 
-// canMaskMissingState reports whether the XDC A.93/A.94 auto-enable of
-// checkpointSyncNoState may fire, i.e. whether a missing parent state or a
-// ValidateState mismatch may be masked by importing with EmptyRootHash instead
-// of surfacing as an error.
+// canMaskMissingState reports whether a missing parent state during bulk sync
+// may be masked by importing with EmptyRootHash. A ValidateState mismatch,
+// including one caused by a missing trie node, is never masked (F-2026-19723).
 //
 // Masking is only ever acceptable for a plain follower that is mid-bulk-sync on
 // an XDC chain. It is excluded for:
@@ -2948,8 +2947,8 @@ func (bc *BlockChain) ProcessBlock(ctx context.Context, parentRoot common.Hash, 
 	// Set up the state reader feeding execution, along with a cleanup to run once
 	// processing is complete (stop the prefetcher, upload reader statistics).
 	statedb, cleanup, err := bc.setupExecutionState(parentRoot, block, vmConfig, config, &interrupt, &execIndex)
-	// XDC: sdb backs the EmptyRootHash stand-in used while checkpointSyncNoState
-	// is active (here and in the A.94 recovery below). XDC chains are never UBT.
+	// XDC: sdb backs the EmptyRootHash stand-in used when the parent state is
+	// missing during bulk sync. XDC chains are never UBT.
 	sdb := state.NewMPTDatabase(bc.triedb, bc.codedb).WithSnapshot(bc.snaps)
 	if err != nil {
 		// XDC A.93: Auto-enable checkpointSyncNoState when parent state is
@@ -3056,42 +3055,28 @@ func (bc *BlockChain) ProcessBlock(ctx context.Context, parentRoot common.Hash, 
 		err = bc.validator.ValidateState(block, statedb, res, false)
 		spanEnd(&err)
 		if err != nil {
-			// XDC A.94: Auto-recover from "invalid merkle root" during bulk fast-sync.
-			// When NodeData/snap-sync delivered a partial trie at the pivot, `HasState`
-			// only checks the root node — deeper storage reads silently return zero,
-			// so execution produces a wrong IntermediateRoot even though `state.New`
-			// succeeded. We switch into checkpointSyncNoState mode and discard the
-			// wrong-state for this block; subsequent blocks skip execution+validation
-			// until snap-sync heals the trie. Strictly gated to XDC + XdcBulkSyncMode.
-			// Refs #886.
-			// #62 guard: an archive node or a block producer must surface a ValidateState
-			// mismatch as a bad
-			// block, never mask it (this is what hid the net #62 block-16 fork/gas
-			// divergence and blocked minting). See the A.93 note above.
+			// A state-root mismatch is a bad block, including when execution
+			// read a missing trie node (F-2026-19723). Masking that case wrote
+			// the block and latched no-state mode, so every later block skipped
+			// execution. The node does not canonize the block and does not enter
+			// no-state mode; the import can be retried once the trie node is
+			// present. A block whose execution matches the header root is still
+			// imported, which is every block a current node produces on a
+			// complete trie. The parent-state miss above is a different case:
+			// execution never started, and bulk sync still uses the empty trie
+			// there so a follower with no parent state can keep importing.
 			//
-			// #1426: mask only when execution actually hit a missing trie node,
-			// i.e. the parent trie is genuinely incomplete. A mismatch on a
-			// complete state is a real divergence (or a forged root) and, as
-			// in canonical XDPoSChain, a bad block: masking it would canonize
-			// the block and latch no-state mode for every block after it.
+			// A missing trie node below the root means the local state is
+			// incomplete, not that the block is bad (XDC-HUNT-55): say so, and
+			// keep the error type so the syncer does not mark honest peers.
 			var missing *trie.MissingNodeError
-			if bc.canMaskMissingState() && errors.As(statedb.Error(), &missing) {
-				log.Warn("BlockChain: A.94 auto-recover on ValidateState mismatch during bulk sync",
-					"block", block.NumberU64(), "err", err)
-				bc.storeCheckpointSyncNoState(true)
-				rawdb.WriteCheckpointSyncNoState(bc.db, true)
-				// Discard the wrong-state statedb and replace with an empty one so
-				// writeBlockAndSetHead persists EmptyRootHash for this block, not the
-				// incorrectly-executed trie.
-				res = &ProcessResult{Receipts: types.Receipts{}}
-				statedb, err = state.New(types.EmptyRootHash, sdb)
-				if err != nil {
-					return nil, err
-				}
-			} else {
-				bc.reportBadBlock(block, res, err)
+			if errors.As(err, &missing) {
+				log.Error("Local state is incomplete: trie node missing while validating block, a state repair or new sync is needed",
+					"number", block.Number(), "hash", block.Hash(), "err", err)
 				return nil, err
 			}
+			bc.reportBadBlock(block, res, err)
+			return nil, err
 		}
 	}
 	vtime := time.Since(vstart)
