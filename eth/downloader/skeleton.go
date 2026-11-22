@@ -281,6 +281,9 @@ type skeleton struct {
 	peers *peerSet                   // Set of peers we can sync from
 	idles map[string]*peerConnection // Set of idle peers in the current sync cycle
 	drop  peerDropFn                 // Drops a peer for misbehaving
+	// dropUseless drops a peer that cannot extend the skeleton (timeout, empty
+	// replies) but did nothing wrong; the owner may defer it. Nil means drop.
+	dropUseless peerDropFn
 
 	// XDC fix #131: track consecutive empty-header responses per peer.
 	// Peers that repeatedly return 0 headers get dropped to unblock skeleton sync.
@@ -337,6 +340,15 @@ type chainReader interface {
 
 // newSkeleton creates a new sync skeleton that tracks a potentially dangling
 // header chain until it's linked into an existing set of blocks.
+// dropUselessPeer drops a peer that is merely useless to the skeleton.
+func (s *skeleton) dropUselessPeer(id string) {
+	if s.dropUseless != nil {
+		s.dropUseless(id)
+		return
+	}
+	s.drop(id)
+}
+
 func newSkeleton(db ethdb.Database, peers *peerSet, drop peerDropFn, filler backfiller, chain chainReader) *skeleton {
 	sk := &skeleton{
 		db:                 db,
@@ -1194,7 +1206,7 @@ func (s *skeleton) executeTask(peer *peerConnection, req *headerRequest) {
 		// gone stale and monitor them. However, in that case too, we need a way
 		// to protect against malicious peers never responding, so it would need
 		// a second, hard-timeout mechanism.
-		s.drop(peer.id)
+		s.dropUselessPeer(peer.id)
 
 	case res := <-resCh:
 		// Headers successfully retrieved, update the metrics
@@ -1234,7 +1246,7 @@ func (s *skeleton) executeTask(peer *peerConnection, req *headerRequest) {
 					"peer", peer.id, "consecutive", count, "peers", totalPeers)
 				res.Done <- errors.New("no headers delivered")
 				s.scheduleRevertRequest(req)
-				s.drop(peer.id)
+				s.dropUselessPeer(peer.id)
 			} else {
 				if count >= maxEmptyResponses && peerStarved {
 					peer.log.Warn("Skeleton: keeping peer despite empties (peer-starved)",

@@ -241,6 +241,7 @@ func newHandler(config *handlerConfig) (*handler, error) {
 	// Construct the downloader (long sync)
 	snapV2 := resolveSnapV2(config.SnapV2, config.Chain.Config(), config.Database)
 	h.downloader = downloader.New(config.Database, config.Sync, h.chain, h.removePeer, h.enableSyncedFeatures, snapV2)
+	h.downloader.SetUselessPeerDropFn(h.removeUselessPeer)
 	if h.downloader.ConfigSyncMode() == ethconfig.SnapSync {
 		log.Info("Selected snap sync state syncer", "version", h.downloader.SnapSyncVersion())
 	}
@@ -641,15 +642,13 @@ func (h *handler) runSnapExtension(peer *snap.Peer, handler snap.Handler) error 
 	return handler(peer)
 }
 
-// removePeer requests disconnection of a peer.
-func (h *handler) removePeer(id string) {
-	// XDC (#807 Phase 6): during snap-sync's SNAP_RUNNING phase, skip the
-	// useless-peer disconnect. The downloader's skeleton-sync calls
-	// removePeer when it can't extend the skeleton via that peer, but the
-	// peer's snap subprotocol may still be actively delivering state.
-	// Disconnecting tears down the snap channel and aborts state download.
-	// During SNAP_RUNNING we keep peers connected; if they truly misbehave,
-	// other layers (banList, taintPeer) will handle them.
+// removeUselessPeer requests disconnection of a peer that is merely useless to
+// the header skeleton. XDC (#807 Phase 6): during snap-sync's SNAP_RUNNING phase
+// it is skipped, because the peer's snap subprotocol may still be actively
+// delivering state and disconnecting tears down the snap channel and aborts the
+// state download. Only this reason is skipped: every other removePeer caller
+// reports a protocol fault and must disconnect in every phase (XDC-HUNT-04).
+func (h *handler) removeUselessPeer(id string) {
 	if h.xdcSync != nil && xdcSnapPhase(h.xdcSync.snapPhase.Load()) == phaseSnapRunning {
 		peerShort := id
 		if len(peerShort) > 12 {
@@ -658,6 +657,11 @@ func (h *handler) removePeer(id string) {
 		log.Debug("XDC: skipping useless-peer disconnect during SNAP_RUNNING", "peer", peerShort)
 		return
 	}
+	h.removePeer(id)
+}
+
+// removePeer requests disconnection of a peer.
+func (h *handler) removePeer(id string) {
 	peer := h.peers.peer(id)
 	if peer != nil {
 		peer.Peer.Disconnect(p2p.DiscUselessPeer)
