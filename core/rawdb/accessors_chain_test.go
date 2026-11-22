@@ -1101,3 +1101,43 @@ func TestReadCanonicalHashZeroPlaceholder(t *testing.T) {
 		t.Fatalf("real freezer hash: have %x, want %x", got, frHash)
 	}
 }
+
+// TestReadHeaderRangeGapPlaceholders checks that a header range over the XDC snap
+// gap-fill placeholders returns no placeholder bytes: nothing without a
+// backfill, the backfilled headers from the key-value store with one, and it
+// stops at the first block that still has none (XDC-HUNT-17).
+func TestReadHeaderRangeGapPlaceholders(t *testing.T) {
+	kv := NewMemoryDatabase()
+	fr := NewMemoryFreezer(false, chainFreezerTableConfigs)
+	db := &freezerdb{KeyValueStore: kv, chainFreezer: &chainFreezer{ancients: fr}}
+	if err := xdcFillGapAncients(fr, 0, 3); err != nil {
+		t.Fatal(err)
+	}
+	if got := ReadHeaderRange(db, 2, 3); len(got) != 0 {
+		t.Fatalf("no backfill: got %d items %x, want none", len(got), got)
+	}
+	headers := make([]*types.Header, 3)
+	for n := range headers {
+		headers[n] = &types.Header{Number: big.NewInt(int64(n)), Extra: []byte{byte(n)}}
+	}
+	// Backfill blocks 1 and 2 only: the range stops at block 0.
+	for _, n := range []int{1, 2} {
+		WriteHeader(kv, headers[n])
+		WriteCanonicalHash(kv, headers[n].Hash(), uint64(n))
+	}
+	got := ReadHeaderRange(db, 2, 3)
+	if len(got) != 2 {
+		t.Fatalf("partial backfill: got %d items, want 2", len(got))
+	}
+	for i, n := range []int{2, 1} {
+		var h types.Header
+		if err := rlp.DecodeBytes(got[i], &h); err != nil || h.Hash() != headers[n].Hash() {
+			t.Fatalf("item %d: want header %d, err=%v", i, n, err)
+		}
+	}
+	WriteHeader(kv, headers[0])
+	WriteCanonicalHash(kv, headers[0].Hash(), 0)
+	if got := ReadHeaderRange(db, 2, 3); len(got) != 3 {
+		t.Fatalf("full backfill: got %d items, want 3", len(got))
+	}
+}
