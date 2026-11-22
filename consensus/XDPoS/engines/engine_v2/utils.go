@@ -59,6 +59,15 @@ func (x *XDPoS_v2) verifyMsgSignature(signedHashToBeVerified common.Hash, signat
 		return false, signerAddress, errors.New("empty masternode list")
 	}
 
+	// Reject a high-S signature before it can be stored in the vote or timeout
+	// pool. recoverUniqueSigners already refuses the same bytes in a certificate,
+	// so a local quorum built from them advances a round peers will not accept.
+	// crypto.Sign emits low-S, so a historical seal produced by an honest node
+	// still verifies.
+	if !hasLowS(signature) {
+		return false, signerAddress, utils.ErrInvalidSignature
+	}
+
 	// Recover public key
 	pubkey, err := crypto.Ecrecover(signedHashToBeVerified.Bytes(), signature)
 	if err != nil {

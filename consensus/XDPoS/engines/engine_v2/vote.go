@@ -378,11 +378,26 @@ func (x *XDPoS_v2) onVotePoolThresholdReached(chain consensus.ChainReader, poole
 		return nil
 	}
 
+	// A certificate is built only from signatures recoverUniqueSigners accepts.
+	// A high-S vote that reached the pool must not advance the round: peers
+	// reject that certificate.
+	vote := currentVoteMsg.(*types.Vote)
+	signedHash := types.VoteSigHash(&types.VoteForSign{
+		ProposedBlockInfo: vote.ProposedBlockInfo,
+		GapNumber:         vote.GapNumber,
+	})
+	accepted, _, err := recoverUniqueSigners(signedHash, validSignatures, epochInfo.Masternodes)
+	if err != nil || float64(len(accepted)) < float64(epochInfo.MasternodesLen)*certThreshold {
+		log.Warn("[onVotePoolThresholdReached] certificate signatures rejected",
+			"accepted", len(accepted), "err", err)
+		return nil
+	}
+
 	// Generate QC
 	quorumCert := &types.QuorumCert{
-		ProposedBlockInfo: currentVoteMsg.(*types.Vote).ProposedBlockInfo,
-		Signatures:        validSignatures,
-		GapNumber:         currentVoteMsg.(*types.Vote).GapNumber,
+		ProposedBlockInfo: vote.ProposedBlockInfo,
+		Signatures:        accepted,
+		GapNumber:         vote.GapNumber,
 	}
 
 	// Process QC

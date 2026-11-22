@@ -195,10 +195,25 @@ func (x *XDPoS_v2) onTimeoutPoolThresholdReached(chain consensus.ChainReader, po
 		return nil
 	}
 
+	// Same rule as a vote certificate: only signatures recoverUniqueSigners
+	// accepts may form a timeout certificate. A high-S timeout must not
+	// advance the round on a certificate peers reject.
+	current := currentTimeoutMsg.(*types.Timeout)
+	signedHash := types.TimeoutSigHash(&types.TimeoutForSign{
+		Round:     current.Round,
+		GapNumber: current.GapNumber,
+	})
+	accepted, _, err := recoverUniqueSigners(signedHash, signatures, epochInfo.Masternodes)
+	if err != nil || float64(len(accepted)) < float64(epochInfo.MasternodesLen)*certThreshold {
+		log.Warn("[onTimeoutPoolThresholdReached] certificate signatures rejected",
+			"accepted", len(accepted), "err", err, "tcRound", timeoutRound)
+		return nil
+	}
+
 	// Generate TC with only active-masternode signatures.
 	timeoutCert := &types.TimeoutCert{
 		Round:      timeoutRound,
-		Signatures: signatures,
+		Signatures: accepted,
 		GapNumber:  gapNumber,
 	}
 
