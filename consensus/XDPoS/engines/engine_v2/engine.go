@@ -2861,6 +2861,18 @@ func (x *XDPoS_v2) getMasternodesFromSnapshot(chain consensus.ChainReader, epoch
 	return nil
 }
 
+// rememberEpochForHeader stores epoch info under hash only when that hash is
+// the header's own hash. verifyQC asks for the parent epoch using the
+// certificate's proposed-block hash before the hash is checked; storing the
+// parent epoch under an unchecked hash lets a rejected certificate poison a
+// later lookup.
+func (x *XDPoS_v2) rememberEpochForHeader(header *types.Header, hash common.Hash, info *types.EpochSwitchInfo) {
+	if header == nil || info == nil || header.Hash() != hash {
+		return
+	}
+	x.epochSwitches.Add(hash, info)
+}
+
 // getEpochSwitchInfoWithParents is like getEpochSwitchInfo but can resolve the
 // epoch switch header from the supplied parents slice when it is not yet in the DB.
 // Required during bulk sync when a batch spans an epoch boundary.
@@ -2897,7 +2909,7 @@ func (x *XDPoS_v2) getEpochSwitchInfoWithParents(chain consensus.ChainReader, he
 			if _, round, err := x.getExtraFieldsNoChain(header); err == nil &&
 				info.EpochSwitchBlockInfo != nil &&
 				round < x.epochEndRound(info) {
-				x.epochSwitches.Add(hash, info)
+				x.rememberEpochForHeader(header, hash, info)
 				return info, nil
 			}
 		}
@@ -2945,7 +2957,7 @@ func (x *XDPoS_v2) getEpochSwitchInfoWithParents(chain consensus.ChainReader, he
 				}
 				log.Info("[getEpochSwitchInfoWithParents] target header is epoch switch (round-0)",
 					"number", h.Number.Uint64(), "hash", hash.Hex(), "masternodes", len(masternodes))
-				x.epochSwitches.Add(hash, info)
+				x.rememberEpochForHeader(h, hash, info)
 				return info, nil
 			}
 		}
@@ -3003,7 +3015,7 @@ func (x *XDPoS_v2) getEpochSwitchInfoWithParents(chain consensus.ChainReader, he
 							}
 							log.Debug("[getEpochSwitchInfoWithParents] found epoch switch via round2epochBlockInfo cache",
 								"number", h.Number.Uint64(), "epochSwitch", blockInfo.Number.Uint64(), "epochStartRound", targetEpochStartRound, "round", round)
-							x.epochSwitches.Add(hash, info)
+							x.rememberEpochForHeader(h, hash, info)
 							return info, nil
 						}
 					} else {
@@ -3026,7 +3038,7 @@ func (x *XDPoS_v2) getEpochSwitchInfoWithParents(chain consensus.ChainReader, he
 								}
 								log.Debug("[getEpochSwitchInfoWithParents] found epoch switch via round2epochBlockInfo cache (by number)",
 									"number", h.Number.Uint64(), "epochSwitch", blockInfo.Number.Uint64(), "epochStartRound", targetEpochStartRound)
-								x.epochSwitches.Add(hash, info)
+								x.rememberEpochForHeader(h, hash, info)
 								return info, nil
 							}
 						}
@@ -3087,7 +3099,7 @@ func (x *XDPoS_v2) getEpochSwitchInfoWithParents(chain consensus.ChainReader, he
 							}
 							log.Debug("[getEpochSwitchInfoWithParents] found epoch switch by DB walk-back",
 								"number", h.Number.Uint64(), "epochSwitch", num, "round", fullRound)
-							x.epochSwitches.Add(hash, info)
+							x.rememberEpochForHeader(h, hash, info)
 							return info, nil
 						}
 					}
@@ -3119,7 +3131,7 @@ func (x *XDPoS_v2) getEpochSwitchInfoWithParents(chain consensus.ChainReader, he
 					}
 					log.Info("[getEpochSwitchInfoWithParents] checkpoint boundary fallback: target IS epoch switch",
 						"number", h.Number.Uint64(), "hash", hash.Hex(), "masternodes", len(masternodes))
-					x.epochSwitches.Add(hash, info)
+					x.rememberEpochForHeader(h, hash, info)
 					return info, nil
 				}
 			}
@@ -3197,7 +3209,7 @@ func (x *XDPoS_v2) getEpochSwitchInfoWithParents(chain consensus.ChainReader, he
 	if _, ok := x.epochSwitches.Get(esHash); !ok {
 		x.epochSwitches.Add(esHash, info)
 	}
-	x.epochSwitches.Add(hash, info)
+	x.rememberEpochForHeader(h, hash, info)
 	return info, nil
 }
 

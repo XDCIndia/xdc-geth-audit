@@ -477,8 +477,18 @@ func (x *XDPoS_v2) verifyQC(chain consensus.ChainReader, quorumCert *types.Quoru
 		}
 	}
 
-	// Verify block info
-	return x.VerifyBlockInfo(chain, quorumCert.ProposedBlockInfo, parentHeader)
+	// Verify block info. This is the check that the certificate's proposed-block
+	// hash is the header hash. The epoch lookup above must not have stored the
+	// parent epoch under that hash; do it only after this succeeds.
+	if err := x.VerifyBlockInfo(chain, quorumCert.ProposedBlockInfo, parentHeader); err != nil {
+		return err
+	}
+	if h := chain.GetHeaderByHash(quorumCert.ProposedBlockInfo.Hash); h != nil && h.Hash() == quorumCert.ProposedBlockInfo.Hash {
+		if _, cacheErr := x.getEpochSwitchInfo(chain, h, h.Hash()); cacheErr != nil {
+			log.Debug("[verifyQC] epoch not cached after accept", "hash", h.Hash(), "err", cacheErr)
+		}
+	}
+	return nil
 }
 
 // processQC processes a quorum certificate
