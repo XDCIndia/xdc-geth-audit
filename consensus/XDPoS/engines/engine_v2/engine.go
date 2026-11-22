@@ -3601,6 +3601,10 @@ func (x *XDPoS_v2) GetPreviousPenaltyByHash(chain consensus.ChainReader, hash co
 		log.Error("[GetPreviousPenaltyByHash] getPreviousEpochSwitchInfoByHash error", "err", err)
 		return nil, err
 	}
+	if epochSwitchInfo == nil {
+		// No block has the epoch number current-limit: empty list, as canonical.
+		return []common.Address{}, nil
+	}
 	header := chain.GetHeaderByHash(epochSwitchInfo.EpochSwitchBlockInfo.Hash)
 	if header == nil {
 		// Header not yet in DB (fast/snap sync): use the Penalties already cached

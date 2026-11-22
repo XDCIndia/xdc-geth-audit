@@ -15,12 +15,19 @@ import (
 	"github.com/ethereum/go-ethereum/log"
 )
 
-// getPreviousEpochSwitchInfoByHash walks backward through epoch switches.
-// Returns the epoch switch info `limit` epochs before the epoch containing `hash`.
-// Matches v2.6.8 engines/engine_v2/epochSwitch.go.
+// getPreviousEpochSwitchInfoByHash returns the epoch switch info of the epoch
+// number `limit` below the epoch containing `hash`, or (nil, nil) when that
+// epoch has no block.
 //
-// If the walk stops early because the chain is too young (no previous V2
-// epoch), the info for the earliest available epoch is returned without error.
+// The epoch is found by number, as canonical does (engine_v2/engine.go:1240-1261
+// in XDPoSChain v3.0.0-testnet-2: epochNum - limit, empty result when no block
+// has that epoch number or when epochNum < limit). It must not count
+// epoch-switch blocks: after an outage that skips a whole epoch number, the
+// count lands on an older epoch and the penalty lists differ from canonical.
+//
+// The walk goes through the epoch-switch parent links, one existing epoch per
+// step, and stops at the first epoch number not above the target.
+//
 // If the walk stops because an epoch-switch header is absent from the local DB
 // (A.68.2 priming incomplete or its depth less than the penalty lookback
 // window), ErrPenaltyAncestorMissing is returned so the caller can treat the
@@ -31,23 +38,34 @@ func (x *XDPoS_v2) getPreviousEpochSwitchInfoByHash(chain consensus.ChainReader,
 		log.Error("[getPreviousEpochSwitchInfoByHash] getEpochSwitchInfo error", "err", err)
 		return nil, err
 	}
-	for i := 0; i < limit; i++ {
+	epochOf := func(info *types.EpochSwitchInfo) uint64 {
+		return x.config.V2.SwitchEpoch + uint64(info.EpochSwitchBlockInfo.Round)/x.config.Epoch
+	}
+	if epochOf(epochSwitchInfo) < uint64(limit) {
+		return nil, nil
+	}
+	target := epochOf(epochSwitchInfo) - uint64(limit)
+	for epochOf(epochSwitchInfo) > target {
 		parentHash, ok, lookupErr := x.epochSwitchParentHashOrErr(chain, epochSwitchInfo)
 		if lookupErr != nil {
 			// Epoch-switch header not in DB — retryable, not a bad block.
 			log.Warn("[getPreviousEpochSwitchInfoByHash] epoch-switch header missing from DB",
-				"iteration", i, "limit", limit, "err", lookupErr)
+				"limit", limit, "err", lookupErr)
 			return nil, lookupErr
 		}
 		if !ok {
-			// Chain too young: no previous V2 epoch. Stop without error.
-			break
+			// Chain too young: no previous V2 epoch, so the target has no block.
+			return nil, nil
 		}
 		epochSwitchInfo, err = x.getEpochSwitchInfo(chain, nil, parentHash)
 		if err != nil {
-			log.Error("[getPreviousEpochSwitchInfoByHash] recursive getEpochSwitchInfo error", "err", err, "iteration", i)
+			log.Error("[getPreviousEpochSwitchInfoByHash] recursive getEpochSwitchInfo error", "err", err)
 			return nil, err
 		}
+	}
+	if epochOf(epochSwitchInfo) != target {
+		// The target epoch number was skipped: no block, empty list.
+		return nil, nil
 	}
 	return epochSwitchInfo, nil
 }
