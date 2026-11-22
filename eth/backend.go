@@ -608,6 +608,7 @@ func New(stack *node.Node, config *ethconfig.Config) (*Ethereum, error) {
 				Vote:     h.BroadcastVote,
 				Timeout:  h.BroadcastTimeout,
 				SyncInfo: h.BroadcastSyncInfo,
+				Own:      h.BroadcastOwn,
 			}, chainReader, chainHeightFn)
 			b.SetConsensusFns(v2)
 			b.SetBroadcastCh(v2.BroadcastCh)
