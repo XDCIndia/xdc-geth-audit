@@ -6486,17 +6486,37 @@ func emptyHistoryBody(h *types.Header) *types.Body {
 }
 
 func snapBlockComplete(db ethdb.Reader, hash common.Hash, num uint64, txHash common.Hash) bool {
-	if !rawdb.HasHeader(db, hash, num) {
+	header := rawdb.ReadHeader(db, hash, num)
+	if header == nil {
 		return false
 	}
-	if txHash == types.EmptyTxsHash {
-		// Empty blocks still need a body record: GetBlock/eth_getBlockByNumber
-		// return nil without one (the backfill writes it, see emptyHistoryBody).
-		return rawdb.HasBody(db, hash, num)
+	body := rawdb.ReadBody(db, hash, num)
+	if body == nil {
+		return false
 	}
-	// History is complete only with the receipts too (eth_getTransactionReceipt,
-	// log filters); a block missing them stays pending and is retried.
-	return rawdb.HasBody(db, hash, num) && rawdb.HasReceipts(db, hash, num)
+	// The fast-sync anchor writes an empty body and empty receipts for every
+	// header. Those records exist, but they are not the block unless the
+	// roots match.
+	check := types.CopyHeader(header)
+	if txHash != (common.Hash{}) {
+		check.TxHash = txHash
+	}
+	if !verifyBodyAgainstHeader(check, body) {
+		return false
+	}
+	if check.TxHash == types.EmptyTxsHash {
+		return true
+	}
+	receipts := rawdb.ReadRawReceipts(db, hash, num)
+	if len(receipts) == 0 {
+		return header.ReceiptHash == types.EmptyReceiptsHash
+	}
+	if types.DeriveSha(receipts, trie.NewStackTrie(nil)) == header.ReceiptHash {
+		return true
+	}
+	// A non-empty receipt list stored for a non-empty body is the block the
+	// backfill already checked. An empty placeholder never reaches here.
+	return len(receipts) == len(body.Transactions)
 }
 
 // verifyBodyAgainstHeader returns true iff body's transaction root, uncle hash,
