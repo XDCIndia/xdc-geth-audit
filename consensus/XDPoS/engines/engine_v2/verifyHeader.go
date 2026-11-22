@@ -403,6 +403,13 @@ func (x *XDPoS_v2) verifyHeader(chain consensus.ChainReader, header *types.Heade
 		// by publishing any permutation of the correct validator set.
 		// Before ValidatorOrderBlock: diagnostic only (warn, no rejection).
 		// From ValidatorOrderBlock: hard rejection — the header is invalid.
+		//
+		// The block stays at the far-future placeholder on mainnet and Apothem,
+		// and nil everywhere else. Both leave a reordered list valid, which is
+		// what current-main and legacy XDPoSChain accept. Moving it earlier on
+		// this client alone would reject headers those clients still seal
+		// (#1722). Nil and the placeholder are the same rule at every block a
+		// node imports today.
 		if fullVerify && !utils.ValidatorsOrderMatches(masterNodes, validatorsAddress) {
 			if chain.Config().IsValidatorOrder(header.Number) {
 				return fmt.Errorf("epoch-switch header.Validators order does not match calcMasternodes at block %s", header.Number)

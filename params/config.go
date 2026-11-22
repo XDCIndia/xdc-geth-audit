@@ -85,7 +85,7 @@ var (
 		CancunBlock:         big.NewInt(98_802_000),     // XDPoSChain MainnetConstant.cancunBlock — Target 28th Jan 2026
 		AmsterdamBlock:      big.NewInt(99_999_999_999), // Glamsterdam incl. EIP-7928 BAL: placeholder far-future block, not scheduled (#1644)
 		SigningTxBoundBlock: big.NewInt(99_999_999_999), // CertiK XDC-04/XDC-09: placeholder far-future block, scheduled with legacy (#1721)
-		ValidatorOrderBlock: big.NewInt(99_999_999_999), // CertiK XDC-11: placeholder far-future block, scheduled with legacy (#1722)
+		ValidatorOrderBlock: big.NewInt(99_999_999_999), // CertiK XDC-11 / F-2026-19815: placeholder, not a scheduled activation. Same rule as nil until legacy agrees a block (#1722).
 		ParoleDedupBlock:    big.NewInt(99_999_999_999), // CertiK XDC-12: placeholder far-future block, scheduled with legacy (#1723)
 		XDPoS: &XDPoSConfig{
 			Period:              2,                                                                 // 2 second block time
@@ -1053,7 +1053,7 @@ var (
 		PragueBlock:                big.NewInt(84_333_000),     // XDPoSChain v3.0.0-testnet-1 genesis/testnet.json pragueBlock (#2815, moved from 87,633,000)
 		AmsterdamBlock:             big.NewInt(99_999_999_999), // Glamsterdam incl. EIP-7928 BAL: placeholder far-future block, not scheduled (#1644)
 		SigningTxBoundBlock:        big.NewInt(99_999_999_999), // CertiK XDC-04/XDC-09: placeholder far-future block, scheduled with legacy (#1721)
-		ValidatorOrderBlock:        big.NewInt(99_999_999_999), // CertiK XDC-11: placeholder far-future block, scheduled with legacy (#1722)
+		ValidatorOrderBlock:        big.NewInt(99_999_999_999), // CertiK XDC-11 / F-2026-19815: placeholder, not a scheduled activation. Same rule as nil until legacy agrees a block (#1722).
 		ParoleDedupBlock:           big.NewInt(99_999_999_999), // CertiK XDC-12: placeholder far-future block, scheduled with legacy (#1723)
 		XDPoS: &XDPoSConfig{
 			Period:              2,                                                                 // 2 second block time
