@@ -12,6 +12,7 @@ import (
 	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/ethereum/go-ethereum/consensus"
 	"github.com/ethereum/go-ethereum/consensus/XDPoS"
+	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
@@ -27,6 +28,33 @@ type signerOnlyBackend struct {
 }
 
 func (b *signerOnlyBackend) Engine() consensus.Engine { return b.engine }
+
+type epochMapBackend struct {
+	Backend
+	cfg    *params.ChainConfig
+	engine consensus.Engine
+}
+
+func (b *epochMapBackend) ChainConfig() *params.ChainConfig { return b.cfg }
+func (b *epochMapBackend) Engine() consensus.Engine         { return b.engine }
+func (b *epochMapBackend) BlockChain() *core.BlockChain     { return nil }
+
+func TestF202620640EpochArgumentIsNotABlockNumber(t *testing.T) {
+	cfg := &params.ChainConfig{XDPoS: &params.XDPoSConfig{Epoch: 900}}
+	engine := XDPoS.New(cfg.XDPoS, rawdb.NewMemoryDatabase())
+	api := &BlockChainAPI{b: &epochMapBackend{cfg: cfg, engine: engine}}
+	checkpoint, epochOut := api.GetCheckpointFromEpoch(context.Background(), 5)
+	if epochOut != 5 {
+		t.Fatalf("epoch field = %d, want the requested epoch 5", epochOut)
+	}
+	if checkpoint != 900*4 {
+		t.Fatalf("checkpoint = %d, want 3600", checkpoint)
+	}
+	// Treating 5 as a block number yields checkpoint 900 and epoch 1.
+	if checkpoint == 900 || epochOut == 1 {
+		t.Fatal("epoch 5 was read as block 5")
+	}
+}
 
 // TestRpcOutputBlockSignersV2Seal verifies that rpcOutputBlockSigners recovers
 // the real signer from a 65-byte V2 Validator field instead of splitting it into
