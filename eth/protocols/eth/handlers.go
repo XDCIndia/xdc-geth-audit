@@ -454,17 +454,17 @@ func serviceGetReceiptsQuery70(chain *core.BlockChain, query GetReceiptsRequest,
 // legacyHeaderAnchorIndex returns the index of the queued request's anchor
 // in headers, or -1 when the batch is empty or does not contain it.
 func legacyHeaderAnchorIndex(headers []*types.Header, req legacyHeaderReq) int {
-	if req.anchorHash != (common.Hash{}) {
+	if req.byNumber {
 		for i, h := range headers {
-			if h != nil && h.Hash() == req.anchorHash {
+			if h != nil && h.Number != nil && h.Number.Uint64() == req.anchorNumber {
 				return i
 			}
 		}
 		return -1
 	}
-	if req.anchorNumber != 0 {
+	if req.anchorHash != (common.Hash{}) {
 		for i, h := range headers {
-			if h != nil && h.Number != nil && h.Number.Uint64() == req.anchorNumber {
+			if h != nil && h.Hash() == req.anchorHash {
 				return i
 			}
 		}
@@ -524,7 +524,13 @@ func handleBlockHeaders(backend Backend, msg Decoder, peer *Peer) error {
 			}
 			return nil
 		}
-		req = peer.popLegacyHeaderReq()
+		// Take only the request that was matched. A cancel may have removed
+		// it after the peek; do not pop whatever is now at the head.
+		var taken bool
+		req, taken = peer.takeLegacyHeaderReq(req.id)
+		if !taken {
+			return nil
+		}
 
 		// A caller waiting on its own response channel must not also have
 		// the batch copied onto XDCHeaderResp, or a required-block challenge

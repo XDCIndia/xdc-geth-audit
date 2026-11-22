@@ -74,7 +74,8 @@ type legacyHeaderReq struct {
 	id           uint64      // dispatcher request id
 	count        int         // requested header count (for response truncation)
 	anchorHash   common.Hash // ByHash request: expected hash of headers[0]
-	anchorNumber uint64      // ByNumber request: expected number of headers[0]
+	anchorNumber uint64      // ByNumber request: expected number, including 0
+	byNumber     bool        // anchor is a block number; 0 is genesis, not "unset"
 	hasSink      bool        // a caller is waiting on its own response channel
 }
 
@@ -305,10 +306,24 @@ func (p *Peer) pushLegacyHeaderReqHash(id uint64, count int, hash common.Hash, h
 // pushLegacyHeaderReqNumber enqueues a number-anchored header request.
 func (p *Peer) pushLegacyHeaderReqNumber(id uint64, count int, number uint64, hasSink bool) {
 	p.legacyHeaderQueueMu.Lock()
-	p.legacyHeaderQueue = append(p.legacyHeaderQueue, legacyHeaderReq{id: id, count: count, anchorNumber: number, hasSink: hasSink})
+	p.legacyHeaderQueue = append(p.legacyHeaderQueue, legacyHeaderReq{id: id, count: count, anchorNumber: number, byNumber: true, hasSink: hasSink})
 	p.legacyHeaderQueueMu.Unlock()
 	p.legacyHeaderReqID.Store(id)
 	p.legacyHeaderReqCount.Store(uint64(count))
+}
+
+// removeLegacyHeaderReq drops a queued header request by dispatcher id.
+// The dispatcher calls this when the request is cancelled or times out,
+// so a stale head does not keep later replies from matching.
+func (p *Peer) removeLegacyHeaderReq(id uint64) {
+	p.legacyHeaderQueueMu.Lock()
+	defer p.legacyHeaderQueueMu.Unlock()
+	for i, req := range p.legacyHeaderQueue {
+		if req.id == id {
+			p.legacyHeaderQueue = append(p.legacyHeaderQueue[:i], p.legacyHeaderQueue[i+1:]...)
+			return
+		}
+	}
 }
 
 // peekLegacyHeaderReq returns the oldest pending header request without
@@ -320,6 +335,20 @@ func (p *Peer) peekLegacyHeaderReq() (legacyHeaderReq, bool) {
 		return legacyHeaderReq{}, false
 	}
 	return p.legacyHeaderQueue[0], true
+}
+
+// takeLegacyHeaderReq removes the oldest pending header request when its
+// id is still id. A cancel between peek and take leaves the queue unchanged
+// and returns false.
+func (p *Peer) takeLegacyHeaderReq(id uint64) (legacyHeaderReq, bool) {
+	p.legacyHeaderQueueMu.Lock()
+	defer p.legacyHeaderQueueMu.Unlock()
+	if len(p.legacyHeaderQueue) == 0 || p.legacyHeaderQueue[0].id != id {
+		return legacyHeaderReq{}, false
+	}
+	req := p.legacyHeaderQueue[0]
+	p.legacyHeaderQueue = p.legacyHeaderQueue[1:]
+	return req, true
 }
 
 // popLegacyHeaderReq removes and returns the oldest pending header
@@ -645,9 +674,13 @@ func (p *Peer) RequestHeadersByHash(origin common.Hash, amount int, skip int, re
 			"skip", skip,
 			"reverse", reverse,
 			"req_id", id)
+		req.cleanup = func() { p.removeLegacyHeaderReq(id) }
 		p.pushLegacyHeaderReqHash(id, amount, origin, sink != nil)
 	}
 	if err := p.dispatchRequest(req); err != nil {
+		if p.version == XDPOS2 {
+			p.removeLegacyHeaderReq(id)
+		}
 		return nil, err
 	}
 	return req, nil
@@ -675,9 +708,13 @@ func (p *Peer) RequestHeadersByNumber(origin uint64, amount int, skip int, rever
 			"skip", skip,
 			"reverse", reverse,
 			"req_id", id)
+		req.cleanup = func() { p.removeLegacyHeaderReq(id) }
 		p.pushLegacyHeaderReqNumber(id, amount, origin, sink != nil)
 	}
 	if err := p.dispatchRequest(req); err != nil {
+		if p.version == XDPOS2 {
+			p.removeLegacyHeaderReq(id)
+		}
 		return nil, err
 	}
 	return req, nil

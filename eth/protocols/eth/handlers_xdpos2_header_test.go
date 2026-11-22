@@ -234,3 +234,64 @@ func TestXDPOS2HeaderReplyDeliversMatchingBatchToSyncer(t *testing.T) {
 		t.Fatalf("request 7 still tracked: %v", err)
 	}
 }
+
+// r2Decoder is a test Decoder whose Decode is rlp.DecodeBytes.
+type r2Decoder struct {
+	payload []byte
+}
+
+func (d r2Decoder) Decode(val interface{}) error {
+	return rlp.DecodeBytes(d.payload, val)
+}
+
+func TestXDPOS2GenesisHeaderAnchorNeverMatches(t *testing.T) {
+	peer := newHeaderTestPeer()
+	defer peer.tracker.Stop()
+	peer.pushLegacyHeaderReqNumber(7, 2, 0, false)
+
+	h0 := &types.Header{Number: big.NewInt(0), GasLimit: 8_000_000, Time: 1}
+	h1 := &types.Header{Number: big.NewInt(1), ParentHash: h0.Hash(), GasLimit: 8_000_000, Time: 2}
+	batch, err := rlp.EncodeToBytes([]*types.Header{h0, h1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := handleBlockHeaders(nil, r2Decoder{batch}, peer); err != nil {
+		t.Fatalf("handler: %v", err)
+	}
+	if _, ok := peer.peekLegacyHeaderReq(); ok {
+		t.Fatal("request for block 0 still queued")
+	}
+	select {
+	case hdrs := <-peer.XDCHeaderResp:
+		if hdrs[0].Number.Uint64() != 0 {
+			t.Fatalf("delivered %d, want 0", hdrs[0].Number)
+		}
+	default:
+		t.Fatal("genesis batch was not delivered")
+	}
+}
+
+func TestStaleHeaderRequestBlocksLaterMatch(t *testing.T) {
+	peer := newHeaderTestPeer()
+	defer peer.tracker.Stop()
+	peer.pushLegacyHeaderReqNumber(1, 1, 100, false)
+	peer.pushLegacyHeaderReqNumber(2, 1, 200, false)
+	peer.removeLegacyHeaderReq(1)
+
+	h := &types.Header{Number: big.NewInt(200), GasLimit: 8_000_000, Time: 200}
+	batch, err := rlp.EncodeToBytes([]*types.Header{h})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := handleBlockHeaders(nil, r2Decoder{batch}, peer); err != nil {
+		t.Fatalf("handler: %v", err)
+	}
+	select {
+	case hdrs := <-peer.XDCHeaderResp:
+		if hdrs[0].Number.Uint64() != 200 {
+			t.Fatalf("delivered %d, want 200", hdrs[0].Number)
+		}
+	default:
+		t.Fatal("batch for the later request was not delivered")
+	}
+}
