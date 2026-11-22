@@ -206,16 +206,18 @@ func SealHash(header *types.Header) (hash common.Hash) {
 //
 // F-2026-19621 (Accepted): header.Penalties is intentionally excluded.
 // Including it would change the digest for every historical V1 block, invalidating
-// every seal on mainnet and Apothem — that is never allowed.  The V1 seal therefore
-// does not bind Penalties.  Instead, checkSignersOnCheckpoint (called from
+// every seal on mainnet, Apothem and net 2040. That is never allowed, including
+// behind a later fork: a fork inside V1 history breaks those seals, and a fork
+// after the V2 switch never runs on a V1 header. The V1 seal therefore does not
+// bind Penalties. Instead, checkSignersOnCheckpoint (called from
 // verifyCascadingFields under full verify on non-Apothem chains) computes the
 // expected penalty list via the penalty hook and rejects a checkpoint whose
-// header.Penalties differs from that list (errInvalidCheckpointPenalties).  This
+// header.Penalties differs from that list (errInvalidCheckpointPenalties). This
 // hook-compare is the only binding of Penalties to the block's content; it is
 // unavoidably skipped on the bulk-sync light path (hook needs state not yet
 // available), when ErrPenaltyDataUnavailable is returned (non-archive after rewind),
 // and on Apothem (historical Apothem blocks may carry penalties that do not match
-// the computed set).  These residuals are the minimum necessary to stay compatible
+// the computed set). These residuals are the minimum necessary to stay compatible
 // with the canonical chain.
 func encodeSigHeader(w io.Writer, header *types.Header) {
 	// V1 blocks store the proposer signature in the last 65 bytes of header.Extra.
