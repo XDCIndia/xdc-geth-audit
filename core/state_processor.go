@@ -172,15 +172,6 @@ func (p *StateProcessor) Process(ctx context.Context, block *types.Block, stated
 	// Run the pre-execution system calls
 	blockAccessList.Merge(PreExecution(ctx, block.BeaconRoot(), parent, config, evm, block.Number(), block.Time()))
 
-	// XDC: resolve TRC21 fee recipient once per block. After TIPTRC21Fee
-	// (Apothem 23,779,191), the masternode's registered candidate-owner —
-	// looked up from the validator contract (0x88) — receives the per-tx
-	// gas-fee credit instead of the masternode. Computed before the loop so
-	// that within-block balance mutations on the owner do not influence the
-	// lookup. Passed through to ApplyTransactionWithEVM where it routes the
-	// fee in state_transition.go.
-	coinbaseOwner := getCoinbaseOwner(p.chain.Engine(), statedb, header)
-
 	// XDC: TRC21 token fees (XDPoSChain core/blockchain.go + Process). Tokens
 	// registered in the TRC21 issuer pay the fees of transactions sent to them
 	// from their fee capacity, read once from the parent state here and drawn
@@ -252,6 +243,15 @@ func (p *StateProcessor) Process(ctx context.Context, block *types.Block, stated
 			continue
 		}
 		tokenFee := ApplyTRC21TokenFee(config, msg, tokensFee, tx, blockNumber)
+		// XDC: resolve the TRC21 fee recipient for this tx. After TIPTRC21Fee
+		// (Apothem 23,779,191), the masternode's registered candidate-owner —
+		// looked up from the validator contract (0x88) — receives the gas-fee
+		// credit instead of the masternode. Canonical reads it from state for
+		// each transaction (core/state_processor.go:442-443 and :652 in
+		// XDPoSChain v3.0.0-testnet-2), so an owner change by an earlier tx of
+		// the block applies to the fee of a later one (XDC-HUNT-35). Passed to
+		// ApplyTransactionWithEVM where it routes the fee in state_transition.go.
+		coinbaseOwner := getCoinbaseOwner(p.chain.Engine(), statedb, header)
 		statedb.SetTxContext(tx.Hash(), i, uint32(i+1))
 		receipt, bal, err := applyTransactionWithEVM(ctx, msg, gp, statedb, blockNumber, blockHash, context.Time, tx, evm, eagerBloom, coinbaseOwner)
 		if err != nil {
