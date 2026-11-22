@@ -471,7 +471,7 @@ func (x *XDPoS_v2) verifyHeader(chain consensus.ChainReader, header *types.Heade
 		masterNodes = x.GetMasternodesWithParents(chain, header, parents)
 	}
 
-	verified, validatorAddress, err := x.verifyMsgSignature(sigHash(header), header.Validator, masterNodes)
+	verified, validatorAddress, err := x.verifyMsgSignature(x.sealHash(header), header.Validator, masterNodes)
 	if err != nil {
 		for index, mn := range masterNodes {
 			log.Error("[verifyHeader] masternode list during validator verification", "Masternode Address", mn.Hex(), "index", index)
