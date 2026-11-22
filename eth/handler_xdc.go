@@ -14,11 +14,94 @@ package eth
 
 import (
 	"math/big"
+	"sync"
+	"time"
 
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/eth/protocols/eth"
 	"github.com/ethereum/go-ethereum/log"
 )
+
+// bftPeerSendQueueLen is the number of outbound BFT or block messages queued
+// for one peer. A further message is dropped. One goroutine drains the queue.
+const bftPeerSendQueueLen = 32
+
+// bftPeerSendFullTimeout is how long a peer's send queue may stay full before
+// the peer is disconnected. A peer that stops reading would otherwise hold
+// the sender goroutine and drop every later message.
+var bftPeerSendFullTimeout = 5 * time.Second
+
+// bftOutbound is one queued send.
+type bftOutbound struct {
+	code uint64
+	msg  interface{}
+}
+
+// bftPeerSender is one peer's outbound queue and the goroutine that serves it.
+type bftPeerSender struct {
+	ch        chan bftOutbound
+	quit      chan struct{}
+	stopOnce  sync.Once
+	mu        sync.Mutex
+	fullSince time.Time
+}
+
+func (p *ethPeer) ensureBFTSender() *bftPeerSender {
+	p.bftOnce.Do(func() {
+		s := &bftPeerSender{
+			ch:   make(chan bftOutbound, bftPeerSendQueueLen),
+			quit: make(chan struct{}),
+		}
+		p.bftSend = s
+		go p.bftSendLoop(s)
+	})
+	return p.bftSend
+}
+
+func (p *ethPeer) bftSendLoop(s *bftPeerSender) {
+	for {
+		select {
+		case <-s.quit:
+			return
+		case item := <-s.ch:
+			if err := p.Peer.Send(item.code, item.msg); err != nil {
+				log.Trace("[XDC-P2P] peer send failed", "peer", p.ID(), "code", item.code, "err", err)
+			}
+		}
+	}
+}
+
+// stopBFTSend stops the peer's sender goroutine. It is safe to call more than once.
+func (p *ethPeer) stopBFTSend() {
+	if p == nil || p.bftSend == nil {
+		return
+	}
+	p.bftSend.stopOnce.Do(func() { close(p.bftSend.quit) })
+}
+
+// enqueuePeerSend pushes msg onto the peer's send queue. The call does not
+// block. A message is dropped when the queue is full. If the queue stays full
+// for bftPeerSendFullTimeout the peer is disconnected.
+func (h *handler) enqueuePeerSend(p *ethPeer, code uint64, msg interface{}) {
+	s := p.ensureBFTSender()
+	s.mu.Lock()
+	select {
+	case s.ch <- bftOutbound{code: code, msg: msg}:
+		s.fullSince = time.Time{}
+		s.mu.Unlock()
+	default:
+		disconnect := false
+		if s.fullSince.IsZero() {
+			s.fullSince = time.Now()
+		} else if time.Since(s.fullSince) >= bftPeerSendFullTimeout {
+			disconnect = true
+		}
+		s.mu.Unlock()
+		if disconnect {
+			h.removePeer(p.ID())
+		}
+	}
+}
 
 // BroadcastVote propagates a V2 consensus vote to all connected peers.
 // Sends types.Vote directly so wire carries RLP(types.Vote), matching
@@ -37,12 +120,7 @@ func (h *handler) BroadcastVote(vote *types.Vote) {
 	h.peers.lock.RUnlock()
 
 	for _, p := range peers {
-		p := p
-		go func() {
-			if err := p.Peer.Send(eth.VoteMsg, vote); err != nil {
-				log.Trace("[XDC-P2P] Send vote failed", "peer", p.ID(), "err", err)
-			}
-		}()
+		h.enqueuePeerSend(p, eth.VoteMsg, vote)
 	}
 	log.Debug("[XDC-P2P] Vote broadcast complete", "peers", len(peers), "round", vote.ProposedBlockInfo.Round)
 }
@@ -64,12 +142,7 @@ func (h *handler) BroadcastTimeout(timeout *types.Timeout) {
 	h.peers.lock.RUnlock()
 
 	for _, p := range peers {
-		p := p
-		go func() {
-			if err := p.Peer.Send(eth.TimeoutMsg, timeout); err != nil {
-				log.Trace("[XDC-P2P] Send timeout failed", "peer", p.ID(), "err", err)
-			}
-		}()
+		h.enqueuePeerSend(p, eth.TimeoutMsg, timeout)
 	}
 	log.Debug("[XDC-P2P] Timeout broadcast complete", "peers", len(peers), "round", timeout.Round)
 }
@@ -89,12 +162,7 @@ func (h *handler) BroadcastSyncInfo(syncInfo *types.SyncInfo) {
 	h.peers.lock.RUnlock()
 
 	for _, p := range peers {
-		p := p
-		go func() {
-			if err := p.Peer.Send(eth.SyncInfoMsg, syncInfo); err != nil {
-				log.Trace("[XDC-P2P] Send syncInfo failed", "peer", p.ID(), "err", err)
-			}
-		}()
+		h.enqueuePeerSend(p, eth.SyncInfoMsg, syncInfo)
 	}
 	log.Debug("[XDC-P2P] SyncInfo broadcast complete", "peers", len(peers))
 }
@@ -143,12 +211,7 @@ func (h *handler) BroadcastBlock(block *types.Block) {
 		TD:    td,
 	}
 	for _, p := range peers {
-		p := p
-		go func() {
-			if err := p.Peer.Send(eth.NewBlockMsg, pkt); err != nil {
-				log.Trace("[XDC-P2P] Send NewBlock failed", "peer", p.ID(), "err", err)
-			}
-		}()
+		h.enqueuePeerSend(p, eth.NewBlockMsg, pkt)
 	}
 	log.Debug("[XDC-P2P] Block broadcast started",
 		"number", block.NumberU64(), "hash", block.Hash(), "peers", len(peers))

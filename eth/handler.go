@@ -673,6 +673,7 @@ func (h *handler) unregisterPeer(id string) {
 	h.txFetcher.Drop(id)
 	h.blobFetcher.Drop(id)
 	h.txTracker.NotifyPeerDrop(id)
+	peer.stopBFTSend()
 	if h.xdcSync != nil {
 		// #1876: a peer may resync onto the canonical branch before it reconnects.
 		h.xdcSync.forkGuardVerdicts.Delete(id)

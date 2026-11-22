@@ -328,8 +328,9 @@ func (b *Bfter) Stop() {
 }
 
 // broadcastWorker drains fwdQueue and delivers each message to the broadcast
-// layer. bcastWorkers of these run concurrently; the pool size is the hard
-// upper bound on concurrent peer-send goroutines (Hacken F-2026-19460 residual).
+// layer. bcastWorkers of these run concurrently. They do not send to peers
+// inline: each peer has one fixed-length queue and one sender goroutine, and
+// that queue is what bounds peer sends.
 func (b *Bfter) broadcastWorker() {
 	for {
 		select {
