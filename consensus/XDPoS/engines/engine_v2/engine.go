@@ -2099,33 +2099,49 @@ func (x *XDPoS_v2) findEpochSwitchAfter(chain consensus.ChainReader, fromNumber 
 	return nil
 }
 
-// IsEpochSwitch checks if a header is an epoch switch block
+// IsEpochSwitch checks if a header is an epoch switch block. It remembers the
+// round-to-block entry of an epoch switch, as canonical XDPoSChain does. Use
+// epochSwitchRecord for a header that is not accepted yet.
 func (x *XDPoS_v2) IsEpochSwitch(header *types.Header) (bool, uint64, error) {
+	isSwitch, epochNum, record, err := x.epochSwitchRecord(header)
+	if record != nil {
+		x.round2epochBlockInfo.Add(record.Round, record)
+		log.Debug("[IsEpochSwitch] EPOCH SWITCH CACHED", "number", header.Number.Uint64(), "round", record.Round)
+	}
+	return isSwitch, epochNum, err
+}
+
+// epochSwitchRecord is IsEpochSwitch without the cache write. When the header
+// is an epoch switch that belongs in the round-to-block cache it also returns
+// the entry; the caller adds it once the header is accepted. verifyHeader does
+// this, so a header that fails the seal or leader check cannot replace the
+// entry of the accepted block for its round (#2073).
+func (x *XDPoS_v2) epochSwitchRecord(header *types.Header) (bool, uint64, *types.BlockInfo, error) {
 	// V1->V2 switch block is treated as an epoch switch
 	if header.Number.Cmp(x.config.V2.SwitchBlock) == 0 {
 		log.Info("[IsEpochSwitch] V1->V2 switch block", "number", header.Number.Uint64())
-		return true, header.Number.Uint64() / x.config.Epoch, nil
+		return true, header.Number.Uint64() / x.config.Epoch, nil, nil
 	}
 
 	quorumCert, round, err := x.getExtraFieldsNoChain(header)
 	if err != nil {
 		log.Error("[IsEpochSwitch] decode error", "err", err, "number", header.Number.Uint64())
-		return false, 0, err
+		return false, 0, nil, err
 	}
 
 	// v147 FIX: Handle V1 headers gracefully — V1 headers are NOT epoch switches
 	if quorumCert == nil && round == 0 {
-		return false, 0, nil
+		return false, 0, nil, nil
 	}
 
 	// Defensive nil checks (#391)
 	if quorumCert == nil {
 		log.Error("[IsEpochSwitch] quorumCert is nil", "number", header.Number.Uint64())
-		return false, 0, errors.New("quorumCert is nil")
+		return false, 0, nil, errors.New("quorumCert is nil")
 	}
 	if quorumCert.ProposedBlockInfo == nil {
 		log.Error("[IsEpochSwitch] ProposedBlockInfo is nil", "number", header.Number.Uint64())
-		return false, 0, errors.New("ProposedBlockInfo is nil")
+		return false, 0, nil, errors.New("ProposedBlockInfo is nil")
 	}
 
 	parentRound := quorumCert.ProposedBlockInfo.Round
@@ -2135,19 +2151,19 @@ func (x *XDPoS_v2) IsEpochSwitch(header *types.Header) (bool, uint64, error) {
 	// If parent is the V2 switch block, this is the first V2 epoch switch
 	if quorumCert.ProposedBlockInfo.Number.Cmp(x.config.V2.SwitchBlock) == 0 {
 		log.Info("[IsEpochSwitch] First V2 epoch", "number", header.Number.Uint64(), "round", round)
-		return true, epochNum, nil
+		return true, epochNum, nil, nil
 	}
 
 	isEpochSwitch := parentRound < epochStartRound
 
-	// CRITICAL FIX: Add epoch switch to round2epochBlockInfo cache like v2.6.8
+	// Epoch switches go into the round2epochBlockInfo cache like v2.6.8.
+	var record *types.BlockInfo
 	if isEpochSwitch {
-		x.round2epochBlockInfo.Add(round, &types.BlockInfo{
+		record = &types.BlockInfo{
 			Hash:   header.Hash(),
 			Number: header.Number,
 			Round:  round,
-		})
-		log.Debug("[IsEpochSwitch] EPOCH SWITCH CACHED", "number", header.Number.Uint64(), "round", round, "parentRound", parentRound, "epochStartRound", epochStartRound)
+		}
 	}
 
 	// Debug logging for all epoch switch checks near the V2 switch boundary
@@ -2163,7 +2179,7 @@ func (x *XDPoS_v2) IsEpochSwitch(header *types.Header) (bool, uint64, error) {
 			"qcBlockRound", quorumCert.ProposedBlockInfo.Round)
 	}
 
-	return isEpochSwitch, epochNum, nil
+	return isEpochSwitch, epochNum, record, nil
 }
 
 // calcMasternodes calculates masternodes for a block.

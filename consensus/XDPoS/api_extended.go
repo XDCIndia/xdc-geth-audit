@@ -147,7 +147,12 @@ func (api *API) GetV2BlockByHeader(header *types.Header, uncle bool) *V2BlockInf
 		if err == nil {
 			info.Round = round
 		}
-		info.Masternodes = api.xdpos.GetMasternodes(api.chain, header)
+		// Resolve masternodes only for a header this node has, as canonical
+		// does: the lookup writes engine caches, and the header here comes
+		// from the caller (#2073).
+		if api.chain.GetHeaderByHash(header.Hash()) != nil {
+			info.Masternodes = api.xdpos.GetMasternodes(api.chain, header)
+		}
 		// F-2026-19639: return the quorum certificate carried in the header.
 		var extra types.ExtraFields_v2
 		if err := utils.DecodeBytesExtraFields(header.Extra, &extra); err == nil && extra.QuorumCert != nil {

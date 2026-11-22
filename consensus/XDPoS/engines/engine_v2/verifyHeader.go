@@ -218,12 +218,20 @@ func (x *XDPoS_v2) verifyHeader(chain consensus.ChainReader, header *types.Heade
 	// therefore cannot poison the gap snapshot — the defer sees retErr != nil
 	// and skips the seed entirely. This ordering is the SYNC-11 fix for item 1
 	// of the ordering bug identified in PR #1864 review.
+	// switchRecord is the round-to-block cache entry of this header. It is
+	// written in the defer below, with the seed, only when every check passed:
+	// a header rejected by the seal or leader check must not replace the entry
+	// of the accepted block for its round (#2073).
+	var switchRecord *types.BlockInfo
 	defer func() {
 		if retErr == nil && seedGapFromSwitch {
 			x.sync11SeedGap(chain, seedGapNum, header)
 		}
+		if retErr == nil && switchRecord != nil {
+			x.round2epochBlockInfo.Add(switchRecord.Round, switchRecord)
+		}
 	}()
-	isEpochSwitch, _, err := x.IsEpochSwitch(header)
+	isEpochSwitch, _, switchRecord, err := x.epochSwitchRecord(header)
 	if err != nil {
 		log.Error("[verifyHeader] error when checking if header is epoch switch header", "Hash", header.Hash(), "Number", header.Number, "Error", err)
 		return err
