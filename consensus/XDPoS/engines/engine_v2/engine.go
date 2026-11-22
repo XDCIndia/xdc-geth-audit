@@ -1180,12 +1180,16 @@ func (x *XDPoS_v2) getSnapshot(chain consensus.ChainReader, number uint64, forSi
 				}
 				if len(masternodes) > 0 {
 					snap := newSnapshotWithPenalties(gapNumber, gapHeader.Hash(), masternodes, penalties)
-					snap.Version = 6 // forward-seed certified; see rebuildGapSnapshotFromState
-					x.snapshots.Add(snap.Hash, snap)
+					// XDC-HUNT-46: persist as a header seed (version 5) so
+					// RepairSeededCandidatePool can still fill the full pool from
+					// state. Only the in-memory copy is marked 6, which stops this
+					// path from running again in the session.
 					if serr := storeSnapshot(snap, x.db); serr != nil {
 						log.Error("[getSnapshot] live-mn-set: failed to persist forward-seed snapshot",
 							"gap", gapNumber, "err", serr)
 					}
+					snap.Version = 6
+					x.snapshots.Add(snap.Hash, snap)
 					log.Warn("[getSnapshot] live-mn-set: no contract state at gap, forward-seeded from epoch switch header",
 						"gap", gapNumber, "epochSwitch", epochSwitchHdr.Number.Uint64(),
 						"validators", len(masternodes), "penalties", len(penalties))
@@ -1214,12 +1218,13 @@ func (x *XDPoS_v2) getSnapshot(chain consensus.ChainReader, number uint64, forSi
 					}
 					if len(masternodes) > 0 {
 						snap := newSnapshotWithPenalties(gapNumber, gapHeader.Hash(), masternodes, penalties)
-						snap.Version = 6
-						x.snapshots.Add(snap.Hash, snap)
+						// XDC-HUNT-46: persisted as version 5, see the forward seed above.
 						if serr := storeSnapshot(snap, x.db); serr != nil {
 							log.Error("[getSnapshot] live-mn-set: failed to persist checkpoint-seed snapshot",
 								"gap", gapNumber, "checkpoint", checkpointNumber, "err", serr)
 						}
+						snap.Version = 6
+						x.snapshots.Add(snap.Hash, snap)
 						log.Warn("[getSnapshot] live-mn-set: seeded from checkpoint direct-lookup",
 							"gap", gapNumber, "checkpoint", checkpointNumber,
 							"validators", len(masternodes))
