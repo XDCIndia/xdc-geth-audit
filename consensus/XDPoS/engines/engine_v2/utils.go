@@ -641,6 +641,7 @@ func (x *XDPoS_v2) commitBlocks(chain consensus.ChainReader, proposedBlockHeader
 		Hash:   grandParentBlock.Hash(),
 		Round:  round,
 	}
+	rawdb.WriteBFTCommittedBlock(x.db, x.highestCommitBlock)
 	log.Info("Block committed (3-chain rule)",
 		"number", x.highestCommitBlock.Number,
 		"round", x.highestCommitBlock.Round,

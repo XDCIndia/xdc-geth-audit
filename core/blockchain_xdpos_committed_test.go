@@ -142,6 +142,256 @@ func testReorgAllowedAboveCommittedBlock(t *testing.T, scheme string) {
 	t.Logf("InsertChain result for above-committed reorg: %v (ok)", err)
 }
 
+// TestSetHeadRefusedBelowCommittedBlock checks that SetHead cannot rewind
+// under the committed block. The sync rollback path uses SetHead and does
+// not go through reorg.
+func TestSetHeadRefusedBelowCommittedBlock(t *testing.T) {
+	eng := &committedEngine{Engine: ethash.NewFaker()}
+	genesis := &Genesis{
+		BaseFee: big.NewInt(params.InitialBaseFee),
+		Config:  params.AllEthashProtocolChanges,
+	}
+	bc, err := NewBlockChain(rawdb.NewMemoryDatabase(), genesis, eng, nil)
+	if err != nil {
+		t.Fatalf("NewBlockChain: %v", err)
+	}
+	defer bc.Stop()
+	_, canonBlocks := makeBlockChainWithGenesis(genesis, 8, ethash.NewFaker(), canonicalSeed)
+	if _, err := bc.InsertChain(canonBlocks); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	eng.committed = &types.BlockInfo{Hash: canonBlocks[5].Hash(), Number: canonBlocks[5].Number()}
+	if err := bc.SetHead(3); err == nil {
+		t.Fatal("SetHead below the committed block was accepted")
+	}
+	if head := bc.CurrentBlock().Number.Uint64(); head != 8 {
+		t.Fatalf("head = %d, want 8", head)
+	}
+	if err := bc.SetHead(6); err != nil {
+		t.Fatalf("SetHead at the committed block: %v", err)
+	}
+}
+
+// TestSetHeadWithTimestampRewindsBelowCommittedBlock checks that the
+// timestamp rewind used by the config-compat startup path cannot drop an
+// XDPoS committed block. SetHead(3) is refused; the timestamp of that same
+// block must be refused too, and the head must stay at block 8.
+func TestSetHeadWithTimestampRewindsBelowCommittedBlock(t *testing.T) {
+	eng := &committedEngine{Engine: ethash.NewFaker()}
+	genesis := &Genesis{
+		BaseFee: big.NewInt(params.InitialBaseFee),
+		Config:  params.AllEthashProtocolChanges,
+	}
+	bc, err := NewBlockChain(rawdb.NewMemoryDatabase(), genesis, eng, nil)
+	if err != nil {
+		t.Fatalf("NewBlockChain: %v", err)
+	}
+	defer bc.Stop()
+	_, canonBlocks := makeBlockChainWithGenesis(genesis, 8, ethash.NewFaker(), canonicalSeed)
+	if _, err := bc.InsertChain(canonBlocks); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	eng.committed = &types.BlockInfo{Hash: canonBlocks[5].Hash(), Number: canonBlocks[5].Number()}
+	if err := bc.SetHead(3); err == nil {
+		t.Fatal("SetHead below the committed block was accepted")
+	}
+	if err := bc.SetHeadWithTimestamp(canonBlocks[2].Time()); err == nil {
+		t.Fatal("SetHeadWithTimestamp below the committed block was accepted")
+	}
+	if head := bc.CurrentBlock().Number.Uint64(); head != 8 {
+		t.Fatalf("head = %d, want 8", head)
+	}
+	if got := bc.GetCanonicalHash(canonBlocks[5].NumberU64()); got != canonBlocks[5].Hash() {
+		t.Fatalf("committed block hash = %s, want %s", got, canonBlocks[5].Hash())
+	}
+}
+
+// recordingInvalidator records InvalidateCaches calls. It embeds
+// committedEngine so the committed-block guard still applies.
+type recordingInvalidator struct {
+	committedEngine
+	called bool
+	head   uint64
+}
+
+func (e *recordingInvalidator) InvalidateCaches(newHead uint64) {
+	e.called = true
+	e.head = newHead
+}
+
+// TestSetHeadWithTimestampAllowedAtCommittedBlock checks that a timestamp
+// at the committed block still rewinds and invalidates consensus caches.
+func TestSetHeadWithTimestampAllowedAtCommittedBlock(t *testing.T) {
+	eng := &recordingInvalidator{committedEngine: committedEngine{Engine: ethash.NewFaker()}}
+	genesis := &Genesis{
+		BaseFee: big.NewInt(params.InitialBaseFee),
+		Config:  params.AllEthashProtocolChanges,
+	}
+	bc, err := NewBlockChain(rawdb.NewMemoryDatabase(), genesis, eng, nil)
+	if err != nil {
+		t.Fatalf("NewBlockChain: %v", err)
+	}
+	defer bc.Stop()
+	_, canonBlocks := makeBlockChainWithGenesis(genesis, 8, ethash.NewFaker(), canonicalSeed)
+	if _, err := bc.InsertChain(canonBlocks); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	eng.committed = &types.BlockInfo{Hash: canonBlocks[5].Hash(), Number: canonBlocks[5].Number()}
+	if err := bc.SetHeadWithTimestamp(canonBlocks[5].Time()); err != nil {
+		t.Fatalf("SetHeadWithTimestamp at the committed block: %v", err)
+	}
+	if head := bc.CurrentBlock().Number.Uint64(); head != 6 {
+		t.Fatalf("head = %d, want 6", head)
+	}
+	if !eng.called || eng.head != 6 {
+		t.Fatalf("InvalidateCaches called=%v head=%d, want called with 6", eng.called, eng.head)
+	}
+}
+
+// TestConfigCompatTimestampRewindRefusedBelowCommitted checks the startup
+// path. A timestamp fork mismatch that would rewind under the committed
+// block must fail NewBlockChain and must not persist the new chain config.
+func TestConfigCompatTimestampRewindRefusedBelowCommitted(t *testing.T) {
+	eng := &committedEngine{Engine: ethash.NewFaker()}
+	stored := *params.AllEthashProtocolChanges
+	genesis := &Genesis{
+		BaseFee: big.NewInt(params.InitialBaseFee),
+		Config:  &stored,
+	}
+	db := rawdb.NewMemoryDatabase()
+	bc, err := NewBlockChain(db, genesis, eng, nil)
+	if err != nil {
+		t.Fatalf("NewBlockChain: %v", err)
+	}
+	_, canonBlocks := makeBlockChainWithGenesis(genesis, 8, ethash.NewFaker(), canonicalSeed)
+	if _, err := bc.InsertChain(canonBlocks); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	bc.Stop()
+
+	eng.committed = &types.BlockInfo{Hash: canonBlocks[5].Hash(), Number: canonBlocks[5].Number()}
+	updated := stored
+	shanghai := canonBlocks[2].Time()
+	updated.ShanghaiTime = &shanghai
+	next := &Genesis{
+		BaseFee: big.NewInt(params.InitialBaseFee),
+		Config:  &updated,
+	}
+	if _, err := NewBlockChain(db, next, eng, nil); err == nil {
+		t.Fatal("config-compat timestamp rewind below the committed block was accepted")
+	}
+	genesisHash := rawdb.ReadCanonicalHash(db, 0)
+	if cfg := rawdb.ReadChainConfig(db, genesisHash); cfg == nil || cfg.ShanghaiTime != nil {
+		t.Fatalf("chain config was updated after a refused rewind: %+v", cfg)
+	}
+
+	// The original config still opens, and the committed block is canonical.
+	eng.committed = nil
+	bc, err = NewBlockChain(db, genesis, eng, nil)
+	if err != nil {
+		t.Fatalf("reopen with stored config: %v", err)
+	}
+	defer bc.Stop()
+	if head := bc.CurrentBlock().Number.Uint64(); head != 8 {
+		t.Fatalf("head after refused startup rewind = %d, want 8", head)
+	}
+	if got := bc.GetCanonicalHash(canonBlocks[5].NumberU64()); got != canonBlocks[5].Hash() {
+		t.Fatalf("committed block hash = %s, want %s", got, canonBlocks[5].Hash())
+	}
+}
+
+// TestConfigCompatTimestampRewindAboveCommitted checks that a timestamp
+// fork rewind at or above the committed block still runs and persists the
+// new chain config.
+func TestConfigCompatTimestampRewindAboveCommitted(t *testing.T) {
+	eng := &committedEngine{Engine: ethash.NewFaker()}
+	stored := *params.AllEthashProtocolChanges
+	genesis := &Genesis{
+		BaseFee: big.NewInt(params.InitialBaseFee),
+		Config:  &stored,
+	}
+	db := rawdb.NewMemoryDatabase()
+	// Archive mode keeps every block's state on disk. A non-archive Stop
+	// only persists a few recent tries, and the timestamp rewind would then
+	// walk back to genesis looking for state.
+	opts := DefaultConfig().WithArchive(true)
+	bc, err := NewBlockChain(db, genesis, eng, opts)
+	if err != nil {
+		t.Fatalf("NewBlockChain: %v", err)
+	}
+	_, canonBlocks := makeBlockChainWithGenesis(genesis, 8, ethash.NewFaker(), canonicalSeed)
+	if _, err := bc.InsertChain(canonBlocks); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	bc.Stop()
+
+	// Committed block is block 2. Shanghai at block 6's timestamp rewinds to
+	// timestamp-1, which lands on block 5, still above the committed block.
+	eng.committed = &types.BlockInfo{Hash: canonBlocks[1].Hash(), Number: canonBlocks[1].Number()}
+	updated := stored
+	shanghai := canonBlocks[5].Time()
+	updated.ShanghaiTime = &shanghai
+	next := &Genesis{
+		BaseFee: big.NewInt(params.InitialBaseFee),
+		Config:  &updated,
+	}
+	bc, err = NewBlockChain(db, next, eng, opts)
+	if err != nil {
+		t.Fatalf("config-compat timestamp rewind above the committed block: %v", err)
+	}
+	defer bc.Stop()
+	if head := bc.CurrentBlock().Number.Uint64(); head != 5 {
+		t.Fatalf("head = %d, want 5", head)
+	}
+	genesisHash := rawdb.ReadCanonicalHash(db, 0)
+	cfg := rawdb.ReadChainConfig(db, genesisHash)
+	if cfg == nil || cfg.ShanghaiTime == nil || *cfg.ShanghaiTime != shanghai {
+		t.Fatalf("chain config ShanghaiTime = %v, want %d", cfg, shanghai)
+	}
+	if got := bc.GetCanonicalHash(canonBlocks[1].NumberU64()); got != canonBlocks[1].Hash() {
+		t.Fatalf("committed block hash = %s, want %s", got, canonBlocks[1].Hash())
+	}
+}
+
+// TestConfigCompatRewindRefusedByStoredCommittedMarker is the real startup
+// case (XDC-HUNT-29): the V2 engine is not wired yet and reports no committed
+// block, but the marker is in the database. A config-compat rewind below it
+// must still fail NewBlockChain.
+func TestConfigCompatRewindRefusedByStoredCommittedMarker(t *testing.T) {
+	eng := &committedEngine{Engine: ethash.NewFaker()} // committed stays nil
+	stored := *params.AllEthashProtocolChanges
+	genesis := &Genesis{
+		BaseFee: big.NewInt(params.InitialBaseFee),
+		Config:  &stored,
+	}
+	db := rawdb.NewMemoryDatabase()
+	bc, err := NewBlockChain(db, genesis, eng, nil)
+	if err != nil {
+		t.Fatalf("NewBlockChain: %v", err)
+	}
+	_, canonBlocks := makeBlockChainWithGenesis(genesis, 8, ethash.NewFaker(), canonicalSeed)
+	if _, err := bc.InsertChain(canonBlocks); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	bc.Stop()
+
+	rawdb.WriteBFTCommittedBlock(db, &types.BlockInfo{Hash: canonBlocks[5].Hash(), Number: canonBlocks[5].Number()})
+	updated := stored
+	shanghai := canonBlocks[2].Time()
+	updated.ShanghaiTime = &shanghai
+	next := &Genesis{
+		BaseFee: big.NewInt(params.InitialBaseFee),
+		Config:  &updated,
+	}
+	if _, err := NewBlockChain(db, next, eng, nil); err == nil {
+		t.Fatal("startup rewind below the stored committed marker was accepted")
+	}
+	genesisHash := rawdb.ReadCanonicalHash(db, 0)
+	if cfg := rawdb.ReadChainConfig(db, genesisHash); cfg == nil || cfg.ShanghaiTime != nil {
+		t.Fatalf("chain config was updated after a refused rewind: %+v", cfg)
+	}
+}
+
 // containsStr is strings.Contains without importing strings.
 func containsStr(s, sub string) bool {
 	if len(sub) == 0 {

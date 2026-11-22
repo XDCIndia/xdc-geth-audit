@@ -139,6 +139,24 @@ type committedBlocker interface {
 	LatestCommittedBlock() *types.BlockInfo
 }
 
+// latestCommittedBlock returns the XDPoS committed block that a rewind must not
+// drop, or nil for engines without one. During NewBlockChain the V2 engine is
+// not wired yet and has not loaded its state, so it reports nothing; the stored
+// marker is read from the database instead (XDC-HUNT-29).
+func (bc *BlockChain) latestCommittedBlock() *types.BlockInfo {
+	cb, ok := bc.engine.(committedBlocker)
+	if !ok {
+		return nil
+	}
+	if lcb := cb.LatestCommittedBlock(); lcb != nil && lcb.Number != nil {
+		return lcb
+	}
+	if lcb := rawdb.ReadBFTCommittedBlock(bc.db); lcb != nil && lcb.Number != nil {
+		return lcb
+	}
+	return nil
+}
+
 const (
 	bodyCacheLimit     = 256
 	blockCacheLimit    = 256
@@ -640,9 +658,18 @@ func NewBlockChain(db ethdb.Database, genesis *Genesis, engine consensus.Engine,
 	if compatErr != nil {
 		log.Warn("Rewinding chain to upgrade configuration", "err", compatErr)
 		if compatErr.RewindToTime > 0 {
-			bc.SetHeadWithTimestamp(compatErr.RewindToTime)
+			err = bc.SetHeadWithTimestamp(compatErr.RewindToTime)
 		} else {
-			bc.SetHead(compatErr.RewindToBlock)
+			err = bc.SetHead(compatErr.RewindToBlock)
+		}
+		// A refused rewind (for example below an XDPoS committed block) must
+		// not persist the new chain config. The stored config stays as it
+		// was, and startup fails instead of running a head that the engine
+		// has already committed past.
+		if err != nil {
+			log.Error("Failed to rewind chain for configuration upgrade", "err", err)
+			bc.Stop()
+			return nil, err
 		}
 		rawdb.WriteChainConfig(db, genesisHash, chainConfig)
 	}
@@ -1192,6 +1219,12 @@ func (bc *BlockChain) historyPruningRequired(policy history.HistoryPolicy, tail,
 // was snap synced or full synced and in which state, the method will try to
 // delete minimal data from disk whilst retaining chain consistency.
 func (bc *BlockChain) SetHead(head uint64) error {
+	// A committed XDPoS block must survive SetHead the same way it survives
+	// reorg. Paths that do not call reorg (sync rollback, debug_setHead) are
+	// covered here.
+	if lcb := bc.latestCommittedBlock(); lcb != nil && head < lcb.Number.Uint64() {
+		return fmt.Errorf("refusing to set head %d below XDPoS committed block %d", head, lcb.Number.Uint64())
+	}
 	if _, err := bc.setHeadBeyondRoot(head, 0, common.Hash{}, false); err != nil {
 		return err
 	}
@@ -1210,10 +1243,64 @@ func (bc *BlockChain) SetHead(head uint64) error {
 // synced and in which state, the method will try to delete minimal data from
 // disk whilst retaining chain consistency.
 func (bc *BlockChain) SetHeadWithTimestamp(timestamp uint64) error {
+	// Resolve the timestamp to a header number before deleting anything.
+	// SetHead already refuses a head below the XDPoS committed block; this
+	// path is what the config-compat startup rewind uses, so it must refuse
+	// the same way.
+	headHdr := bc.headerAtOrBeforeTime(timestamp)
+	if lcb := bc.latestCommittedBlock(); lcb != nil {
+		var headNum uint64
+		if headHdr != nil {
+			headNum = headHdr.Number.Uint64()
+		}
+		if headHdr == nil || headNum < lcb.Number.Uint64() {
+			return fmt.Errorf("refusing to set head %d below XDPoS committed block %d", headNum, lcb.Number.Uint64())
+		}
+	}
 	if _, err := bc.setHeadBeyondRoot(0, timestamp, common.Hash{}, false); err != nil {
 		return err
 	}
+	// XDC: same cache purge as SetHead. The timestamp path used to skip it,
+	// so a config-compat rewind left consensus caches holding blocks that
+	// had just been deleted.
+	if inv, ok := bc.engine.(consensus.CacheInvalidator); ok {
+		head := bc.CurrentBlock().Number.Uint64()
+		inv.InvalidateCaches(head)
+	}
 	return bc.sendChainHeadEvent()
+}
+
+// headerAtOrBeforeTime returns the highest canonical header whose timestamp
+// is at or below the target. Canonical timestamps are non-decreasing, so
+// this is the header SetHeadWithTimestamp lands on before any state-repair
+// rewind. Nil means no canonical header is at or before the target.
+func (bc *BlockChain) headerAtOrBeforeTime(timestamp uint64) *types.Header {
+	head := bc.CurrentHeader()
+	if head == nil {
+		return nil
+	}
+	if head.Time <= timestamp {
+		return head
+	}
+	lo, hi := uint64(0), head.Number.Uint64()
+	var best *types.Header
+	for lo <= hi {
+		mid := lo + (hi-lo)/2
+		hdr := bc.GetHeaderByNumber(mid)
+		if hdr == nil || hdr.Time > timestamp {
+			if mid == 0 {
+				break
+			}
+			hi = mid - 1
+			continue
+		}
+		best = hdr
+		if mid == hi {
+			break
+		}
+		lo = mid + 1
+	}
+	return best
 }
 
 // sendChainHeadEvent notifies all subscribers about the new chain head,

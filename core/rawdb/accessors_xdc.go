@@ -109,6 +109,7 @@ var (
 	bftHighestVotedRoundKey     = []byte("bftsafety-hvr")
 	bftHighestSelfMinedRoundKey = []byte("bftsafety-hsmr")
 	bftLockQCKey                = []byte("bftsafety-lqc")
+	bftCommittedBlockKey        = []byte("bftsafety-commit")
 )
 
 // ReadBFTHighestVotedRound reads the persisted highest voted round.
@@ -183,5 +184,41 @@ func WriteBFTLockQC(db ethdb.KeyValueWriter, qc *types.QuorumCert) {
 	}
 	if err := db.Put(bftLockQCKey, data); err != nil {
 		log.Crit("Failed to persist BFT lock QC", "err", err)
+	}
+}
+
+// ReadBFTCommittedBlock reads the last XDPoS v2 committed block marker.
+// Returns nil if the key does not exist or decoding fails.
+func ReadBFTCommittedBlock(db ethdb.Reader) *types.BlockInfo {
+	data, err := db.Get(bftCommittedBlockKey)
+	if err != nil || len(data) == 0 {
+		return nil
+	}
+	var info types.BlockInfo
+	if err := rlp.DecodeBytes(data, &info); err != nil {
+		log.Error("Invalid BFT committed block RLP in DB", "err", err)
+		return nil
+	}
+	return &info
+}
+
+// WriteBFTCommittedBlock persists the committed block marker. A stored marker
+// with a higher number is kept.
+func WriteBFTCommittedBlock(db ethdb.KeyValueWriter, info *types.BlockInfo) {
+	if info == nil || info.Number == nil {
+		return
+	}
+	if reader, ok := db.(ethdb.Reader); ok {
+		if stored := ReadBFTCommittedBlock(reader); stored != nil && stored.Number != nil &&
+			stored.Number.Cmp(info.Number) > 0 {
+			return
+		}
+	}
+	data, err := rlp.EncodeToBytes(info)
+	if err != nil {
+		log.Crit("Failed to RLP encode BFT committed block", "err", err)
+	}
+	if err := db.Put(bftCommittedBlockKey, data); err != nil {
+		log.Crit("Failed to persist BFT committed block", "err", err)
 	}
 }
