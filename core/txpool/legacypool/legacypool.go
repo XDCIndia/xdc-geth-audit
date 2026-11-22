@@ -2095,6 +2095,20 @@ func canScopeReset(oldHead, newHead *types.Header, sinceFull int) bool {
 		sinceFull < fullDemoteEvery
 }
 
+// requeueDemoted moves a tx that left the pending list into the queue. If the
+// queue refuses it (a better tx has the same nonce there), the tx is in neither
+// list any more, so it is also removed from the lookup and the price heap.
+//
+// Note, this method assumes the pool lock is held!
+func (pool *LegacyPool) requeueDemoted(hash common.Hash, tx *types.Transaction) {
+	// Internal shuffle shouldn't touch the lookup set.
+	if _, err := pool.enqueueTx(hash, tx, false); err != nil {
+		log.Debug("Dropping demoted transaction refused by the queue", "hash", hash, "err", err)
+		pool.all.Remove(hash)
+		pool.priced.Removed(1)
+	}
+}
+
 func (pool *LegacyPool) demoteUnexecutables(accounts map[common.Address]struct{}) {
 	// Iterate over all accounts and demote any non-executable transactions.
 	// When a scoped set is provided, restrict iteration to those accounts only.
@@ -2130,7 +2144,7 @@ func (pool *LegacyPool) demoteUnexecutables(accounts map[common.Address]struct{}
 			log.Trace("Demoting pending transaction", "hash", hash)
 
 			// Internal shuffle shouldn't touch the lookup set.
-			pool.enqueueTx(hash, tx, false)
+			pool.requeueDemoted(hash, tx)
 		}
 		pool.priced.Removed(len(olds) + len(drops))
 		pendingGauge.Dec(int64(len(olds) + len(drops) + len(invalids)))
@@ -2143,7 +2157,7 @@ func (pool *LegacyPool) demoteUnexecutables(accounts map[common.Address]struct{}
 				log.Warn("Demoting invalidated transaction", "hash", hash)
 
 				// Internal shuffle shouldn't touch the lookup set.
-				pool.enqueueTx(hash, tx, false)
+				pool.requeueDemoted(hash, tx)
 			}
 			pendingGauge.Dec(int64(len(gapped)))
 		}
