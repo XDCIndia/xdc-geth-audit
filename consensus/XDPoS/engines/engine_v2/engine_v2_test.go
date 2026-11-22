@@ -428,9 +428,12 @@ func TestSendVote_HighestVotedRound_F2026_19622(t *testing.T) {
 	}
 
 	// Consequence: the node must be able to vote in round 6 (the very next round).
-	// qcR5 is the QC we just formed (round=5 > lockQC.round=4), so the voting
-	// rule's safety branch is satisfied.
-	blockInfoR6 := &types.BlockInfo{Round: 6, Number: big.NewInt(3), Hash: common.Hash{0x06}}
+	// The lock is the certificate for the block just certified (round 5). The
+	// next honest proposal extends that block and carries the same certificate,
+	// so the extension check allows the vote.
+	child := &types.Header{Number: big.NewInt(3), ParentHash: blockHash, Difficulty: big.NewInt(1)}
+	chain.headers[child.Hash()] = child
+	blockInfoR6 := &types.BlockInfo{Round: 6, Number: big.NewInt(3), Hash: child.Hash()}
 	qcR5 := &types.QuorumCert{
 		ProposedBlockInfo: &types.BlockInfo{Round: 5, Number: big.NewInt(2), Hash: blockHash},
 	}

@@ -398,10 +398,19 @@ func (x *XDPoS_v2) ReinitBFT(chain consensus.ChainReader, header *types.Header) 
 	// ProposedBlockInfo must be initialized (not nil) because initial() checks
 	// x.highestQuorumCert.ProposedBlockInfo.Hash — a nil pointer dereferences.
 	x.isInitialized = false
+	prev := x.highestQuorumCert
 	x.highestQuorumCert = &types.QuorumCert{
 		ProposedBlockInfo: &types.BlockInfo{},
 	}
-	return x.initial(chain, header)
+	err := x.initial(chain, header)
+	// XDC-HUNT-37: the head header carries the certificate for its parent.
+	// A node that already holds the certificate for the head itself must not
+	// fall back one block.
+	if prev != nil && prev.ProposedBlockInfo != nil && prev.ProposedBlockInfo.Hash != (common.Hash{}) &&
+		prev.ProposedBlockInfo.Round > x.highestQuorumCert.ProposedBlockInfo.Round {
+		x.highestQuorumCert = prev
+	}
+	return err
 }
 
 func (x *XDPoS_v2) initial(chain consensus.ChainReader, header *types.Header) error {
@@ -470,6 +479,8 @@ func (x *XDPoS_v2) initial(chain consensus.ChainReader, header *types.Header) er
 			}
 		}
 	}
+
+	x.raiseHighestQCFromLock(chain)
 
 	// Initialize first v2 snapshot
 	lastGapNum := uint64(0)
@@ -618,6 +629,34 @@ func (x *XDPoS_v2) initial(chain consensus.ChainReader, header *types.Header) er
 
 	log.Warn("[initial] finish initialisation")
 	return nil
+}
+
+// raiseHighestQCFromLock restores the certificate for the block the node
+// certified before shutdown. The lock is the certificate for the head, but the
+// head header only carries the certificate for its parent, so after a restart
+// highestQuorumCert sits one block below the lock. Every leader then builds a
+// sibling of the head and verifyVotingRule refuses it (XDC-HUNT-54). The lock
+// is raised only when its block is local and its signatures verify.
+func (x *XDPoS_v2) raiseHighestQCFromLock(chain consensus.ChainReader) {
+	lock := x.lockQuorumCert
+	if lock == nil || lock.ProposedBlockInfo == nil || lock.ProposedBlockInfo.Number == nil ||
+		lock.ProposedBlockInfo.Round <= x.highestQuorumCert.ProposedBlockInfo.Round {
+		return
+	}
+	h := chain.GetHeaderByHash(lock.ProposedBlockInfo.Hash)
+	if h == nil {
+		return
+	}
+	if err := x.verifyQC(chain, lock, h, nil); err != nil {
+		log.Warn("[initial] stored lock QC failed verification, not raising highest QC",
+			"round", lock.ProposedBlockInfo.Round, "number", lock.ProposedBlockInfo.Number, "err", err)
+		return
+	}
+	log.Info("[initial] raising highest QC to the stored lock",
+		"from", x.highestQuorumCert.ProposedBlockInfo.Round, "to", lock.ProposedBlockInfo.Round)
+	if err := x.processQC(chain, lock); err != nil {
+		log.Warn("[initial] processQC of the stored lock failed", "err", err)
+	}
 }
 
 // applyTimeoutParamsForHeader selects the V2 timeout config for the header's

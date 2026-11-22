@@ -529,14 +529,25 @@ func (x *XDPoS_v2) processQC(chain consensus.ChainReader, incomingQuorumCert *ty
 		return fmt.Errorf("block not found, number: %v, hash: %v", incomingQuorumCert.ProposedBlockInfo.Number, incomingQuorumCert.ProposedBlockInfo.Hash)
 	}
 
-	// Update lock QC for blocks after V2 switch
+	// Update lock QC for blocks after V2 switch.
+	// The certificate that arrived names the block that was just certified.
+	// The certificate inside that block's header names its parent, one block
+	// lower. Locking on the parent let a same-height sibling pass the vote
+	// rule (F-2026-19609). The lock is local vote state: header validity is
+	// unchanged, and the next honest proposal still extends this certificate,
+	// so a node that has not taken this change still votes for the same block.
 	if proposedBlockHeader.Number.Cmp(x.config.V2.SwitchBlock) > 0 {
-		proposedBlockQuorumCert, round, _, err := x.getExtraFields(chain, proposedBlockHeader)
+		_, round, _, err := x.getExtraFields(chain, proposedBlockHeader)
 		if err != nil {
 			return err
 		}
-		if x.lockQuorumCert == nil || (proposedBlockQuorumCert != nil && proposedBlockQuorumCert.ProposedBlockInfo.Round > x.lockQuorumCert.ProposedBlockInfo.Round) {
-			x.lockQuorumCert = proposedBlockQuorumCert
+		incomingInfo := incomingQuorumCert.ProposedBlockInfo
+		lockInfo := (*types.BlockInfo)(nil)
+		if x.lockQuorumCert != nil {
+			lockInfo = x.lockQuorumCert.ProposedBlockInfo
+		}
+		if incomingInfo != nil && (lockInfo == nil || incomingInfo.Round > lockInfo.Round) {
+			x.lockQuorumCert = incomingQuorumCert
 			// F-2026-19774: persist so a restart cannot lower the lock below what
 			// was committed before shutdown.
 			rawdb.WriteBFTLockQC(x.db, x.lockQuorumCert)
