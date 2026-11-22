@@ -146,6 +146,36 @@ func crossedCheckpointChunk(prev, next uint64) bool {
 	return next/fastSyncCheckpointEveryN > prev/fastSyncCheckpointEveryN
 }
 
+// maxLateDeliveries bounds the synthetic late-delivery requests (A.47) queued for
+// the sync loop at one time (XDC-HUNT-34).
+const maxLateDeliveries = 16
+
+// admitLateDelivery reports whether an unsolicited NodeData pack may be queued as
+// a late delivery (XDC-HUNT-34). No request returns more than MaxStateFetch
+// blobs, so a bigger pack is abuse: it is refused and the peer dropped. At most
+// maxLateDeliveries are queued at once; a pack above that is discarded, as
+// canonical discards all unrequested node data.
+func (d *Downloader) admitLateDelivery(peerID string, blobs [][]byte, finished []*stateReq) bool {
+	if len(blobs) > MaxStateFetch {
+		log.Warn("Peer sent oversized unrequested NodeData", "peer", peerID, "blobs", len(blobs))
+		if d.dropPeer != nil {
+			d.dropPeer(peerID)
+		}
+		return false
+	}
+	late := 0
+	for _, f := range finished {
+		if f.peer == nil {
+			late++
+		}
+	}
+	if late >= maxLateDeliveries {
+		log.Debug("Too many late NodeData deliveries queued, discarding", "peer", peerID, "len", len(blobs))
+		return false
+	}
+	return true
+}
+
 // stateReq represents a batch of state fetch requests grouped together into
 // a single data retrieval network packet.
 type stateReq struct {
@@ -348,6 +378,9 @@ func (d *Downloader) runFastStateSync(s *fastStateSync) *fastStateSync {
 				blobs := pack.(*statePack).states
 				if len(blobs) == 0 {
 					log.Debug("Unrequested node data (empty)", "peer", pack.PeerId())
+					continue
+				}
+				if !d.admitLateDelivery(pack.PeerId(), blobs, finished) {
 					continue
 				}
 				log.Trace("Routing late-delivery NodeData via synthetic req",
@@ -1166,10 +1199,21 @@ func (s *fastStateSync) process(req *stateReq) (int, error) {
 	// XDC-16: reject responses that contain more blobs than were requested.
 	// A compliant peer must never exceed nItems; an oversized response wastes
 	// CPU hashing blobs we didn't ask for and signals a misbehaving peer.
-	// Drop the peer and return 0 so all tasks requeue via the deferred cleanup.
+	// Drop the peer, put the request's tasks back in the global pools (the
+	// deferred cleanup only clears the in-flight markers; fillTasks took the
+	// tasks out of the pools and the trie scheduler hands out each node once,
+	// XDC-HUNT-16) and return 0.
 	if len(req.response) > int(req.nItems) {
 		req.peer.log.Warn("Peer sent more NodeData blobs than requested",
 			"requested", req.nItems, "received", len(req.response))
+		for path, task := range req.trieTasks {
+			delete(task.attempts, req.peer.id)
+			s.trieTasks[path] = task
+		}
+		for hash, task := range req.codeTasks {
+			delete(task.attempts, req.peer.id)
+			s.codeTasks[hash] = task
+		}
 		if s.d.dropPeer != nil {
 			s.d.dropPeer(req.peer.id)
 		}
