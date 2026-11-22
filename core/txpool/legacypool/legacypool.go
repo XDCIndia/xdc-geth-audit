@@ -801,6 +801,7 @@ func (pool *LegacyPool) promoteSpecialTx(from common.Address, tx *types.Transact
 	// Mirrors XDPoSChain/core/txpool/txpool.go:960:
 	//   if old.IsSpecialTransaction() { return false, ErrDuplicateSpecialTransaction }
 	// Deviation: allow replacement when the old tx's signing window is expired.
+	var replaced *types.Transaction
 	if old := list.txs.Get(tx.Nonce()); old != nil {
 		if old.IsSpecialTransaction() && !pool.isSigningTxExpired(old) {
 			// Incumbent is a still-valid special tx — reject replacement.
@@ -816,6 +817,23 @@ func (pool *LegacyPool) promoteSpecialTx(from common.Address, tx *types.Transact
 		pool.all.Remove(old.Hash())
 		pool.priced.Removed(1)
 		pendingReplaceMeter.Mark(1)
+		replaced = old
+	}
+
+	// Keep list.totalcost equal to the sum of the transactions in the list.
+	// list.Add does this; skipping it here lets a later Forward/subTotalCost
+	// subtract a cost that was never added and panic the reorg goroutine.
+	cost, overflow := uint256.FromBig(tx.Cost())
+	if overflow {
+		return false, errors.New("special transaction cost overflow")
+	}
+	total, overflow := new(uint256.Int).AddOverflow(list.totalcost, cost)
+	if overflow {
+		return false, errors.New("special transaction total cost overflow")
+	}
+	list.totalcost = total
+	if replaced != nil {
+		list.subTotalCost([]*types.Transaction{replaced})
 	}
 
 	list.txs.Put(tx)
@@ -1617,7 +1635,22 @@ func (pool *LegacyPool) runReorg(done chan struct{}, reset *txpoolResetRequest, 
 		// XDC-36: capture whether reset succeeded; skip head-specific post-processing
 		// (nonce forwarding, demotion, base-fee repricing) when it did not, so we do
 		// not operate on stale currentState / pendingNonces for the requested head.
+		var capacityBefore map[common.Address]*big.Int
+		if blockSenders != nil && pool.currentState != nil {
+			capacityBefore = state.GetTRC21FeeCapacityFromState(pool.currentState)
+		}
 		resetOK = pool.reset(reset.oldHead, reset.newHead, preState)
+
+		if resetOK && blockSenders != nil && capacityBefore != nil && pool.currentState != nil {
+			reduced := reducedTRC21Issuers(capacityBefore, state.GetTRC21FeeCapacityFromState(pool.currentState))
+			for _, addr := range accountsSendingTo(pool.pending, reduced) {
+				if _, seen := blockSenders[addr]; seen {
+					continue
+				}
+				blockSenders[addr] = struct{}{}
+				promoteAddrs = append(promoteAddrs, addr)
+			}
+		}
 
 		if resetOK {
 			// Nonces were reset, discard any events that became stale
@@ -2013,6 +2046,46 @@ func (pool *LegacyPool) truncateQueue() {
 			pool.reserver.Release(addr)
 		}
 	}
+}
+
+// reducedTRC21Issuers returns tokens whose fee capacity fell in this block.
+func reducedTRC21Issuers(before, after map[common.Address]*big.Int) map[common.Address]struct{} {
+	out := make(map[common.Address]struct{})
+	for token, prev := range before {
+		if prev == nil {
+			continue
+		}
+		next := after[token]
+		if next == nil || next.Cmp(prev) < 0 {
+			out[token] = struct{}{}
+		}
+	}
+	return out
+}
+
+// accountsSendingTo returns pending accounts that have a transaction to one of
+// the given addresses. Used to demote a payer when a TRC21 fee capacity drops,
+// without walking every pending account on resets that did not change a capacity.
+func accountsSendingTo(pending map[common.Address]*list, targets map[common.Address]struct{}) []common.Address {
+	if len(targets) == 0 {
+		return nil
+	}
+	var out []common.Address
+	for addr, txs := range pending {
+		if txs == nil {
+			continue
+		}
+		for _, tx := range txs.Flatten() {
+			if tx.To() == nil {
+				continue
+			}
+			if _, ok := targets[*tx.To()]; ok {
+				out = append(out, addr)
+				break
+			}
+		}
+	}
+	return out
 }
 
 // demoteUnexecutables removes invalid and processed transactions from the pools

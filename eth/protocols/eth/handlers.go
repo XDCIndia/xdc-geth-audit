@@ -469,11 +469,16 @@ func handleBlockHeaders(backend Backend, msg Decoder, peer *Peer) error {
 		}
 		log.Info("XDPOS2 BlockHeaders received (pre-req)", "peer", peer.ID()[:8], "count", len(headers))
 
-		// Route 1: push to peer.XDCHeaderResp where xdcSyncer waits.
-		// Non-blocking — if reader isn't ready, drop.
-		select {
-		case peer.XDCHeaderResp <- headers:
-		default:
+		// Pop before deciding the shared channel. A caller waiting on its
+		// own response channel must not also have the batch copied onto
+		// XDCHeaderResp, or a required-block challenge and the syncer take
+		// each other's reply.
+		req := peer.popLegacyHeaderReq()
+		if !req.hasSink {
+			select {
+			case peer.XDCHeaderResp <- headers:
+			default:
+			}
 		}
 
 		// Route 2 (#807 Phase 9): also bridge to the standard dispatcher
@@ -493,7 +498,6 @@ func handleBlockHeaders(backend Backend, msg Decoder, peer *Peer) error {
 		// requests in roughly FIFO order. Phase 9.3 / Phase 10 also
 		// handles the XDPOS2 server-side quirk where the peer anchors
 		// its response at a different block than what was requested.
-		req := peer.popLegacyHeaderReq()
 		log.Info("XDPOS2 BlockHeaders received",
 			"peer", peer.ID()[:8],
 			"count", len(headers),
@@ -623,6 +627,9 @@ func handleBlockBodies(backend Backend, msg Decoder, peer *Peer) error {
 			return err
 		}
 		log.Info("XDPOS2 BlockBodies received", "peer", peer.ID()[:8], "count", len(bodies))
+		if err := xdpos2BodiesFitRequest(bodies, peer.legacyBodyReqCount.Load()); err != nil {
+			return fmt.Errorf("XDPOS2 BlockBodies: %w", err)
+		}
 		// BlockBodiesResponse is []BlockBody — bodies already decoded, no
 		// re-encoding needed. Just wrap and dispatch.
 		reqID := peer.LastXDCBodyReqID()
@@ -676,6 +683,19 @@ const (
 	minWithdrawalEncodedSize = 1 + 3 + 21 // Min size for RLP encoded withdrawal
 	minReceiptEncodedSize    = 1 + 4      // Min size for RLP encoded receipt
 )
+
+// xdpos2BodiesFitRequest checks a version-100 body batch before it is hashed.
+func xdpos2BodiesFitRequest(bodies []BlockBody, requested uint64) error {
+	if requested > 0 && uint64(len(bodies)) > requested {
+		return fmt.Errorf("%d bodies for a request of %d", len(bodies), requested)
+	}
+	for i := range bodies {
+		if err := checkBodyItemCounts(&bodies[i]); err != nil {
+			return fmt.Errorf("body %d: %w", i, err)
+		}
+	}
+	return nil
+}
 
 // checkBodyItemCounts rejects bodies containing more transactions or withdrawals
 // than can fit in their encoded size.

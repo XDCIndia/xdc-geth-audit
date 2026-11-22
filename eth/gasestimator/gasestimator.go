@@ -45,6 +45,11 @@ type Options struct {
 	BlobBaseFee *big.Int // BlobBaseFee optionally overrides the blob base fee in the execution context.
 
 	ErrorRatio float64 // Allowed overestimation ratio for faster estimation termination
+
+	// Precompiles, when set, replaces the fork set derived from Header.
+	// eth_estimateGas uses it so a block-number override cannot turn the
+	// privacy precompiles on outside the loaded state's window.
+	Precompiles vm.PrecompiledContracts
 }
 
 // Estimate returns the lowest possible gas limit that allows the transaction to
@@ -245,6 +250,9 @@ func run(ctx context.Context, call *core.Message, opts *Options) (*core.Executio
 		evmContext.BlobBaseFee = new(big.Int)
 	}
 	evm := vm.NewEVM(evmContext, dirtyState, opts.Config, vm.Config{NoBaseFee: true})
+	if opts.Precompiles != nil {
+		evm.SetPrecompiles(opts.Precompiles)
+	}
 	defer evm.Release()
 
 	// Monitor the outer context and interrupt the EVM upon cancellation. To avoid

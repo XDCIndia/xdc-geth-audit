@@ -523,7 +523,7 @@ func Sign(m [32]byte, rings []Ring, privkeys []*ecdsa.PrivateKey, s int) (*RingS
 
 // verify ring signature contained in RingSignature struct
 // returns true if a valid signature, false otherwise
-func Verify(sig *RingSignature, verifyMes bool) bool {
+func Verify(sig *RingSignature, verifyMes bool, abort ...func() bool) bool {
 	// setup
 	rings := sig.Ring
 	ringsize := sig.Size
@@ -553,6 +553,9 @@ func Verify(sig *RingSignature, verifyMes bool) bool {
 	// and c[0] = H)(m, s[n-1]*G + c[n-1]*P[n-1]) where n is the ring size
 	//log.Info("C", "0", common.Bytes2Hex(C[0].Bytes()))
 	for j := 0; j < ringsize; j++ {
+		if proofAborted(abort) {
+			return false
+		}
 		var l []byte
 		for i := 0; i < numRing; i++ {
 			// Validate S[i][j] and C[j]

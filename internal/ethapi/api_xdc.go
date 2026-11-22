@@ -141,17 +141,9 @@ func (s *BlockChainAPI) GetCandidateStatus(ctx context.Context, coinbaseAddress 
 	}
 	epochConfig := config.XDPoS.Epoch
 
-	// Calculate checkpoint block number
-	blockNum := uint64(epoch)
-	if epoch < 0 {
-		blockNum = s.b.CurrentBlock().Number.Uint64()
-	}
-	checkpointNumber := (blockNum / epochConfig) * epochConfig
-	if checkpointNumber == 0 {
-		checkpointNumber = epochConfig
-	}
-
-	result[fieldEpoch] = checkpointNumber / epochConfig
+	checkpoint, epochOut := s.GetCheckpointFromEpoch(ctx, epoch)
+	checkpointNumber := uint64(checkpoint)
+	result[fieldEpoch] = uint64(epochOut)
 
 	block, err := s.b.BlockByNumber(ctx, rpc.BlockNumber(checkpointNumber))
 	if err != nil || block == nil {
@@ -240,19 +232,9 @@ func (s *BlockChainAPI) GetCandidates(ctx context.Context, epoch rpc.BlockNumber
 		result["success"] = false
 		return result, errors.New("XDPoS config not found")
 	}
-	epochConfig := config.XDPoS.Epoch
-
-	// Calculate checkpoint block number
-	blockNum := uint64(epoch)
-	if epoch < 0 {
-		blockNum = s.b.CurrentBlock().Number.Uint64()
-	}
-	checkpointNumber := (blockNum / epochConfig) * epochConfig
-	if checkpointNumber == 0 {
-		checkpointNumber = epochConfig
-	}
-
-	result["epoch"] = checkpointNumber / epochConfig
+	checkpoint, epochOut := s.GetCheckpointFromEpoch(ctx, epoch)
+	checkpointNumber := uint64(checkpoint)
+	result["epoch"] = uint64(epochOut)
 
 	// Get candidates from state
 	statedb, _, err := s.b.StateAndHeaderByNumber(ctx, rpc.BlockNumber(checkpointNumber))
@@ -459,7 +441,7 @@ func deriveTrie(list types.DerivableList) *trie.Trie {
 }
 
 // GetRewardByHash returns the reward info stored for the block with the given hash.
-func (s *BlockChainAPI) GetRewardByHash(hash common.Hash) map[string]map[string]map[string]*big.Int {
+func (s *BlockChainAPI) GetRewardByHash(hash common.Hash) map[string]interface{} {
 	return s.b.GetRewardByHash(hash)
 }
 

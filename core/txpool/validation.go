@@ -154,6 +154,13 @@ func ValidateTransaction(tx *types.Transaction, head *types.Header, signer types
 	if tx.IsSpecialTransaction() && opts.NotSigner != nil && opts.NotSigner(from) {
 		return fmt.Errorf("%w: %s", ErrSpecialTxNotFromSigner, from.Hex())
 	}
+	// XDC: a signing or randomize transaction is gasless. A non-zero value or
+	// gas price is rejected here, at admission, so it never enters the pool.
+	// Block validity is unchanged: ApplySigningTransaction still accepts a
+	// historical special transaction that a block already contains.
+	if tx.IsSpecialTransaction() && (tx.Value().Sign() != 0 || tx.GasFeeCap().Sign() != 0 || tx.GasTipCap().Sign() != 0) {
+		return fmt.Errorf("%w: value %s gasFeeCap %s", ErrSpecialTxNonZeroCost, tx.Value(), tx.GasFeeCap())
+	}
 	// Sanity check for extremely large numbers (supported by RLP or RPC)
 	value, overflow := uint256.FromBig(tx.Value())
 	if overflow {

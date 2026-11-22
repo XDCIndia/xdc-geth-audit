@@ -59,6 +59,15 @@ func (x *XDPoS_v2) verifyMsgSignature(signedHashToBeVerified common.Hash, signat
 		return false, signerAddress, errors.New("empty masternode list")
 	}
 
+	// Reject a high-S signature before it can be stored in the vote or timeout
+	// pool. recoverUniqueSigners already refuses the same bytes in a certificate,
+	// so a local quorum built from them advances a round peers will not accept.
+	// crypto.Sign emits low-S, so a historical seal produced by an honest node
+	// still verifies.
+	if !hasLowS(signature) {
+		return false, signerAddress, utils.ErrInvalidSignature
+	}
+
 	// Recover public key
 	pubkey, err := crypto.Ecrecover(signedHashToBeVerified.Bytes(), signature)
 	if err != nil {
@@ -78,6 +87,20 @@ func (x *XDPoS_v2) verifyMsgSignature(signedHashToBeVerified common.Hash, signat
 		"signer", signerAddress,
 		"masternodes", len(masternodes))
 	return false, signerAddress, nil
+}
+
+// lowSSignatures drops signatures that are not in canonical low-S form.
+// recoverUniqueSigners rejects a whole list when any one signature is high-S;
+// a certificate must be built from the signatures it would accept, so the
+// high-S ones are removed first.
+func lowSSignatures(sigs []types.Signature) []types.Signature {
+	out := make([]types.Signature, 0, len(sigs))
+	for _, sig := range sigs {
+		if hasLowS(sig) {
+			out = append(out, sig)
+		}
+	}
+	return out
 }
 
 // hasLowS reports whether the signature's S value is in the lower half of the
@@ -468,8 +491,18 @@ func (x *XDPoS_v2) verifyQC(chain consensus.ChainReader, quorumCert *types.Quoru
 		}
 	}
 
-	// Verify block info
-	return x.VerifyBlockInfo(chain, quorumCert.ProposedBlockInfo, parentHeader)
+	// Verify block info. This is the check that the certificate's proposed-block
+	// hash is the header hash. The epoch lookup above must not have stored the
+	// parent epoch under that hash; do it only after this succeeds.
+	if err := x.VerifyBlockInfo(chain, quorumCert.ProposedBlockInfo, parentHeader); err != nil {
+		return err
+	}
+	if h := chain.GetHeaderByHash(quorumCert.ProposedBlockInfo.Hash); h != nil && h.Hash() == quorumCert.ProposedBlockInfo.Hash {
+		if _, cacheErr := x.getEpochSwitchInfo(chain, h, h.Hash()); cacheErr != nil {
+			log.Debug("[verifyQC] epoch not cached after accept", "hash", h.Hash(), "err", cacheErr)
+		}
+	}
+	return nil
 }
 
 // processQC processes a quorum certificate

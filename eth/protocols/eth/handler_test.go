@@ -581,6 +581,23 @@ func TestCheckBodyItemCounts(t *testing.T) {
 	}
 }
 
+func TestF202620596Version100BodiesCheckedBeforeHash(t *testing.T) {
+	var tiny rlp.RawList[*types.Transaction]
+	for range 1000 {
+		tiny.AppendRaw([]byte{0x01})
+	}
+	bodies := []BlockBody{{Transactions: tiny}}
+	if err := xdpos2BodiesFitRequest(bodies, 1); err == nil {
+		t.Fatal("a body with an impossible transaction count was accepted")
+	}
+	if err := xdpos2BodiesFitRequest([]BlockBody{{}, {}}, 1); err == nil {
+		t.Fatal("more bodies than the request asked for were accepted")
+	}
+	if err := xdpos2BodiesFitRequest([]BlockBody{{}}, 1); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestCheckReceiptItemCounts(t *testing.T) {
 	// The smallest possible encodings must be accepted.
 	receipts := []*types.Receipt{

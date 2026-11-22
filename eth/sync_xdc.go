@@ -2835,15 +2835,27 @@ func (s *xdcSyncer) fullSyncOnce() {
 	for i, h := range headers {
 		hashes[i] = h.Hash()
 	}
-	bodies := s.fetchBodiesHedged(peer, candidates, hashes)
+	bodies, hedgeFailed := s.fetchBodiesHedged(peer, candidates, hashes)
 	if len(bodies) == 0 {
-		log.Debug("xdcSyncer: empty body batch", "headers", len(headers))
+		// The header-race winner delivered no bodies and the hedge did not
+		// either. Taint that peer so the next round can be won by someone else.
+		// A parent check here would not help: the winner can set ParentHash to
+		// the public head hash and still withhold the bodies.
+		if hedgeFailed {
+			s.taintPeer(peer)
+		}
+		log.Debug("xdcSyncer: empty body batch", "headers", len(headers), "hedgeFailed", hedgeFailed)
 		return
 	}
 
 	blocks := s.buildBlocks(headers, bodies)
 	if len(blocks) == 0 {
-		log.Debug("xdcSyncer: no valid blocks to import")
+		// Bodies arrived but none matched their headers, and the hedge failed
+		// as well. Same taint: this peer should not win the next race.
+		if hedgeFailed {
+			s.taintPeer(peer)
+		}
+		log.Debug("xdcSyncer: no valid blocks to import", "hedgeFailed", hedgeFailed)
 		return
 	}
 	if blocks = s.dropAwaitingM2(blocks); len(blocks) == 0 {
@@ -3490,8 +3502,8 @@ func (s *xdcSyncer) repairAnchorGapBodies(peer *eth.Peer) {
 	if pairCount > len(hdrSlice) {
 		pairCount = len(hdrSlice)
 	}
-	batch := db.NewBatch()
-	written := 0
+	var okHeaders []*types.Header
+	var okBodies []*types.Body
 	for i := 0; i < pairCount; i++ {
 		txs, err := bodies[i].Transactions.Items()
 		if err != nil || len(txs) == 0 {
@@ -3507,7 +3519,36 @@ func (s *xdcSyncer) repairAnchorGapBodies(peer *eth.Peer) {
 				body.Withdrawals = wd
 			}
 		}
-		rawdb.WriteBody(batch, hdrSlice[i].Hash(), hdrSlice[i].Number.Uint64(), body)
+		if !verifyBodyAgainstHeader(hdrSlice[i], body) {
+			log.Warn("xdcSyncer: A.74 gap repair — body does not match header",
+				"block", hdrSlice[i].Number, "peer", peer.ID())
+			s.taintPeer(peer)
+			return
+		}
+		okHeaders = append(okHeaders, hdrSlice[i])
+		okBodies = append(okBodies, body)
+	}
+	if len(okHeaders) == 0 {
+		return
+	}
+	receipts := s.fetchReceiptsBatch(peer, okHeaders)
+	if len(receipts) < len(okHeaders) {
+		log.Warn("xdcSyncer: A.74 gap repair — receipts missing, will retry",
+			"have", len(receipts), "want", len(okHeaders))
+		return
+	}
+	batch := db.NewBatch()
+	written := 0
+	for i, hdr := range okHeaders {
+		if types.DeriveSha(receipts[i], trie.NewStackTrie(nil)) != hdr.ReceiptHash {
+			log.Warn("xdcSyncer: A.74 gap repair — receipts do not match header",
+				"block", hdr.Number, "peer", peer.ID())
+			s.taintPeer(peer)
+			return
+		}
+		rawdb.WriteBody(batch, hdr.Hash(), hdr.Number.Uint64(), okBodies[i])
+		rawdb.WriteReceipts(batch, hdr.Hash(), hdr.Number.Uint64(), receipts[i])
+		writeBackfillTxLookups(db, hdr.Number.Uint64(), okBodies[i])
 		written++
 	}
 	if err := batch.Write(); err != nil {
@@ -4121,6 +4162,12 @@ func (s *xdcSyncer) onCanonicalBranch(p *eth.Peer, head *types.Header) bool {
 	return known && canonical // no answer: not cached, the peer may answer next time
 }
 
+// guardHeaderMatches reports whether the first header is the guard block.
+// A batch that starts at another number is not a verdict.
+func guardHeaderMatches(hdrs []*types.Header, num uint64) bool {
+	return len(hdrs) > 0 && hdrs[0] != nil && hdrs[0].Number != nil && hdrs[0].Number.Uint64() == num
+}
+
 // guardCheck asks p for the fork-guard block and caches whether p is on the
 // canonical branch; known is false when p did not answer (nothing cached).
 func (s *xdcSyncer) guardCheck(p *eth.Peer, num uint64, want common.Hash) (canonical, known bool) {
@@ -4128,7 +4175,7 @@ func (s *xdcSyncer) guardCheck(p *eth.Peer, num uint64, want common.Hash) (canon
 		return v.(bool), true
 	}
 	hdrs := s.fetchHeaderBatchTimeout(p, num, 1, xdcBulkReqTimeout)
-	if len(hdrs) == 0 {
+	if !guardHeaderMatches(hdrs, num) {
 		return false, false
 	}
 	canonical = hdrs[0].Hash() == want
@@ -5715,7 +5762,7 @@ func (s *xdcSyncer) bodyRankedCandidates(candidates []*eth.Peer) []*eth.Peer {
 // idle candidate after xdcBodyHedgeDelay if primary has not responded.
 // Hard deadline is xdcBulkReqTimeout. Updates per-peer body statistics.
 // Respects XDCBodyReqMu serialisation per peer (SYNC-12 refs #1869, #1858).
-func (s *xdcSyncer) fetchBodiesHedged(primary *eth.Peer, candidates []*eth.Peer, hashes []common.Hash) []eth.BlockBody {
+func (s *xdcSyncer) fetchBodiesHedged(primary *eth.Peer, candidates []*eth.Peer, hashes []common.Hash) ([]eth.BlockBody, bool) {
 	type bodyResult struct {
 		bodies   []eth.BlockBody
 		peerID   string
@@ -5760,7 +5807,9 @@ func (s *xdcSyncer) fetchBodiesHedged(primary *eth.Peer, candidates []*eth.Peer,
 		case res := <-ch:
 			s.recordBodyStat(res.peerID, res.lat, res.timedOut)
 			if len(res.bodies) > 0 {
-				return res.bodies
+				// A peer delivered bodies. The hedge is not a failure when it
+				// was not required, and not a failure when it produced them.
+				return res.bodies, false
 			}
 			// Primary returned early with no bodies — start hedge immediately.
 			startHedge()
@@ -5769,21 +5818,22 @@ func (s *xdcSyncer) fetchBodiesHedged(primary *eth.Peer, candidates []*eth.Peer,
 				select {
 				case res2 := <-ch:
 					s.recordBodyStat(res2.peerID, res2.lat, res2.timedOut)
-					return res2.bodies // may be nil
+					// hedgeFailed is true when the hedge also returned nothing.
+					return res2.bodies, len(res2.bodies) == 0
 				case <-deadline.C:
-					return nil
+					return nil, true
 				case <-s.quitCh:
-					return nil
+					return nil, true
 				}
 			}
-			return nil
+			return nil, true
 		case <-hedge.C:
 			startHedge()
 		case <-deadline.C:
 			s.recordBodyStat(primary.ID(), xdcBulkReqTimeout, true)
-			return nil
+			return nil, true
 		case <-s.quitCh:
-			return nil
+			return nil, true
 		}
 	}
 }
@@ -6274,11 +6324,28 @@ func (s *xdcSyncer) prefetchAncestorBodiesAndReceipts(peer *eth.Peer, allHeaders
 					body.Withdrawals = wd
 				}
 			}
+			if !verifyBodyAgainstHeader(batchHeaders[i], body) {
+				log.Warn("xdcSyncer: A.72 body does not match header; stopping",
+					"block", batchHeaders[i].Number, "peer", activePeer.ID())
+				s.taintPeer(activePeer)
+				return
+			}
 			typeBodies[i] = body
 		}
 		var typedReceipts []types.Receipts
 		if len(receipts) >= pairCount {
 			typedReceipts = receipts[:pairCount]
+			for i := 0; i < pairCount; i++ {
+				if typedReceipts[i] == nil {
+					continue
+				}
+				if types.DeriveSha(typedReceipts[i], trie.NewStackTrie(nil)) != batchHeaders[i].ReceiptHash {
+					log.Warn("xdcSyncer: A.72 receipts do not match header; stopping",
+						"block", batchHeaders[i].Number, "peer", activePeer.ID())
+					s.taintPeer(activePeer)
+					return
+				}
+			}
 		}
 		// Trim headers to pairCount so PrimeAncestorBodies validation succeeds.
 		hdrSlice := batchHeaders[:pairCount]
@@ -6425,17 +6492,37 @@ func emptyHistoryBody(h *types.Header) *types.Body {
 }
 
 func snapBlockComplete(db ethdb.Reader, hash common.Hash, num uint64, txHash common.Hash) bool {
-	if !rawdb.HasHeader(db, hash, num) {
+	header := rawdb.ReadHeader(db, hash, num)
+	if header == nil {
 		return false
 	}
-	if txHash == types.EmptyTxsHash {
-		// Empty blocks still need a body record: GetBlock/eth_getBlockByNumber
-		// return nil without one (the backfill writes it, see emptyHistoryBody).
-		return rawdb.HasBody(db, hash, num)
+	body := rawdb.ReadBody(db, hash, num)
+	if body == nil {
+		return false
 	}
-	// History is complete only with the receipts too (eth_getTransactionReceipt,
-	// log filters); a block missing them stays pending and is retried.
-	return rawdb.HasBody(db, hash, num) && rawdb.HasReceipts(db, hash, num)
+	// The fast-sync anchor writes an empty body and empty receipts for every
+	// header. Those records exist, but they are not the block unless the
+	// roots match.
+	check := types.CopyHeader(header)
+	if txHash != (common.Hash{}) {
+		check.TxHash = txHash
+	}
+	if !verifyBodyAgainstHeader(check, body) {
+		return false
+	}
+	if check.TxHash == types.EmptyTxsHash {
+		return true
+	}
+	receipts := rawdb.ReadRawReceipts(db, hash, num)
+	if len(receipts) == 0 {
+		return header.ReceiptHash == types.EmptyReceiptsHash
+	}
+	if types.DeriveSha(receipts, trie.NewStackTrie(nil)) == header.ReceiptHash {
+		return true
+	}
+	// A non-empty receipt list stored for a non-empty body is the block the
+	// backfill already checked. An empty placeholder never reaches here.
+	return len(receipts) == len(body.Transactions)
 }
 
 // verifyBodyAgainstHeader returns true iff body's transaction root, uncle hash,

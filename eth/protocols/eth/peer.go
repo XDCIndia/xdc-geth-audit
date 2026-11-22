@@ -75,6 +75,7 @@ type legacyHeaderReq struct {
 	count        int         // requested header count (for response truncation)
 	anchorHash   common.Hash // ByHash request: expected hash of headers[0]
 	anchorNumber uint64      // ByNumber request: expected number of headers[0]
+	hasSink      bool        // a caller is waiting on its own response channel
 }
 
 type Peer struct {
@@ -104,6 +105,7 @@ type Peer struct {
 	legacyHeaderQueue   []legacyHeaderReq
 
 	legacyBodyReqID     atomic.Uint64
+	legacyBodyReqCount  atomic.Uint64
 	legacyReceiptsReqID atomic.Uint64
 
 	// XDC: dedicated response channels for XDPOS2 legacy data-plane messages.
@@ -292,18 +294,18 @@ func (p *Peer) LastXDCBodyReqID() uint64 {
 // This will be nil for peers below protocol version eth/69.
 // pushLegacyHeaderReqHash enqueues a hash-anchored header request.
 // Refs #807 Phase 9.3 + Phase 10.
-func (p *Peer) pushLegacyHeaderReqHash(id uint64, count int, hash common.Hash) {
+func (p *Peer) pushLegacyHeaderReqHash(id uint64, count int, hash common.Hash, hasSink bool) {
 	p.legacyHeaderQueueMu.Lock()
-	p.legacyHeaderQueue = append(p.legacyHeaderQueue, legacyHeaderReq{id: id, count: count, anchorHash: hash})
+	p.legacyHeaderQueue = append(p.legacyHeaderQueue, legacyHeaderReq{id: id, count: count, anchorHash: hash, hasSink: hasSink})
 	p.legacyHeaderQueueMu.Unlock()
 	p.legacyHeaderReqID.Store(id)
 	p.legacyHeaderReqCount.Store(uint64(count))
 }
 
 // pushLegacyHeaderReqNumber enqueues a number-anchored header request.
-func (p *Peer) pushLegacyHeaderReqNumber(id uint64, count int, number uint64) {
+func (p *Peer) pushLegacyHeaderReqNumber(id uint64, count int, number uint64, hasSink bool) {
 	p.legacyHeaderQueueMu.Lock()
-	p.legacyHeaderQueue = append(p.legacyHeaderQueue, legacyHeaderReq{id: id, count: count, anchorNumber: number})
+	p.legacyHeaderQueue = append(p.legacyHeaderQueue, legacyHeaderReq{id: id, count: count, anchorNumber: number, hasSink: hasSink})
 	p.legacyHeaderQueueMu.Unlock()
 	p.legacyHeaderReqID.Store(id)
 	p.legacyHeaderReqCount.Store(uint64(count))
@@ -632,7 +634,7 @@ func (p *Peer) RequestHeadersByHash(origin common.Hash, amount int, skip int, re
 			"skip", skip,
 			"reverse", reverse,
 			"req_id", id)
-		p.pushLegacyHeaderReqHash(id, amount, origin)
+		p.pushLegacyHeaderReqHash(id, amount, origin, sink != nil)
 	}
 	if err := p.dispatchRequest(req); err != nil {
 		return nil, err
@@ -662,7 +664,7 @@ func (p *Peer) RequestHeadersByNumber(origin uint64, amount int, skip int, rever
 			"skip", skip,
 			"reverse", reverse,
 			"req_id", id)
-		p.pushLegacyHeaderReqNumber(id, amount, origin)
+		p.pushLegacyHeaderReqNumber(id, amount, origin, sink != nil)
 	}
 	if err := p.dispatchRequest(req); err != nil {
 		return nil, err
@@ -702,6 +704,7 @@ func (p *Peer) RequestBodies(hashes []common.Hash, sink chan *Response) (*Reques
 		// Bare hash list — eth/63 wire shape used by production XDC peers.
 		data = GetBlockBodiesRequest(hashes)
 		p.legacyBodyReqID.Store(id)
+		p.legacyBodyReqCount.Store(uint64(len(hashes)))
 	} else {
 		data = &GetBlockBodiesPacket{
 			RequestId:             id,

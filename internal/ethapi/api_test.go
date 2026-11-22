@@ -726,7 +726,7 @@ func (b testBackend) HistoryRetention() HistoryRetention {
 }
 
 // XDC-specific methods required by the Backend interface.
-func (b testBackend) GetRewardByHash(hash common.Hash) map[string]map[string]map[string]*big.Int {
+func (b testBackend) GetRewardByHash(hash common.Hash) map[string]interface{} {
 	return nil
 }
 func (b testBackend) BlockChain() *core.BlockChain { return b.chain }

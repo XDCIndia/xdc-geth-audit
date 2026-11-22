@@ -548,11 +548,11 @@ func (b *backendMock) Engine() consensus.Engine { return nil }
 func (b *backendMock) CurrentView() *filtermaps.ChainView           { return nil }
 func (b *backendMock) NewMatcherBackend() filtermaps.MatcherBackend { return nil }
 
-func (b *backendMock) HistoryPruningCutoff() uint64 { return 0 }
+func (b *backendMock) HistoryPruningCutoff() uint64       { return 0 }
 func (b *backendMock) HistoryRetention() HistoryRetention { return HistoryRetention{} }
 
 // XDC-specific methods required by the Backend interface.
-func (b *backendMock) GetRewardByHash(hash common.Hash) map[string]map[string]map[string]*big.Int {
+func (b *backendMock) GetRewardByHash(hash common.Hash) map[string]interface{} {
 	return nil
 }
 func (b *backendMock) BlockChain() *core.BlockChain               { return nil }

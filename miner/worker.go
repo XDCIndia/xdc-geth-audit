@@ -67,11 +67,6 @@ type environment struct {
 	size     uint64         // size of the block we are building
 	gasPool  *core.GasPool  // available gas used to pack transactions
 	coinbase common.Address
-	// coinbaseOwner is the XDC TRC21 fee recipient (the masternode's registered
-	// candidate-owner) resolved ONCE per block before tx execution, mirroring
-	// core/state_processor.go Process. Zero address ⇒ fees route to the coinbase
-	// (pre-TIPTRC21Fee behaviour). Set by the XDPoS worker after makeEnv.
-	coinbaseOwner common.Address
 
 	// XDC TRC21 token fees, mirroring core/state_processor.go Process: the
 	// capacities read from the pre-tx state, drawn down as txs are committed and
@@ -501,7 +496,8 @@ func (miner *Miner) commitBlobTransaction(ctx context.Context, env *environment,
 //     ApplySigningTransaction (zero-gas, no EVM), NOT the normal EVM path;
 //   - XDCx txs to 0x91-0x94 in the TIPXDCXReceiver window run through
 //     ApplyEmptyTransaction (both via core.RouteTransaction);
-//   - all other txs route the TRC21 gas fee to env.coinbaseOwner.
+//   - all other txs route the TRC21 gas fee to the candidate-owner of env.coinbase,
+//     read from state for each tx.
 func (miner *Miner) applyTransaction(ctx context.Context, env *environment, tx *types.Transaction) (*types.Receipt, *bal.ConstructionBlockAccessList, error) {
 	var (
 		snap        = env.state.Snapshot()
@@ -531,7 +527,10 @@ func (miner *Miner) applyTransaction(ctx context.Context, env *environment, tx *
 			receipt, err = core.ApplyEmptyTransaction(config, env.state, blockNumber, blockHash, tx, env.gasPool.Used())
 		default:
 			tokenFee := env.trc21Fee != nil && core.ApplyTRC21TokenFee(config, msg, env.trc21Fee, tx, blockNumber)
-			receipt, txBAL, err = core.ApplyTransactionWithEVM(ctx, msg, env.gasPool, env.state, blockNumber, blockHash, env.header.Time, tx, env.evm, env.coinbaseOwner)
+			// The owner is read from state for each tx, as core.Process does
+			// (canonical core/state_processor.go:442-443), so a block holds the
+			// same fee routing when it is built and when it is imported.
+			receipt, txBAL, err = core.ApplyTransactionWithEVM(ctx, msg, env.gasPool, env.state, blockNumber, blockHash, env.header.Time, tx, env.evm, state.GetCandidateOwner(env.state, env.coinbase))
 			if err == nil && tokenFee {
 				core.SettleTRC21TokenFee(config, env.state, msg, tx, receipt, blockNumber, env.trc21Fee, env.trc21Updated, env.trc21FeeUsed)
 			}

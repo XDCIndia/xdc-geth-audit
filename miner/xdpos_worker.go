@@ -45,7 +45,6 @@ import (
 	"github.com/ethereum/go-ethereum/consensus/misc/eip1559"
 	"github.com/ethereum/go-ethereum/contracts"
 	"github.com/ethereum/go-ethereum/core"
-	"github.com/ethereum/go-ethereum/core/state"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/params"
@@ -612,13 +611,6 @@ func (w *XdcWorker) commitNewWork() {
 	}
 	defer env.discard()
 
-	// XDC: resolve the TRC21 fee recipient (masternode candidate-owner) ONCE
-	// from the pre-tx state, mirroring core/state_processor.go Process. The
-	// miner's applyTransaction uses this to route fees and dispatch special txs
-	// (signing → ApplySigningTransaction) exactly as InsertChain re-execution
-	// will — without it the minted block's state root diverges and the producer
-	// rejects its own block (#952 / apothem 83,088,792 "invalid merkle root").
-	env.coinbaseOwner = state.GetCandidateOwner(env.state, w.coinbase)
 	env.initTRC21Fee()
 
 	if !isEpochSwitch {
@@ -848,10 +840,6 @@ func (w *XdcWorker) commitV1Work(parent *types.Block) {
 	}
 	defer env.discard()
 
-	// XDC: resolve the TRC21 fee recipient once before tx execution (mirrors
-	// core/state_processor.go Process) so applyTransaction routes fees/special
-	// txs identically to InsertChain re-execution (#952).
-	env.coinbaseOwner = state.GetCandidateOwner(env.state, w.coinbase)
 	env.initTRC21Fee()
 
 	// Store a pre-transaction state copy for V1 reward calculation at checkpoint

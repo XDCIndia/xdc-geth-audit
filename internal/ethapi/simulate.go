@@ -364,6 +364,7 @@ func (sim *simulator) processBlock(ctx context.Context, block *simBlock, header,
 		blockContext.BlobBaseFee = block.BlockOverrides.BlobBaseFee.ToInt()
 	}
 	precompiles := sim.activePrecompiles(header)
+	precompiles = limitPrivacyPrecompiles(sim.chainConfig, precompiles, sim.base.Number, headerMerged(sim.base), sim.base.Time, header.Number, headerMerged(header), header.Time)
 
 	// State overrides are applied prior to execution of a block
 	if err := block.StateOverrides.Apply(sim.state, precompiles); err != nil {
@@ -566,6 +567,10 @@ func (sim *simulator) sanitizeCall(call *TransactionArgs, state vm.StateDB, head
 		return false, errors.New("authorizationList requires a base fee")
 	}
 	return gasCapped, call.CallDefaults(0, header.BaseFee, sim.chainConfig.ChainID)
+}
+
+func headerMerged(h *types.Header) bool {
+	return h != nil && h.Difficulty != nil && h.Difficulty.Sign() == 0
 }
 
 func (sim *simulator) activePrecompiles(base *types.Header) vm.PrecompiledContracts {

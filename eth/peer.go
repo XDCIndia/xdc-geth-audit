@@ -17,6 +17,8 @@
 package eth
 
 import (
+	"sync"
+
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/eth/protocols/eth"
 	"github.com/ethereum/go-ethereum/eth/protocols/snap"
@@ -39,6 +41,11 @@ type peerBlockRange struct {
 type ethPeer struct {
 	*eth.Peer
 	snapExt *snapPeer // Satellite `snap` connection
+
+	// One sender goroutine and a fixed-length queue for BFT and block gossip.
+	// bftOnce starts the sender on the first enqueue.
+	bftOnce sync.Once
+	bftSend *bftPeerSender
 }
 
 // info gathers and returns some `eth` protocol metadata known about a peer.
