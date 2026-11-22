@@ -4337,6 +4337,9 @@ func (s *xdcSyncer) fetchPeerHeadHeader() *types.Header {
 	var heads []peerHead
 	for _, ep := range s.handler.peers.all() {
 		p := ep.Peer
+		if s.isPeerTainted(p.ID()) {
+			continue
+		}
 		rng := p.BlockRange()
 		if rng == nil || rng.LatestBlockHash == (common.Hash{}) {
 			log.Debug("xdcSyncer.fetchPeerHeadHeader: peer no block range", "peer", p.ID()[:12])
@@ -4393,12 +4396,67 @@ func (s *xdcSyncer) fetchPeerHeadHeader() *types.Header {
 		log.Debug("xdcSyncer.fetchPeerHeadHeader: pivot batch fetch failed", "peer", lowest.peer.ID()[:12], "pivotNum", pivotNum)
 		return nil
 	}
+	// XDC-HUNT-32: the pivot header (and so the state root the snap download
+	// targets) comes from one peer. Adopt it only when a second, different peer
+	// serves the same header at that number. A disagreement taints both peers so
+	// the next attempt picks another pair; no answer leaves the pivot unselected
+	// (retried on the next tick).
+	var others []*eth.Peer
+	for _, ep := range s.handler.peers.all() {
+		if ep.Peer.ID() != lowest.peer.ID() && !s.isPeerTainted(ep.Peer.ID()) {
+			others = append(others, ep.Peer)
+		}
+	}
+	if len(others) > pivotConfirmMaxPeers {
+		others = others[:pivotConfirmMaxPeers]
+	}
+	ok, conflict := confirmPivot(pivotHdrs[0], len(others), func(i int) *types.Header {
+		if hdrs := s.fetchHeaderBatch(others[i], pivotNum, 1); len(hdrs) > 0 {
+			return hdrs[0]
+		}
+		return nil
+	})
+	if !ok {
+		if conflict >= 0 {
+			log.Warn("xdcSyncer: snap pivot header disagrees between two peers — tainting both",
+				"pivot", pivotNum, "source", lowest.peer.ID()[:12], "other", others[conflict].ID()[:12])
+			s.taintPeer(lowest.peer)
+			s.taintPeer(others[conflict])
+		} else {
+			log.Debug("xdcSyncer.fetchPeerHeadHeader: snap pivot not confirmed by a second peer",
+				"pivot", pivotNum, "source", lowest.peer.ID()[:12], "asked", len(others))
+		}
+		return nil
+	}
 	log.Info("xdcSyncer: peer head selection",
 		"selected_peer", lowest.peer.ID()[:12],
 		"selected_head", lowest.hdr.Number.Uint64(),
 		"pivot", pivotHdrs[0].Number.Uint64(),
 		"peer_count", len(heads))
 	return pivotHdrs[0]
+}
+
+// pivotConfirmMaxPeers bounds how many other peers are asked to confirm a pivot
+// header in one attempt.
+const pivotConfirmMaxPeers = 3
+
+// confirmPivot reports whether one of n other peers serves the same header as
+// pivot at the same number. fetch(i) returns peer i's header at that number, or
+// nil when it did not answer; non-answers and wrong-number answers are skipped.
+// On a different header it returns false and that peer's index; with no answer
+// at all it returns false and -1.
+func confirmPivot(pivot *types.Header, n int, fetch func(i int) *types.Header) (ok bool, conflict int) {
+	for i := 0; i < n; i++ {
+		h := fetch(i)
+		if h == nil || h.Number == nil || h.Number.Cmp(pivot.Number) != 0 {
+			continue
+		}
+		if h.Hash() == pivot.Hash() {
+			return true, -1
+		}
+		return false, i
+	}
+	return false, -1
 }
 
 // fetchHeaderByHash issues a hash-based GetBlockHeaders request to a
