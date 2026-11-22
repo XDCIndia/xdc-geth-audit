@@ -459,7 +459,7 @@ func deriveTrie(list types.DerivableList) *trie.Trie {
 }
 
 // GetRewardByHash returns the reward info stored for the block with the given hash.
-func (s *BlockChainAPI) GetRewardByHash(hash common.Hash) map[string]map[string]map[string]*big.Int {
+func (s *BlockChainAPI) GetRewardByHash(hash common.Hash) map[string]interface{} {
 	return s.b.GetRewardByHash(hash)
 }
 

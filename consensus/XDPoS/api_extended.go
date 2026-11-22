@@ -6,7 +6,6 @@ package XDPoS
 
 import (
 	"encoding/base64"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"math/big"
@@ -459,37 +458,10 @@ func (api *API) GetRewardByAccount(account common.Address, begin rpc.BlockNumber
 			continue
 		}
 
-		// Reward file: map[validator]map[voter]map[field]*big.Int
-		// We look for account as either a validator key or a voter key.
-		var raw map[string]map[string]map[string]*big.Int
-		if err := json.Unmarshal(data, &raw); err != nil {
-			continue
-		}
-
-		// Accumulate total reward for this account in this block
-		total := new(big.Int)
-		for validator, voters := range raw {
-			if strings.ToLower(validator) == accountHex {
-				// account is a masternode - sum all fields for all voters
-				for _, fields := range voters {
-					for _, amt := range fields {
-						if amt != nil {
-							total.Add(total, amt)
-						}
-					}
-				}
-			} else {
-				// account may be a voter under this validator
-				for voter, fields := range voters {
-					if strings.ToLower(voter) == accountHex {
-						for _, amt := range fields {
-							if amt != nil {
-								total.Add(total, amt)
-							}
-						}
-					}
-				}
-			}
+		total, err := AccountRewardFromFile(data, accountHex)
+		if err != nil {
+			log.Warn("[GetRewardByAccount] reward file did not decode", "file", name, "err", err)
+			return AccountRewardResponse{Rewards: rewards}, fmt.Errorf("reward file %s: %w", name, err)
 		}
 
 		if total.Sign() > 0 {

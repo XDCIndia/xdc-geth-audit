@@ -18,7 +18,6 @@ package eth
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"math/big"
@@ -30,6 +29,7 @@ import (
 	"github.com/ethereum/go-ethereum/accounts"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/consensus"
+	"github.com/ethereum/go-ethereum/consensus/XDPoS"
 	"github.com/ethereum/go-ethereum/consensus/misc/eip1559"
 	"github.com/ethereum/go-ethereum/consensus/misc/eip4844"
 	"github.com/ethereum/go-ethereum/core"
@@ -46,6 +46,7 @@ import (
 	"github.com/ethereum/go-ethereum/ethdb"
 	"github.com/ethereum/go-ethereum/event"
 	"github.com/ethereum/go-ethereum/internal/ethapi"
+	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/rpc"
 )
@@ -596,28 +597,28 @@ func (b *EthAPIBackend) Engine() consensus.Engine {
 	return b.eth.engine
 }
 
-func (b *EthAPIBackend) GetRewardByHash(hash common.Hash) map[string]map[string]map[string]*big.Int {
+func (b *EthAPIBackend) GetRewardByHash(hash common.Hash) map[string]interface{} {
 	header := b.eth.blockchain.GetHeaderByHash(hash)
-	if header != nil {
-		data, err := os.ReadFile(filepath.Join(common.StoreRewardFolder, header.Number.String()+"."+header.Hash().Hex()))
-		if err == nil {
-			rewards := make(map[string]map[string]map[string]*big.Int)
-			err = json.Unmarshal(data, &rewards)
-			if err == nil {
-				return rewards
-			}
-		} else {
-			data, err = os.ReadFile(filepath.Join(common.StoreRewardFolder, header.Number.String()+"."+header.HashNoValidator().Hex()))
-			if err == nil {
-				rewards := make(map[string]map[string]map[string]*big.Int)
-				err = json.Unmarshal(data, &rewards)
-				if err == nil {
-					return rewards
-				}
-			}
-		}
+	if header == nil {
+		return map[string]interface{}{}
 	}
-	return make(map[string]map[string]map[string]*big.Int)
+	names := []string{
+		header.Number.String() + "." + header.Hash().Hex(),
+		header.Number.String() + "." + header.HashNoValidator().Hex(),
+	}
+	for _, name := range names {
+		data, err := os.ReadFile(filepath.Join(common.StoreRewardFolder, name))
+		if err != nil {
+			continue
+		}
+		rewards, err := XDPoS.DecodeRewardFileObject(data)
+		if err != nil {
+			log.Error("reward file did not decode", "file", name, "err", err)
+			return map[string]interface{}{}
+		}
+		return rewards
+	}
+	return map[string]interface{}{}
 }
 
 func (b *EthAPIBackend) CurrentHeader() *types.Header {

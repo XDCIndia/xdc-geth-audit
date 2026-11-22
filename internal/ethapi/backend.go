@@ -93,7 +93,7 @@ type Backend interface {
 	HistoryPruningCutoff() uint64
 	HistoryRetention() HistoryRetention
 
-	GetRewardByHash(hash common.Hash) map[string]map[string]map[string]*big.Int
+	GetRewardByHash(hash common.Hash) map[string]interface{}
 
 	// XDPoS-specific methods
 	BlockChain() *core.BlockChain
