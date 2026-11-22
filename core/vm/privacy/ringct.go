@@ -185,8 +185,10 @@ func computeSignatureSize(numRing int, ringSize int) int {
 	return 8 + 8 + 32 + 32 + numRing*ringSize*32 + numRing*ringSize*33 + numRing*33
 }
 
-// deserializes the byteified signature into a RingSignature struct
-func Deserialize(r []byte) (*RingSignature, error) {
+// Deserialize decodes a serialized ring signature and checks it with Verify.
+// The optional abort function is passed to Verify, so an RPC call can stop the
+// check. Block processing passes none.
+func Deserialize(r []byte, abort ...func() bool) (*RingSignature, error) {
 	if len(r) < 16 {
 		return nil, errors.New("failed to deserialize ring signature")
 	}
@@ -257,7 +259,7 @@ func Deserialize(r []byte) (*RingSignature, error) {
 
 	sig.SerializedRing = r
 
-	if !Verify(sig, false) {
+	if !Verify(sig, false, abort...) {
 		return nil, errors.New("failed to deserialize, invalid ring signature")
 	}
 
