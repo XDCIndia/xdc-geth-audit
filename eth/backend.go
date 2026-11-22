@@ -447,6 +447,15 @@ func New(stack *node.Node, config *ethconfig.Config) (*Ethereum, error) {
 		}
 	}
 
+	// XDC-HUNT-06: canonical XDPoSChain calls Initial with the local head at
+	// startup. A failure is not fatal here (a snap-synced node may not hold the
+	// gap header yet); the engine then initialises lazily as before.
+	if xdposEngine, ok := eth.engine.(*XDPoS.XDPoS); ok {
+		if err := xdposEngine.Initial(eth.blockchain, eth.blockchain.CurrentHeader()); err != nil {
+			log.Warn("XDPoS V2 startup init from local head failed, deferring", "err", err)
+		}
+	}
+
 	// Initialize filtermaps log index.
 	fmConfig := filtermaps.Config{
 		History:        config.LogHistory,

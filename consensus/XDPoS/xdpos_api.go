@@ -305,7 +305,21 @@ func (c *XDPoS) HandleProposedBlock(chain consensus.ChainHeaderReader, header *t
 // Initial initializes the consensus engine with the current chain state.
 func (c *XDPoS) Initial(chain consensus.ChainHeaderReader, header *types.Header) error {
 	log.Info("[Initial] Consensus engine initializing", "block", header.Number)
-	return nil
+	// XDC-HUNT-06: seed the V2 engine from the local head at startup, as
+	// canonical XDPoSChain does (XDPoS.go Initial, eth/backend.go). Without
+	// this the first header a peer sends seeds the round and the commit marker.
+	v2, ok := c.EngineV2.(interface {
+		Initial(consensus.ChainReader, *types.Header) error
+	})
+	if !c.IsV2Block(header) || !ok {
+		return nil
+	}
+	cr, ok := chain.(consensus.ChainReader)
+	if !ok {
+		log.Warn("[Initial] chain does not implement ChainReader, skipping", "block", header.Number)
+		return nil
+	}
+	return v2.Initial(cr, header)
 }
 
 // GetAuthorisedSignersFromSnapshot returns authorised signers from the snapshot.
