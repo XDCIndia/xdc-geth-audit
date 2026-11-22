@@ -2764,7 +2764,11 @@ func BenchmarkMultiAccountBatchInsert(b *testing.B) {
 // contracts.CreateTxSign, which is the only tx an XDPoS masternode coinbase ever
 // sends. gasPrice 0 is deliberate — special-txs are price-exempt in the pool.
 func signTransaction(nonce uint64, key *ecdsa.PrivateKey) *types.Transaction {
-	tx := types.NewTransaction(nonce, common.BlockSignersBinary, big.NewInt(0), 200000, big.NewInt(0), nil)
+	data := common.Hex2Bytes(common.HexSignMethod)
+	blockNum := new(big.Int).SetUint64(nonce + 1)
+	input := append(data, common.LeftPadBytes(blockNum.Bytes(), 32)...)
+	input = append(input, common.LeftPadBytes(blockNum.Bytes(), 32)...)
+	tx := types.NewTransaction(nonce, common.BlockSignersBinary, big.NewInt(0), 200000, big.NewInt(0), input)
 	signed, _ := types.SignTx(tx, types.HomesteadSigner{}, key)
 	return signed
 }

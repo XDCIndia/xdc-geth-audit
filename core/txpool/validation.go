@@ -151,14 +151,16 @@ func ValidateTransaction(tx *types.Transaction, head *types.Header, signer types
 	}
 	// XDC: special transactions are price-exempt, so only masternode signers
 	// may send them (XDPoSChain core/txpool/validation.go:130-134).
-	if tx.IsSpecialTransaction() && opts.NotSigner != nil && opts.NotSigner(from) {
+	// The signer and zero-cost checks apply only to the known selectors.
+	// Any other calldata to those addresses is an ordinary transaction.
+	if tx.KnownSpecialCall() && opts.NotSigner != nil && opts.NotSigner(from) {
 		return fmt.Errorf("%w: %s", ErrSpecialTxNotFromSigner, from.Hex())
 	}
 	// XDC: a signing or randomize transaction is gasless. A non-zero value or
 	// gas price is rejected here, at admission, so it never enters the pool.
 	// Block validity is unchanged: ApplySigningTransaction still accepts a
 	// historical special transaction that a block already contains.
-	if tx.IsSpecialTransaction() && (tx.Value().Sign() != 0 || tx.GasFeeCap().Sign() != 0 || tx.GasTipCap().Sign() != 0) {
+	if tx.KnownSpecialCall() && (tx.Value().Sign() != 0 || tx.GasFeeCap().Sign() != 0 || tx.GasTipCap().Sign() != 0) {
 		return fmt.Errorf("%w: value %s gasFeeCap %s", ErrSpecialTxNonZeroCost, tx.Value(), tx.GasFeeCap())
 	}
 	// Sanity check for extremely large numbers (supported by RLP or RPC)
@@ -215,8 +217,14 @@ func ValidateTransaction(tx *types.Transaction, head *types.Header, signer types
 	// Observed on xdc04 modern (devnet-5151) where sign-txs were created
 	// (`contracts: masternode signing tx submitted ... nonce=19`) but never
 	// reached V1 node1's txpool (pending=0 queued=0).
-	if !tx.IsSpecialTransaction() && tx.GasTipCapIntCmp(opts.MinTip) < 0 {
+	if !tx.KnownSpecialCall() && tx.GasTipCapIntCmp(opts.MinTip) < 0 {
 		return fmt.Errorf("%w: gas tip cap %v, minimum needed %v", ErrTxGasPriceTooLow, tx.GasTipCap(), opts.MinTip)
+	}
+	// XDC: the miner never includes a tx to BlockSigners with fewer than 68
+	// bytes of calldata (miner/worker.go, canonical miner/worker.go:1141-1150).
+	// Such a tx would stay in pending without end, so refuse it here.
+	if to := tx.To(); to != nil && *to == common.BlockSignersBinary && len(tx.Data()) < 68 {
+		return fmt.Errorf("%w: %d bytes", ErrSpecialTxShortData, len(tx.Data()))
 	}
 	if tx.Type() == types.BlobTxType {
 		return validateBlobSidecar(tx, head, opts)
@@ -416,7 +424,7 @@ func ValidateTransactionWithState(tx *types.Transaction, signer types.Signer, op
 	// special-tx exemption. Without this check, txs priced below the Gas2500x
 	// floor (625 gwei) enter the pool on modern but can never be mined, and they
 	// block nonce-consecutive replacements until they are evicted.
-	if opts.Config != nil && opts.Config.IsXDC() && opts.CurrentNumber != nil && !tx.IsSpecialTransaction() {
+	if opts.Config != nil && opts.Config.IsXDC() && opts.CurrentNumber != nil && !tx.KnownSpecialCall() {
 		pendingNum := new(big.Int).Add(opts.CurrentNumber(), common.Big1)
 		// Canonical chainDefaultGasPrice: the Gas2500x / Gas50x tier price, or
 		// the common.DefaultMinGasPrice baseline before any tier fork.

@@ -829,7 +829,7 @@ func splitSpecialTxs(pending map[common.Address][]*txpool.LazyTransaction) map[c
 		for _, ltx := range txs {
 			if len(normal) == 0 {
 				// Still in the leading special-tx prefix for this account.
-				if tx := ltx.Resolve(); tx != nil && tx.IsSpecialTransaction() {
+				if tx := ltx.Resolve(); tx != nil && tx.KnownSpecialCall() {
 					special[from] = append(special[from], ltx)
 					continue
 				}
