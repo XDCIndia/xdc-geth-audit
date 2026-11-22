@@ -295,3 +295,35 @@ func TestStaleHeaderRequestBlocksLaterMatch(t *testing.T) {
 		t.Fatal("batch for the later request was not delivered")
 	}
 }
+
+// TestXDPOS2LateHeaderReplyAfterTimeoutIsDiscarded: a correct reply that arrives
+// after the local timeout removed its request is discarded once; the same reply
+// again, with nothing in flight, disconnects the peer (XDC-HUNT-25).
+func TestXDPOS2LateHeaderReplyAfterTimeoutIsDiscarded(t *testing.T) {
+	peer := newHeaderTestPeer()
+	defer peer.tracker.Stop()
+	peer.pushLegacyHeaderReqNumber(42, 1, 7, true)
+	peer.removeLegacyHeaderReq(42) // the request timed out
+
+	batch, err := rlp.EncodeToBytes([]*types.Header{{Number: big.NewInt(7)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := handleBlockHeaders(nil, rawDecoder{batch}, peer); err != nil {
+		t.Fatalf("late reply to a timed-out request disconnected the peer: %v", err)
+	}
+	select {
+	case <-peer.XDCHeaderResp:
+		t.Fatal("late reply was delivered")
+	default:
+	}
+	if err := handleBlockHeaders(nil, rawDecoder{batch}, peer); err == nil {
+		t.Fatal("repeated reply with nothing in flight returned nil")
+	}
+	// A reply that matches no timed-out request is still an error.
+	peer.pushLegacyHeaderReqNumber(43, 1, 9, true)
+	peer.removeLegacyHeaderReq(43)
+	if err := handleBlockHeaders(nil, rawDecoder{batch}, peer); err == nil {
+		t.Fatal("reply for a different anchor accepted")
+	}
+}

@@ -104,6 +104,10 @@ type Peer struct {
 	// the oldest. Refs #807 Phase 9.3.
 	legacyHeaderQueueMu sync.Mutex
 	legacyHeaderQueue   []legacyHeaderReq
+	// legacyHeaderTimedOut is a short record of header requests that were removed
+	// (timeout or cancel) so that a correct but late reply is discarded instead
+	// of being treated as unsolicited (XDC-HUNT-25). Guarded by legacyHeaderQueueMu.
+	legacyHeaderTimedOut []legacyHeaderReq
 
 	legacyBodyReqID     atomic.Uint64
 	legacyBodyReqCount  atomic.Uint64
@@ -326,9 +330,30 @@ func (p *Peer) removeLegacyHeaderReq(id uint64) {
 	for i, req := range p.legacyHeaderQueue {
 		if req.id == id {
 			p.legacyHeaderQueue = append(p.legacyHeaderQueue[:i], p.legacyHeaderQueue[i+1:]...)
+			if p.legacyHeaderTimedOut = append(p.legacyHeaderTimedOut, req); len(p.legacyHeaderTimedOut) > maxTimedOutHeaderReqs {
+				p.legacyHeaderTimedOut = p.legacyHeaderTimedOut[1:]
+			}
 			return
 		}
 	}
+}
+
+// maxTimedOutHeaderReqs is how many removed header requests are remembered.
+const maxTimedOutHeaderReqs = 8
+
+// consumeTimedOutHeaderReq reports whether headers is the late reply to a
+// request that was removed after a timeout or cancel, and forgets that request.
+// An empty reply matches the oldest remembered request.
+func (p *Peer) consumeTimedOutHeaderReq(headers []*types.Header) bool {
+	p.legacyHeaderQueueMu.Lock()
+	defer p.legacyHeaderQueueMu.Unlock()
+	for i, req := range p.legacyHeaderTimedOut {
+		if (len(headers) == 0 && i == 0) || legacyHeaderAnchorIndex(headers, req) >= 0 {
+			p.legacyHeaderTimedOut = append(p.legacyHeaderTimedOut[:i], p.legacyHeaderTimedOut[i+1:]...)
+			return true
+		}
+	}
+	return false
 }
 
 // peekLegacyHeaderReq returns the oldest pending header request without

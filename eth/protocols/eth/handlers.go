@@ -499,6 +499,13 @@ func handleBlockHeaders(backend Backend, msg Decoder, peer *Peer) error {
 		// nothing in flight is unsolicited and drops the peer.
 		req, ok := peer.peekLegacyHeaderReq()
 		if !ok {
+			// A correct reply that arrives after the local timeout is not an
+			// attack: discard it once. The peer is disconnected when it repeats
+			// a reply with nothing in flight (XDC-HUNT-25).
+			if peer.consumeTimedOutHeaderReq(headers) {
+				log.Debug("XDPOS2 BlockHeaders: late reply to a timed-out request discarded", "peer", peer.ID()[:8])
+				return nil
+			}
 			return fmt.Errorf("XDPOS2 BlockHeaders: reply with no in-flight request")
 		}
 		anchorIdx := legacyHeaderAnchorIndex(headers, req)
