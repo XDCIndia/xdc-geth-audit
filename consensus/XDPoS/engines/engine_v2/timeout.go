@@ -85,6 +85,12 @@ func (x *XDPoS_v2) VerifyTimeoutMessage(chain consensus.ChainReader, timeoutMsg 
 		return false, err
 	}
 
+	if epochInfo, epochErr := x.getTCEpochInfo(chain, &types.TimeoutCert{Round: timeoutMsg.Round}); epochErr == nil {
+		if err := x.timeoutGapMatchesEpoch(chain, epochInfo, timeoutMsg.Round, timeoutMsg.GapNumber); err != nil {
+			return false, err
+		}
+	}
+
 	timeoutMsg.SetSigner(signer)
 	return verified, nil
 }
@@ -103,6 +109,11 @@ func (x *XDPoS_v2) timeoutHandler(chain consensus.ChainReader, timeout *types.Ti
 			Type:          "timeout",
 			IncomingRound: timeout.Round,
 			CurrentRound:  x.currentRound,
+		}
+	}
+	if epochInfo, epochErr := x.getTCEpochInfo(chain, &types.TimeoutCert{Round: timeout.Round}); epochErr == nil {
+		if err := x.timeoutGapMatchesEpoch(chain, epochInfo, timeout.Round, timeout.GapNumber); err != nil {
+			return err
 		}
 	}
 
@@ -420,6 +431,9 @@ func (x *XDPoS_v2) verifyTC(chain consensus.ChainReader, timeoutCert *types.Time
 	epochInfo, err := x.getTCEpochInfo(chain, timeoutCert)
 	if err != nil {
 		log.Error("[verifyTC] Failed to get TC epoch info", "tcRound", timeoutCert.Round, "error", err)
+		return err
+	}
+	if err := x.timeoutGapMatchesEpoch(chain, epochInfo, timeoutCert.Round, timeoutCert.GapNumber); err != nil {
 		return err
 	}
 
