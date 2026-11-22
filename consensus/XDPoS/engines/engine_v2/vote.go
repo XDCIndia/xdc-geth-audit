@@ -255,7 +255,11 @@ func (x *XDPoS_v2) voteHandler(chain consensus.ChainReader, voteMsg *types.Vote)
 	// Equivocation detection in goroutines — never blocks or alters acceptance (#1478).
 	if x.ForensicsProcessor != nil {
 		go x.ForensicsProcessor.DetectEquivocationInVotePool(voteMsg, x.votePool)
-		go x.ForensicsProcessor.ProcessVoteEquivocation(chain, x, voteMsg)
+		go func() {
+			if err := x.ForensicsProcessor.ProcessVoteEquivocation(chain, x, voteMsg); err != nil {
+				log.Error("[forensics] vote equivocation failed", "err", err)
+			}
+		}()
 	}
 
 	// Get epoch info

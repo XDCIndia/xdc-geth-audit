@@ -120,6 +120,9 @@ func (x *XDPoS_v2) timeoutHandler(chain consensus.ChainReader, timeout *types.Ti
 	// Add to pool
 	numberOfTimeouts, pooledTimeouts := x.timeoutPool.Add(timeout)
 	log.Debug("[timeoutHandler] collected timeout", "count", numberOfTimeouts)
+	if x.ForensicsProcessor != nil {
+		go x.ForensicsProcessor.DetectEquivocationInTimeoutPool(timeout, x.timeoutPool)
+	}
 
 	// Get epoch info
 	epochInfo, err := x.getEpochSwitchInfo(chain, chain.CurrentHeader(), chain.CurrentHeader().Hash())

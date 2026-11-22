@@ -642,7 +642,11 @@ func (x *XDPoS_v2) commitBlocks(chain consensus.ChainReader, proposedBlockHeader
 	// Runs in a goroutine — never blocks or alters block acceptance.
 	if x.ForensicsProcessor != nil {
 		headerQcToBeCommitted := []types.Header{*parentBlock, *proposedBlockHeader}
-		go x.ForensicsProcessor.ForensicsMonitoring(chain, x, headerQcToBeCommitted, *incomingQc)
+		go func() {
+			if err := x.ForensicsProcessor.ForensicsMonitoring(chain, x, headerQcToBeCommitted, *incomingQc); err != nil {
+				log.Error("[forensics] monitoring failed", "err", err)
+			}
+		}()
 	}
 
 	return true, nil

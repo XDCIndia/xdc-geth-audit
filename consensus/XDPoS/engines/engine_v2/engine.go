@@ -243,6 +243,7 @@ func createEngine(chainConfig *params.ChainConfig, db ethdb.Database, minePeriod
 
 		ForensicsProcessor: NewForensics(),
 	}
+	go engine.watchForensics()
 
 	// Set timeout callback
 	timeoutTimer.OnTimeoutFn = engine.OnCountdownTimeout
@@ -3281,6 +3282,29 @@ func (x *XDPoS_v2) getEpochSwitchInfoWithParents(chain consensus.ChainReader, he
 
 // StopBroadcast unblocks own-message sends. Later sends return without
 // waiting for a receiver.
+// watchForensics is the production subscriber for forensics proofs.
+// Proofs are otherwise only written by the sender. The loop ends when
+// broadcast stops.
+func (x *XDPoS_v2) watchForensics() {
+	if x == nil || x.ForensicsProcessor == nil {
+		return
+	}
+	ch := make(chan types.ForensicsEvent, 8)
+	sub := x.ForensicsProcessor.SubscribeForensicsEvent(ch)
+	defer sub.Unsubscribe()
+	for {
+		select {
+		case ev := <-ch:
+			if ev.ForensicsProof == nil {
+				continue
+			}
+			log.Error("[forensics] proof", "id", ev.ForensicsProof.Id, "type", ev.ForensicsProof.ForensicsType)
+		case <-x.broadcastQuit:
+			return
+		}
+	}
+}
+
 func (x *XDPoS_v2) StopBroadcast() {
 	if x == nil || x.broadcastQuit == nil {
 		return
