@@ -299,12 +299,15 @@ func (s *BlockChainAPI) rpcOutputBlockSigners(block *types.Block, ctx context.Co
 	}
 
 	if engine, ok := s.b.Engine().(*XDPoS.XDPoS); ok {
-		// M2 (or V2 creator): always try RecoverValidator when Validator is 65 bytes.
-		if addr, err := engine.RecoverValidator(header); err == nil {
-			addSigner(addr)
-		}
-		// M1 creator: only valid for V1 blocks (Extra ends with a 65-byte seal).
-		if !engine.IsV2Block(header) {
+		if engine.IsV2Block(header) {
+			// The V2 proposer signs the V2 digest. RecoverValidator uses the V1 digest.
+			if addr, err := engine.Author(header); err == nil {
+				addSigner(addr)
+			}
+		} else {
+			if addr, err := engine.RecoverValidator(header); err == nil {
+				addSigner(addr)
+			}
 			if addr, err := engine.RecoverSigner(header); err == nil {
 				addSigner(addr)
 			}
@@ -324,10 +327,10 @@ func (s *BlockChainAPI) findFinalityOfBlock(ctx context.Context, block *types.Bl
 	if block == nil || len(masternodes) == 0 {
 		return 0, nil
 	}
-	// F-2026-19638: a V2 block that a quorum certificate has committed is
-	// final. The engine records that with SetFinalized, which the "finalized"
-	// block tag reads. Report 100 for a canonical V2 block at or below it.
-	if s.isCommittedV2Block(ctx, block) {
+	// A canonical block at or below the finalized head is final. Reporting it
+	// as signer-count over masternode-count stays below 100 when a V1 block
+	// has two seals.
+	if s.isAtOrBelowFinalized(ctx, block) {
 		return 100, nil
 	}
 
@@ -348,13 +351,9 @@ func (s *BlockChainAPI) findFinalityOfBlock(ctx context.Context, block *types.Bl
 	return finality, nil
 }
 
-// isCommittedV2Block reports whether block is an XDPoS V2 block on the
-// canonical chain at or below the finalized (QC-committed) block.
-func (s *BlockChainAPI) isCommittedV2Block(ctx context.Context, block *types.Block) bool {
-	engine, ok := s.b.Engine().(*XDPoS.XDPoS)
-	if !ok || !engine.IsV2Block(block.Header()) {
-		return false
-	}
+// isAtOrBelowFinalized reports whether block is on the canonical chain at or
+// below the finalized head.
+func (s *BlockChainAPI) isAtOrBelowFinalized(ctx context.Context, block *types.Block) bool {
 	final, err := s.b.HeaderByNumber(ctx, rpc.FinalizedBlockNumber)
 	if err != nil || final == nil || block.NumberU64() > final.Number.Uint64() {
 		return false
