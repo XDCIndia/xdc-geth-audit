@@ -892,8 +892,11 @@ func ApplySigningTransaction(config *params.ChainConfig, statedb *state.StateDB,
 		return nil, err
 	}
 	nonce := statedb.GetNonce(from)
-	if nonce != tx.Nonce() {
-		return nil, fmt.Errorf("signing tx nonce mismatch: state=%d tx=%d", nonce, tx.Nonce())
+	if tx.Nonce() < nonce {
+		return nil, fmt.Errorf("%w: signing tx nonce %d, state %d", ErrNonceTooLow, tx.Nonce(), nonce)
+	}
+	if tx.Nonce() > nonce {
+		return nil, fmt.Errorf("%w: signing tx nonce %d, state %d", ErrNonceTooHigh, tx.Nonce(), nonce)
 	}
 	statedb.SetNonce(from, nonce+1, tracing.NonceChangeUnspecified)
 
