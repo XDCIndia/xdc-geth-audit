@@ -180,6 +180,19 @@ func (v *BlockValidator) ValidateBody(block *types.Block) error {
 		}
 	}
 
+	// F-2026-19462: a header batch is verified before its blocks are written, so
+	// HookVerifyMNs cannot read the parent yet and defers the signer list.
+	// Replay that check now. The parent of this block has been written on the
+	// sequential import path. Apothem and a missing parent state stay skipped
+	// inside the hook.
+	if recheck, ok := v.bc.engine.(interface {
+		RecheckV1Validators(*types.Header) error
+	}); ok {
+		if err := recheck.RecheckV1Validators(header); err != nil {
+			return err
+		}
+	}
+
 	// XDC Network: Cache signing transactions for reward calculation.
 	// During initial sync, blocks aren't written to DB before Finalize is called.
 	// We cache signing txs during body validation so they're available for
