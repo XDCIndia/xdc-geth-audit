@@ -539,6 +539,61 @@ func (f *Forensics) isVoteBlamed(chain consensus.ChainReader, highestCommittedQC
 	return false, decodedExtraField.QuorumCert, nil
 }
 
+// DetectEquivocationInTimeoutPool reports two timeouts from one signer in
+// one round. The pool keeps only the first, so the incoming message is
+// compared with what is already stored. This does not change acceptance.
+func (f *Forensics) DetectEquivocationInTimeoutPool(timeout *types.Timeout, timeoutPool *utils.Pool) {
+	if timeout == nil || timeoutPool == nil {
+		return
+	}
+	signer := timeout.GetSigner()
+	if signer == (common.Address{}) {
+		return
+	}
+	for _, k := range timeoutPool.PoolObjKeysList() {
+		keyedRound, err := strconv.ParseInt(strings.Split(k, ":")[0], 10, 64)
+		if err != nil {
+			continue
+		}
+		if types.Round(keyedRound) != timeout.Round {
+			continue
+		}
+		for _, obj := range timeoutPool.GetObjsByKey(k) {
+			other, ok := obj.(*types.Timeout)
+			if !ok || other.GetSigner() != signer {
+				continue
+			}
+			if other.Hash() == timeout.Hash() {
+				continue
+			}
+			f.sendTimeoutEquivocationProof(timeout, other, signer)
+			return
+		}
+	}
+}
+
+func (f *Forensics) sendTimeoutEquivocationProof(a, b *types.Timeout, signer common.Address) {
+	content, err := json.Marshal(map[string]interface{}{
+		"signer": signer,
+		"round":  a.Round,
+		"gapA":   a.GapNumber,
+		"gapB":   b.GapNumber,
+		"hashA":  a.Hash(),
+		"hashB":  b.Hash(),
+	})
+	if err != nil {
+		log.Error("[forensics] timeout proof encode failed", "err", err)
+		return
+	}
+	proof := &types.ForensicProof{
+		Id:            fmt.Sprintf("%x:%d:timeout", signer, a.Round),
+		ForensicsType: "Timeout",
+		Content:       string(content),
+	}
+	log.Error("[forensics] timeout equivocation", "signer", signer, "round", a.Round)
+	go f.forensicsFeed.Send(types.ForensicsEvent{ForensicsProof: proof})
+}
+
 func (f *Forensics) DetectEquivocationInVotePool(vote *types.Vote, votePool *utils.Pool) {
 	poolKey := vote.PoolKey()
 	votePoolKeys := votePool.PoolObjKeysList()
