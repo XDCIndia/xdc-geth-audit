@@ -351,18 +351,30 @@ func (x *XDPoS_v2) verifyHeader(chain consensus.ChainReader, header *types.Heade
 			// the header under verification choose the list its own signer and leader
 			// are then checked against.
 			if !fullVerify {
-				log.Warn("[verifyHeader] masternode set mismatch tolerated (trusting header.Validators)",
-					"block", header.Number.Uint64(),
-					"mnCount", len(masterNodes),
-					"valCount", len(validatorsAddress),
-					"hookPenaltyNil", x.HookPenalty == nil,
-					"snapshotMissing", err != nil && errors.Is(err, utils.ErrV2SnapshotMissing))
-				masterNodes = validatorsAddress
-				localList = false
-				localPenalties = contracts.ExtractAddressFromBytes(header.Penalties)
-				// CertiK XDC-10: the header's lists are trusted here too; recheck
-				// them once the batch is committed.
-				x.pendingSwitchRechecks.Add(header.Hash(), header.Number.Uint64())
+				// While state is still healing and this header is not an in-batch
+				// bulk-sync ancestor, do not take the leader from the header's own
+				// validator list. Any key that list places at the leader index would
+				// otherwise pass. The proposer is checked against the local list.
+				// XdcBulkSyncMode keeps the reduced check below.
+				if core.CheckpointSyncNoStateActive.Load() && !core.XdcBulkSyncMode.Load() {
+					log.Warn("[verifyHeader] epoch-switch validator list differs from the local list; leader stays on the local list",
+						"block", header.Number.Uint64(),
+						"mnCount", len(masterNodes),
+						"valCount", len(validatorsAddress))
+				} else {
+					log.Warn("[verifyHeader] masternode set mismatch tolerated (trusting header.Validators)",
+						"block", header.Number.Uint64(),
+						"mnCount", len(masterNodes),
+						"valCount", len(validatorsAddress),
+						"hookPenaltyNil", x.HookPenalty == nil,
+						"snapshotMissing", err != nil && errors.Is(err, utils.ErrV2SnapshotMissing))
+					masterNodes = validatorsAddress
+					localList = false
+					localPenalties = contracts.ExtractAddressFromBytes(header.Penalties)
+					// CertiK XDC-10: the header's lists are trusted here too; recheck
+					// them once the batch is committed.
+					x.pendingSwitchRechecks.Add(header.Hash(), header.Number.Uint64())
+				}
 			} else {
 				log.Warn("[verifyHeader DIAG]",
 					"block", header.Number.Uint64(),
