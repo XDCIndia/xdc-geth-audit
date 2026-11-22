@@ -37,6 +37,51 @@ import (
 // maxTimeFutureBlocks) a gossiped block may be and still be handled when due.
 const maxNewBlockDelay = 30 * time.Second
 
+const (
+	// maxParkedNewBlocks bounds the future-timestamp blocks waiting on a timer,
+	// in total. Each peer may park one (XDC-HUNT-02).
+	maxParkedNewBlocks = 16
+	// maxInvalidNewBlocks is how many definitively invalid NewBlocks a peer may
+	// send before it is disconnected (XDC-HUNT-03).
+	maxInvalidNewBlocks = 5
+	// maxTrackedInvalidPeers bounds the per-peer invalid-block counters.
+	maxTrackedInvalidPeers = 1024
+)
+
+var errTooManyInvalidBlocks = errors.New("too many invalid NewBlock packets")
+
+// parkNewBlock reserves a timer slot for peer. It refuses when the peer already
+// has a parked block or the total limit is reached.
+func (h *ethHandler) parkNewBlock(peerID string) bool {
+	h.newBlockMu.Lock()
+	defer h.newBlockMu.Unlock()
+	if _, ok := h.parkedBlocks[peerID]; ok || len(h.parkedBlocks) >= maxParkedNewBlocks {
+		return false
+	}
+	h.parkedBlocks[peerID] = struct{}{}
+	return true
+}
+
+func (h *ethHandler) unparkNewBlock(peerID string) {
+	h.newBlockMu.Lock()
+	delete(h.parkedBlocks, peerID)
+	h.newBlockMu.Unlock()
+}
+
+// noteInvalidNewBlock counts one invalid NewBlock from the peer and returns an
+// error once the peer is over the limit, which disconnects it.
+func (h *ethHandler) noteInvalidNewBlock(peerID string, err error) error {
+	h.newBlockMu.Lock()
+	n, _ := h.invalidBlocks.Get(peerID)
+	n++
+	h.invalidBlocks.Add(peerID, n)
+	h.newBlockMu.Unlock()
+	if n > maxInvalidNewBlocks {
+		return fmt.Errorf("%w: %v", errTooManyInvalidBlocks, err)
+	}
+	return nil
+}
+
 // ethHandler implements the eth.Backend interface to handle the various network
 // packets that are sent as replies or broadcasts.
 type ethHandler handler
@@ -217,7 +262,16 @@ func (h *ethHandler) Handle(peer *eth.Peer, packet eth.Packet) error {
 		// with ErrFutureBlock, so the assigned M2 never co-signs it and the
 		// un-co-signed block later arrives through the syncer.
 		if delay := time.Until(time.Unix(int64(block.Time()), 0)); delay > 0 && delay <= maxNewBlockDelay {
+			// Cheap checks first, so a peer cannot park junk (XDC-HUNT-02): only a
+			// block at head or head+1 that we do not have is worth waiting for, and
+			// each peer may park one at a time, a few in total.
+			cur := h.chain.CurrentBlock()
+			if cur == nil || block.NumberU64() < cur.Number.Uint64() || block.NumberU64() > cur.Number.Uint64()+1 ||
+				h.chain.HasBlock(block.Hash(), block.NumberU64()) || !h.parkNewBlock(peer.ID()) {
+				return nil
+			}
 			time.AfterFunc(delay, func() {
+				h.unparkNewBlock(peer.ID())
 				select {
 				case <-h.quitSync:
 					return // handler stopped — skip
@@ -292,9 +346,21 @@ func (h *ethHandler) Handle(peer *eth.Peer, packet eth.Packet) error {
 				"block", block.NumberU64(), "hash", block.Hash())
 			return nil
 		}
+		// Check the header before InsertChain: InsertChain recovers every
+		// transaction sender first and writes a bad-block record on failure, a
+		// cost the sender chooses (XDC-HUNT-03). The engine caches the result, so
+		// the check in InsertChain is cheap after this.
+		if err := h.chain.Engine().VerifyHeader(h.chain, block.Header()); err != nil && isDefinitiveInvalidBlockError(err) {
+			peer.Log().Debug("XDC NewBlock: invalid header",
+				"block", block.NumberU64(), "hash", block.Hash(), "err", err)
+			return h.noteInvalidNewBlock(peer.ID(), err)
+		}
 		if _, err := h.chain.InsertChain(types.Blocks{block}); err != nil {
 			peer.Log().Debug("XDC NewBlock: InsertChain failed",
 				"block", block.NumberU64(), "hash", block.Hash(), "err", err)
+			if isDefinitiveInvalidBlockError(err) {
+				return h.noteInvalidNewBlock(peer.ID(), err)
+			}
 			return nil // don't drop peer for transient insert failures
 		}
 		peer.Log().Debug("XDC NewBlock: tip extended",
