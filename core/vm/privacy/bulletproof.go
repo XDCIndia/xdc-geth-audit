@@ -1199,10 +1199,13 @@ func MRPVerify(mrp *MultiRangeProof, abort ...func() bool) bool {
 	if proofAborted(abort) {
 		return false
 	}
-	EC = genECPrimeGroupKey(m*bitsPerValue, abort...)
-	if proofAborted(abort) || EC.N == nil {
+	// Build into a local value. An aborted build returns an empty value and
+	// must not replace the shared EC.
+	ecp := genECPrimeGroupKey(m*bitsPerValue, abort...)
+	if proofAborted(abort) || ecp.N == nil {
 		return false
 	}
+	EC = ecp
 
 	//changes:
 	// check 1 changes since it includes all commitments
