@@ -38,18 +38,20 @@ func NewPool() *Pool {
 	}
 }
 
-// roundOfPoolKey returns the round field, which is the first ':'-separated
-// component of a vote or timeout pool key.
-func roundOfPoolKey(key string) (string, bool) {
-	round, _, ok := strings.Cut(key, ":")
+// signerSlotID names the one slot that a recovered signer may hold. For a vote
+// (key round:gap:number:hash) the slot is per round, across every block, gap
+// and number. For a timeout (key round:gap) it is per round and gap: a signer
+// that sends its timeout again with the gap number of a new epoch inside one
+// round is an honest signer, and canonical keeps both entries (#2089).
+func signerSlotID(signer common.Address, key string) (string, bool) {
+	round, rest, ok := strings.Cut(key, ":")
 	if !ok || round == "" {
 		return "", false
 	}
-	return round, true
-}
-
-func signerRoundID(signer common.Address, round string) string {
-	return signer.Hex() + ":" + round
+	if !strings.Contains(rest, ":") {
+		return signer.Hex() + ":" + key, true
+	}
+	return signer.Hex() + ":" + round, true
 }
 
 // Add adds an object to the pool
@@ -77,8 +79,8 @@ func (p *Pool) Add(obj PoolObj) (int, map[common.Hash]PoolObj) {
 	// the same round is dropped (XDC-07, F-2026-20590).
 	incomingSigner := obj.GetSigner()
 	if incomingSigner != (common.Address{}) {
-		if round, ok := roundOfPoolKey(key); ok {
-			if _, held := p.signerRound[signerRoundID(incomingSigner, round)]; held {
+		if id, ok := signerSlotID(incomingSigner, key); ok {
+			if _, held := p.signerRound[id]; held {
 				if len(p.pool[key]) == 0 {
 					delete(p.pool, key)
 				}
@@ -104,8 +106,8 @@ func (p *Pool) Add(obj PoolObj) (int, map[common.Hash]PoolObj) {
 	if _, exists := p.pool[key][hash]; !exists {
 		p.pool[key][hash] = obj
 		if incomingSigner != (common.Address{}) {
-			if round, ok := roundOfPoolKey(key); ok {
-				p.signerRound[signerRoundID(incomingSigner, round)] = key
+			if id, ok := signerSlotID(incomingSigner, key); ok {
+				p.signerRound[id] = key
 			}
 		}
 	}
@@ -174,16 +176,12 @@ func (p *Pool) Clear() {
 func (p *Pool) ClearByPoolKey(key string) {
 	p.lock.Lock()
 	defer p.lock.Unlock()
-	if objs := p.pool[key]; objs != nil {
-		if round, ok := roundOfPoolKey(key); ok {
-			for _, obj := range objs {
-				if signer := obj.GetSigner(); signer != (common.Address{}) {
-					id := signerRoundID(signer, round)
-					if p.signerRound[id] == key {
-						delete(p.signerRound, id)
-					}
-				}
-			}
+	// Drop every slot that points at this key. Do not look the slots up by the
+	// stored objects: verifyVotes blanks a vote's signer after it was pooled,
+	// which would leave its slot behind (#2089).
+	for id, k := range p.signerRound {
+		if k == key {
+			delete(p.signerRound, id)
 		}
 	}
 	delete(p.pool, key)
