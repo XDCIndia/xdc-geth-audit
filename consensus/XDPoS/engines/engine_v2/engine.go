@@ -2560,7 +2560,12 @@ func (x *XDPoS_v2) getExtraFields(chain consensus.ChainReader, header *types.Hea
 func decodeMasternodesFromHeaderExtra(header *types.Header) []common.Address {
 	extraVanity := 32
 	extraSeal := 65
-	masternodes := make([]common.Address, (len(header.Extra)-extraVanity-extraSeal)/common.AddressLength)
+	// Same guards as canonical XDPoSChain engine_v2/utils.go decodeMasternodesFromHeaderExtra.
+	payload := len(header.Extra) - extraVanity - extraSeal
+	if payload < 0 || payload%common.AddressLength != 0 {
+		return nil
+	}
+	masternodes := make([]common.Address, payload/common.AddressLength)
 	for i := 0; i < len(masternodes); i++ {
 		copy(masternodes[i][:], header.Extra[extraVanity+i*common.AddressLength:])
 	}
