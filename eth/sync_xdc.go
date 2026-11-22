@@ -738,8 +738,7 @@ func (s *xdcSyncer) loop() {
 				// heartbeat sampling instant, so the strict `cur >= maxPeerHead`
 				// never accumulates 3 consecutive ticks and XdcBulkSyncMode never
 				// clears — which keeps a producer's miner gate 3 closed forever.
-				const tipAtPeerTolerance = 3
-				peerAtTip := maxPeerHead > 0 && cur+tipAtPeerTolerance >= maxPeerHead
+				peerAtTip := peerAdvertisesTip(cur, maxPeerHead, s.networkTipSeen.Load())
 
 				// #190: peer-independent at-tip signal via head-timestamp freshness.
 				// Legacy XDPoSChain peers speak xpos2/100 and do NOT send the
@@ -854,6 +853,22 @@ func (s *xdcSyncer) loop() {
 			}
 		}
 	}
+}
+
+// tipAtPeerTolerance is how many blocks below the peer-advertised max a synced
+// node may be at the heartbeat sampling instant (#190).
+const tipAtPeerTolerance = 3
+
+// peerAdvertisesTip reports whether the peer-advertised head says the node is at
+// tip: some non-XDPOS2 peer advertised a head and cur is within
+// tipAtPeerTolerance of the best known tip. The advertised head is the peer's
+// word, so a low value must not end bulk-sync mode on its own: the best tip also
+// counts the syncer's verified networkTipSeen, which includes the XDPOS2 peers
+// that never send a block range (same rule as peersConfirmAtTip, #1884). Without
+// it, the only eth/69 peer advertising a head at or below ours ended bulk-sync
+// mode for a node that was far behind (XDC-HUNT-05).
+func peerAdvertisesTip(cur, maxPeerHead, networkTip uint64) bool {
+	return maxPeerHead > 0 && cur+tipAtPeerTolerance >= max(maxPeerHead, networkTip)
 }
 
 // maybeSync runs syncOnce single-flight, with panic recovery so a BigBalance
