@@ -96,6 +96,14 @@ func (v *BlockValidator) ValidateBody(block *types.Block) error {
 	// Blob transactions may be present after the Cancun fork.
 	var blobs int
 	for i, tx := range block.Transactions() {
+		// XDC has no blob transactions: canonical XDPoSChain has no type 3 in
+		// its transaction decoder (core/types/transaction.go decodeTyped), so
+		// it cannot decode a block that holds one. The Prague signer recovers
+		// the type here, and a type 3 tx to 0x89 or 0x91-0x94 skips every
+		// blob check of the state transition, so reject it for all routes.
+		if v.config.IsXDC() && tx.Type() == types.BlobTxType {
+			return fmt.Errorf("blob transaction at index %d: %w", i, ErrTxTypeNotSupported)
+		}
 		// Count the number of blobs to validate against the header's blobGasUsed
 		blobs += len(tx.BlobHashes())
 
