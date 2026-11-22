@@ -78,6 +78,11 @@ type XDPoS_v2 struct {
 	lock     sync.RWMutex
 	signLock sync.RWMutex
 
+	// broadcastQuit is closed by StopBroadcast. A send that starts after that
+	// returns instead of blocking on BroadcastCh.
+	broadcastQuit chan struct{}
+	broadcastStop sync.Once
+
 	// Channels
 	BroadcastCh  chan interface{}
 	minePeriodCh chan int
@@ -206,6 +211,7 @@ func createEngine(chainConfig *params.ChainConfig, db ethdb.Database, minePeriod
 
 		timeoutWorker: timeoutTimer,
 		BroadcastCh:   make(chan interface{}),
+		broadcastQuit: make(chan struct{}),
 		minePeriodCh:  minePeriodCh,
 		newRoundCh:    newRoundCh,
 
@@ -3219,11 +3225,32 @@ func (x *XDPoS_v2) getEpochSwitchInfoWithParents(chain consensus.ChainReader, he
 	return info, nil
 }
 
-// Broadcast sends a message to the BFT channel
+// StopBroadcast unblocks own-message sends. Later sends return without
+// waiting for a receiver.
+func (x *XDPoS_v2) StopBroadcast() {
+	if x == nil || x.broadcastQuit == nil {
+		return
+	}
+	x.broadcastStop.Do(func() { close(x.broadcastQuit) })
+}
+
+// Broadcast sends a message to the BFT channel.
 func (x *XDPoS_v2) broadcastToBftChannel(msg interface{}) {
-	go func() {
+	go x.deliverBroadcast(msg)
+}
+
+// deliverBroadcast sends msg to BroadcastCh, or returns when StopBroadcast
+// has closed broadcastQuit. An unbuffered send with no receiver would
+// otherwise block the goroutine after the dispatcher has stopped.
+func (x *XDPoS_v2) deliverBroadcast(msg interface{}) {
+	if x.broadcastQuit == nil {
 		x.BroadcastCh <- msg
-	}()
+		return
+	}
+	select {
+	case x.BroadcastCh <- msg:
+	case <-x.broadcastQuit:
+	}
 }
 
 // getSyncInfo returns current sync info
