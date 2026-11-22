@@ -262,6 +262,11 @@ type LegacyPool struct {
 	pendingNonces *noncer                      // Pending state tracking virtual nonces
 	reserver      txpool.Reserver              // Address reserver to ensure exclusivity across subpools
 
+	// trc21Capacity is the TRC21 fee capacity of every registered token at the
+	// current head. It is built once per head, as canonical does (pool.reset),
+	// and not for each admitted tx under the pool lock. Guarded by mu.
+	trc21Capacity map[common.Address]*big.Int
+
 	pending map[common.Address]*list // All currently processable transactions
 	queue   *queue
 	all     *lookup     // All transactions to allow lookups
@@ -353,6 +358,7 @@ func (pool *LegacyPool) Init(gasTip uint64, head *types.Header, reserver txpool.
 	}
 	pool.currentHead.Store(head)
 	pool.currentState = statedb
+	pool.trc21Capacity = state.GetTRC21FeeCapacityFromState(statedb)
 	pool.pendingNonces = newNoncer(statedb)
 
 	pool.wg.Add(1)
@@ -615,7 +621,7 @@ func (pool *LegacyPool) trc21Data() (map[common.Address]*big.Int, func(*types.Tr
 	if pool.currentState == nil || !pool.chainconfig.IsXDC() {
 		return nil, nil
 	}
-	issuers := state.GetTRC21FeeCapacityFromState(pool.currentState)
+	issuers := pool.trc21Capacity
 	if len(issuers) == 0 {
 		return nil, nil
 	}
@@ -678,7 +684,7 @@ func (pool *LegacyPool) validateTx(tx *types.Transaction) error {
 		// core/txpool/legacypool/legacypool.go:622 trc21FeeCapacity). Config
 		// and the head number also drive the gas-price tier floor (Gas50x /
 		// Gas2500x).
-		Trc21FeeCapacity: state.GetTRC21FeeCapacityFromState(pool.currentState),
+		Trc21FeeCapacity: pool.trc21Capacity,
 		Config:           pool.chainconfig,
 		CurrentNumber: func() *big.Int {
 			if head := pool.currentHead.Load(); head != nil {
@@ -1612,12 +1618,12 @@ func (pool *LegacyPool) runReorg(done chan struct{}, reset *txpoolResetRequest, 
 		// not operate on stale currentState / pendingNonces for the requested head.
 		var capacityBefore map[common.Address]*big.Int
 		if blockSenders != nil && pool.currentState != nil {
-			capacityBefore = state.GetTRC21FeeCapacityFromState(pool.currentState)
+			capacityBefore = pool.trc21Capacity
 		}
 		resetOK = pool.reset(reset.oldHead, reset.newHead, preState)
 
 		if resetOK && blockSenders != nil && capacityBefore != nil && pool.currentState != nil {
-			reduced := reducedTRC21Issuers(capacityBefore, state.GetTRC21FeeCapacityFromState(pool.currentState))
+			reduced := reducedTRC21Issuers(capacityBefore, pool.trc21Capacity)
 			for _, addr := range accountsSendingTo(pool.pending, reduced) {
 				if _, seen := blockSenders[addr]; seen {
 					continue
@@ -1846,6 +1852,7 @@ func (pool *LegacyPool) reset(oldHead, newHead *types.Header, preState *state.St
 	}
 	pool.currentHead.Store(newHead)
 	pool.currentState = statedb
+	pool.trc21Capacity = state.GetTRC21FeeCapacityFromState(statedb)
 	pool.pendingNonces = newNoncer(statedb)
 
 	// XDC: empty-route txs (0x91-0x94) do not advance the sender's nonce
