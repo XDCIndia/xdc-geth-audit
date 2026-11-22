@@ -2609,6 +2609,11 @@ func DecodeExtraFields(extra []byte, decoded *types.ExtraFields_v2) error {
 	if len(extra) < 1 {
 		return errors.New("extra too short")
 	}
+	// Canonical DecodeBytesExtraFields refuses an extra field above 20 KiB
+	// (consensus/XDPoS/utils/utils.go:80-84).
+	if len(extra) > utils.MaxV2ExtraSize {
+		return errors.New("extra field is too long")
+	}
 	if extra[0] != 2 {
 		return errors.New("not V2 extra format")
 	}
