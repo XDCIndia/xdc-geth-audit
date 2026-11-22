@@ -2835,15 +2835,27 @@ func (s *xdcSyncer) fullSyncOnce() {
 	for i, h := range headers {
 		hashes[i] = h.Hash()
 	}
-	bodies := s.fetchBodiesHedged(peer, candidates, hashes)
+	bodies, hedgeFailed := s.fetchBodiesHedged(peer, candidates, hashes)
 	if len(bodies) == 0 {
-		log.Debug("xdcSyncer: empty body batch", "headers", len(headers))
+		// The header-race winner delivered no bodies and the hedge did not
+		// either. Taint that peer so the next round can be won by someone else.
+		// A parent check here would not help: the winner can set ParentHash to
+		// the public head hash and still withhold the bodies.
+		if hedgeFailed {
+			s.taintPeer(peer)
+		}
+		log.Debug("xdcSyncer: empty body batch", "headers", len(headers), "hedgeFailed", hedgeFailed)
 		return
 	}
 
 	blocks := s.buildBlocks(headers, bodies)
 	if len(blocks) == 0 {
-		log.Debug("xdcSyncer: no valid blocks to import")
+		// Bodies arrived but none matched their headers, and the hedge failed
+		// as well. Same taint: this peer should not win the next race.
+		if hedgeFailed {
+			s.taintPeer(peer)
+		}
+		log.Debug("xdcSyncer: no valid blocks to import", "hedgeFailed", hedgeFailed)
 		return
 	}
 	if blocks = s.dropAwaitingM2(blocks); len(blocks) == 0 {
@@ -5715,7 +5727,7 @@ func (s *xdcSyncer) bodyRankedCandidates(candidates []*eth.Peer) []*eth.Peer {
 // idle candidate after xdcBodyHedgeDelay if primary has not responded.
 // Hard deadline is xdcBulkReqTimeout. Updates per-peer body statistics.
 // Respects XDCBodyReqMu serialisation per peer (SYNC-12 refs #1869, #1858).
-func (s *xdcSyncer) fetchBodiesHedged(primary *eth.Peer, candidates []*eth.Peer, hashes []common.Hash) []eth.BlockBody {
+func (s *xdcSyncer) fetchBodiesHedged(primary *eth.Peer, candidates []*eth.Peer, hashes []common.Hash) ([]eth.BlockBody, bool) {
 	type bodyResult struct {
 		bodies   []eth.BlockBody
 		peerID   string
@@ -5760,7 +5772,9 @@ func (s *xdcSyncer) fetchBodiesHedged(primary *eth.Peer, candidates []*eth.Peer,
 		case res := <-ch:
 			s.recordBodyStat(res.peerID, res.lat, res.timedOut)
 			if len(res.bodies) > 0 {
-				return res.bodies
+				// A peer delivered bodies. The hedge is not a failure when it
+				// was not required, and not a failure when it produced them.
+				return res.bodies, false
 			}
 			// Primary returned early with no bodies — start hedge immediately.
 			startHedge()
@@ -5769,21 +5783,22 @@ func (s *xdcSyncer) fetchBodiesHedged(primary *eth.Peer, candidates []*eth.Peer,
 				select {
 				case res2 := <-ch:
 					s.recordBodyStat(res2.peerID, res2.lat, res2.timedOut)
-					return res2.bodies // may be nil
+					// hedgeFailed is true when the hedge also returned nothing.
+					return res2.bodies, len(res2.bodies) == 0
 				case <-deadline.C:
-					return nil
+					return nil, true
 				case <-s.quitCh:
-					return nil
+					return nil, true
 				}
 			}
-			return nil
+			return nil, true
 		case <-hedge.C:
 			startHedge()
 		case <-deadline.C:
 			s.recordBodyStat(primary.ID(), xdcBulkReqTimeout, true)
-			return nil
+			return nil, true
 		case <-s.quitCh:
-			return nil
+			return nil, true
 		}
 	}
 }
