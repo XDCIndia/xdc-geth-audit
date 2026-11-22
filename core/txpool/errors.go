@@ -88,6 +88,12 @@ var (
 	// current masternode signer. Mirrors XDPoSChain core/txpool/errors.go.
 	ErrSpecialTxNotFromSigner = errors.New("special transaction sender is not a signer")
 
+	// ErrSpecialTxNonZeroCost is returned when a special transaction carries a
+	// non-zero value or gas price. Those transactions are defined to be
+	// gasless; a non-zero cost is not added to the account list total on the
+	// signer fast path, and the later subtraction panics the pool.
+	ErrSpecialTxNonZeroCost = errors.New("special transaction must have zero value and zero gas price")
+
 	// ErrUnderMinGasPrice is returned when a non-special XDC transaction's gas
 	// price is below the XDC tier minimum (Gas50x or Gas2500x). Mirrors
 	// XDPoSChain core/txpool/validation.go ErrUnderMinGasPrice.
