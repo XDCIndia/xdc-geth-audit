@@ -70,7 +70,16 @@ func AttachConsensusV1Hooks(adaptor *XDPoS.XDPoS, bc *core.BlockChain, chainConf
 	// canonical history. Apothem (chain 51) stays skipped for every V1
 	// checkpoint, through the V2 switch at block 56,828,700, because canonical
 	// never enforced this field there.
+	//
+	// The list is bounded. When it is full the oldest entry is dropped, not the
+	// new one: an old entry is one whose block never reached body validation
+	// (header-only sync, a rejected batch), and the new header is the one that
+	// body validation will ask about (#2084). The check cannot be an error
+	// here: header-only sync of V1 history defers every checkpoint and never
+	// rechecks it, so an error would stop that sync at the 33rd checkpoint.
+	const maxDeferredSigners = 32
 	deferredSigners := make(map[common.Hash][]common.Address)
+	var deferredOrder []common.Hash // keys of deferredSigners, oldest first
 	var deferredMu sync.Mutex
 
 	// HookVerifyMNs: verifies the Validators field at epoch checkpoints against
@@ -110,9 +119,15 @@ func AttachConsensusV1Hooks(adaptor *XDPoS.XDPoS, bc *core.BlockChain, chainConf
 			log.Warn("[V1 HookVerifyMNs] parent header unknown, deferring validator check", "number", number)
 			hookVerifyMNsMissingStateSkips.Inc(1)
 			deferredMu.Lock()
-			if len(deferredSigners) < 32 {
-				deferredSigners[header.Hash()] = append([]common.Address(nil), signers...)
+			hash := header.Hash()
+			if _, known := deferredSigners[hash]; !known {
+				if len(deferredOrder) >= maxDeferredSigners {
+					delete(deferredSigners, deferredOrder[0])
+					deferredOrder = deferredOrder[1:]
+				}
+				deferredOrder = append(deferredOrder, hash)
 			}
+			deferredSigners[hash] = append([]common.Address(nil), signers...)
 			deferredMu.Unlock()
 			return nil
 		}
@@ -133,9 +148,16 @@ func AttachConsensusV1Hooks(adaptor *XDPoS.XDPoS, bc *core.BlockChain, chainConf
 	}
 	adaptor.HookRecheckV1Validators = func(header *types.Header) error {
 		deferredMu.Lock()
-		signers, ok := deferredSigners[header.Hash()]
+		hash := header.Hash()
+		signers, ok := deferredSigners[hash]
 		if ok {
-			delete(deferredSigners, header.Hash())
+			delete(deferredSigners, hash)
+			for i, h := range deferredOrder {
+				if h == hash {
+					deferredOrder = append(deferredOrder[:i], deferredOrder[i+1:]...)
+					break
+				}
+			}
 		}
 		deferredMu.Unlock()
 		if !ok {
