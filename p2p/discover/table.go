@@ -151,7 +151,7 @@ func newTable(t transport, db *enode.DB, cfg Config) (*Table, error) {
 	if err := tab.setFallbackNodes(cfg.Bootnodes); err != nil {
 		return nil, err
 	}
-	tab.loadSeedNodes()
+	tab.loadSeedNodes(false)
 
 	return tab, nil
 }
@@ -484,8 +484,9 @@ func (tab *Table) doRefresh(done chan struct{}) {
 
 	// Load nodes from the database and insert
 	// them. This should yield a few previously seen nodes that are
-	// (hopefully) still alive.
-	tab.loadSeedNodes()
+	// (hopefully) still alive. Seeds go through the table loop so the
+	// revalidation list is not updated on this goroutine.
+	tab.loadSeedNodes(true)
 
 	// Run self lookup to discover new neighbor nodes.
 	tab.net.lookupSelf()
@@ -501,7 +502,11 @@ func (tab *Table) doRefresh(done chan struct{}) {
 	}
 }
 
-func (tab *Table) loadSeedNodes() {
+// loadSeedNodes inserts seed nodes. viaLoop is set when the table loop is
+// already running: the add is delivered to that loop, which owns the
+// revalidation list. The constructor calls this before the loop starts and
+// inserts directly.
+func (tab *Table) loadSeedNodes(viaLoop bool) {
 	seeds := tab.db.QuerySeeds(seedCount, seedMaxAge)
 	seeds = append(seeds, tab.nursery...)
 	for i := range seeds {
@@ -510,6 +515,10 @@ func (tab *Table) loadSeedNodes() {
 			age := time.Since(tab.db.LastPongReceived(seed.ID(), seed.IPAddr()))
 			addr, _ := seed.UDPEndpoint()
 			tab.log.Trace("Found seed node in database", "id", seed.ID(), "addr", addr, "age", age)
+		}
+		if viaLoop {
+			tab.addFoundNode(seed, false)
+			continue
 		}
 		tab.mutex.Lock()
 		tab.handleAddNode(addNodeOp{node: seed, isInbound: false})

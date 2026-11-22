@@ -30,7 +30,10 @@ import (
 // and checks that v5 traffic forwarded through the shared connection is neither
 // counted as bad v4 traffic nor counted twice in the ingress meter.
 func TestMetricsSharedSocket(t *testing.T) {
-	metrics.Enable()
+	// Enable is not safe to call again while the meter ticker is running.
+	if !metrics.Enabled() {
+		metrics.Enable()
+	}
 
 	key := newkey()
 	db, _ := enode.OpenDB("")
