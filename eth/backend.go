@@ -602,6 +602,7 @@ func New(stack *node.Node, config *ethconfig.Config) (*Ethereum, error) {
 			}, chainReader, chainHeightFn)
 			b.SetConsensusFns(v2)
 			b.SetBroadcastCh(v2.BroadcastCh)
+			b.SetBroadcastStopper(v2.StopBroadcast)
 			if chainConfig.XDPoS != nil {
 				b.SetEpoch(chainConfig.XDPoS.Epoch)
 			}

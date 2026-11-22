@@ -1891,6 +1891,11 @@ func (c *XDPoS) SealHash(header *types.Header) common.Hash {
 
 // Close implements consensus.Engine.
 func (c *XDPoS) Close() error {
+	if c != nil && c.EngineV2 != nil {
+		if stop, ok := c.EngineV2.(interface{ StopBroadcast() }); ok {
+			stop.StopBroadcast()
+		}
+	}
 	return nil
 }
 

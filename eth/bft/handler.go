@@ -100,9 +100,10 @@ type Bfter struct {
 	engine      EngineV2
 	chainHeight ChainHeightFn
 
-	broadcast   BroadcastFns
-	broadcastCh chan interface{}
-	quit        chan struct{}
+	broadcast     BroadcastFns
+	broadcastCh   chan interface{}
+	quit          chan struct{}
+	stopBroadcast func()
 
 	// fwdQueue is the bounded forward queue shared by the inbound-forward path
 	// (Vote/Timeout/SyncInfo) and the engine-broadcast loop.
@@ -154,6 +155,12 @@ func (b *Bfter) SetBroadcastCh(ch chan interface{}) {
 	if ch != nil {
 		b.broadcastCh = ch
 	}
+}
+
+// SetBroadcastStopper is called from Stop so an own-message send that starts
+// after the dispatcher has exited does not block.
+func (b *Bfter) SetBroadcastStopper(stop func()) {
+	b.stopBroadcast = stop
 }
 
 // SetEpoch records the chain's epoch length, used in the timeout-distance
@@ -325,6 +332,9 @@ func (b *Bfter) Start() {
 // Stop terminates the loop and all workers.
 func (b *Bfter) Stop() {
 	close(b.quit)
+	if b.stopBroadcast != nil {
+		b.stopBroadcast()
+	}
 }
 
 // broadcastWorker drains fwdQueue and delivers each message to the broadcast
