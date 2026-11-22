@@ -7,6 +7,8 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"reflect"
 	"sort"
 	"strconv"
@@ -137,4 +139,32 @@ func RlpHash(x interface{}) (h common.Hash) {
 	}
 	hw.Sum(h[:0])
 	return h
+}
+
+// WriteFileAtomic writes data to path through a temporary file in the same
+// directory and a rename, so a reader or a crash never sees a cut-short file.
+// The temporary file name starts with a dot, so it is not taken for a
+// "<number>.<hash>" reward file.
+func WriteFileAtomic(path string, data []byte, perm os.FileMode) error {
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".tmp-")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	if _, err = tmp.Write(data); err == nil {
+		err = tmp.Sync()
+	}
+	if cerr := tmp.Close(); err == nil {
+		err = cerr
+	}
+	if err == nil {
+		err = os.Chmod(tmpName, perm)
+	}
+	if err == nil {
+		err = os.Rename(tmpName, path)
+	}
+	if err != nil {
+		os.Remove(tmpName)
+	}
+	return err
 }

@@ -10,7 +10,6 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
-	"os"
 	"path/filepath"
 	"strconv"
 	"sync"
@@ -3724,7 +3723,7 @@ func (x *XDPoS_v2) saveRewardToFile(blockHash common.Hash, blockNumber uint64) {
 		return
 	}
 	filename := strconv.FormatUint(blockNumber, 10) + "." + blockHash.Hex()
-	if err = os.WriteFile(filepath.Join(common.StoreRewardFolder, filename), data, 0644); err != nil {
+	if err = utils.WriteFileAtomic(filepath.Join(common.StoreRewardFolder, filename), data, 0644); err != nil {
 		log.Error("[saveRewardToFile] Error writing reward file", "filename", filename, "err", err)
 	}
 }
