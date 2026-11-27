@@ -40,6 +40,8 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/fdlimit"
 	"github.com/ethereum/go-ethereum/common/hexutil"
+	"github.com/ethereum/go-ethereum/consensus"
+	"github.com/ethereum/go-ethereum/consensus/XDPoS"
 	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/core/history"
 	"github.com/ethereum/go-ethereum/core/rawdb"
@@ -53,6 +55,7 @@ import (
 	"github.com/ethereum/go-ethereum/eth/fetcher"
 	"github.com/ethereum/go-ethereum/eth/filters"
 	"github.com/ethereum/go-ethereum/eth/gasprice"
+	"github.com/ethereum/go-ethereum/eth/hooks"
 	"github.com/ethereum/go-ethereum/eth/syncer"
 	"github.com/ethereum/go-ethereum/eth/tracers"
 	"github.com/ethereum/go-ethereum/ethdb"
@@ -2912,8 +2915,20 @@ func MakeChain(ctx *cli.Context, stack *node.Node, readonly bool) (*core.BlockCh
 	if err != nil {
 		Fatalf("Can't create BlockChain: %v", err)
 	}
+	attachXDPoSV1Hooks(engine, chain, config)
 
 	return chain, chainDb
+}
+
+// attachXDPoSV1Hooks wires the XDPoS V1 consensus hooks the way the eth backend
+// does (eth/backend.go), so import, export and replay verify V1 blocks like live
+// sync does. Without them a V1 checkpoint whose gap snapshot disagrees with the
+// header has no contract fallback (canonical engine_v1/engine.go:255-268) and
+// canonical history is rejected (mainnet block 469,800 on geth import).
+func attachXDPoSV1Hooks(engine consensus.Engine, chain *core.BlockChain, config *params.ChainConfig) {
+	if xdposEngine, ok := engine.(*XDPoS.XDPoS); ok {
+		hooks.AttachConsensusV1Hooks(xdposEngine, chain, config)
+	}
 }
 
 // MakeConsolePreloads retrieves the absolute paths for the console JavaScript

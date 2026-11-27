@@ -58,6 +58,22 @@ const (
 	importBatchSize = 2500
 )
 
+// importCheckpointEpoch returns the epoch length of an XDPoS chain, or 0 when
+// ImportChain may batch freely. InsertChain verifies the headers of a batch
+// before it executes any block of it. A V1 checkpoint is checked against state
+// that executing earlier blocks produces: the gap snapshot written when its gap
+// block (Gap blocks before) runs, and the penalties, which read the signing
+// state of the whole epoch at the chain head. ImportChain therefore starts a
+// new batch at every checkpoint, so the head is the block before the
+// checkpoint when it is verified. Live sync reaches the same state because it
+// inserts blocks as they arrive.
+func importCheckpointEpoch(config *params.ChainConfig) uint64 {
+	if config != nil && config.XDPoS != nil {
+		return config.XDPoS.Epoch
+	}
+	return 0
+}
+
 // exportBlock is the on-disk representation used by geth export and import.
 //
 // It intentionally differs from types.Block's network encoding: a block access
@@ -226,7 +242,9 @@ func ImportChain(chain *core.BlockChain, fn string) error {
 	stream := rlp.NewStream(reader, 0)
 
 	// Run actual the import.
+	epoch := importCheckpointEpoch(chain.Config())
 	blocks := make(types.Blocks, importBatchSize)
+	var pending *types.Block // first block of the next batch
 	n := 0
 	for batch := 0; ; batch++ {
 		// Load a batch of RLP blocks.
@@ -235,17 +253,26 @@ func ImportChain(chain *core.BlockChain, fn string) error {
 		}
 		i := 0
 		for ; i < importBatchSize; i++ {
-			var record exportBlock
-			if err := stream.Decode(&record); err == io.EOF {
-				break
-			} else if err != nil {
-				return fmt.Errorf("at block %d: %v", n, err)
+			b := pending
+			pending = nil
+			if b == nil {
+				var record exportBlock
+				if err := stream.Decode(&record); err == io.EOF {
+					break
+				} else if err != nil {
+					return fmt.Errorf("at block %d: %v", n, err)
+				}
+				b = record.block()
 			}
-			b := record.block()
 			// don't import first block
 			if b.NumberU64() == 0 {
 				i--
 				continue
+			}
+			// A checkpoint starts a batch (see importCheckpointEpoch).
+			if epoch > 0 && i > 0 && b.NumberU64()%epoch == 0 {
+				pending = b
+				break
 			}
 			blocks[i] = b
 			n++

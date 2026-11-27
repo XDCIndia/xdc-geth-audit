@@ -258,3 +258,46 @@ func TestV1HookVerifyMNsDefersUntilParentIsWritten(t *testing.T) {
 		t.Fatalf("recheck after parent write, correct validators: got %v", err)
 	}
 }
+
+// TestV1HookRecheckWithoutParentStateIsAnError: a deferred check that is
+// replayed after the parent header is written, but whose parent state is
+// missing, is an error. The first pass keeps skipping a missing state
+// (F-2026-19462).
+func TestV1HookRecheckWithoutParentStateIsAnError(t *testing.T) {
+	db := rawdb.NewMemoryDatabase()
+	bc, err := core.NewBlockChain(db, &core.Genesis{
+		Config:     params.AllEthashProtocolChanges,
+		Difficulty: common.Big1,
+		GasLimit:   8_000_000,
+	}, ethash.NewFaker(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer bc.Stop()
+	chainConfig := *params.AllEthashProtocolChanges
+	chainConfig.ChainID = big.NewInt(50)
+	chainConfig.XDPoS = &params.XDPoSConfig{Epoch: 900, Gap: 450, Period: 2}
+	adaptor := XDPoS.New(chainConfig.XDPoS, db)
+	AttachConsensusV1Hooks(adaptor, bc, &chainConfig)
+
+	// The parent header will exist, its state root will not.
+	parent := &types.Header{
+		ParentHash: bc.Genesis().Hash(),
+		Number:     big.NewInt(899),
+		Root:       common.Hash{0x99},
+		Difficulty: common.Big1,
+	}
+	cp := &types.Header{Number: big.NewInt(900), ParentHash: parent.Hash(), Validators: []byte("x")}
+	signers := []common.Address{{0x01}}
+	if err := adaptor.HookVerifyMNs(cp, signers); err != nil { // parent unknown: deferred
+		t.Fatal(err)
+	}
+	rawdb.WriteHeader(db, parent)
+	if err := adaptor.RecheckV1Validators(cp); err == nil {
+		t.Fatal("recheck without the parent state returned nil: the checkpoint passes unchecked")
+	}
+	// First pass with the header but without state still skips.
+	if err := adaptor.HookVerifyMNs(cp, signers); err != nil {
+		t.Fatalf("first pass without parent state: got %v, want nil", err)
+	}
+}
