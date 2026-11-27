@@ -30,6 +30,7 @@ import (
 
 	"github.com/dchest/siphash"
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/common/lru"
 	"github.com/ethereum/go-ethereum/consensus/XDPoS"
 	"github.com/ethereum/go-ethereum/consensus/XDPoS/engines/engine_v2"
 	"github.com/ethereum/go-ethereum/core"
@@ -210,6 +211,14 @@ type handler struct {
 	// (only on nodes that want BFT participation — i.e., have the V2 engine wired).
 	// Gate all dispatch with h.bfter != nil before use.
 	bfter *bft.Bfter
+
+	// XDC: NewBlock abuse bounds. parkedBlocks
+	// holds, per peer, the future-timestamp block waiting on a timer (its hash and
+	// size); invalidBlocks counts
+	// definitively invalid NewBlocks per peer ID.
+	newBlockMu    sync.Mutex
+	parkedBlocks  map[string]parkedBlock
+	invalidBlocks *lru.Cache[string, int]
 }
 
 // newHandler returns a handler for all Ethereum chain management protocol.
@@ -227,6 +236,8 @@ func newHandler(config *handlerConfig) (*handler, error) {
 		quitSync:       make(chan struct{}),
 		handlerDoneCh:  make(chan struct{}),
 		handlerStartCh: make(chan struct{}),
+		parkedBlocks:   make(map[string]parkedBlock),
+		invalidBlocks:  lru.NewCache[string, int](maxTrackedInvalidPeers),
 	}
 	// Construct the downloader (long sync)
 	snapV2 := resolveSnapV2(config.SnapV2, config.Chain.Config(), config.Database)
