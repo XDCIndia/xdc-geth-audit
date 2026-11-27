@@ -285,6 +285,16 @@ func (x *XDPoS_v2) verifyHeader(chain consensus.ChainReader, header *types.Heade
 				log.Error("[verifyHeader] calcMasternodes failed under fullVerify", "Number", header.Number, "Hash", header.Hash(), "err", err)
 				return err
 			}
+			// F-2026-19463: at the tip (not bulk sync) a node without state does not
+			// take the leader list from the header either, so a reordered
+			// Validators cannot pick the slot leader. The missing data is retried:
+			// ErrV2SnapshotMissing and ErrPenaltyDataUnavailable write no bad-block
+			// record and taint no peer. Bulk sync above the anchor keeps the
+			// two-thirds overlap gate below.
+			if noStateSwitch && !core.XdcBulkSyncMode.Load() {
+				log.Debug("[verifyHeader] F-2026-19463: no-state leader list not taken from the header", "Number", header.Number, "Hash", header.Hash(), "err", err)
+				return err
+			}
 			if noStateSwitch {
 				if derr := x.requireDerivedSwitchSet(chain, header, parent, parents); derr != nil {
 					return derr

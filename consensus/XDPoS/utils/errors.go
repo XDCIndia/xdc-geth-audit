@@ -105,6 +105,14 @@ var ErrEpochSwitchParentNotInDB = errors.New("epoch switch parent header not in 
 // checkpoint to supply the set. F-2026-20648.
 var ErrEpochSwitchSetNotDerivable = errors.New("epoch-switch validator set cannot be derived from verified data")
 
+// ErrPenaltyDataUnavailable is wrapped by the penalty hooks when this node lacks
+// the data to compute a checkpoint's penalties (state pruned after a rewind,
+// block bodies of a batch not written yet). It is missing data, not an invalid
+// block, so it is retried: no bad-block record, no peer taint. It lives here so
+// core and the V2 engine can match it; XDPoS.ErrPenaltyDataUnavailable is the
+// same value. F-2026-19463.
+var ErrPenaltyDataUnavailable = errors.New("v1 penalty data unavailable")
+
 // ErrV2SnapshotMissing is returned by getSnapshot when a V2 epoch's gap-block
 // snapshot was never persisted because UpdateMasternodesFromHeader didn't run
 // at gap-block import (typically because A.94 checkpoint-sync-no-state was
