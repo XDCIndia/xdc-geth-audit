@@ -52,17 +52,10 @@ func TestAutoPinPicksHighestValidCheckpoint(t *testing.T) {
 		&params.TrustedSyncCheckpoint{Number: 200, Hash: nonZeroHash(5), Root: nonZeroHash(6), Masternodes: mns},
 	)
 
-	if pinned := AutoPinPivotFromCheckpoints(chain, cfg); !pinned {
-		t.Fatal("expected auto-pin to select a checkpoint")
-	}
-	if cfg.FastSyncPivotNumber != 300 {
-		t.Errorf("FastSyncPivotNumber = %d, want 300 (highest valid)", cfg.FastSyncPivotNumber)
-	}
-	if cfg.FastSyncPivotHash != nonZeroHash(3) {
-		t.Errorf("FastSyncPivotHash = %s, want hash of checkpoint 300", cfg.FastSyncPivotHash.Hex())
-	}
-	if cfg.FastSyncPivotRoot != nonZeroHash(4) {
-		t.Errorf("FastSyncPivotRoot = %s, want root of checkpoint 300", cfg.FastSyncPivotRoot.Hex())
+	_ = cfg
+	best := selectAutoPivotCheckpoint(chain.TrustedSyncCheckpoints)
+	if best == nil || best.Number != 300 || best.Hash != nonZeroHash(3) || best.Root != nonZeroHash(4) {
+		t.Fatalf("selected %+v, want checkpoint 300 (highest valid)", best)
 	}
 }
 
@@ -77,11 +70,9 @@ func TestAutoPinSkipsCheckpointsWithoutMasternodes(t *testing.T) {
 		&params.TrustedSyncCheckpoint{Number: 300, Hash: nonZeroHash(5), Root: nonZeroHash(6)}, // no masternodes
 	)
 
-	if pinned := AutoPinPivotFromCheckpoints(chain, cfg); !pinned {
-		t.Fatal("expected auto-pin to select the middle checkpoint")
-	}
-	if cfg.FastSyncPivotNumber != 200 {
-		t.Errorf("FastSyncPivotNumber = %d, want 200 (only one with masternodes)", cfg.FastSyncPivotNumber)
+	_ = cfg
+	if best := selectAutoPivotCheckpoint(chain.TrustedSyncCheckpoints); best == nil || best.Number != 200 {
+		t.Fatalf("selected %+v, want checkpoint 200 (only one with masternodes)", best)
 	}
 }
 
@@ -186,13 +177,11 @@ func TestNoAutoPivot_FunctionUnchangedByFlag(t *testing.T) {
 		&params.TrustedSyncCheckpoint{Number: 500, Hash: nonZeroHash(7), Root: nonZeroHash(8), Masternodes: mns},
 	)
 
-	// Without NoAutoPivot: AutoPinPivotFromCheckpoints pins the checkpoint.
+	// Without NoAutoPivot: AutoPinPivotFromCheckpoints still refuses, since the
+	// compiled checkpoint has no QC (F-2026-19471).
 	cfgDefault := &Config{SyncMode: FastSync, NoAutoPivot: false}
-	if !AutoPinPivotFromCheckpoints(chain, cfgDefault) {
-		t.Fatal("default path: expected auto-pin to succeed")
-	}
-	if cfgDefault.FastSyncPivotNumber != 500 {
-		t.Errorf("default path: FastSyncPivotNumber = %d, want 500", cfgDefault.FastSyncPivotNumber)
+	if AutoPinPivotFromCheckpoints(chain, cfgDefault) || cfgDefault.FastSyncPivotNumber != 0 {
+		t.Fatal("default path: expected the checkpoint without a QC not to be pinned")
 	}
 
 	// With NoAutoPivot: the CALLER (eth/backend.go) skips the call entirely.
@@ -228,8 +217,8 @@ func TestNoAutoPivot_DefaultPathUnchanged(t *testing.T) {
 	if !cfg.NoAutoPivot {
 		AutoPinPivotFromCheckpoints(chain, cfg)
 	}
-	if cfg.FastSyncPivotNumber != 10000 {
-		t.Errorf("default path: FastSyncPivotNumber = %d, want 10000", cfg.FastSyncPivotNumber)
+	if cfg.FastSyncPivotNumber != 0 {
+		t.Errorf("default path: FastSyncPivotNumber = %d, want 0 (no QC, F-2026-19471)", cfg.FastSyncPivotNumber)
 	}
 }
 
@@ -250,11 +239,12 @@ func TestAutoCheckpointPivotDefaultOptOut(t *testing.T) {
 	}
 }
 
-// TestAutoCheckpointPivotEnablesAutoPin verifies that setting AutoCheckpointPivot
-// enables the A.96 auto-pin path. Simulates the opt-in gate in backend.go:
+// TestAutoCheckpointPivotRefusesUnverifiedPin verifies that even with AutoCheckpointPivot
+// set, a compiled checkpoint without a QC is not pinned (F-2026-19471). Simulates
+// the opt-in gate in backend.go:
 //
 //	if config.AutoCheckpointPivot { AutoPinPivotFromCheckpoints(...) }
-func TestAutoCheckpointPivotEnablesAutoPin(t *testing.T) {
+func TestAutoCheckpointPivotRefusesUnverifiedPin(t *testing.T) {
 	mns := []common.Address{{0x3}}
 	chain := xdcChainConfig(
 		&params.TrustedSyncCheckpoint{Number: 9999, Hash: nonZeroHash(11), Root: nonZeroHash(12), Masternodes: mns},
@@ -263,11 +253,11 @@ func TestAutoCheckpointPivotEnablesAutoPin(t *testing.T) {
 
 	// Simulate backend.go opt-in: only call when AutoCheckpointPivot is true.
 	if cfg.AutoCheckpointPivot {
-		if !AutoPinPivotFromCheckpoints(chain, cfg) {
-			t.Fatal("expected auto-pin to succeed when AutoCheckpointPivot=true")
+		if AutoPinPivotFromCheckpoints(chain, cfg) {
+			t.Fatal("pinned a compiled checkpoint that carries no quorum certificate")
 		}
 	}
-	if cfg.FastSyncPivotNumber != 9999 {
-		t.Errorf("FastSyncPivotNumber = %d, want 9999", cfg.FastSyncPivotNumber)
+	if cfg.FastSyncPivotNumber != 0 || cfg.FastSyncPivotHash != (common.Hash{}) || cfg.FastSyncPivotRoot != (common.Hash{}) {
+		t.Errorf("pivot set to %d despite no QC (F-2026-19471)", cfg.FastSyncPivotNumber)
 	}
 }
