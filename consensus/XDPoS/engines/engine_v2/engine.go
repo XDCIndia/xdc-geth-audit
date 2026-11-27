@@ -657,6 +657,12 @@ func (x *XDPoS_v2) loadBFTSafetyState() {
 			x.lockQuorumCert = stored
 		}
 	}
+	if stored := rawdb.ReadBFTCommittedBlock(x.db); stored != nil {
+		if x.highestCommitBlock == nil || (stored.Number != nil && (x.highestCommitBlock.Number == nil || stored.Number.Cmp(x.highestCommitBlock.Number) > 0)) {
+			log.Info("[loadBFTSafetyState] restoring committed block", "number", stored.Number, "hash", stored.Hash)
+			x.highestCommitBlock = stored
+		}
+	}
 }
 
 // Author returns the signer of a block
