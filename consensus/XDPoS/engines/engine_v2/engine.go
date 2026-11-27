@@ -521,12 +521,8 @@ func (x *XDPoS_v2) initial(chain consensus.ChainReader, header *types.Header) er
 			// Initialize timeout
 			minePeriod := x.config.V2.CurrentConfig.MinePeriod
 			log.Warn("[initial] miner wait period", "period", minePeriod)
-			// A.97-M.A Task 1 nil-guard: see UpdateParams comment above.
-			if x.minePeriodCh != nil {
-				go func() {
-					x.minePeriodCh <- minePeriod
-				}()
-			}
+			// Non-blocking, nil-safe: see notifyMinePeriod (F-2026-20604).
+			x.notifyMinePeriod(minePeriod)
 			// Start countdown timer
 			x.applyTimeoutParamsForHeader(header)
 			x.timeoutWorker.Reset(chain, 0, 0)
@@ -571,12 +567,8 @@ func (x *XDPoS_v2) initial(chain consensus.ChainReader, header *types.Header) er
 				}
 				minePeriod := x.config.V2.CurrentConfig.MinePeriod
 				log.Warn("[initial] miner wait period", "period", minePeriod)
-				// A.97-M.A Task 1 nil-guard: see UpdateParams comment above.
-				if x.minePeriodCh != nil {
-					go func() {
-						x.minePeriodCh <- minePeriod
-					}()
-				}
+				// Non-blocking, nil-safe: see notifyMinePeriod (F-2026-20604).
+				x.notifyMinePeriod(minePeriod)
 				x.applyTimeoutParamsForHeader(header)
 				x.timeoutWorker.Reset(chain, 0, 0)
 				log.Warn("[initial] finish initialisation (deferred snapshot)")
@@ -612,12 +604,8 @@ func (x *XDPoS_v2) initial(chain consensus.ChainReader, header *types.Header) er
 	// Initialize timeout
 	minePeriod := x.config.V2.CurrentConfig.MinePeriod
 	log.Warn("[initial] miner wait period", "period", minePeriod)
-	// A.97-M.A Task 1 nil-guard: see UpdateParams comment above.
-	if x.minePeriodCh != nil {
-		go func() {
-			x.minePeriodCh <- minePeriod
-		}()
-	}
+	// Non-blocking, nil-safe: see notifyMinePeriod (F-2026-20604).
+	x.notifyMinePeriod(minePeriod)
 
 	// Start countdown timer with the head's round config, not the round-zero
 	// values left from engine construction. processQC may be skipped on this
