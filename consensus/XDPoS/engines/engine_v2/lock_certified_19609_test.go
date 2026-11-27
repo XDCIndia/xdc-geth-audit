@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/core/types"
 )
 
@@ -76,5 +77,71 @@ func TestF202619609LockFollowsTheCertifiedBlock(t *testing.T) {
 	}
 	if eng.lockQuorumCert.ProposedBlockInfo.Round != 12 || eng.lockQuorumCert.ProposedBlockInfo.Hash != b12.Hash() {
 		t.Fatalf("lock moved off block 12: %+v", eng.lockQuorumCert.ProposedBlockInfo)
+	}
+}
+
+// lockRestartFixture returns a chain 10..12 whose head B (12) carries only the
+// certificate for its parent, plus the signed certificate for B that the node
+// stored as its lock before the restart. The epoch cache knows B's committee.
+func lockRestartFixture(t *testing.T, eng *XDPoS_v2, signers int) (*mockChain1330, *types.Header, *types.QuorumCert) {
+	t.Helper()
+	keys, addrs := genNKeys(t, 4)
+	b8 := buildV2Header(t, 8, 8, 7, common.Hash{0x07}, nil)
+	b9 := buildV2Header(t, 9, 9, 8, b8.Hash(), nil)
+	b10 := buildV2Header(t, 10, 10, 9, b9.Hash(), nil)
+	b11 := buildV2Header(t, 11, 11, 10, b10.Hash(), nil)
+	b12 := buildV2Header(t, 12, 12, 11, b11.Hash(), nil)
+	chain := &mockChain1330{byNumber: map[uint64]*types.Header{8: b8, 9: b9, 10: b10, 11: b11, 12: b12}}
+	eng.epochSwitches.Add(b12.Hash(), &types.EpochSwitchInfo{
+		Masternodes:          addrs,
+		MasternodesLen:       len(addrs),
+		EpochSwitchBlockInfo: &types.BlockInfo{Hash: b10.Hash(), Round: 0, Number: big.NewInt(0)},
+	})
+	info := &types.BlockInfo{Hash: b12.Hash(), Round: 12, Number: big.NewInt(12)}
+	lock := &types.QuorumCert{
+		ProposedBlockInfo: info,
+		Signatures:        makeQCSignatures(t, info, 0, keys[:signers]),
+	}
+	return chain, b12, lock
+}
+
+func restartEngine(eng *XDPoS_v2) {
+	eng.isInitialized = false
+	eng.highestQuorumCert = &types.QuorumCert{ProposedBlockInfo: &types.BlockInfo{}}
+	eng.currentRound = 0
+	eng.highestVotedRound = 0
+	eng.lockQuorumCert = nil
+}
+
+// TestF202619609RestartRaisesHighestQCToStoredLock restarts a node that held
+// the certificate for its head B. The head header carries only the
+// certificate for B's parent. The stored lock must raise the highest
+// certificate to B, so the node builds on B and votes for a child of B.
+func TestF202619609RestartRaisesHighestQCToStoredLock(t *testing.T) {
+	eng, db := newA894Engine(t)
+	chain, head, lock := lockRestartFixture(t, eng, 4)
+	rawdb.WriteBFTLockQC(db, lock)
+	restartEngine(eng)
+
+	eng.lock.Lock()
+	err := eng.initial(chain, head)
+	eng.lock.Unlock()
+	if err != nil {
+		t.Fatalf("initial: %v", err)
+	}
+	if got := eng.highestQuorumCert.ProposedBlockInfo; got.Hash != head.Hash() || got.Round != 12 {
+		t.Fatalf("highest QC = %+v, want the certificate for block 12", got)
+	}
+	if eng.currentRound != 13 {
+		t.Fatalf("currentRound = %d, want 13", eng.currentRound)
+	}
+
+	child := buildV2Header(t, 13, 13, 12, head.Hash(), nil)
+	chain.byNumber[13] = child
+	ok, err := eng.verifyVotingRule(chain, &types.BlockInfo{
+		Hash: child.Hash(), Round: 13, Number: big.NewInt(13),
+	}, lock)
+	if err != nil || !ok {
+		t.Fatalf("child of the head: vote=%v err=%v, want true", ok, err)
 	}
 }
