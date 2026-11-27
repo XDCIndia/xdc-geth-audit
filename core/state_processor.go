@@ -203,9 +203,25 @@ func (p *StateProcessor) Process(ctx context.Context, block *types.Block, stated
 		// canonical XDPoSChain (TransactionToMessage, then routeTransaction
 		// inside ApplyTransactionWithEVM), so a tx with a bad signature is
 		// rejected on every route, the 0x91-0x94 empty route included.
-		msg, err := TransactionToMessage(tx, signer, header.BaseFee)
-		if err != nil {
-			return nil, fmt.Errorf("could not apply tx %d [%v]: %w", i, tx.Hash().Hex(), err)
+		//
+		// The 256-bit width checks of TransactionToMessage apply to the EVM
+		// route only. Canonical has no width check on its message conversion
+		// (core/state_transition.go:170-206) and the signing and empty routes
+		// never read the fee or value fields, so a 0x89 tx with a 257-bit gas
+		// price is valid there. Only the sender is recovered for those routes.
+		route := RouteTransaction(config, blockNumber, tx)
+		var msg *Message
+		if route == TxRouteEVM {
+			var err error
+			if msg, err = TransactionToMessage(tx, signer, header.BaseFee); err != nil {
+				return nil, fmt.Errorf("could not apply tx %d [%v]: %w", i, tx.Hash().Hex(), err)
+			}
+		} else {
+			from, err := types.Sender(signer, tx)
+			if err != nil {
+				return nil, fmt.Errorf("could not apply tx %d [%v]: %w", i, tx.Hash().Hex(), err)
+			}
+			msg = &Message{From: from}
 		}
 		// XDC: reject transactions from or to blacklisted addresses once the
 		// chain has passed BlackListHFNumber.  Canonical XDPoSChain enforces
@@ -227,7 +243,7 @@ func (p *StateProcessor) Process(ctx context.Context, block *types.Block, stated
 		// (0x91-0x94, in the TIPXDCXReceiver window) bypass the EVM; see
 		// RouteTransaction. Canonical XDPoSChain produces byte-identical
 		// receipts on these paths and the parity gates depend on it.
-		switch RouteTransaction(config, blockNumber, tx) {
+		switch route {
 		case TxRouteSign:
 			receipt, err := ApplySigningTransaction(config, statedb, blockNumber, blockHash, tx, gp.Used())
 			if err != nil {
@@ -281,8 +297,10 @@ func (p *StateProcessor) Process(ctx context.Context, block *types.Block, stated
 	blockAccessList.Merge(bal)
 
 	// XDC: Set parentState on the engine for reward calculation.
-	if xdposEngine, ok := p.chain.Engine().(interface{ SetParentState(*state.StateDB) }); ok {
-		xdposEngine.SetParentState(parentState)
+	if xdposEngine, ok := p.chain.Engine().(interface {
+		SetParentState(post, pre *state.StateDB)
+	}); ok {
+		xdposEngine.SetParentState(statedb, parentState)
 	}
 
 	// Finalize the block, applying any consensus engine specific extras
@@ -457,6 +475,10 @@ func applyTransactionWithEVM(ctx context.Context, msg *Message, gp *GasPool, sta
 			defer func() { hooks.OnTxEnd(receipt, err) }()
 		}
 	}
+	// XDC: canonical sets the sender balance of 60 mainnet blocks to a fixed
+	// value before it applies the tx (core/state_processor.go:439 and :650 in
+	// XDPoSChain v3.0.0-testnet-2). Non-EVM routes never reach this point.
+	applyHistoricalBalanceBypass(statedb, blockNumber, msg.From)
 	// Apply the transaction to the current state (included in the env).
 	// Thread the optional owner through to ApplyMessage for TRC21 fee routing.
 	result, err := ApplyMessage(evm, msg, gp, owner...)
@@ -952,27 +974,37 @@ func ApplySigningTransaction(config *params.ChainConfig, statedb *state.StateDB,
 // reports non-zero gas, and the state root + receipts root diverge starting
 // at the very first TIPXDCX block.
 func ApplyEmptyTransaction(config *params.ChainConfig, statedb *state.StateDB, blockNumber *big.Int, blockHash common.Hash, tx *types.Transaction, cumulativeGasUsed uint64) (*types.Receipt, error) {
-	var root []byte
-	if config.IsByzantium(blockNumber) {
-		statedb.Finalise(params.Rules{IsEIP158: true})
-	} else {
-		root = statedb.IntermediateRoot(params.Rules{IsEIP158: config.IsEIP158(blockNumber)}).Bytes()
-	}
-
 	// Chain IDs 5151, 5050 and 5551 still have the empty-tx route open.
 	// Mainnet and Apothem keep the historical zero-gas receipt with no nonce change.
-	if emptyRouteTracksNonce(config) {
-		from, err := types.Sender(types.MakeSigner(config, blockNumber, 0), tx)
+	// The checks run before Finalise: Finalise drops every state snapshot, and a
+	// caller (the miner) must be able to revert to its pre-tx snapshot on error.
+	var (
+		from    common.Address
+		nonce   uint64
+		tracked = emptyRouteTracksNonce(config)
+	)
+	if tracked {
+		var err error
+		from, err = types.Sender(types.MakeSigner(config, blockNumber, 0), tx)
 		if err != nil {
 			return nil, err
 		}
-		nonce := statedb.GetNonce(from)
+		nonce = statedb.GetNonce(from)
 		if tx.Nonce() < nonce {
 			return nil, fmt.Errorf("%w: empty tx nonce %d, state %d", ErrNonceTooLow, tx.Nonce(), nonce)
 		}
 		if tx.Nonce() > nonce {
 			return nil, fmt.Errorf("%w: empty tx nonce %d, state %d", ErrNonceTooHigh, tx.Nonce(), nonce)
 		}
+	}
+
+	var root []byte
+	if config.IsByzantium(blockNumber) {
+		statedb.Finalise(params.Rules{IsEIP158: true})
+	} else {
+		root = statedb.IntermediateRoot(params.Rules{IsEIP158: config.IsEIP158(blockNumber)}).Bytes()
+	}
+	if tracked {
 		statedb.SetNonce(from, nonce+1, tracing.NonceChangeUnspecified)
 	}
 

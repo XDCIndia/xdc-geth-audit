@@ -13,6 +13,7 @@ import (
 	"github.com/ethereum/go-ethereum/consensus/XDPoS/utils"
 	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/params"
 )
 
@@ -126,4 +127,35 @@ func TestF202619608ActiveGateRejectsSkipWithoutCertificate(t *testing.T) {
 	if !errors.Is(err, utils.ErrRoundSkipWithoutTimeout) {
 		t.Fatalf("certificate for the parent round: got %v", err)
 	}
+}
+
+func signTimeoutGap(t *testing.T, round types.Round, gap uint64, keys ...*ecdsa.PrivateKey) []types.Signature {
+	t.Helper()
+	hash := types.TimeoutSigHash(&types.TimeoutForSign{Round: round, GapNumber: gap})
+	sigs := make([]types.Signature, len(keys))
+	for i, key := range keys {
+		sig, err := crypto.Sign(hash[:], key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		sigs[i] = sig
+	}
+	return sigs
+}
+
+func resealWithCertificate(t *testing.T, h *types.Header, keys []*ecdsa.PrivateKey, epoch uint64, tc *types.TimeoutCert) {
+	t.Helper()
+	var extra types.ExtraFields_v2
+	if err := DecodeExtraFields(h.Extra, &extra); err != nil {
+		t.Fatal(err)
+	}
+	extra.TimeoutCert = tc
+	encoded, err := extra.EncodeToBytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.Extra = encoded
+	h.Validator = nil
+	leader := int(uint64(extra.Round) % epoch % uint64(len(keys)))
+	ltSeal(t, h, keys[leader])
 }

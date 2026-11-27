@@ -209,10 +209,68 @@ func TestLiveMnSet_ForwardSeed_SkipsIntermediateEpochSwitch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("loadSnapshot after fix: %v", err)
 	}
-	if reloaded.Version != 6 {
-		t.Fatalf("FAIL: DB snapshot Version = %d after fix, want 6 (persisted overwrite)", reloaded.Version)
+	// XDC-HUNT-46: the persisted forward seed is a header seed (version 5),
+	// so RepairSeededCandidatePool can still repair it. The candidate count
+	// check below tells it apart from the poisoned entry, also version 5.
+	if reloaded.Version != 5 {
+		t.Fatalf("FAIL: DB snapshot Version = %d after fix, want 5 (header seed)", reloaded.Version)
 	}
 	if len(reloaded.NextEpochCandidates) != len(correctMNs) {
 		t.Fatalf("FAIL: DB snapshot has %d candidates, want %d (correct epoch switch)", len(reloaded.NextEpochCandidates), len(correctMNs))
+	}
+}
+
+// TestXDCHunt46ForwardSeedIsStillRepairable runs the signing path for a gap
+// below the pivot, which forward-seeds the snapshot from the epoch-switch
+// header, and then the pool repair. The stored seed must stay a header seed so
+// the repair fills the standby candidates from state.
+func TestXDCHunt46ForwardSeedIsStillRepairable(t *testing.T) {
+	lvl, err := leveldb.New(t.TempDir(), 256, 0, "", false)
+	if err != nil {
+		t.Fatalf("leveldb: %v", err)
+	}
+	db := rawdb.NewDatabase(lvl)
+	cfg := &params.ChainConfig{
+		ChainID: big.NewInt(5151),
+		XDPoS: &params.XDPoSConfig{
+			Epoch: 900,
+			Gap:   450,
+			V2: &params.V2{
+				SwitchBlock: new(big.Int).SetUint64(0),
+				CurrentConfig: &params.V2Config{
+					MinePeriod:       2,
+					TimeoutPeriod:    10,
+					ExpTimeoutConfig: params.ExpTimeoutConfig{Base: 2.0, MaxExponent: 6},
+					CertThreshold:    2.0 / 3.0,
+				},
+				AllConfigs: map[uint64]*params.V2Config{},
+			},
+		},
+	}
+	eng := createEngine(cfg, db, nil, nil)
+
+	const gapNumber = uint64(4950)
+	_, validators := genNKeys(t, 7)
+	_, standby := genNKeys(t, 3)
+	switchHeader := makeRoundEpochSwitchHeader(t, 5400, 5400, 5399, validators)
+	gapHeader := &types.Header{Number: big.NewInt(int64(gapNumber)), Difficulty: big.NewInt(1), Extra: []byte{0x01}}
+	chain := &mockChainForGapNumber1327{
+		byHash:   map[common.Hash]*types.Header{gapHeader.Hash(): gapHeader, switchHeader.Hash(): switchHeader},
+		byNumber: map[uint64]*types.Header{gapNumber: gapHeader, 5400: switchHeader},
+	}
+
+	if _, err := eng.getSnapshot(chain, gapNumber, true, nil); err != nil {
+		t.Fatalf("getSnapshot(forSigning): %v", err)
+	}
+	// Snap-synced node: the gap is below the pivot.
+	rawdb.WriteLastPivotNumber(db, gapNumber+1000)
+	statedb := seedCandidateState(t, append(append([]common.Address{}, validators...), standby...))
+	repaired, err := eng.RepairSeededCandidatePool(gapHeader, validators, statedb)
+	if err != nil || !repaired {
+		t.Fatalf("repair after the signing path: repaired=%v err=%v, want true", repaired, err)
+	}
+	snap, _ := loadSnapshot(db, gapHeader.Hash())
+	if len(snap.NextEpochCandidates) != len(validators)+len(standby) {
+		t.Fatalf("candidates = %d, want %d", len(snap.NextEpochCandidates), len(validators)+len(standby))
 	}
 }

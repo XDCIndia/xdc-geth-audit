@@ -10,7 +10,6 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
-	"os"
 	"path/filepath"
 	"strconv"
 	"sync"
@@ -142,12 +141,14 @@ type XDPoS_v2 struct {
 // markSelfMined records round as the highest round this node sealed. The
 // write takes x.lock because yourturnAligned reads the field under it
 // (review R4-W02).
-func (x *XDPoS_v2) markSelfMined(round types.Round) {
+func (x *XDPoS_v2) markSelfMined(round types.Round) error {
 	x.lock.Lock()
 	x.highestSelfMinedRound = round
 	x.lock.Unlock()
 	// F-2026-19774: persist so a restart inside a round cannot produce a second seal.
 	rawdb.WriteBFTHighestSelfMinedRound(x.db, round)
+	// XDC-HUNT-30: sync before the sealed block can be broadcast.
+	return x.db.SyncKeyValue()
 }
 
 // SetHookReward wires the reward hook for V2 epoch-switch blocks.
@@ -979,7 +980,10 @@ func (x *XDPoS_v2) Seal(chain consensus.ChainReader, block *types.Block, stop <-
 		log.Error("[Seal] Error decoding extra field", "error", err)
 		return nil, err
 	}
-	x.markSelfMined(decodedExtra.Round)
+	if err := x.markSelfMined(decodedExtra.Round); err != nil {
+		log.Error("[Seal] Failed to sync highestSelfMinedRound, block not sealed", "err", err)
+		return nil, err
+	}
 
 	return block.WithSeal(header), nil
 }
@@ -1184,12 +1188,16 @@ func (x *XDPoS_v2) getSnapshot(chain consensus.ChainReader, number uint64, forSi
 				}
 				if len(masternodes) > 0 {
 					snap := newSnapshotWithPenalties(gapNumber, gapHeader.Hash(), masternodes, penalties)
-					snap.Version = 6 // forward-seed certified; see rebuildGapSnapshotFromState
-					x.snapshots.Add(snap.Hash, snap)
+					// XDC-HUNT-46: persist as a header seed (version 5) so
+					// RepairSeededCandidatePool can still fill the full pool from
+					// state. Only the in-memory copy is marked 6, which stops this
+					// path from running again in the session.
 					if serr := storeSnapshot(snap, x.db); serr != nil {
 						log.Error("[getSnapshot] live-mn-set: failed to persist forward-seed snapshot",
 							"gap", gapNumber, "err", serr)
 					}
+					snap.Version = 6
+					x.snapshots.Add(snap.Hash, snap)
 					log.Warn("[getSnapshot] live-mn-set: no contract state at gap, forward-seeded from epoch switch header",
 						"gap", gapNumber, "epochSwitch", epochSwitchHdr.Number.Uint64(),
 						"validators", len(masternodes), "penalties", len(penalties))
@@ -1218,12 +1226,13 @@ func (x *XDPoS_v2) getSnapshot(chain consensus.ChainReader, number uint64, forSi
 					}
 					if len(masternodes) > 0 {
 						snap := newSnapshotWithPenalties(gapNumber, gapHeader.Hash(), masternodes, penalties)
-						snap.Version = 6
-						x.snapshots.Add(snap.Hash, snap)
+						// XDC-HUNT-46: persisted as version 5, see the forward seed above.
 						if serr := storeSnapshot(snap, x.db); serr != nil {
 							log.Error("[getSnapshot] live-mn-set: failed to persist checkpoint-seed snapshot",
 								"gap", gapNumber, "checkpoint", checkpointNumber, "err", serr)
 						}
+						snap.Version = 6
+						x.snapshots.Add(snap.Hash, snap)
 						log.Warn("[getSnapshot] live-mn-set: seeded from checkpoint direct-lookup",
 							"gap", gapNumber, "checkpoint", checkpointNumber,
 							"validators", len(masternodes))
@@ -2112,33 +2121,49 @@ func (x *XDPoS_v2) findEpochSwitchAfter(chain consensus.ChainReader, fromNumber 
 	return nil
 }
 
-// IsEpochSwitch checks if a header is an epoch switch block
+// IsEpochSwitch checks if a header is an epoch switch block. It remembers the
+// round-to-block entry of an epoch switch, as canonical XDPoSChain does. Use
+// epochSwitchRecord for a header that is not accepted yet.
 func (x *XDPoS_v2) IsEpochSwitch(header *types.Header) (bool, uint64, error) {
+	isSwitch, epochNum, record, err := x.epochSwitchRecord(header)
+	if record != nil {
+		x.round2epochBlockInfo.Add(record.Round, record)
+		log.Debug("[IsEpochSwitch] EPOCH SWITCH CACHED", "number", header.Number.Uint64(), "round", record.Round)
+	}
+	return isSwitch, epochNum, err
+}
+
+// epochSwitchRecord is IsEpochSwitch without the cache write. When the header
+// is an epoch switch that belongs in the round-to-block cache it also returns
+// the entry; the caller adds it once the header is accepted. verifyHeader does
+// this, so a header that fails the seal or leader check cannot replace the
+// entry of the accepted block for its round (#2073).
+func (x *XDPoS_v2) epochSwitchRecord(header *types.Header) (bool, uint64, *types.BlockInfo, error) {
 	// V1->V2 switch block is treated as an epoch switch
 	if header.Number.Cmp(x.config.V2.SwitchBlock) == 0 {
 		log.Info("[IsEpochSwitch] V1->V2 switch block", "number", header.Number.Uint64())
-		return true, header.Number.Uint64() / x.config.Epoch, nil
+		return true, header.Number.Uint64() / x.config.Epoch, nil, nil
 	}
 
 	quorumCert, round, err := x.getExtraFieldsNoChain(header)
 	if err != nil {
 		log.Error("[IsEpochSwitch] decode error", "err", err, "number", header.Number.Uint64())
-		return false, 0, err
+		return false, 0, nil, err
 	}
 
 	// v147 FIX: Handle V1 headers gracefully — V1 headers are NOT epoch switches
 	if quorumCert == nil && round == 0 {
-		return false, 0, nil
+		return false, 0, nil, nil
 	}
 
 	// Defensive nil checks (#391)
 	if quorumCert == nil {
 		log.Error("[IsEpochSwitch] quorumCert is nil", "number", header.Number.Uint64())
-		return false, 0, errors.New("quorumCert is nil")
+		return false, 0, nil, errors.New("quorumCert is nil")
 	}
 	if quorumCert.ProposedBlockInfo == nil {
 		log.Error("[IsEpochSwitch] ProposedBlockInfo is nil", "number", header.Number.Uint64())
-		return false, 0, errors.New("ProposedBlockInfo is nil")
+		return false, 0, nil, errors.New("ProposedBlockInfo is nil")
 	}
 
 	parentRound := quorumCert.ProposedBlockInfo.Round
@@ -2148,19 +2173,19 @@ func (x *XDPoS_v2) IsEpochSwitch(header *types.Header) (bool, uint64, error) {
 	// If parent is the V2 switch block, this is the first V2 epoch switch
 	if quorumCert.ProposedBlockInfo.Number.Cmp(x.config.V2.SwitchBlock) == 0 {
 		log.Info("[IsEpochSwitch] First V2 epoch", "number", header.Number.Uint64(), "round", round)
-		return true, epochNum, nil
+		return true, epochNum, nil, nil
 	}
 
 	isEpochSwitch := parentRound < epochStartRound
 
-	// CRITICAL FIX: Add epoch switch to round2epochBlockInfo cache like v2.6.8
+	// Epoch switches go into the round2epochBlockInfo cache like v2.6.8.
+	var record *types.BlockInfo
 	if isEpochSwitch {
-		x.round2epochBlockInfo.Add(round, &types.BlockInfo{
+		record = &types.BlockInfo{
 			Hash:   header.Hash(),
 			Number: header.Number,
 			Round:  round,
-		})
-		log.Debug("[IsEpochSwitch] EPOCH SWITCH CACHED", "number", header.Number.Uint64(), "round", round, "parentRound", parentRound, "epochStartRound", epochStartRound)
+		}
 	}
 
 	// Debug logging for all epoch switch checks near the V2 switch boundary
@@ -2176,7 +2201,7 @@ func (x *XDPoS_v2) IsEpochSwitch(header *types.Header) (bool, uint64, error) {
 			"qcBlockRound", quorumCert.ProposedBlockInfo.Round)
 	}
 
-	return isEpochSwitch, epochNum, nil
+	return isEpochSwitch, epochNum, record, nil
 }
 
 // calcMasternodes calculates masternodes for a block.
@@ -2597,7 +2622,12 @@ func (x *XDPoS_v2) getExtraFields(chain consensus.ChainReader, header *types.Hea
 func decodeMasternodesFromHeaderExtra(header *types.Header) []common.Address {
 	extraVanity := 32
 	extraSeal := 65
-	masternodes := make([]common.Address, (len(header.Extra)-extraVanity-extraSeal)/common.AddressLength)
+	// Same guards as canonical XDPoSChain engine_v2/utils.go decodeMasternodesFromHeaderExtra.
+	payload := len(header.Extra) - extraVanity - extraSeal
+	if payload < 0 || payload%common.AddressLength != 0 {
+		return nil
+	}
+	masternodes := make([]common.Address, payload/common.AddressLength)
 	for i := 0; i < len(masternodes); i++ {
 		copy(masternodes[i][:], header.Extra[extraVanity+i*common.AddressLength:])
 	}
@@ -2608,6 +2638,11 @@ func decodeMasternodesFromHeaderExtra(header *types.Header) []common.Address {
 func DecodeExtraFields(extra []byte, decoded *types.ExtraFields_v2) error {
 	if len(extra) < 1 {
 		return errors.New("extra too short")
+	}
+	// Canonical DecodeBytesExtraFields refuses an extra field above 20 KiB
+	// (consensus/XDPoS/utils/utils.go:80-84).
+	if len(extra) > utils.MaxV2ExtraSize {
+		return errors.New("extra field is too long")
 	}
 	if extra[0] != 2 {
 		return errors.New("not V2 extra format")
@@ -3628,6 +3663,10 @@ func (x *XDPoS_v2) GetPreviousPenaltyByHash(chain consensus.ChainReader, hash co
 		log.Error("[GetPreviousPenaltyByHash] getPreviousEpochSwitchInfoByHash error", "err", err)
 		return nil, err
 	}
+	if epochSwitchInfo == nil {
+		// No block has the epoch number current-limit: empty list, as canonical.
+		return []common.Address{}, nil
+	}
 	header := chain.GetHeaderByHash(epochSwitchInfo.EpochSwitchBlockInfo.Hash)
 	if header == nil {
 		// Header not yet in DB (fast/snap sync): use the Penalties already cached
@@ -3715,7 +3754,7 @@ func (x *XDPoS_v2) saveRewardToFile(blockHash common.Hash, blockNumber uint64) {
 		return
 	}
 	filename := strconv.FormatUint(blockNumber, 10) + "." + blockHash.Hex()
-	if err = os.WriteFile(filepath.Join(common.StoreRewardFolder, filename), data, 0644); err != nil {
+	if err = utils.WriteFileAtomic(filepath.Join(common.StoreRewardFolder, filename), data, 0644); err != nil {
 		log.Error("[saveRewardToFile] Error writing reward file", "filename", filename, "err", err)
 	}
 }

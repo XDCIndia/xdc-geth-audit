@@ -1744,7 +1744,7 @@ func (c *ringSignatureVerifier) Run(proof []byte) ([]byte, error) {
 }
 
 func (c *ringSignatureVerifier) RunAbort(proof []byte, abort func() bool) ([]byte, error) {
-	der, err := privacy.Deserialize(proof)
+	der, err := privacy.Deserialize(proof, abort)
 	if err != nil {
 		return []byte{}, errors.New("fail to deserialize proof")
 	}

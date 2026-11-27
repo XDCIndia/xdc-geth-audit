@@ -329,9 +329,24 @@ func ReadHeaderRange(db ethdb.Reader, number uint64, count uint64) []rlp.RawValu
 		log.Warn("Incomplete read of headers from freezer", "wanted", count, "read", len(data))
 		return rlpHeaders
 	}
-	// The data is on the order [h, h+1, .., n] -- reordering needed
-	for i := range data {
-		rlpHeaders = append(rlpHeaders, data[len(data)-1-i])
+	// The data is on the order [h, h+1, .., n] -- reordering needed.
+	// An XDC snap gap-fill placeholder (the one byte 0x00) is not a header: use
+	// the backfilled header from the key-value store, and stop the range at the
+	// first block that has none (XDC-HUNT-17).
+	first := i + 1 - count
+	for j := len(data) - 1; j >= 0; j-- {
+		item := data[j]
+		if len(item) == 1 && item[0] == 0x00 {
+			item = nil
+			n := first + uint64(j)
+			if hash := ReadCanonicalHash(db, n); hash != (common.Hash{}) {
+				item, _ = db.Get(headerKey(n, hash))
+			}
+			if len(item) == 0 {
+				break
+			}
+		}
+		rlpHeaders = append(rlpHeaders, item)
 	}
 	return rlpHeaders
 }

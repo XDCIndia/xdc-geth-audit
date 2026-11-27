@@ -62,6 +62,11 @@ func (p ECPoint) Equal(p2 ECPoint) bool {
 func (p ECPoint) Mult(s *big.Int) ECPoint {
 	modS := new(big.Int).Mod(s, EC.N)
 	X, Y := EC.C.ScalarMult(p.X, p.Y, modS.Bytes())
+	if X == nil || Y == nil {
+		// The cgo ScalarMult returns nil, nil for a zero scalar. The canonical
+		// btcec curve returns the point at infinity, which is (0, 0) here.
+		return EC.Zero()
+	}
 	return ECPoint{X, Y}
 }
 
@@ -1216,10 +1221,13 @@ func MRPVerify(mrp *MultiRangeProof, abort ...func() bool) bool {
 	if proofAborted(abort) {
 		return false
 	}
-	EC = genECPrimeGroupKey(m*bitsPerValue, abort...)
-	if proofAborted(abort) || EC.N == nil {
+	// Build into a local value. An aborted build returns an empty value and
+	// must not replace the shared EC.
+	ecp := genECPrimeGroupKey(m*bitsPerValue, abort...)
+	if proofAborted(abort) || ecp.N == nil {
 		return false
 	}
+	EC = ecp
 
 	//changes:
 	// check 1 changes since it includes all commitments

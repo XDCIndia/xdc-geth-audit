@@ -90,7 +90,10 @@ type stateObject struct {
 
 // empty returns whether the account is considered empty.
 func (s *stateObject) empty() bool {
-	return s.data.Nonce == 0 && s.data.Balance.IsZero() && bytes.Equal(s.data.CodeHash, types.EmptyCodeHash.Bytes())
+	// BigBalance is set only when the true balance is at least 2^256. The
+	// 256-bit Balance field is then wrapped and can be zero (balance exactly
+	// 2^256), but the account is not empty (canonical keeps the full big.Int).
+	return s.data.Nonce == 0 && s.data.Balance.IsZero() && s.data.BigBalance == nil && bytes.Equal(s.data.CodeHash, types.EmptyCodeHash.Bytes())
 }
 
 // newObject creates a state object.

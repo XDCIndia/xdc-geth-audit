@@ -80,8 +80,14 @@ var Defaults = Config{
 	TxSyncDefaultTimeout:    20 * time.Second,
 	TxSyncMaxTimeout:        1 * time.Minute,
 	SlowBlockThreshold:      -1, // Disabled by default; set via --debug.logslowblock flag
-	RangeLimit:              0,
+	RangeLimit:              defaultRangeLimit,
 }
+
+// defaultRangeLimit is the built-in maximum block span (end - begin) for
+// eth_getLogs and other range queries. Upstream go-ethereum leaves this at
+// 0, which does not cap the span. A command-line value of 0 still means
+// unlimited.
+const defaultRangeLimit = 10000
 
 //go:generate go run github.com/fjl/gencodec -type Config -formats toml -out gen_config.go
 
@@ -260,6 +266,8 @@ type Config struct {
 	TxSyncMaxTimeout     time.Duration `toml:",omitempty"`
 
 	// RangeLimit restricts the maximum range (end - start) for range queries.
+	// 0 means unlimited. The built-in default is defaultRangeLimit blocks;
+	// --rpc.rangelimit 0 turns the cap off.
 	RangeLimit uint64 `toml:",omitempty"`
 }
 

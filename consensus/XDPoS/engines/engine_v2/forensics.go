@@ -47,7 +47,16 @@ func (f *Forensics) SubscribeForensicsEvent(ch chan<- types.ForensicsEvent) even
 	return f.scope.Track(f.forensicsFeed.Subscribe(ch))
 }
 
+// recoverForensics stops a panic in a forensics goroutine from ending the
+// process. Forensics is a monitor and must never be able to stop the node (#2108).
+func recoverForensics(name string) {
+	if r := recover(); r != nil {
+		log.Error("[forensics] recovered from panic", "func", name, "panic", r)
+	}
+}
+
 func (f *Forensics) ForensicsMonitoring(chain consensus.ChainReader, engine *XDPoS_v2, headerQcToBeCommitted []types.Header, incomingQC types.QuorumCert) error {
+	defer recoverForensics("ForensicsMonitoring")
 	f.ProcessForensics(chain, engine, incomingQC)
 	return f.SetCommittedQCs(headerQcToBeCommitted, incomingQC)
 }
@@ -307,6 +316,7 @@ func (f *Forensics) getQcSignerAddresses(quorumCert types.QuorumCert) []string {
 		pubkey, err := crypto.Ecrecover(quorumCertSignedHash.Bytes(), signature)
 		if err != nil {
 			log.Error("[getQcSignerAddresses] Fail to Ecrecover signer from the quorumCertSignedHash", "quorumCert.GapNumber", quorumCert.GapNumber, "quorumCert.ProposedBlockInfo", quorumCert.ProposedBlockInfo)
+			continue
 		}
 
 		copy(signerAddress[:], crypto.Keccak256(pubkey[1:])[12:])
@@ -441,6 +451,7 @@ Forensics runs in a seperate go routine as its no system critical
 Link to the flow diagram: https://hashlabs.atlassian.net/wiki/spaces/HASHLABS/pages/99516417/Vote+Equivocation+detection+specification
 */
 func (f *Forensics) ProcessVoteEquivocation(chain consensus.ChainReader, engine *XDPoS_v2, incomingVote *types.Vote) error {
+	defer recoverForensics("ProcessVoteEquivocation")
 	log.Debug("Received a vote in forensics", "vote", incomingVote)
 	// Clone the values to a temporary variable under the read lock.
 	f.mu.RLock()
@@ -543,6 +554,7 @@ func (f *Forensics) isVoteBlamed(chain consensus.ChainReader, highestCommittedQC
 // one round. The pool keeps only the first, so the incoming message is
 // compared with what is already stored. This does not change acceptance.
 func (f *Forensics) DetectEquivocationInTimeoutPool(timeout *types.Timeout, timeoutPool *utils.Pool) {
+	defer recoverForensics("DetectEquivocationInTimeoutPool")
 	if timeout == nil || timeoutPool == nil {
 		return
 	}
@@ -595,6 +607,7 @@ func (f *Forensics) sendTimeoutEquivocationProof(a, b *types.Timeout, signer com
 }
 
 func (f *Forensics) DetectEquivocationInVotePool(vote *types.Vote, votePool *utils.Pool) {
+	defer recoverForensics("DetectEquivocationInVotePool")
 	poolKey := vote.PoolKey()
 	votePoolKeys := votePool.PoolObjKeysList()
 	// The vote handler recovers the signer before the vote is pooled. Compare

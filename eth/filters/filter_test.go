@@ -25,6 +25,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/accounts/abi"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/consensus/ethash"
@@ -33,6 +34,7 @@ import (
 	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
+	"github.com/ethereum/go-ethereum/eth/ethconfig"
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/rpc"
 	"github.com/ethereum/go-ethereum/triedb"
@@ -650,5 +652,151 @@ func TestRangeLimit(t *testing.T) {
 		}
 	} else {
 		t.Fatalf("expected rpc error, got %v", err)
+	}
+}
+
+// TestDefaultRangeLimitCapsLogQuery checks the built-in eth_getLogs span cap.
+// A span under the default is served. A span over it is rejected. Passing 0
+// still means unlimited, which is what --rpc.rangelimit 0 does.
+func TestDefaultRangeLimitCapsLogQuery(t *testing.T) {
+	limit := ethconfig.Defaults.RangeLimit
+	if limit == 0 {
+		t.Fatal("default RangeLimit is unlimited")
+	}
+
+	db := rawdb.NewMemoryDatabase()
+	backend, sys := newTestFilterSystem(db, Config{})
+	defer db.Close()
+
+	gspec := &core.Genesis{
+		Config:  params.TestChainConfig,
+		Alloc:   types.GenesisAlloc{},
+		BaseFee: big.NewInt(params.InitialBaseFee),
+	}
+	if _, err := gspec.Commit(db, triedb.NewDatabase(db, nil), nil); err != nil {
+		t.Fatal(err)
+	}
+	chain, _ := core.GenerateChain(gspec.Config, gspec.ToBlock(), ethash.NewFaker(), db, 10, func(i int, gen *core.BlockGen) {})
+	options := core.DefaultConfig().WithStateScheme(rawdb.HashScheme)
+	options.TxLookupLimit = 0
+	bc, err := core.NewBlockChain(db, gspec, ethash.NewFaker(), options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = bc.InsertChain(chain); err != nil {
+		t.Fatal(err)
+	}
+	backend.startFilterMaps(0, false, filtermaps.DefaultParams)
+	defer backend.stopFilterMaps()
+
+	if _, err = sys.NewRangeFilter(0, 9, nil, nil, limit).Logs(context.Background()); err != nil {
+		t.Fatalf("span under the default cap: %v", err)
+	}
+	_, err = sys.NewRangeFilter(0, int64(limit)+1, nil, nil, limit).Logs(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "exceed maximum block range") {
+		t.Fatalf("span over the default cap was not rejected: %v", err)
+	}
+	if _, err = sys.NewRangeFilter(0, int64(limit)+1, nil, nil, 0).Logs(context.Background()); err != nil && strings.Contains(err.Error(), "exceed maximum block range") {
+		t.Fatalf("RangeLimit 0 rejected the span: %v", err)
+	}
+}
+
+// TestRangeLimitResolvesBlockTags checks the span cap after latest, safe,
+// finalized and pending are real block numbers rather than sentinels.
+func TestRangeLimitResolvesBlockTags(t *testing.T) {
+	limit := ethconfig.Defaults.RangeLimit
+	db := rawdb.NewMemoryDatabase()
+	backend, sys := newTestFilterSystem(db, Config{RangeLimit: 5})
+	defer db.Close()
+	gspec := &core.Genesis{
+		Config:  params.TestChainConfig,
+		Alloc:   types.GenesisAlloc{},
+		BaseFee: big.NewInt(params.InitialBaseFee),
+	}
+	if _, err := gspec.Commit(db, triedb.NewDatabase(db, nil), nil); err != nil {
+		t.Fatal(err)
+	}
+	chain, _ := core.GenerateChain(gspec.Config, gspec.ToBlock(), ethash.NewFaker(), db, 10, func(i int, gen *core.BlockGen) {})
+	options := core.DefaultConfig().WithStateScheme(rawdb.HashScheme)
+	options.TxLookupLimit = 0
+	bc, err := core.NewBlockChain(db, gspec, ethash.NewFaker(), options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = bc.InsertChain(chain); err != nil {
+		t.Fatal(err)
+	}
+	backend.startFilterMaps(0, false, filtermaps.DefaultParams)
+	defer backend.stopFilterMaps()
+
+	// 10-block chain, default cap: 0 to latest is inside the cap.
+	if _, err = sys.NewRangeFilter(0, rpc.LatestBlockNumber.Int64(), nil, nil, limit).Logs(context.Background()); err != nil {
+		t.Fatalf("from 0 to latest on a 10-block chain: %v", err)
+	}
+	// Same chain is longer than a cap of 5.
+	_, err = sys.NewRangeFilter(0, rpc.LatestBlockNumber.Int64(), nil, nil, 5).Logs(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "exceed maximum block range 5") {
+		t.Fatalf("from 0 to latest over the cap: %v", err)
+	}
+	// Explicit numbers keep the previous rule.
+	if _, err = sys.NewRangeFilter(0, 4, nil, nil, 5).Logs(context.Background()); err != nil {
+		t.Fatalf("explicit span under the cap: %v", err)
+	}
+	_, err = sys.NewRangeFilter(0, 9, nil, nil, 5).Logs(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "exceed maximum block range 5") {
+		t.Fatalf("explicit span over the cap: %v", err)
+	}
+
+	safe, finalized := uint64(8), uint64(7)
+	backend.safeNum = &safe
+	backend.finalizedNum = &finalized
+	if _, err = sys.NewRangeFilter(rpc.SafeBlockNumber.Int64(), rpc.LatestBlockNumber.Int64(), nil, nil, 5).Logs(context.Background()); err != nil {
+		t.Fatalf("safe to latest: %v", err)
+	}
+	if _, err = sys.NewRangeFilter(rpc.FinalizedBlockNumber.Int64(), rpc.LatestBlockNumber.Int64(), nil, nil, 5).Logs(context.Background()); err != nil {
+		t.Fatalf("finalized to latest: %v", err)
+	}
+	_, err = sys.NewRangeFilter(0, rpc.PendingBlockNumber.Int64(), nil, nil, 5).Logs(context.Background())
+	if !errors.Is(err, errPendingLogsUnsupported) && (err == nil || !strings.Contains(err.Error(), "pending logs are not supported")) {
+		t.Fatalf("pending: %v", err)
+	}
+
+	es := NewEventSystem(sys)
+	logs := make(chan []*types.Log, 1)
+	sub, err := es.SubscribeLogs(ethereum.FilterQuery{
+		FromBlock: big.NewInt(8),
+		ToBlock:   big.NewInt(rpc.LatestBlockNumber.Int64()),
+	}, logs)
+	if err != nil {
+		t.Fatalf("subscription inside the cap: %v", err)
+	}
+	sub.Unsubscribe()
+	_, err = es.SubscribeLogs(ethereum.FilterQuery{
+		FromBlock: big.NewInt(0),
+		ToBlock:   big.NewInt(rpc.LatestBlockNumber.Int64()),
+	}, logs)
+	if err == nil || !strings.Contains(err.Error(), "exceed maximum block range 5") {
+		t.Fatalf("subscription over the cap: %v", err)
+	}
+	_, err = es.SubscribeLogs(ethereum.FilterQuery{
+		FromBlock: big.NewInt(rpc.SafeBlockNumber.Int64()),
+		ToBlock:   big.NewInt(rpc.LatestBlockNumber.Int64()),
+	}, logs)
+	if err != nil {
+		t.Fatalf("safe to latest subscription: %v", err)
+	}
+	_, err = es.SubscribeLogs(ethereum.FilterQuery{
+		FromBlock: big.NewInt(rpc.FinalizedBlockNumber.Int64()),
+		ToBlock:   big.NewInt(rpc.LatestBlockNumber.Int64()),
+	}, logs)
+	if err != nil {
+		t.Fatalf("finalized to latest subscription: %v", err)
+	}
+	_, err = es.SubscribeLogs(ethereum.FilterQuery{
+		FromBlock: big.NewInt(rpc.PendingBlockNumber.Int64()),
+		ToBlock:   big.NewInt(rpc.LatestBlockNumber.Int64()),
+	}, logs)
+	if err == nil || !strings.Contains(err.Error(), "pending logs are not supported") {
+		t.Fatalf("pending subscription: %v", err)
 	}
 }

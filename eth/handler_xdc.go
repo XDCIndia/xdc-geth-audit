@@ -26,6 +26,11 @@ import (
 // for one peer. A further message is dropped. One goroutine drains the queue.
 const bftPeerSendQueueLen = 32
 
+// bftPeerOwnQueueLen is the length of the second queue, for this node's own
+// votes, timeouts, syncInfo and blocks. The sender goroutine drains it first,
+// so forwarded traffic that fills the main queue cannot drop them (#2079).
+const bftPeerOwnQueueLen = 8
+
 // bftPeerSendFullTimeout is how long a peer's send queue may stay full before
 // the peer is disconnected. A peer that stops reading would otherwise hold
 // the sender goroutine and drop every later message.
@@ -40,6 +45,7 @@ type bftOutbound struct {
 // bftPeerSender is one peer's outbound queue and the goroutine that serves it.
 type bftPeerSender struct {
 	ch        chan bftOutbound
+	own       chan bftOutbound // served before ch
 	quit      chan struct{}
 	stopOnce  sync.Once
 	mu        sync.Mutex
@@ -48,45 +54,74 @@ type bftPeerSender struct {
 
 func (p *ethPeer) ensureBFTSender() *bftPeerSender {
 	p.bftOnce.Do(func() {
-		s := &bftPeerSender{
-			ch:   make(chan bftOutbound, bftPeerSendQueueLen),
-			quit: make(chan struct{}),
-		}
-		p.bftSend = s
-		go p.bftSendLoop(s)
+		p.bftSend = newBFTPeerSender()
+		go p.bftSendLoop(p.bftSend)
 	})
 	return p.bftSend
 }
 
+func newBFTPeerSender() *bftPeerSender {
+	return &bftPeerSender{
+		ch:   make(chan bftOutbound, bftPeerSendQueueLen),
+		own:  make(chan bftOutbound, bftPeerOwnQueueLen),
+		quit: make(chan struct{}),
+	}
+}
+
 func (p *ethPeer) bftSendLoop(s *bftPeerSender) {
+	send := func(item bftOutbound) {
+		if err := p.Peer.Send(item.code, item.msg); err != nil {
+			log.Trace("[XDC-P2P] peer send failed", "peer", p.ID(), "code", item.code, "err", err)
+		}
+	}
 	for {
+		// Own messages first.
+		select {
+		case item := <-s.own:
+			send(item)
+			continue
+		default:
+		}
 		select {
 		case <-s.quit:
 			return
+		case item := <-s.own:
+			send(item)
 		case item := <-s.ch:
-			if err := p.Peer.Send(item.code, item.msg); err != nil {
-				log.Trace("[XDC-P2P] peer send failed", "peer", p.ID(), "code", item.code, "err", err)
-			}
+			send(item)
 		}
 	}
 }
 
-// stopBFTSend stops the peer's sender goroutine. It is safe to call more than once.
+// stopBFTSend stops the peer's sender goroutine. It is safe to call more than
+// once. If the sender was never started, it is made already stopped, so a
+// later enqueue cannot start a goroutine for a peer that is gone (#2079).
 func (p *ethPeer) stopBFTSend() {
-	if p == nil || p.bftSend == nil {
+	if p == nil {
 		return
 	}
+	p.bftOnce.Do(func() { p.bftSend = newBFTPeerSender() }) // no goroutine
 	p.bftSend.stopOnce.Do(func() { close(p.bftSend.quit) })
 }
 
 // enqueuePeerSend pushes msg onto the peer's send queue. The call does not
 // block. A message is dropped when the queue is full. If the queue stays full
-// for bftPeerSendFullTimeout the peer is disconnected.
-func (h *handler) enqueuePeerSend(p *ethPeer, code uint64, msg interface{}) {
+// for bftPeerSendFullTimeout the peer is disconnected. own selects the queue
+// for this node's own messages, which the sender serves first.
+func (h *handler) enqueuePeerSend(p *ethPeer, code uint64, msg interface{}, own bool) {
 	s := p.ensureBFTSender()
+	select {
+	case <-s.quit:
+		return // peer is closed
+	default:
+	}
+	q := s.ch
+	if own {
+		q = s.own
+	}
 	s.mu.Lock()
 	select {
-	case s.ch <- bftOutbound{code: code, msg: msg}:
+	case q <- bftOutbound{code: code, msg: msg}:
 		s.fullSince = time.Time{}
 		s.mu.Unlock()
 	default:
@@ -120,9 +155,35 @@ func (h *handler) BroadcastVote(vote *types.Vote) {
 	h.peers.lock.RUnlock()
 
 	for _, p := range peers {
-		h.enqueuePeerSend(p, eth.VoteMsg, vote)
+		h.enqueuePeerSend(p, eth.VoteMsg, vote, false)
 	}
 	log.Debug("[XDC-P2P] Vote broadcast complete", "peers", len(peers), "round", vote.ProposedBlockInfo.Round)
+}
+
+// BroadcastOwn sends a vote, timeout or syncInfo that this node made itself.
+// It uses the priority queue of each peer, so forwarded messages do not drop it.
+func (h *handler) BroadcastOwn(msg interface{}) {
+	var code uint64
+	switch msg.(type) {
+	case *types.Vote:
+		code = eth.VoteMsg
+	case *types.Timeout:
+		code = eth.TimeoutMsg
+	case *types.SyncInfo:
+		code = eth.SyncInfoMsg
+	default:
+		return
+	}
+	h.peers.lock.RLock()
+	peers := make([]*ethPeer, 0, len(h.peers.peers))
+	for _, p := range h.peers.peers {
+		peers = append(peers, p)
+	}
+	h.peers.lock.RUnlock()
+
+	for _, p := range peers {
+		h.enqueuePeerSend(p, code, msg, true)
+	}
 }
 
 // BroadcastTimeout propagates a V2 consensus timeout to all connected peers.
@@ -142,7 +203,7 @@ func (h *handler) BroadcastTimeout(timeout *types.Timeout) {
 	h.peers.lock.RUnlock()
 
 	for _, p := range peers {
-		h.enqueuePeerSend(p, eth.TimeoutMsg, timeout)
+		h.enqueuePeerSend(p, eth.TimeoutMsg, timeout, false)
 	}
 	log.Debug("[XDC-P2P] Timeout broadcast complete", "peers", len(peers), "round", timeout.Round)
 }
@@ -162,7 +223,7 @@ func (h *handler) BroadcastSyncInfo(syncInfo *types.SyncInfo) {
 	h.peers.lock.RUnlock()
 
 	for _, p := range peers {
-		h.enqueuePeerSend(p, eth.SyncInfoMsg, syncInfo)
+		h.enqueuePeerSend(p, eth.SyncInfoMsg, syncInfo, false)
 	}
 	log.Debug("[XDC-P2P] SyncInfo broadcast complete", "peers", len(peers))
 }
@@ -211,7 +272,7 @@ func (h *handler) BroadcastBlock(block *types.Block) {
 		TD:    td,
 	}
 	for _, p := range peers {
-		h.enqueuePeerSend(p, eth.NewBlockMsg, pkt)
+		h.enqueuePeerSend(p, eth.NewBlockMsg, pkt, true)
 	}
 	log.Debug("[XDC-P2P] Block broadcast started",
 		"number", block.NumberU64(), "hash", block.Hash(), "peers", len(peers))

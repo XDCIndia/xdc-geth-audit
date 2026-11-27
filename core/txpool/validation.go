@@ -220,6 +220,12 @@ func ValidateTransaction(tx *types.Transaction, head *types.Header, signer types
 	if !tx.KnownSpecialCall() && tx.GasTipCapIntCmp(opts.MinTip) < 0 {
 		return fmt.Errorf("%w: gas tip cap %v, minimum needed %v", ErrTxGasPriceTooLow, tx.GasTipCap(), opts.MinTip)
 	}
+	// XDC: the miner never includes a tx to BlockSigners with fewer than 68
+	// bytes of calldata (miner/worker.go, canonical miner/worker.go:1141-1150).
+	// Such a tx would stay in pending without end, so refuse it here.
+	if to := tx.To(); to != nil && *to == common.BlockSignersBinary && len(tx.Data()) < 68 {
+		return fmt.Errorf("%w: %d bytes", ErrSpecialTxShortData, len(tx.Data()))
+	}
 	if tx.Type() == types.BlobTxType {
 		return validateBlobSidecar(tx, head, opts)
 	}

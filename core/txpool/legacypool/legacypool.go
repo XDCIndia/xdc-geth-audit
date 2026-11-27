@@ -262,6 +262,11 @@ type LegacyPool struct {
 	pendingNonces *noncer                      // Pending state tracking virtual nonces
 	reserver      txpool.Reserver              // Address reserver to ensure exclusivity across subpools
 
+	// trc21Capacity is the TRC21 fee capacity of every registered token at the
+	// current head. It is built once per head, as canonical does (pool.reset),
+	// and not for each admitted tx under the pool lock. Guarded by mu.
+	trc21Capacity map[common.Address]*big.Int
+
 	pending map[common.Address]*list // All currently processable transactions
 	queue   *queue
 	all     *lookup     // All transactions to allow lookups
@@ -353,6 +358,7 @@ func (pool *LegacyPool) Init(gasTip uint64, head *types.Header, reserver txpool.
 	}
 	pool.currentHead.Store(head)
 	pool.currentState = statedb
+	pool.trc21Capacity = state.GetTRC21FeeCapacityFromState(statedb)
 	pool.pendingNonces = newNoncer(statedb)
 
 	pool.wg.Add(1)
@@ -615,7 +621,7 @@ func (pool *LegacyPool) trc21Data() (map[common.Address]*big.Int, func(*types.Tr
 	if pool.currentState == nil || !pool.chainconfig.IsXDC() {
 		return nil, nil
 	}
-	issuers := state.GetTRC21FeeCapacityFromState(pool.currentState)
+	issuers := pool.trc21Capacity
 	if len(issuers) == 0 {
 		return nil, nil
 	}
@@ -678,7 +684,7 @@ func (pool *LegacyPool) validateTx(tx *types.Transaction) error {
 		// core/txpool/legacypool/legacypool.go:622 trc21FeeCapacity). Config
 		// and the head number also drive the gas-price tier floor (Gas50x /
 		// Gas2500x).
-		Trc21FeeCapacity: state.GetTRC21FeeCapacityFromState(pool.currentState),
+		Trc21FeeCapacity: pool.trc21Capacity,
 		Config:           pool.chainconfig,
 		CurrentNumber: func() *big.Int {
 			if head := pool.currentHead.Load(); head != nil {
@@ -1612,12 +1618,12 @@ func (pool *LegacyPool) runReorg(done chan struct{}, reset *txpoolResetRequest, 
 		// not operate on stale currentState / pendingNonces for the requested head.
 		var capacityBefore map[common.Address]*big.Int
 		if blockSenders != nil && pool.currentState != nil {
-			capacityBefore = state.GetTRC21FeeCapacityFromState(pool.currentState)
+			capacityBefore = pool.trc21Capacity
 		}
 		resetOK = pool.reset(reset.oldHead, reset.newHead, preState)
 
 		if resetOK && blockSenders != nil && capacityBefore != nil && pool.currentState != nil {
-			reduced := reducedTRC21Issuers(capacityBefore, state.GetTRC21FeeCapacityFromState(pool.currentState))
+			reduced := reducedTRC21Issuers(capacityBefore, pool.trc21Capacity)
 			for _, addr := range accountsSendingTo(pool.pending, reduced) {
 				if _, seen := blockSenders[addr]; seen {
 					continue
@@ -1846,6 +1852,7 @@ func (pool *LegacyPool) reset(oldHead, newHead *types.Header, preState *state.St
 	}
 	pool.currentHead.Store(newHead)
 	pool.currentState = statedb
+	pool.trc21Capacity = state.GetTRC21FeeCapacityFromState(statedb)
 	pool.pendingNonces = newNoncer(statedb)
 
 	// XDC: empty-route txs (0x91-0x94) do not advance the sender's nonce
@@ -2088,6 +2095,20 @@ func canScopeReset(oldHead, newHead *types.Header, sinceFull int) bool {
 		sinceFull < fullDemoteEvery
 }
 
+// requeueDemoted moves a tx that left the pending list into the queue. If the
+// queue refuses it (a better tx has the same nonce there), the tx is in neither
+// list any more, so it is also removed from the lookup and the price heap.
+//
+// Note, this method assumes the pool lock is held!
+func (pool *LegacyPool) requeueDemoted(hash common.Hash, tx *types.Transaction) {
+	// Internal shuffle shouldn't touch the lookup set.
+	if _, err := pool.enqueueTx(hash, tx, false); err != nil {
+		log.Debug("Dropping demoted transaction refused by the queue", "hash", hash, "err", err)
+		pool.all.Remove(hash)
+		pool.priced.Removed(1)
+	}
+}
+
 func (pool *LegacyPool) demoteUnexecutables(accounts map[common.Address]struct{}) {
 	// Iterate over all accounts and demote any non-executable transactions.
 	// When a scoped set is provided, restrict iteration to those accounts only.
@@ -2123,7 +2144,7 @@ func (pool *LegacyPool) demoteUnexecutables(accounts map[common.Address]struct{}
 			log.Trace("Demoting pending transaction", "hash", hash)
 
 			// Internal shuffle shouldn't touch the lookup set.
-			pool.enqueueTx(hash, tx, false)
+			pool.requeueDemoted(hash, tx)
 		}
 		pool.priced.Removed(len(olds) + len(drops))
 		pendingGauge.Dec(int64(len(olds) + len(drops) + len(invalids)))
@@ -2136,7 +2157,7 @@ func (pool *LegacyPool) demoteUnexecutables(accounts map[common.Address]struct{}
 				log.Warn("Demoting invalidated transaction", "hash", hash)
 
 				// Internal shuffle shouldn't touch the lookup set.
-				pool.enqueueTx(hash, tx, false)
+				pool.requeueDemoted(hash, tx)
 			}
 			pendingGauge.Dec(int64(len(gapped)))
 		}

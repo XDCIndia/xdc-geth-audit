@@ -568,6 +568,14 @@ func SetupGenesisBlockWithOverride(db ethdb.Database, triedb *triedb.Database, g
 
 	// TODO(rjl493456442) better to define the comparator of chain config
 	// and short circuit if the chain config is not changed.
+	// XDC fork blocks and XDPoS settings are not covered by CheckCompatible.
+	// A mismatch refuses to start, where an upstream mismatch rewinds the chain
+	// (a stored config without a field is not a mismatch; see CheckXDCCompatible).
+	if head.Number.Sign() != 0 {
+		if err := storedCfg.CheckXDCCompatible(newCfg, head.Number); err != nil {
+			return nil, common.Hash{}, nil, fmt.Errorf("stored chain config is incompatible with this binary: %w", err)
+		}
+	}
 	compatErr := storedCfg.CheckCompatible(newCfg, head.Number.Uint64(), head.Time)
 	if compatErr != nil && ((head.Number.Uint64() != 0 && compatErr.RewindToBlock != 0) || (head.Time != 0 && compatErr.RewindToTime != 0)) {
 		return newCfg, ghash, compatErr, nil

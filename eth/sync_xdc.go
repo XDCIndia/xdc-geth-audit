@@ -456,9 +456,13 @@ type xdcSyncer struct {
 	// A.97.2 snap-heal state. healStarted is a one-shot guard so
 	// maybeStartSnapHeal spawns at most one goroutine per AT_TIP transition.
 	// healStatusMu protects healStatus for concurrent RPC reads. Refs #894.
-	healStarted  atomic.Bool
-	healStatusMu sync.Mutex
-	healStatus   xdcHealStatus
+	healStarted atomic.Bool
+	// missingNodeBlock / missingNodeTries count consecutive MissingNodeError
+	// import failures at one block (XDC-HUNT-55). Only syncOnce touches them.
+	missingNodeBlock uint64
+	missingNodeTries int
+	healStatusMu     sync.Mutex
+	healStatus       xdcHealStatus
 
 	// Issue #1045: snap-sync live-lock prevention.
 	//
@@ -1589,7 +1593,36 @@ const healGateBBlocks = 128
 //
 // Called from maybeTransitionToAtTip AFTER core.XdcBulkSyncMode.Store(false).
 // Refs #894.
-func (s *xdcSyncer) maybeStartSnapHeal() {
+func (s *xdcSyncer) maybeStartSnapHeal() { s.startSnapHeal(true) }
+
+// missingNodeHealAfter is how many consecutive MissingNodeError import failures
+// at the same block start the snap heal (XDC-HUNT-55).
+const missingNodeHealAfter = 3
+
+// noteMissingTrieNode records the outcome of a failed import at block number and
+// reports whether the same block has now failed missingNodeHealAfter times in a
+// row with a missing trie node. Any other error or block resets the count.
+func (s *xdcSyncer) noteMissingTrieNode(number uint64, err error) bool {
+	var missing *trie.MissingNodeError
+	if !errors.As(err, &missing) {
+		s.missingNodeBlock, s.missingNodeTries = 0, 0
+		return false
+	}
+	if s.missingNodeTries > 0 && s.missingNodeBlock == number {
+		s.missingNodeTries++
+	} else {
+		s.missingNodeBlock, s.missingNodeTries = number, 1
+	}
+	if s.missingNodeTries < missingNodeHealAfter {
+		return false
+	}
+	s.missingNodeTries = 0
+	return true
+}
+
+// startSnapHeal is maybeStartSnapHeal; requireNoState false also heals a node
+// whose no-state flag is not set but whose head state has missing trie nodes.
+func (s *xdcSyncer) startSnapHeal(requireNoState bool) {
 	// Env-gate first: cheapest check, avoids dereferencing handler in tests.
 	if !snapHealEnabled() {
 		s.healStatusMu.Lock()
@@ -1602,7 +1635,7 @@ func (s *xdcSyncer) maybeStartSnapHeal() {
 		return // non-XDC chain
 	}
 	bc := s.handler.chain
-	if !bc.CheckpointSyncNoState() {
+	if requireNoState && !bc.CheckpointSyncNoState() {
 		// A.96 / default path: flag is false → nothing to heal.
 		log.Debug("A.97.2: snap-heal skipped — checkpointSyncNoState already false")
 		s.healStatusMu.Lock()
@@ -1775,7 +1808,9 @@ func (s *xdcSyncer) maybeStartSnapHeal() {
 
 		// Gate B passed: healed head state is provably the canonical state on
 		// disk — clear the flag so normal execution + state commit resumes.
-		bc.SetCheckpointSyncNoState(false)
+		if bc.CheckpointSyncNoState() {
+			bc.SetCheckpointSyncNoState(false)
+		}
 		log.Info("A.97.2: snap-heal completed",
 			"root", lastRoot.Hex(),
 			"head", func() uint64 {
@@ -2929,6 +2964,20 @@ func (s *xdcSyncer) fullSyncOnce() {
 	if err != nil {
 		log.Warn("xdcSyncer: InsertChain failed",
 			"from", fromBlock, "attempted", len(blocks), "inserted", n, "err", err)
+		// XDC-HUNT-55: the same block failing again and again on a missing trie
+		// node is our own incomplete state; start the snap heal instead of
+		// retrying forever. It needs XDC_SNAP_HEAL=1 and snap peers.
+		if blocks[min(n, len(blocks)-1)] != nil &&
+			s.noteMissingTrieNode(blocks[min(n, len(blocks)-1)].NumberU64(), err) {
+			if snapHealEnabled() {
+				log.Warn("xdcSyncer: block keeps failing on a missing trie node — starting snap heal",
+					"block", blocks[min(n, len(blocks)-1)].NumberU64())
+				s.startSnapHeal(false)
+			} else {
+				log.Error("xdcSyncer: block keeps failing on a missing trie node: local state is incomplete; set XDC_SNAP_HEAL=1 to heal it or resync",
+					"block", blocks[min(n, len(blocks)-1)].NumberU64())
+			}
+		}
 		// F-2026-20648: a gap below the pivot with no proven pool yet; retry the proof.
 		if errors.Is(err, xdcutils.ErrV2SnapshotMissing) {
 			s.proveGapPoolsRetry()
@@ -3009,6 +3058,7 @@ func (s *xdcSyncer) fullSyncOnce() {
 		}
 	}
 	// Successful import (or healed via co-signed-sibling adoption) — clear stuck state.
+	s.missingNodeBlock, s.missingNodeTries = 0, 0
 	if s.stuckFailures > 0 {
 		s.stuckFrom = 0
 		s.stuckFailures = 0
@@ -3613,10 +3663,35 @@ func (s *xdcSyncer) repairAnchorGapBodies(peer *eth.Peer) {
 	s.anchorGapRepaired.Store(true)
 }
 
-// verifiedCompetingHeader reports whether header is a real competing block:
-// the consensus engine accepts it. A peer-supplied header that fails this
-// check is not evidence for moving the local head.
-func verifiedCompetingHeader(chain *core.BlockChain, header *types.Header) bool {
+// checkpointCatchupEnd returns the last block number of the fast-sync catch-up
+// window, where V2 skips verifyQC, and whether a fast-sync anchor exists. The
+// formula, anchor + 2 epochs, is the one inCheckpointCatchup and
+// BlockChain.GetTrustedCheckpointAnchor use.
+func checkpointCatchupEnd(chain *core.BlockChain) (uint64, bool) {
+	anchor, _, _ := chain.GetTrustedCheckpointAnchor()
+	if anchor == 0 {
+		return 0, false
+	}
+	epoch := uint64(900)
+	if cfg := chain.Config().XDPoS; cfg != nil && cfg.Epoch != 0 {
+		epoch = cfg.Epoch
+	}
+	return anchor + 2*epoch, true
+}
+
+// verifiedCompetingBranch reports whether header is evidence of a real competing
+// branch: the consensus engine accepts it and, when its parent is not local, the
+// whole branch that links it to a block we hold. A peer-supplied header that
+// fails this is not evidence for moving the local head.
+//
+// A header with a parent we hold has to pass VerifyHeader itself; a mutated copy
+// of the local head does not. A header with an unknown parent always stops at
+// ErrUnknownAncestor before any seal or certificate check, so a forged parent
+// hash would pass for free (XDC-HUNT-33): the branch is fetched from the peer
+// that served it, back to a header whose parent is local, and verified in order
+// with VerifyHeaders (seal, and the V2 certificates as import does).
+func (s *xdcSyncer) verifiedCompetingBranch(p *eth.Peer, header *types.Header) bool {
+	chain := s.handler.chain
 	if chain == nil || header == nil || chain.Engine() == nil || header.Number == nil || header.Number.Sign() == 0 {
 		return false
 	}
@@ -3624,15 +3699,82 @@ func verifiedCompetingHeader(chain *core.BlockChain, header *types.Header) bool 
 	if err == nil {
 		return true
 	}
-	// A competing branch's parent is not on the local chain, so verification
-	// stops at ErrUnknownAncestor. That is a real fork, which is the case the
-	// rollback exists for. A header whose parent is already local has to pass
-	// verification; a mutated copy of the local head does not.
 	if !errors.Is(err, consensus.ErrUnknownAncestor) {
 		return false
 	}
-	parent := chain.GetHeader(header.ParentHash, header.Number.Uint64()-1)
-	return parent == nil
+	if chain.GetHeader(header.ParentHash, header.Number.Uint64()-1) != nil {
+		return false // the parent is local, so the header had to verify on its own
+	}
+	if p == nil {
+		return false
+	}
+	branch := s.fetchForkBranch(p, header)
+	return branch != nil && s.verifyForkBranch(branch)
+}
+
+// fetchForkBranch fetches from p the headers that link evidence back to a header
+// whose parent is local, at most xdcRollbackWindowMax deep. It returns them in
+// ascending order, or nil when p does not serve a linked branch.
+func (s *xdcSyncer) fetchForkBranch(p *eth.Peer, evidence *types.Header) []*types.Header {
+	chain := s.handler.chain
+	branch := []*types.Header{evidence}
+	for uint64(len(branch)) <= xdcRollbackWindowMax {
+		first := branch[0]
+		num := first.Number.Uint64()
+		if num <= 1 {
+			return nil
+		}
+		if chain.GetHeader(first.ParentHash, num-1) != nil {
+			return branch
+		}
+		count := min(uint64(xdpos2MaxHeaderFetch), num-1)
+		hdrs := s.fetchHeaderBatchTimeout(p, num-count, int(count), xdcBulkReqTimeout)
+		if len(hdrs) == 0 {
+			return nil
+		}
+		var older []*types.Header
+		for i := len(hdrs) - 1; i >= 0; i-- {
+			h := hdrs[i]
+			next := first
+			if len(older) > 0 {
+				next = older[0]
+			}
+			if h == nil || h.Number == nil || h.Number.Uint64()+1 != next.Number.Uint64() || h.Hash() != next.ParentHash {
+				return nil // does not link to what we have
+			}
+			older = append([]*types.Header{h}, older...)
+			if h.Number.Uint64() <= 1 || chain.GetHeader(h.ParentHash, h.Number.Uint64()-1) != nil {
+				break
+			}
+		}
+		branch = append(older, branch...)
+	}
+	return nil
+}
+
+// forkBranchVerifyTimeout bounds the VerifyHeaders pass over a fetched branch.
+const forkBranchVerifyTimeout = 2 * time.Minute
+
+// verifyForkBranch verifies an ascending, linked branch whose first header has a
+// local parent, the way import does.
+func (s *xdcSyncer) verifyForkBranch(branch []*types.Header) bool {
+	chain := s.handler.chain
+	abort, results := chain.Engine().VerifyHeaders(chain, branch)
+	defer close(abort)
+	timeout := time.After(forkBranchVerifyTimeout)
+	for range branch {
+		select {
+		case err := <-results:
+			if err != nil {
+				return false
+			}
+		case <-timeout:
+			return false
+		case <-s.quitCh:
+			return false
+		}
+	}
+	return true
 }
 
 // rollbackWindow returns the exponential rollback window for a given cumulative
@@ -3780,6 +3922,7 @@ func (s *xdcSyncer) maybeRollbackOnUnknownAncestor(fromBlock uint64, peer *eth.P
 	forkConfirmed := false
 	triggerDisagrees := false
 	var forkEvidence *types.Header
+	var forkEvidencePeer *eth.Peer // peer that served forkEvidence
 	if peer != nil {
 		peerAtHead := s.fetchHeaderBatchTimeout(peer, cur.Number.Uint64(), 1, xdcBulkReqTimeout)
 		if len(peerAtHead) > 0 && peerAtHead[0].Number.Uint64() == cur.Number.Uint64() {
@@ -3789,6 +3932,7 @@ func (s *xdcSyncer) maybeRollbackOnUnknownAncestor(fromBlock uint64, peer *eth.P
 			}
 			triggerDisagrees = true // triggering peer sees a different block at our height
 			forkEvidence = peerAtHead[0]
+			forkEvidencePeer = peer
 		}
 		// else: inconclusive — peer timed out or is behind our head
 	}
@@ -3820,6 +3964,7 @@ func (s *xdcSyncer) maybeRollbackOnUnknownAncestor(fromBlock uint64, peer *eth.P
 			}
 			forkConfirmed = true
 			forkEvidence = altHdrs[0]
+			forkEvidencePeer = altPeer
 			break
 		}
 		// No other peer was conclusive. Right after a new head, alt peers often
@@ -3839,10 +3984,11 @@ func (s *xdcSyncer) maybeRollbackOnUnknownAncestor(fromBlock uint64, peer *eth.P
 		}
 	}
 
-	if forkConfirmed && !verifiedCompetingHeader(s.handler.chain, forkEvidence) {
-		// A different hash at our height is not enough. The header has to pass
-		// consensus verification (seal or certificate). Unverified headers must
-		// not move the head.
+	if forkConfirmed && !s.verifiedCompetingBranch(forkEvidencePeer, forkEvidence) {
+		// A different hash at our height is not enough. The header, and the
+		// branch that links it to a block we hold, has to pass consensus
+		// verification (seal or certificate). Unverified headers must not move
+		// the head.
 		log.Warn("xdcSyncer: competing header failed verification — skipping rollback",
 			"head", cur.Number.Uint64(), "evidence", func() common.Hash {
 				if forkEvidence == nil {
@@ -3866,6 +4012,24 @@ func (s *xdcSyncer) maybeRollbackOnUnknownAncestor(fromBlock uint64, peer *eth.P
 		s.stuckFailures = 0
 		core.XdcForkRecovering.Store(false)
 		return
+	}
+
+	// XDC-HUNT-53: a node that used fast sync skips verifyQC for blocks up to the
+	// anchor plus two epochs (inCheckpointCatchup). Once the head is past that
+	// window every block above it was imported with the certificate check, and a
+	// rollback must not put the head back inside it, or the blocks imported
+	// after would be accepted without the check. Clamp the target to the end of
+	// the window; at or above the head there is nothing to roll back.
+	if end, ok := checkpointCatchupEnd(s.handler.chain); ok && cur.Number.Uint64() > end && target < end {
+		log.Debug("xdcSyncer: clamping rollback target to the end of the fast-sync catch-up window",
+			"unclamped", target, "windowEnd", end, "localHead", cur.Number.Uint64())
+		target = end
+		if target >= cur.Number.Uint64() {
+			core.XdcForkRecovering.Store(false)
+			s.stuckFrom = 0
+			s.stuckFailures = 0
+			return
+		}
 	}
 
 	// Item 1 (#1667, revised): Finality clamp — clamp the rollback target to
@@ -4374,6 +4538,9 @@ func (s *xdcSyncer) fetchPeerHeadHeader() *types.Header {
 	var heads []peerHead
 	for _, ep := range s.handler.peers.all() {
 		p := ep.Peer
+		if s.isPeerTainted(p.ID()) {
+			continue
+		}
 		rng := p.BlockRange()
 		if rng == nil || rng.LatestBlockHash == (common.Hash{}) {
 			log.Debug("xdcSyncer.fetchPeerHeadHeader: peer no block range", "peer", p.ID()[:12])
@@ -4430,12 +4597,67 @@ func (s *xdcSyncer) fetchPeerHeadHeader() *types.Header {
 		log.Debug("xdcSyncer.fetchPeerHeadHeader: pivot batch fetch failed", "peer", lowest.peer.ID()[:12], "pivotNum", pivotNum)
 		return nil
 	}
+	// XDC-HUNT-32: the pivot header (and so the state root the snap download
+	// targets) comes from one peer. Adopt it only when a second, different peer
+	// serves the same header at that number. A disagreement taints both peers so
+	// the next attempt picks another pair; no answer leaves the pivot unselected
+	// (retried on the next tick).
+	var others []*eth.Peer
+	for _, ep := range s.handler.peers.all() {
+		if ep.Peer.ID() != lowest.peer.ID() && !s.isPeerTainted(ep.Peer.ID()) {
+			others = append(others, ep.Peer)
+		}
+	}
+	if len(others) > pivotConfirmMaxPeers {
+		others = others[:pivotConfirmMaxPeers]
+	}
+	ok, conflict := confirmPivot(pivotHdrs[0], len(others), func(i int) *types.Header {
+		if hdrs := s.fetchHeaderBatch(others[i], pivotNum, 1); len(hdrs) > 0 {
+			return hdrs[0]
+		}
+		return nil
+	})
+	if !ok {
+		if conflict >= 0 {
+			log.Warn("xdcSyncer: snap pivot header disagrees between two peers — tainting both",
+				"pivot", pivotNum, "source", lowest.peer.ID()[:12], "other", others[conflict].ID()[:12])
+			s.taintPeer(lowest.peer)
+			s.taintPeer(others[conflict])
+		} else {
+			log.Debug("xdcSyncer.fetchPeerHeadHeader: snap pivot not confirmed by a second peer",
+				"pivot", pivotNum, "source", lowest.peer.ID()[:12], "asked", len(others))
+		}
+		return nil
+	}
 	log.Info("xdcSyncer: peer head selection",
 		"selected_peer", lowest.peer.ID()[:12],
 		"selected_head", lowest.hdr.Number.Uint64(),
 		"pivot", pivotHdrs[0].Number.Uint64(),
 		"peer_count", len(heads))
 	return pivotHdrs[0]
+}
+
+// pivotConfirmMaxPeers bounds how many other peers are asked to confirm a pivot
+// header in one attempt.
+const pivotConfirmMaxPeers = 3
+
+// confirmPivot reports whether one of n other peers serves the same header as
+// pivot at the same number. fetch(i) returns peer i's header at that number, or
+// nil when it did not answer; non-answers and wrong-number answers are skipped.
+// On a different header it returns false and that peer's index; with no answer
+// at all it returns false and -1.
+func confirmPivot(pivot *types.Header, n int, fetch func(i int) *types.Header) (ok bool, conflict int) {
+	for i := 0; i < n; i++ {
+		h := fetch(i)
+		if h == nil || h.Number == nil || h.Number.Cmp(pivot.Number) != 0 {
+			continue
+		}
+		if h.Hash() == pivot.Hash() {
+			return true, -1
+		}
+		return false, i
+	}
+	return false, -1
 }
 
 // fetchHeaderByHash issues a hash-based GetBlockHeaders request to a

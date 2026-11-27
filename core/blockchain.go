@@ -55,6 +55,7 @@ import (
 	"github.com/ethereum/go-ethereum/metrics"
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/rlp"
+	"github.com/ethereum/go-ethereum/trie"
 	"github.com/ethereum/go-ethereum/triedb"
 	"github.com/ethereum/go-ethereum/triedb/hashdb"
 	"github.com/ethereum/go-ethereum/triedb/pathdb"
@@ -658,9 +659,18 @@ func NewBlockChain(db ethdb.Database, genesis *Genesis, engine consensus.Engine,
 	if compatErr != nil {
 		log.Warn("Rewinding chain to upgrade configuration", "err", compatErr)
 		if compatErr.RewindToTime > 0 {
-			bc.SetHeadWithTimestamp(compatErr.RewindToTime)
+			err = bc.SetHeadWithTimestamp(compatErr.RewindToTime)
 		} else {
-			bc.SetHead(compatErr.RewindToBlock)
+			err = bc.SetHead(compatErr.RewindToBlock)
+		}
+		// A refused rewind (for example below an XDPoS committed block) must
+		// not persist the new chain config. The stored config stays as it
+		// was, and startup fails instead of running a head that the engine
+		// has already committed past.
+		if err != nil {
+			log.Error("Failed to rewind chain for configuration upgrade", "err", err)
+			bc.Stop()
+			return nil, err
 		}
 		rawdb.WriteChainConfig(db, genesisHash, chainConfig)
 	}
@@ -1234,10 +1244,64 @@ func (bc *BlockChain) SetHead(head uint64) error {
 // synced and in which state, the method will try to delete minimal data from
 // disk whilst retaining chain consistency.
 func (bc *BlockChain) SetHeadWithTimestamp(timestamp uint64) error {
+	// Resolve the timestamp to a header number before deleting anything.
+	// SetHead already refuses a head below the XDPoS committed block; this
+	// path is what the config-compat startup rewind uses, so it must refuse
+	// the same way.
+	headHdr := bc.headerAtOrBeforeTime(timestamp)
+	if lcb := bc.latestCommittedBlock(); lcb != nil {
+		var headNum uint64
+		if headHdr != nil {
+			headNum = headHdr.Number.Uint64()
+		}
+		if headHdr == nil || headNum < lcb.Number.Uint64() {
+			return fmt.Errorf("refusing to set head %d below XDPoS committed block %d", headNum, lcb.Number.Uint64())
+		}
+	}
 	if _, err := bc.setHeadBeyondRoot(0, timestamp, common.Hash{}, false); err != nil {
 		return err
 	}
+	// XDC: same cache purge as SetHead. The timestamp path used to skip it,
+	// so a config-compat rewind left consensus caches holding blocks that
+	// had just been deleted.
+	if inv, ok := bc.engine.(consensus.CacheInvalidator); ok {
+		head := bc.CurrentBlock().Number.Uint64()
+		inv.InvalidateCaches(head)
+	}
 	return bc.sendChainHeadEvent()
+}
+
+// headerAtOrBeforeTime returns the highest canonical header whose timestamp
+// is at or below the target. Canonical timestamps are non-decreasing, so
+// this is the header SetHeadWithTimestamp lands on before any state-repair
+// rewind. Nil means no canonical header is at or before the target.
+func (bc *BlockChain) headerAtOrBeforeTime(timestamp uint64) *types.Header {
+	head := bc.CurrentHeader()
+	if head == nil {
+		return nil
+	}
+	if head.Time <= timestamp {
+		return head
+	}
+	lo, hi := uint64(0), head.Number.Uint64()
+	var best *types.Header
+	for lo <= hi {
+		mid := lo + (hi-lo)/2
+		hdr := bc.GetHeaderByNumber(mid)
+		if hdr == nil || hdr.Time > timestamp {
+			if mid == 0 {
+				break
+			}
+			hi = mid - 1
+			continue
+		}
+		best = hdr
+		if mid == hi {
+			break
+		}
+		lo = mid + 1
+	}
+	return best
 }
 
 // sendChainHeadEvent notifies all subscribers about the new chain head,
@@ -3089,6 +3153,16 @@ func (bc *BlockChain) ProcessBlock(ctx context.Context, parentRoot common.Hash, 
 			// complete trie. The parent-state miss above is a different case:
 			// execution never started, and bulk sync still uses the empty trie
 			// there so a follower with no parent state can keep importing.
+			//
+			// A missing trie node below the root means the local state is
+			// incomplete, not that the block is bad (XDC-HUNT-55): say so, and
+			// keep the error type so the syncer does not mark honest peers.
+			var missing *trie.MissingNodeError
+			if errors.As(err, &missing) {
+				log.Error("Local state is incomplete: trie node missing while validating block, a state repair or new sync is needed",
+					"number", block.Number(), "hash", block.Hash(), "err", err)
+				return nil, err
+			}
 			bc.reportBadBlock(block, res, err)
 			return nil, err
 		}

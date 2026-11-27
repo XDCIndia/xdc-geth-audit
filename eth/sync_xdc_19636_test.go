@@ -12,10 +12,12 @@ import (
 
 // TestF202619636UnverifiedHeadersDoNotRollBack checks that two peers serving a
 // different hash at the local head cannot move the head when that header does
-// not pass consensus verification.
+// not pass consensus verification. The chain is longer than the 128-block
+// rollback window: a shorter one returns before the evidence check and the test
+// would pass without the fix (XDC-HUNT-33).
 func TestF202619636UnverifiedHeadersDoNotRollBack(t *testing.T) {
-	const local = 20
-	n := newXDCFakeNet(t, local, 40)
+	const local = 200
+	n := newXDCFakeNet(t, local, 240)
 	badAtHead := func(origin uint64, amount int) []*types.Header {
 		if origin != local || amount < 1 {
 			return nil
@@ -35,7 +37,7 @@ func TestF202619636UnverifiedHeadersDoNotRollBack(t *testing.T) {
 	if got := n.chain.CurrentBlock().Number.Uint64(); got != head {
 		t.Fatalf("head moved from %d to %d on unverified competing headers", head, got)
 	}
-	if verifiedCompetingHeader(n.chain, badAtHead(local, 1)[0]) {
+	if s.verifiedCompetingBranch(first.Peer, badAtHead(local, 1)[0]) {
 		t.Fatal("the test header unexpectedly passed verification")
 	}
 }

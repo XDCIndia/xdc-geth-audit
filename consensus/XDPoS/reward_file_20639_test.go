@@ -26,7 +26,9 @@ func TestF202620639RewardByAccountSeparatesSignerAndHolder(t *testing.T) {
 		"rewards": {"` + signer.Hex() + `": {"` + owner.Hex() + `": 40, "` + signer.Hex() + `": 60}},
 		"signSlots": 9
 	}`
-	if err := os.WriteFile(filepath.Join(dir, "1800.0xabc"), []byte(body), 0o644); err != nil {
+	block := &types.Header{Number: big.NewInt(1800)}
+	bad := &types.Header{Number: big.NewInt(1801)}
+	if err := os.WriteFile(filepath.Join(dir, "1800."+block.Hash().Hex()), []byte(body), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	decoded, err := DecodeRewardFileObject([]byte(body))
@@ -37,7 +39,7 @@ func TestF202620639RewardByAccountSeparatesSignerAndHolder(t *testing.T) {
 		t.Fatalf("decoded record = %#v", decoded)
 	}
 
-	chain := &stubChain{currentHeader: &types.Header{Number: big.NewInt(2000)}}
+	chain := &stubChain{currentHeader: &types.Header{Number: big.NewInt(2000)}, headers: map[uint64]*types.Header{1800: block, 1801: bad}}
 	api := makeTestAPI(makeTestXDPoSWithV2(), chain)
 
 	signerRes, err := api.GetRewardByAccount(signer, rpc.BlockNumber(0), rpc.LatestBlockNumber)
@@ -57,7 +59,7 @@ func TestF202620639RewardByAccountSeparatesSignerAndHolder(t *testing.T) {
 		t.Fatalf("owner reward = %+v, want 40", ownerRes.Rewards)
 	}
 
-	if err := os.WriteFile(filepath.Join(dir, "1801.0xdef"), []byte(`{"signers":1}`), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "1801."+bad.Hash().Hex()), []byte(`{"signers":1}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := api.GetRewardByAccount(signer, rpc.BlockNumber(0), rpc.LatestBlockNumber); err == nil {

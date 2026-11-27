@@ -385,6 +385,13 @@ func New(stateDb ethdb.Database, mode ethconfig.SyncMode, chain BlockChain, drop
 	return dl
 }
 
+// SetUselessPeerDropFn sets the drop function the header skeleton uses for a peer
+// that cannot extend it (timeouts, empty replies). All other drops use the
+// function given to New.
+func (d *Downloader) SetUselessPeerDropFn(fn func(id string)) {
+	d.skeleton.dropUseless = fn
+}
+
 // SetGapSnapshotFn injects the XDPoS gap-snapshot callback. Must be called
 // before the first FastSync cycle starts. Calling it concurrently with an
 // active sync is safe because gapSnapshotFn is only read inside the

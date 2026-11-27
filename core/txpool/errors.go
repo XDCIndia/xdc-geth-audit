@@ -88,6 +88,10 @@ var (
 	// current masternode signer. Mirrors XDPoSChain core/txpool/errors.go.
 	ErrSpecialTxNotFromSigner = errors.New("special transaction sender is not a signer")
 
+	// ErrSpecialTxShortData is returned for a transaction to BlockSigners with
+	// fewer than 68 bytes of calldata. The miner never includes it.
+	ErrSpecialTxShortData = errors.New("transaction to BlockSigners has too little calldata to be mined")
+
 	// ErrSpecialTxNonZeroCost is returned when a special transaction carries a
 	// non-zero value or gas price. Those transactions are defined to be
 	// gasless; a non-zero cost is not added to the account list total on the

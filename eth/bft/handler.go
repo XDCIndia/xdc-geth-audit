@@ -88,6 +88,10 @@ type BroadcastFns struct {
 	Vote     BroadcastVoteFn
 	Timeout  BroadcastTimeoutFn
 	SyncInfo BroadcastSyncInfoFn
+
+	// Own, when set, sends this node's own vote, timeout or syncInfo to the
+	// peers with priority over relayed messages. It must not block.
+	Own func(msg interface{})
 }
 
 // Bfter dispatches inbound BFT messages into the V2 engine and forwards
@@ -381,6 +385,10 @@ func (b *Bfter) loop() {
 				}
 			}
 		case obj := <-b.broadcastCh:
+			if b.broadcast.Own != nil {
+				b.broadcast.Own(obj)
+				continue
+			}
 			// Own-originated message (engine's own vote/timeout/syncInfo).
 			// Block until fwdQueue accepts or quit fires: dropping this node's
 			// own vote costs the network a QC and a 60 s V2 timeout round.

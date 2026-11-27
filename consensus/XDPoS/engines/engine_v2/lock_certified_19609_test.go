@@ -145,3 +145,39 @@ func TestF202619609RestartRaisesHighestQCToStoredLock(t *testing.T) {
 		t.Fatalf("child of the head: vote=%v err=%v, want true", ok, err)
 	}
 }
+
+// TestXDCHunt54RestartIgnoresUnverifiedLock keeps the highest certificate at
+// the header certificate when the stored lock does not carry a quorum.
+func TestXDCHunt54RestartIgnoresUnverifiedLock(t *testing.T) {
+	eng, db := newA894Engine(t)
+	chain, head, lock := lockRestartFixture(t, eng, 1)
+	rawdb.WriteBFTLockQC(db, lock)
+	restartEngine(eng)
+
+	eng.lock.Lock()
+	err := eng.initial(chain, head)
+	eng.lock.Unlock()
+	if err != nil {
+		t.Fatalf("initial: %v", err)
+	}
+	if got := eng.highestQuorumCert.ProposedBlockInfo.Round; got != 11 {
+		t.Fatalf("highest QC round = %d, want 11 (lock has 1 of 4 signatures)", got)
+	}
+}
+
+// TestXDCHunt37ReinitBFTKeepsHigherQC runs ReinitBFT on a node that holds the
+// certificate for its head. The highest certificate must not fall back to the
+// parent certificate in the head header.
+func TestXDCHunt37ReinitBFTKeepsHigherQC(t *testing.T) {
+	eng, _ := newA894Engine(t)
+	chain, head, held := lockRestartFixture(t, eng, 4)
+	restartEngine(eng)
+	eng.highestQuorumCert = held
+
+	if err := eng.ReinitBFT(chain, head); err != nil {
+		t.Fatalf("ReinitBFT: %v", err)
+	}
+	if got := eng.highestQuorumCert.ProposedBlockInfo.Round; got != 12 {
+		t.Fatalf("highest QC round = %d, want 12", got)
+	}
+}

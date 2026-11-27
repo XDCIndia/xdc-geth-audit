@@ -848,7 +848,7 @@ func (w *XdcWorker) commitV1Work(parent *types.Block) {
 	// StateAtForkBoundary before fillTransactions.  Matching that ordering here
 	// ensures FinalizeAndAssemble reads validator-contract state before any txs
 	// in this block modify it (#1753).
-	w.engine.SetParentState(env.state.Copy())
+	w.engine.SetParentState(env.state, env.state.Copy())
 
 	// Fill transactions from the pool. V1 includes txs in every block (rewards
 	// are applied in Finalize at rCheckpoint blocks, not gated on tx presence).

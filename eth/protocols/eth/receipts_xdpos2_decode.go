@@ -33,9 +33,19 @@ import (
 // first and a list in the second (typed consensus receipts are plain strings),
 // so the consensus decode always fails on an eth/69 receipt. The bloom is
 // recomputed from the logs for the eth/69 form, so DeriveSha is unaffected.
-func decodeReceiptsXDPOS2(raw rlp.RawValue) ([]types.Receipts, error) {
-	var blocks []rlp.RawValue
-	if err := rlp.DecodeBytes(raw, &blocks); err != nil {
+//
+// A list with more than maxBlocks blocks is refused before any block is decoded
+// (XDC-HUNT-50).
+func decodeReceiptsXDPOS2(raw rlp.RawValue, maxBlocks int) ([]types.Receipts, error) {
+	var list rlp.RawList[rlp.RawValue]
+	if err := rlp.DecodeBytes(raw, &list); err != nil {
+		return nil, err
+	}
+	if list.Len() > maxBlocks {
+		return nil, fmt.Errorf("%d blocks of receipts, limit %d", list.Len(), maxBlocks)
+	}
+	blocks, err := list.Items()
+	if err != nil {
 		return nil, err
 	}
 	out := make([]types.Receipts, len(blocks))

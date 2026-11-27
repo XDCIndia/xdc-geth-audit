@@ -60,7 +60,7 @@ func (s *BlockChainAPI) GetBlockSignersByHash(ctx context.Context, blockHash com
 	if err != nil || block == nil {
 		return []common.Address{}, err
 	}
-	masternodes, err := s.GetMasternodes(ctx, block)
+	masternodes, err := s.masternodesOfBlock(block)
 	if err != nil || len(masternodes) == 0 {
 		log.Error("Failed to get masternodes", "err", err, "len(masternodes)", len(masternodes))
 		return []common.Address{}, err
@@ -74,7 +74,7 @@ func (s *BlockChainAPI) GetBlockSignersByNumber(ctx context.Context, blockNumber
 	if err != nil || block == nil {
 		return []common.Address{}, err
 	}
-	masternodes, err := s.GetMasternodes(ctx, block)
+	masternodes, err := s.masternodesOfBlock(block)
 	if err != nil || len(masternodes) == 0 {
 		log.Error("Failed to get masternodes", "err", err, "len(masternodes)", len(masternodes))
 		return []common.Address{}, err
@@ -88,7 +88,7 @@ func (s *BlockChainAPI) GetBlockFinalityByHash(ctx context.Context, blockHash co
 	if err != nil || block == nil {
 		return uint(0), err
 	}
-	masternodes, err := s.GetMasternodes(ctx, block)
+	masternodes, err := s.masternodesOfBlock(block)
 	if err != nil || len(masternodes) == 0 {
 		log.Error("Failed to get masternodes", "err", err, "len(masternodes)", len(masternodes))
 		return uint(0), err
@@ -102,7 +102,7 @@ func (s *BlockChainAPI) GetBlockFinalityByNumber(ctx context.Context, blockNumbe
 	if err != nil || block == nil {
 		return uint(0), err
 	}
-	masternodes, err := s.GetMasternodes(ctx, block)
+	masternodes, err := s.masternodesOfBlock(block)
 	if err != nil || len(masternodes) == 0 {
 		log.Error("Failed to get masternodes", "err", err, "len(masternodes)", len(masternodes))
 		return uint(0), err
@@ -111,7 +111,19 @@ func (s *BlockChainAPI) GetBlockFinalityByNumber(ctx context.Context, blockNumbe
 }
 
 // GetMasternodes returns masternodes set at the starting block of epoch of the given block
-func (s *BlockChainAPI) GetMasternodes(ctx context.Context, b *types.Block) ([]common.Address, error) {
+func (s *BlockChainAPI) GetMasternodes(ctx context.Context, blockNr rpc.BlockNumber) ([]common.Address, error) {
+	block, err := s.b.BlockByNumber(ctx, blockNr)
+	if err != nil {
+		return nil, err
+	}
+	if block == nil {
+		return nil, errors.New("block not found")
+	}
+	return s.masternodesOfBlock(block)
+}
+
+// masternodesOfBlock returns masternodes set at the starting block of epoch of the given block
+func (s *BlockChainAPI) masternodesOfBlock(b *types.Block) ([]common.Address, error) {
 	var masternodes []common.Address
 	if b.Number().Int64() >= 0 {
 		if engine, ok := s.b.Engine().(*XDPoS.XDPoS); ok {

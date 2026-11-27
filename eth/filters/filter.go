@@ -145,9 +145,9 @@ func (f *Filter) Logs(ctx context.Context) ([]*types.Log, error) {
 	if err != nil {
 		return nil, err
 	}
-	if f.rangeLimit != 0 && (end-begin) > f.rangeLimit {
-		return nil, invalidParamsErr("exceed maximum block range %d", f.rangeLimit)
-	}
+	// The span cap is applied in updateChainView, after latest has been
+	// replaced by the current head. Comparing here would treat that sentinel
+	// as block 2^64-1.
 	return f.rangeLogs(ctx, begin, end)
 }
 
@@ -228,6 +228,11 @@ func (s *searchSession) updateChainView() error {
 	}
 	if firstBlock > lastBlock {
 		return errInvalidBlockRange
+	}
+	// Compare the cap to the resolved span. latest is already the head here,
+	// so a query up to latest is not measured against math.MaxUint64.
+	if limit := s.filter.rangeLimit; limit != 0 && lastBlock-firstBlock > limit {
+		return invalidParamsErr("exceed maximum block range %d", limit)
 	}
 	if lastBlock > head {
 		return errBlockRangeIntoFuture

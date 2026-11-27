@@ -920,6 +920,13 @@ func (api *API) TraceCall(ctx context.Context, args ethapi.TransactionArgs, bloc
 
 	// Apply the customization rules if required.
 	if config != nil {
+		// Remember the loaded state header: a block override must not turn the
+		// privacy precompiles on or off for state outside their window.
+		var (
+			stateNumber = new(big.Int).Set(h.Number)
+			stateTime   = h.Time
+			stateMerge  = blockContext.Random != nil
+		)
 		if config.BlockOverrides != nil && config.BlockOverrides.Number != nil && config.BlockOverrides.Number.ToInt().Uint64() == h.Number.Uint64()+1 {
 			// Overriding the block number to n+1 is a common way for wallets to
 			// simulate transactions, however without the following fix, a contract
@@ -936,6 +943,7 @@ func (api *API) TraceCall(ctx context.Context, args ethapi.TransactionArgs, bloc
 		}
 		rules := api.backend.ChainConfig().Rules(blockContext.BlockNumber, blockContext.Random != nil, blockContext.Time)
 		precompiles = vm.ActivePrecompiledContracts(rules)
+		precompiles = ethapi.LimitPrivacyPrecompiles(api.backend.ChainConfig(), precompiles, stateNumber, stateMerge, stateTime, blockContext.BlockNumber, blockContext.Random != nil, blockContext.Time)
 		if err := config.StateOverrides.Apply(statedb, precompiles); err != nil {
 			return nil, err
 		}

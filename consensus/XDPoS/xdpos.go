@@ -41,7 +41,6 @@ import (
 	"io"
 	"math/big"
 	"math/rand"
-	"os"
 	"path/filepath"
 	"reflect"
 	"sort"
@@ -342,11 +341,20 @@ type XDPoS struct {
 	// Testing flags
 	fakeDiff bool // Skip difficulty verifications (testing)
 
-	// XDC: parentState is a copy of statedb before tx processing,
-	// set by Process() and used by Finalize() for reward calculation.
-	// This matches v2.6.8 where parentState is passed to Finalize.
-	parentStateForReward *state.StateDB
+	// XDC: parentStates holds copies of statedb from before tx processing,
+	// set by Process() and the miner and used by Finalize() for reward
+	// calculation. This matches v2.6.8 where parentState is passed to Finalize.
+	// Each copy is keyed by the post-tx state it belongs to, so a concurrent
+	// import, miner round or RPC Finalize cannot take another's copy (#2097).
+	parentStatesMu sync.Mutex
+	parentStates   []parentStateEntry // oldest first, at most maxParentStates
 }
+
+type parentStateEntry struct{ post, pre *state.StateDB }
+
+// maxParentStates bounds the entries that an aborted import or miner round
+// leaves behind: SetParentState without a Finalize.
+const maxParentStates = 16
 
 // EngineV2Iface is the minimal interface for V2 engine, avoiding import cycle. (#94)
 type EngineV2Iface interface {
@@ -486,10 +494,42 @@ func (c *XDPoS) GetMasternodesFromEpochSwitchHeader(chain consensus.ChainReader,
 	return c.EngineV2.GetMasternodesFromEpochSwitchHeader(chain, header)
 }
 
-// SetParentState stores the pre-tx state copy for use in reward calculations.
-// Called by the state processor before Finalize.
-func (c *XDPoS) SetParentState(ps *state.StateDB) {
-	c.parentStateForReward = ps
+// SetParentState stores ps, the pre-tx copy of post, for the reward calculation
+// of the Finalize call that is given post. Called by the state processor and
+// the miner.
+func (c *XDPoS) SetParentState(post, ps *state.StateDB) {
+	if post == nil {
+		return
+	}
+	c.parentStatesMu.Lock()
+	defer c.parentStatesMu.Unlock()
+	for i, e := range c.parentStates {
+		if e.post == post {
+			c.parentStates = append(c.parentStates[:i], c.parentStates[i+1:]...)
+			break
+		}
+	}
+	if len(c.parentStates) >= maxParentStates {
+		c.parentStates = c.parentStates[1:]
+	}
+	c.parentStates = append(c.parentStates, parentStateEntry{post, ps})
+}
+
+// takeParentState returns and removes the pre-tx copy that SetParentState
+// stored for post, or nil if there is none.
+func (c *XDPoS) takeParentState(post *state.StateDB) *state.StateDB {
+	if post == nil {
+		return nil
+	}
+	c.parentStatesMu.Lock()
+	defer c.parentStatesMu.Unlock()
+	for i, e := range c.parentStates {
+		if e.post == post {
+			c.parentStates = append(c.parentStates[:i], c.parentStates[i+1:]...)
+			return e.pre
+		}
+	}
+	return nil
 }
 
 // New creates a XDPoS delegated-proof-of-stake consensus engine.
@@ -717,6 +757,9 @@ func (c *XDPoS) verifyHeaderLightV1(chain consensus.ChainHeaderReader, header *t
 	if parent.Time+c.config.Period > header.Time {
 		return ErrInvalidTimestamp
 	}
+	if err := verifyV1BaseFee(chain.Config(), parent, header); err != nil {
+		return err
+	}
 
 	// #951 Defect 1c: reject empty header.Validator past the first epoch (V1 double
 	// validation requires the assigned-M2 co-signature). Canonical v2.9.3 rejects it
@@ -806,6 +849,33 @@ func verifyNoUnsealedFields(config *params.ChainConfig, header *types.Header) er
 		header.ParentBeaconRoot != nil || header.RequestsHash != nil ||
 		header.BlockAccessListHash != nil || header.SlotNumber != nil {
 		return errUnsealedHeaderFields
+	}
+	return nil
+}
+
+// verifyV1BaseFee is the base-fee rule canonical applies to every V1 header:
+// engine_v1/engine.go:258 calls eip1559.VerifyEip1559Header in
+// verifyCascadingFields. Before the EIP-1559 block the header must carry no
+// base fee; from it the header must carry the exact tier price of its block
+// (canonical CalcBaseFee, consensus/misc/eip1559/eip1559.go:58-75). Canonical's
+// function has no gas limit check, so none is made here either (#2041).
+// BaseFee is part of the V1 seal hash, so a producer could otherwise sign any
+// value.
+func verifyV1BaseFee(config *params.ChainConfig, parent, header *types.Header) error {
+	if !config.IsEIP1559(header.Number) {
+		if header.BaseFee != nil {
+			return fmt.Errorf("invalid baseFee: have %s, want <nil>", header.BaseFee)
+		}
+		return nil
+	}
+	if header.BaseFee == nil {
+		return errors.New("header is missing baseFee")
+	}
+	if parent != nil && config.IsEIP1559(parent.Number) && parent.BaseFee == nil {
+		return errors.New("parent header is missing baseFee")
+	}
+	if want := params.XDCBaseFeeForBlock(config, header.Number); header.BaseFee.Cmp(want) != 0 {
+		return fmt.Errorf("invalid baseFee: have %s, want %s", header.BaseFee, want)
 	}
 	return nil
 }
@@ -988,6 +1058,9 @@ func (c *XDPoS) verifyCascadingFields(chain consensus.ChainHeaderReader, header 
 	}
 	if parent.Time+c.config.Period > header.Time {
 		return ErrInvalidTimestamp
+	}
+	if err := verifyV1BaseFee(chain.Config(), parent, header); err != nil {
+		return err
 	}
 
 	// Retrieve the snapshot needed to verify this header and cache it
@@ -1567,6 +1640,10 @@ func (c *XDPoS) Finalize(chain consensus.ChainHeaderReader, header *types.Header
 		rCheckpoint = c.config.Epoch
 	}
 
+	// Take the pre-tx state for this statedb now, for every block, so that an
+	// entry is never left behind by a block without rewards.
+	parentStateForReward := c.takeParentState(underlyingStateDB(statedb))
+
 	// Cache signing transactions for every block (needed for reward calculation at checkpoints)
 	// Block bodies may not be in DB yet during batch import, so we cache here while we have them
 	if body != nil && len(body.Transactions) > 0 {
@@ -1614,7 +1691,7 @@ func (c *XDPoS) Finalize(chain consensus.ChainHeaderReader, header *types.Header
 	if c.IsV2Block(header) && c.EngineV2 != nil {
 		if sdb := underlyingStateDB(statedb); sdb != nil {
 			if cr, ok2 := chain.(consensus.ChainReader); ok2 {
-				parentState := c.parentStateForReward
+				parentState := parentStateForReward
 				if parentState == nil {
 					parentState = sdb
 				}
@@ -1627,7 +1704,6 @@ func (c *XDPoS) Finalize(chain consensus.ChainHeaderReader, header *types.Header
 				if _, err := c.EngineV2.Finalize(cr, header, sdb, parentState, txs, uncles, nil); err != nil {
 					log.Error("EngineV2.Finalize failed", "number", number, "err", err)
 				}
-				c.parentStateForReward = nil
 				return
 			}
 		}
@@ -1639,7 +1715,13 @@ func (c *XDPoS) Finalize(chain consensus.ChainHeaderReader, header *types.Header
 	if c.IsV2Block(header) && c.EngineV2 != nil {
 		isEpochSwitch, _, err := c.EngineV2.IsEpochSwitch(header)
 		if err != nil {
-			panic(fmt.Sprintf("[Finalize] IsEpochSwitch failed at block %d: %v", number, err))
+			// A header-only reader (eth_simulateV1) is not a ChainReader and its
+			// simulated header carries no V2 extra field: there is no epoch switch
+			// and no reward step. A real chain keeps the panic, as before.
+			if _, ok := chain.(consensus.ChainReader); ok {
+				panic(fmt.Sprintf("[Finalize] IsEpochSwitch failed at block %d: %v", number, err))
+			}
+			log.Debug("[Finalize] simulated V2 header, skipping rewards", "block", number, "err", err)
 		}
 		shouldApplyReward = isEpochSwitch
 	} else {
@@ -1649,7 +1731,7 @@ func (c *XDPoS) Finalize(chain consensus.ChainHeaderReader, header *types.Header
 	if shouldApplyReward {
 		if sdb := underlyingStateDB(statedb); sdb != nil {
 			// Use pre-tx parentState for reading voter/owner info (matches v2.6.8)
-			parentState := c.parentStateForReward
+			parentState := parentStateForReward
 			if parentState == nil {
 				parentState = sdb
 			}
@@ -1668,8 +1750,6 @@ func (c *XDPoS) Finalize(chain consensus.ChainHeaderReader, header *types.Header
 					log.Error("Error applying rewards in Finalize", "number", number, "err", err)
 				}
 			}
-			// Clear parentState after use
-			c.parentStateForReward = nil
 		} else {
 			log.Warn("Finalize: statedb is not *state.StateDB, cannot apply rewards", "block", number, "type", fmt.Sprintf("%T", statedb))
 		}
@@ -1725,9 +1805,11 @@ func (c *XDPoS) FinalizeAndAssemble(chain consensus.ChainHeaderReader, header *t
 	// V2.Finalize returns (*types.Block, error) -- it both finalizes and assembles
 	// per the legacy v2.6.8 signature. Reward gating inside V2.Finalize uses
 	// IsEpochSwitch (round-based), not number%rCheckpoint.
+	// Take the pre-tx state for every block, so no entry is left behind.
+	preTxState := c.takeParentState(statedb)
 	if c.IsV2Block(header) && c.EngineV2 != nil {
 		if cr, ok := chain.(consensus.ChainReader); ok {
-			parentState := c.parentStateForReward
+			parentState := preTxState
 			if parentState == nil {
 				parentState = statedb.Copy()
 			}
@@ -1738,7 +1820,6 @@ func (c *XDPoS) FinalizeAndAssemble(chain consensus.ChainHeaderReader, header *t
 				uncles = body.Uncles
 			}
 			block, err := c.EngineV2.Finalize(cr, header, statedb, parentState, txs, uncles, receipts)
-			c.parentStateForReward = nil
 			if err != nil {
 				return nil, err
 			}
@@ -1762,11 +1843,10 @@ func (c *XDPoS) FinalizeAndAssemble(chain consensus.ChainHeaderReader, header *t
 		// and canonical's miner.  Fall back to statedb.Copy() when the miner has
 		// not provided a pre-tx snapshot (e.g. tests that call FinalizeAndAssemble
 		// directly without going through the miner).
-		parentState := c.parentStateForReward
+		parentState := preTxState
 		if parentState == nil {
 			parentState = statedb.Copy()
 		}
-		c.parentStateForReward = nil
 		rewards, err := c.HookReward(chain, statedb, parentState, header)
 		if err != nil {
 			return nil, err
@@ -1774,7 +1854,7 @@ func (c *XDPoS) FinalizeAndAssemble(chain consensus.ChainHeaderReader, header *t
 		if len(common.StoreRewardFolder) > 0 {
 			data, err := json.Marshal(rewards)
 			if err == nil {
-				err = os.WriteFile(filepath.Join(common.StoreRewardFolder, header.Number.String()+"."+header.Hash().Hex()), data, 0644)
+				err = utils.WriteFileAtomic(filepath.Join(common.StoreRewardFolder, header.Number.String()+"."+header.Hash().Hex()), data, 0644)
 			}
 			if err != nil {
 				log.Error("Error when save reward info", "number", header.Number, "hash", header.Hash().Hex(), "err", err)

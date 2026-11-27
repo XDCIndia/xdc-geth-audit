@@ -55,6 +55,15 @@ func (x *XDPoS_v2) VerifyTimeoutMessage(chain consensus.ChainReader, timeoutMsg 
 		return false, nil
 	}
 
+	// The gap number is chosen by the sender. Check it against the epoch of the
+	// round before getSnapshot builds and stores a snapshot for it (#2062).
+	// This is the check that used to run after the signature check.
+	if epochInfo, epochErr := x.getTCEpochInfo(chain, &types.TimeoutCert{Round: timeoutMsg.Round}); epochErr == nil {
+		if err := x.timeoutGapMatchesEpoch(chain, epochInfo, timeoutMsg.Round, timeoutMsg.GapNumber); err != nil {
+			return false, err
+		}
+	}
+
 	// Get snapshot
 	snap, err := x.getSnapshot(chain, timeoutMsg.GapNumber, true, nil)
 	if err != nil || snap == nil {
@@ -380,7 +389,7 @@ func (x *XDPoS_v2) getTCEpochInfo(chain consensus.ChainReader, timeoutCert *type
 		Round:  epochRound,
 		Number: epochSwitchInfo.EpochSwitchBlockInfo.Number,
 	}
-	log.Info("[getTCEpochInfo] init", "epochRound", epochRound, "tcRound", timeoutCert.Round, "tempTCEpoch", tempTCEpoch)
+	log.Debug("[getTCEpochInfo] init", "epochRound", epochRound, "tcRound", timeoutCert.Round, "tempTCEpoch", tempTCEpoch)
 
 	for epochBlockInfo.Round > timeoutCert.Round && tempTCEpoch > 0 {
 		tempTCEpoch--
@@ -392,7 +401,7 @@ func (x *XDPoS_v2) getTCEpochInfo(chain consensus.ChainReader, timeoutCert *type
 		log.Debug("[getTCEpochInfo] walking back", "epochRound", epochBlockInfo.Round, "tcRound", timeoutCert.Round, "epoch", tempTCEpoch)
 	}
 
-	log.Info("[getTCEpochInfo] found", "epochRound", epochBlockInfo.Round, "tcRound", timeoutCert.Round, "epoch", tempTCEpoch)
+	log.Debug("[getTCEpochInfo] found", "epochRound", epochBlockInfo.Round, "tcRound", timeoutCert.Round, "epoch", tempTCEpoch)
 	epochInfo, err := x.getEpochSwitchInfo(chain, nil, epochBlockInfo.Hash)
 	if err != nil {
 		log.Error("[getTCEpochInfo] Error getting epoch switch info by hash", "hash", epochBlockInfo.Hash, "error", err)

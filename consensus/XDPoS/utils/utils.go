@@ -7,6 +7,8 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"reflect"
 	"sort"
 	"strconv"
@@ -128,10 +130,19 @@ func ValidatorsOrderMatches(expected, actual []common.Address) bool {
 	return true
 }
 
+// MaxV2ExtraSize is the longest extra field a V2 header may carry, as in canonical.
+const MaxV2ExtraSize = 20 * 1024
+
 // Decode extra fields for consensus version >= 2 (XDPoS 2.0 and future versions)
 func DecodeBytesExtraFields(b []byte, val interface{}) error {
 	if len(b) == 0 {
 		return errors.New("extra field is 0 length")
+	}
+	// Prevent payload attack, limit the size of extra field to 20k bytes.
+	// Normal Extrafield payload is less than 7k bytes. Canonical
+	// consensus/XDPoS/utils/utils.go:80-84.
+	if len(b) > MaxV2ExtraSize {
+		return errors.New("extra field is too long")
 	}
 	switch b[0] {
 	case 2:
@@ -149,4 +160,32 @@ func RlpHash(x interface{}) (h common.Hash) {
 	}
 	hw.Sum(h[:0])
 	return h
+}
+
+// WriteFileAtomic writes data to path through a temporary file in the same
+// directory and a rename, so a reader or a crash never sees a cut-short file.
+// The temporary file name starts with a dot, so it is not taken for a
+// "<number>.<hash>" reward file.
+func WriteFileAtomic(path string, data []byte, perm os.FileMode) error {
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".tmp-")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	if _, err = tmp.Write(data); err == nil {
+		err = tmp.Sync()
+	}
+	if cerr := tmp.Close(); err == nil {
+		err = cerr
+	}
+	if err == nil {
+		err = os.Chmod(tmpName, perm)
+	}
+	if err == nil {
+		err = os.Rename(tmpName, path)
+	}
+	if err != nil {
+		os.Remove(tmpName)
+	}
+	return err
 }

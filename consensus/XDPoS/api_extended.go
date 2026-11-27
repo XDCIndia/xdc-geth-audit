@@ -147,7 +147,12 @@ func (api *API) GetV2BlockByHeader(header *types.Header, uncle bool) *V2BlockInf
 		if err == nil {
 			info.Round = round
 		}
-		info.Masternodes = api.xdpos.GetMasternodes(api.chain, header)
+		// Resolve masternodes only for a header this node has, as canonical
+		// does: the lookup writes engine caches, and the header here comes
+		// from the caller (#2073).
+		if api.chain.GetHeaderByHash(header.Hash()) != nil {
+			info.Masternodes = api.xdpos.GetMasternodes(api.chain, header)
+		}
 		// F-2026-19639: return the quorum certificate carried in the header.
 		var extra types.ExtraFields_v2
 		if err := utils.DecodeBytesExtraFields(header.Extra, &extra); err == nil && extra.QuorumCert != nil {
@@ -443,18 +448,39 @@ func (api *API) GetRewardByAccount(account common.Address, begin rpc.BlockNumber
 	}
 
 	rewards := make([]AccountEpochReward, 0)
+	seenV1 := make(map[uint64]struct{})
 	for _, entry := range entries {
 		if entry.IsDir() {
 			continue
 		}
 		// Filename format: "<blockNumber>.<blockHash>"
 		name := entry.Name()
+		parts := strings.SplitN(name, ".", 2)
 		var blockNum uint64
-		if _, err := fmt.Sscanf(strings.SplitN(name, ".", 2)[0], "%d", &blockNum); err != nil {
+		if _, err := fmt.Sscanf(parts[0], "%d", &blockNum); err != nil || len(parts) != 2 {
 			continue
 		}
 		if blockNum < beginNum || blockNum > endNum {
 			continue
+		}
+		// Use only the file of the block this node has at that height. A miner
+		// also writes a file under a pre-seal hash, and a side chain epoch-switch
+		// block leaves its own file: counting them would pay one epoch twice.
+		// A V1 block is saved under its pre-seal hash only (V1 has no save after
+		// sealing), so for V1 the hash cannot be compared and one file per
+		// height is used.
+		header := api.chain.GetHeaderByNumber(blockNum)
+		if header == nil {
+			continue
+		}
+		if api.xdpos.IsV2Block(header) {
+			if !strings.EqualFold(parts[1], header.Hash().Hex()) {
+				continue
+			}
+		} else if _, dup := seenV1[blockNum]; dup {
+			continue
+		} else {
+			seenV1[blockNum] = struct{}{}
 		}
 
 		data, err := os.ReadFile(filepath.Join(common.StoreRewardFolder, name))

@@ -613,6 +613,11 @@ func (x *XDPoS_v2) processQC(chain consensus.ChainReader, incomingQuorumCert *ty
 			// F-2026-19774: persist so a restart cannot lower the lock below what
 			// was committed before shutdown.
 			rawdb.WriteBFTLockQC(x.db, x.lockQuorumCert)
+			// XDC-HUNT-30: the vote that follows must not outlive an unsynced lock.
+			if err := x.db.SyncKeyValue(); err != nil {
+				log.Error("[processQC] Failed to sync lock QC", "err", err)
+				return err
+			}
 		}
 
 		// Commit blocks (3-chain rule)
@@ -1009,12 +1014,11 @@ func (x *XDPoS_v2) getBlockByEpochNumberInCache(chain consensus.ChainReader, est
 			epochSwitchInCache = append(epochSwitchInCache, blockInfo)
 		}
 	}
-	if len(epochSwitchInCache) == 1 {
-		return epochSwitchInCache[0]
-	} else if len(epochSwitchInCache) == 0 {
+	if len(epochSwitchInCache) == 0 {
 		return nil
 	}
-	// when multiple cache hits, need to find the one in main chain
+	// A hit must be a block of the main chain, also when it is the only one
+	// (#2073). Canonical returns a single hit without this check.
 	for _, blockInfo := range epochSwitchInCache {
 		header := chain.GetHeaderByNumber(blockInfo.Number.Uint64())
 		if header == nil {

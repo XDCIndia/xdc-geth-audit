@@ -56,3 +56,9 @@ func limitPrivacyPrecompiles(cfg *params.ChainConfig, have vm.PrecompiledContrac
 	}
 	return have
 }
+
+// LimitPrivacyPrecompiles is limitPrivacyPrecompiles for callers outside this
+// package, such as debug_traceCall.
+func LimitPrivacyPrecompiles(cfg *params.ChainConfig, have vm.PrecompiledContracts, stateNum *big.Int, stateMerge bool, stateTime uint64, execNum *big.Int, execMerge bool, execTime uint64) vm.PrecompiledContracts {
+	return limitPrivacyPrecompiles(cfg, have, stateNum, stateMerge, stateTime, execNum, execMerge, execTime)
+}
