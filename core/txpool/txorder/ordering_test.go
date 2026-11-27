@@ -194,3 +194,27 @@ func TestTransactionTimeSort(t *testing.T) {
 		}
 	}
 }
+
+// F-2026-19457: the fee-cap exemption follows KnownSpecialCall, not the
+// destination alone. An unknown selector to 0x89 below the base fee is
+// rejected; a real sign call is still exempt.
+func TestNewTxWithMinerFeeSpecialExemptionNeedsKnownSelector(t *testing.T) {
+	lazy := func(data []byte) *txpool.LazyTransaction {
+		tx := types.NewTx(&types.LegacyTx{To: &common.BlockSignersBinary, Gas: 100000, GasPrice: new(big.Int), Data: data})
+		return &txpool.LazyTransaction{Hash: tx.Hash(), Tx: tx, GasFeeCap: new(uint256.Int), GasTipCap: new(uint256.Int), Gas: tx.Gas()}
+	}
+	baseFee := uint256.NewInt(10)
+
+	unknown := append(common.Hex2Bytes("deadbeef"), make([]byte, 64)...)
+	if _, err := newTxWithMinerFee(lazy(unknown), common.Address{}, baseFee); err != types.ErrGasFeeCapTooLow {
+		t.Fatalf("unknown selector: err = %v, want ErrGasFeeCapTooLow", err)
+	}
+	sign := append(common.Hex2Bytes(common.HexSignMethod), make([]byte, 64)...)
+	fee, err := newTxWithMinerFee(lazy(sign), common.Address{}, baseFee)
+	if err != nil {
+		t.Fatalf("known sign call rejected: %v", err)
+	}
+	if !fee.fees.IsZero() {
+		t.Fatalf("known sign call tip = %v, want 0", fee.fees)
+	}
+}
