@@ -99,6 +99,12 @@ var ErrAlreadyMined = errors.New("already mined on this round")
 // checkpoint-boundary fallbacks.
 var ErrEpochSwitchParentNotInDB = errors.New("epoch switch parent header not in DB")
 
+// ErrEpochSwitchSetNotDerivable is returned for an epoch-switch header that a
+// node without state cannot check against any set derived from verified data.
+// The header is refused, not trusted; the node waits for a gap-seed or
+// checkpoint to supply the set. F-2026-20648.
+var ErrEpochSwitchSetNotDerivable = errors.New("epoch-switch validator set cannot be derived from verified data")
+
 // ErrV2SnapshotMissing is returned by getSnapshot when a V2 epoch's gap-block
 // snapshot was never persisted because UpdateMasternodesFromHeader didn't run
 // at gap-block import (typically because A.94 checkpoint-sync-no-state was

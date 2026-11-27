@@ -20,9 +20,11 @@ package utils
 import (
 	"flag"
 	"reflect"
+	"slices"
 	"testing"
 
 	"github.com/ethereum/go-ethereum/eth/ethconfig"
+	"github.com/ethereum/go-ethereum/params"
 	"github.com/urfave/cli/v2"
 )
 
@@ -168,4 +170,41 @@ func newTestContext(t *testing.T, args []string, flags ...cli.Flag) *cli.Context
 		t.Fatal(err)
 	}
 	return cli.NewContext(nil, set, nil)
+}
+
+// --snap.gap-rpc: XDC mainnet defaults to the built-in list, the flag overrides
+// it, an explicit empty value disables it, and other networks have no default.
+func TestSetSnapGapRPC(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		args []string
+		toml []string
+		want []string
+	}{
+		{name: "mainnet, unset", args: []string{"--xdcmainnet"}, want: params.XDCMainnetGapRPCs},
+		{name: "mainnet, flag overrides", args: []string{"--xdcmainnet", "--snap.gap-rpc=http://a:1, http://b:2"}, want: []string{"http://a:1", "http://b:2"}},
+		{name: "mainnet, empty disables", args: []string{"--xdcmainnet", "--snap.gap-rpc="}, want: nil},
+		{name: "mainnet, config file wins", args: []string{"--xdcmainnet"}, toml: []string{"http://c:3"}, want: []string{"http://c:3"}},
+		{name: "apothem, unset", args: []string{"--apothem"}, want: nil},
+		{name: "apothem, flag", args: []string{"--apothem", "--snap.gap-rpc=http://a:1"}, want: []string{"http://a:1"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			cfg := ethconfig.Defaults
+			cfg.SnapGapRPC = tt.toml
+			setSnapGapRPC(newTestContext(t, tt.args, SnapGapRPCFlag, XDCMainnetFlag, XDCApothemFlag), &cfg)
+			if !slices.Equal(cfg.SnapGapRPC, tt.want) {
+				t.Fatalf("SnapGapRPC = %v, want %v", cfg.SnapGapRPC, tt.want)
+			}
+		})
+	}
+	// The default is a copy: callers cannot edit the params list through the config.
+	cfg := ethconfig.Defaults
+	setSnapGapRPC(newTestContext(t, []string{"--xdcmainnet"}, SnapGapRPCFlag, XDCMainnetFlag), &cfg)
+	cfg.SnapGapRPC[0] = "x"
+	if params.XDCMainnetGapRPCs[0] == "x" {
+		t.Fatal("default list aliased")
+	}
 }

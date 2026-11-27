@@ -1137,9 +1137,9 @@ func (x *XDPoS_v2) getSnapshot(chain consensus.ChainReader, number uint64, forSi
 				if !ok || stored == nil {
 					stored, _ = loadSnapshot(x.db, gapHeader.Hash())
 				}
-				if stored != nil && len(masternodes) > 0 && len(removeItemFromArray(masternodes, stored.NextEpochCandidates)) == 0 {
+				if stored != nil && (stored.Version >= snapshotVersionProven || len(masternodes) > 0 && len(removeItemFromArray(masternodes, stored.NextEpochCandidates)) == 0) {
 					kept := *stored
-					kept.Version = 6
+					kept.Version = max(6, stored.Version)
 					x.snapshots.Add(kept.Hash, &kept)
 					return &kept, nil
 				}
@@ -1171,9 +1171,9 @@ func (x *XDPoS_v2) getSnapshot(chain consensus.ChainReader, number uint64, forSi
 					if !ok || stored == nil {
 						stored, _ = loadSnapshot(x.db, gapHeader.Hash())
 					}
-					if stored != nil && len(masternodes) > 0 && len(removeItemFromArray(masternodes, stored.NextEpochCandidates)) == 0 {
+					if stored != nil && (stored.Version >= snapshotVersionProven || len(masternodes) > 0 && len(removeItemFromArray(masternodes, stored.NextEpochCandidates)) == 0) {
 						kept := *stored
-						kept.Version = 6
+						kept.Version = max(6, stored.Version)
 						x.snapshots.Add(kept.Hash, &kept)
 						return &kept, nil
 					}
@@ -1226,7 +1226,7 @@ func (x *XDPoS_v2) getSnapshot(chain consensus.ChainReader, number uint64, forSi
 			// deferred instead of labelling the canonical block forged.
 			// forSigning callers (proposer/leader selection) use Validators, not the full
 			// pool, and correctly see the elected set — do not block them.
-			if !forSigning {
+			if !forSigning && snap.Version < snapshotVersionProven {
 				if pivot := rawdb.ReadLastPivotNumber(x.db); pivot != nil && gapNumber < *pivot {
 					return nil, fmt.Errorf("%w at gap %d (checkpoint %d, pivot %d): cached snapshot below snap pivot — candidates from epoch-switch header only, not contract pool", utils.ErrV2SnapshotMissing, gapNumber, checkpointNumber, *pivot)
 				}
@@ -1252,7 +1252,7 @@ func (x *XDPoS_v2) getSnapshot(chain consensus.ChainReader, number uint64, forSi
 			// They are trusted — no V1-format heuristic needed regardless of candidate count.
 			// This handles devnet / chains with V2 from genesis where 3 masternodes is valid.
 			// Issue #1931: same pivot guard as the cache path above.
-			if !forSigning {
+			if !forSigning && snap.Version < snapshotVersionProven {
 				if pivot := rawdb.ReadLastPivotNumber(x.db); pivot != nil && gapNumber < *pivot {
 					return nil, fmt.Errorf("%w at gap %d (checkpoint %d, pivot %d): db snapshot (v%d) below snap pivot — candidates from epoch-switch header only, not contract pool", utils.ErrV2SnapshotMissing, gapNumber, checkpointNumber, *pivot, snap.Version)
 				}
@@ -1557,26 +1557,51 @@ func (x *XDPoS_v2) rebuildGapSnapshotFromState(chain consensus.ChainReader, gapN
 	if len(candidates) == 0 {
 		return nil
 	}
-	// Stake-descending sort with the frozen Go-1.18 quicksort (xdc_sort) —
-	// same tie-ordering as canonical XDPoSChain; see repairSnapshot comment.
-	type candidateStake struct {
-		addr  common.Address
-		stake *big.Int
+	return x.storeGapSnapshot(chain, gapHeader, sortCandidatesByStake(statedb, candidates), 6)
+}
+
+// snapshotVersionProven marks a gap snapshot whose candidate pool was read from
+// 0x88 storage proven by Merkle proof against the gap header's state root, for
+// gaps below the snap pivot where no state exists. Unlike versions 4 to 6 it
+// is accepted below the pivot by getSnapshot and never replaced by a header seed.
+const snapshotVersionProven = 7
+
+// SeedGapSnapshotFromState stores the gap snapshot from a statedb that holds
+// only the 0x88 storage proven against gapHeader.Root (eth_getProof from an
+// untrusted RPC, every node checked by its hash). It is the version-7 twin of
+// rebuildGapSnapshotFromState for snap/fast-synced nodes with no state below
+// the pivot. A missing proof node reads as zero, so any state error after the
+// reads, or an empty pool, is refused rather than stored.
+func (x *XDPoS_v2) SeedGapSnapshotFromState(chain consensus.ChainReader, gapHeader *types.Header, statedb *state.StateDB) error {
+	candidates := state.GetCandidates(statedb)
+	if err := statedb.Error(); err != nil {
+		return fmt.Errorf("gap %d: proven state incomplete: %w", gapHeader.Number, err)
 	}
-	cs := make([]candidateStake, 0, len(candidates))
-	for _, c := range candidates {
-		if c != (common.Address{}) {
-			cs = append(cs, candidateStake{addr: c, stake: state.GetCandidateCap(statedb, c)})
-		}
+	if len(candidates) == 0 {
+		return fmt.Errorf("gap %d: proven state has no candidates", gapHeader.Number)
 	}
-	xdc_sort.Slice(cs, func(i, j int) bool {
-		return cs[i].stake.Cmp(cs[j].stake) >= 0
-	})
-	sorted := make([]common.Address, len(cs))
-	for i, c := range cs {
-		sorted[i] = c.addr
+	sorted := sortCandidatesByStake(statedb, candidates)
+	if err := statedb.Error(); err != nil {
+		return fmt.Errorf("gap %d: proven state incomplete: %w", gapHeader.Number, err)
 	}
-	// Penalties at write time, mirroring UpdateMasternodesFromHeader (P0 #894).
+	x.storeGapSnapshot(chain, gapHeader, sorted, snapshotVersionProven)
+	return nil
+}
+
+// HasProvenGapSnapshot reports whether the gap snapshot stored under hash is
+// already a version-7 (proven) one.
+func (x *XDPoS_v2) HasProvenGapSnapshot(hash common.Hash) bool {
+	if snap, ok := x.snapshots.Get(hash); ok && snap.Version >= snapshotVersionProven {
+		return true
+	}
+	snap, err := loadSnapshot(x.db, hash)
+	return err == nil && snap.Version >= snapshotVersionProven
+}
+
+// storeGapSnapshot writes the stake-sorted pool as the gap snapshot, with
+// penalties at write time mirroring UpdateMasternodesFromHeader (P0 #894).
+func (x *XDPoS_v2) storeGapSnapshot(chain consensus.ChainReader, gapHeader *types.Header, sorted []common.Address, version uint64) *SnapshotV2 {
+	gapNumber := gapHeader.Number.Uint64()
 	var penalties []common.Address
 	if x.HookPenalty != nil {
 		if pen, perr := x.HookPenalty(chain, gapHeader.Number, gapHeader.ParentHash, sorted); perr == nil {
@@ -1587,7 +1612,7 @@ func (x *XDPoS_v2) rebuildGapSnapshotFromState(chain consensus.ChainReader, gapN
 		}
 	}
 	snap := newSnapshotWithPenalties(gapNumber, gapHeader.Hash(), sorted, penalties)
-	snap.Version = 6 // state-certified: authoritative for forSigning membership checks (live-mn-set fix)
+	snap.Version = version // 6: state-certified, authoritative for forSigning membership checks (live-mn-set fix); 7: proven
 	x.snapshots.Add(snap.Hash, snap)
 	if serr := storeSnapshot(snap, x.db); serr != nil {
 		log.Error("[rebuildGapSnapshotFromState] failed to store snapshot", "gap", gapNumber, "err", serr)
@@ -2214,6 +2239,14 @@ func (x *XDPoS_v2) UpdateMasternodes(chain consensus.ChainReader, header *types.
 func (x *XDPoS_v2) UpdateMasternodesWithPenalties(chain consensus.ChainReader, header *types.Header, ms, penalties []common.Address) error {
 	number := header.Number.Uint64()
 	if number%x.config.Epoch != x.config.Epoch-x.config.Gap {
+		return nil
+	}
+
+	// A snapshot proven from the 0x88 state is never replaced by a header seed.
+	if cur, ok := x.snapshots.Get(header.Hash()); ok && cur.Version >= snapshotVersionProven {
+		return nil
+	}
+	if cur, err := loadSnapshot(x.db, header.Hash()); err == nil && cur.Version >= snapshotVersionProven {
 		return nil
 	}
 
