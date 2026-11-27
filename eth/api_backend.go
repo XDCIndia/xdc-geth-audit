@@ -599,7 +599,9 @@ func (b *EthAPIBackend) Engine() consensus.Engine {
 
 func (b *EthAPIBackend) GetRewardByHash(hash common.Hash) map[string]interface{} {
 	header := b.eth.blockchain.GetHeaderByHash(hash)
-	if header == nil {
+	// F-2026-19805: with no --store-reward folder, Join would read the file
+	// name relative to the working directory.
+	if header == nil || common.StoreRewardFolder == "" {
 		return map[string]interface{}{}
 	}
 	names := []string{

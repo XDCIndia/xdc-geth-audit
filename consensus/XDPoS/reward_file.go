@@ -48,9 +48,8 @@ func DecodeRewardFileObject(data []byte) (map[string]interface{}, error) {
 }
 
 // AccountRewardFromFile returns the amount credited to account in one reward
-// file. A signer is reported from RewardLog.Reward once. A holder, owner,
-// voter or foundation address is reported from the rewards keys. signSlots
-// is not an amount.
+// file: the sum of its entries in the rewards keys, whether it is a signer,
+// holder, owner, voter or foundation address. signSlots is not an amount.
 func AccountRewardFromFile(data []byte, accountHex string) (*big.Int, error) {
 	var raw map[string]json.RawMessage
 	if err := json.Unmarshal(data, &raw); err != nil {
@@ -67,27 +66,21 @@ func AccountRewardFromFile(data []byte, accountHex string) (*big.Int, error) {
 }
 
 func accountRewardFromHook(raw map[string]json.RawMessage, accountHex string) (*big.Int, error) {
-	total := new(big.Int)
-	countedSigner := false
+	// F-2026-19805: the amount credited to an address is its entry in the
+	// rewards tables (signer to holder to credited amount), summed over every
+	// signer's table. RewardLog.Reward is the masternode's gross epoch reward,
+	// split among its holders, so it is not credited to the signer address.
+	// An address that is both a signer and a holder gets its holder shares.
 	for _, key := range []string{"signers", "signersProtector", "signersObserver"} {
-		payload, ok := raw[key]
-		if !ok {
-			continue
-		}
-		var signers map[string]RewardLog
-		if err := json.Unmarshal(payload, &signers); err != nil {
-			return nil, fmt.Errorf("reward key %s: %w", key, err)
-		}
-		for signer, entry := range signers {
-			if strings.ToLower(signer) == accountHex && entry.Reward != nil {
-				total.Add(total, entry.Reward)
-				countedSigner = true
+		// Not summed, but a record whose signer tables do not decode is an error.
+		if payload, ok := raw[key]; ok {
+			var signers map[string]RewardLog
+			if err := json.Unmarshal(payload, &signers); err != nil {
+				return nil, fmt.Errorf("reward key %s: %w", key, err)
 			}
 		}
 	}
-	if countedSigner {
-		return total, nil
-	}
+	total := new(big.Int)
 	for _, key := range []string{"rewards", "rewardsProtector", "rewardsObserver"} {
 		payload, ok := raw[key]
 		if !ok {

@@ -44,8 +44,10 @@ func TestF202620639RewardByAccountSeparatesSignerAndHolder(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(signerRes.Rewards) != 1 || signerRes.Rewards[0].Reward != "100" {
-		t.Fatalf("signer reward = %+v, want 100 once", signerRes.Rewards)
+	// F-2026-19805: the signer address is credited its own holder share (60),
+	// not the masternode's gross reward (100).
+	if len(signerRes.Rewards) != 1 || signerRes.Rewards[0].Reward != "60" {
+		t.Fatalf("signer reward = %+v, want its credited 60", signerRes.Rewards)
 	}
 	ownerRes, err := api.GetRewardByAccount(owner, rpc.BlockNumber(0), rpc.LatestBlockNumber)
 	if err != nil {
