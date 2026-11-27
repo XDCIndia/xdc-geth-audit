@@ -1076,23 +1076,19 @@ func (c *XDPoS) verifyCascadingFields(chain consensus.ChainHeaderReader, header 
 	// the parent's signer set, not against the list the checkpoint names (#1418).
 	if number%c.config.Epoch == 0 && v1FullVerifyChain(chain) {
 		gapSigners := c.checkpointSigners(chain, header, parents, snap)
-		// Repair poisoned gap snapshot before the check (#1505): if the local DB
-		// entry (written by the old walk-back code) disagrees with the checkpoint
-		// header's masternode list, evict it so the bootstrap path re-derives the
-		// correct set from the checkpoint's Extra.  The checkpoint header is always
-		// available here but not yet in the chain DB (it is the block being
-		// verified), which is why gapSnapPoisoned() in snapshot() cannot catch this.
-		if c.evictPoisonedGapSnap(chain, header, parents, gapSigners) {
-			gapSigners = c.checkpointSigners(chain, header, parents, snap)
-		}
 		err := c.checkSignersOnCheckpoint(chain, header, gapSigners, parents)
 		if err != nil && c.HookGetSignersFromContract != nil {
 			log.Debug("checkSignersOnCheckpoint failed, fallback to smart contract check", "number", number, "err", err)
-			var signers []common.Address
-			if signers, err = c.getSignersFromContract(chain, header, parents); err != nil {
-				return err
+			signers, gapHeader, cerr := c.getSignersFromContract(chain, header, parents)
+			if cerr != nil {
+				return cerr
 			}
-			err = c.checkSignersOnCheckpoint(chain, header, signers, parents)
+			if err = c.checkSignersOnCheckpoint(chain, header, signers, parents); err == nil {
+				// F-2026-19602: only the contract state of the gap block, never
+				// the checkpoint under verification, may replace a gap snapshot
+				// that disagreed with it (#1505 poisoned snapshot).
+				c.storeGapSnapshot(gapHeader, signers)
+			}
 		}
 		if err != nil {
 			return err
@@ -1259,7 +1255,7 @@ func (c *XDPoS) checkpointSigners(chain consensus.ChainHeaderReader, header *typ
 // blocks on that walk in parents before they are written, so they are looked up
 // there first, as canonical's batch chain reader serves them
 // (consensus/XDPoS/verify_chain_reader.go, core/blockchain.go:2583-2585).
-func (c *XDPoS) getSignersFromContract(chain consensus.ChainHeaderReader, checkpointHeader *types.Header, parents []*types.Header) ([]common.Address, error) {
+func (c *XDPoS) getSignersFromContract(chain consensus.ChainHeaderReader, checkpointHeader *types.Header, parents []*types.Header) ([]common.Address, *types.Header, error) {
 	inBatch := make(map[common.Hash]*types.Header, len(parents))
 	for _, p := range parents {
 		if p != nil {
@@ -1275,14 +1271,25 @@ func (c *XDPoS) getSignersFromContract(chain consensus.ChainHeaderReader, checkp
 		}
 		gapHeader = chain.GetHeader(gapHeader.ParentHash, number-step)
 		if gapHeader == nil {
-			return nil, fmt.Errorf("no block at %d to get the signers from", number-step)
+			return nil, nil, fmt.Errorf("no block at %d to get the signers from", number-step)
 		}
 	}
 	signers, err := c.HookGetSignersFromContract(gapHeader)
 	if err != nil {
-		return nil, fmt.Errorf("can't get signers from smart contract: %w", err)
+		return nil, nil, fmt.Errorf("can't get signers from smart contract: %w", err)
 	}
-	return signers, nil
+	return signers, gapHeader, nil
+}
+
+// storeGapSnapshot writes signers as the snapshot of gapHeader to recents and
+// the DB. The caller must have derived signers from the gap block's contract
+// state and checked the checkpoint against them.
+func (c *XDPoS) storeGapSnapshot(gapHeader *types.Header, signers []common.Address) {
+	snap := newSnapshot(c.config, c.signatures, gapHeader.Number.Uint64(), gapHeader.Hash(), signers)
+	c.recents.Add(gapHeader.Hash(), snap)
+	if err := snap.store(c.db); err != nil {
+		log.Error("failed to persist repaired gap snapshot; in-memory repair only", "gapNumber", gapHeader.Number.Uint64(), "err", err)
+	}
 }
 
 // v1FullVerifyChain reports whether the V1 checks canonical runs only under
@@ -2647,87 +2654,14 @@ func (c *XDPoS) snapshot(chain consensus.ChainHeaderReader, number uint64, hash 
 	return snap, err
 }
 
-// evictPoisonedGapSnap detects and evicts a gap-block snapshot that was
-// written by the walk-back race (#1505) so that the bootstrap re-derives the
-// correct set from the checkpoint's Extra on the next call to checkpointSigners.
-//
-// It is called from verifyCascadingFields where the checkpoint header is
-// available directly (it is the block being verified, not yet in the chain DB,
-// which is why gapSnapPoisoned() in snapshot() cannot catch this case).
-// gapSigners is the signer list returned by the last checkpointSigners call.
-//
-// Returns true if a poisoned entry was evicted and the caller should re-read.
-func (c *XDPoS) evictPoisonedGapSnap(chain consensus.ChainHeaderReader, cpHeader *types.Header, parents []*types.Header, gapSigners []common.Address) bool {
-	// Extract the checkpoint's masternode list (same logic as checkSignersOnCheckpoint).
-	var listed []common.Address
-	number := cpHeader.Number.Uint64()
-	isV2CP := c.config.V2 != nil && c.config.V2.SwitchBlock != nil && number > c.config.V2.SwitchBlock.Uint64()
-	if isV2CP && len(cpHeader.Validators) > 0 && len(cpHeader.Validators)%common.AddressLength == 0 {
-		listed = make([]common.Address, len(cpHeader.Validators)/common.AddressLength)
-		for i := range listed {
-			copy(listed[i][:], cpHeader.Validators[i*common.AddressLength:])
-		}
-	}
-	if len(listed) == 0 && len(cpHeader.Extra) > extraVanity+extraSeal {
-		listed = extractAddressFromBytes(cpHeader.Extra[extraVanity : len(cpHeader.Extra)-extraSeal])
-	}
-	if len(listed) == 0 {
-		return false // can't determine expected set
-	}
-	// A legitimate gap snap holds the pre-penalty election set; the checkpoint's
-	// Extra holds the post-penalty set (gap minus penalised nodes).  After
-	// TIPRandomize the two counts can differ by 1 or more, which is correct.
-	// Only treat the gap snap as poisoned when at least one address in the
-	// checkpoint's Extra is ABSENT from gapSigners — that is the signature of a
-	// walk-back-apply() snap whose Clique voting model wrote the wrong addresses.
-	if checkpointListedIsSubsetOfGap(listed, gapSigners) {
-		return false // checkpoint ⊆ gap snap; difference is legitimate (penalties)
-	}
-	// Mismatch: gap snap is likely poisoned.  Walk back Gap blocks to find the
-	// gap block and evict its DB entry so the bootstrap re-derives it.
-	// Use the parents batch first (blocks in the current verify window), then
-	// fall back to chain.GetHeader for older blocks already in the chain DB.
-	inBatch := make(map[common.Hash]*types.Header, len(parents))
-	for _, p := range parents {
-		if p != nil {
-			inBatch[p.Hash()] = p
-		}
-	}
-	gap := cpHeader
-	for step := uint64(1); step <= c.config.Gap; step++ {
-		p, ok := inBatch[gap.ParentHash]
-		if !ok || p.Number.Uint64() != number-step {
-			p = chain.GetHeader(gap.ParentHash, number-step)
-		}
-		if p == nil {
-			return false // can't walk back; don't risk a bad eviction
-		}
-		gap = p
-	}
-	gapHash := gap.Hash()
-	log.Warn("repairing poisoned gap snapshot in DB from checkpoint Extra",
-		"gapNumber", gap.Number.Uint64(), "gapHash", gapHash,
-		"snapSigners", len(gapSigners), "checkpointSigners", len(listed))
-	// Write the correct snap derived from the checkpoint's Extra directly to DB
-	// and LRU so the second call to checkpointSigners returns the right set.
-	// We cannot rely on the bootstrap falling through because the checkpoint
-	// header is not yet in the chain DB (it is the block being verified).
-	repairedSnap := newSnapshot(c.config, c.signatures, gap.Number.Uint64(), gapHash, listed)
-	c.recents.Add(gapHash, repairedSnap)
-	if err := repairedSnap.store(c.db); err != nil {
-		log.Error("failed to persist repaired gap snapshot; in-memory repair only", "gapNumber", gap.Number.Uint64(), "err", err)
-	}
-	return true
-}
-
 // gapSnapPoisoned is a secondary defence: when a gap snapshot IS in the chain
 // DB (imported blocks), cross-check it against the corresponding checkpoint.
-// The primary repair path is evictPoisonedGapSnap, which runs during
-// verifyCascadingFields where the checkpoint header is directly available.
+// The repair for a checkpoint that is not yet imported is the contract
+// fallback in verifyCascadingFields (storeGapSnapshot).
 func (c *XDPoS) gapSnapPoisoned(chain consensus.ChainHeaderReader, gapNumber uint64, snap *Snapshot) bool {
 	cpHeader := chain.GetHeaderByNumber(gapNumber + c.config.Gap)
 	if cpHeader == nil {
-		return false // checkpoint not yet in DB; primary fix handles this case
+		return false // checkpoint not yet in DB; the contract fallback handles this case
 	}
 	var listed []common.Address
 	isV2CP := c.config.V2 != nil && c.config.V2.SwitchBlock != nil &&
