@@ -3561,6 +3561,28 @@ func (s *xdcSyncer) repairAnchorGapBodies(peer *eth.Peer) {
 	s.anchorGapRepaired.Store(true)
 }
 
+// verifiedCompetingHeader reports whether header is a real competing block:
+// the consensus engine accepts it. A peer-supplied header that fails this
+// check is not evidence for moving the local head.
+func verifiedCompetingHeader(chain *core.BlockChain, header *types.Header) bool {
+	if chain == nil || header == nil || chain.Engine() == nil || header.Number == nil || header.Number.Sign() == 0 {
+		return false
+	}
+	err := chain.Engine().VerifyHeader(chain, header)
+	if err == nil {
+		return true
+	}
+	// A competing branch's parent is not on the local chain, so verification
+	// stops at ErrUnknownAncestor. That is a real fork, which is the case the
+	// rollback exists for. A header whose parent is already local has to pass
+	// verification; a mutated copy of the local head does not.
+	if !errors.Is(err, consensus.ErrUnknownAncestor) {
+		return false
+	}
+	parent := chain.GetHeader(header.ParentHash, header.Number.Uint64()-1)
+	return parent == nil
+}
+
 // rollbackWindow returns the exponential rollback window for a given cumulative
 // rolled-back count. The shift is capped so the result never exceeds
 // xdcRollbackWindowMax and never wraps to zero via uint64 overflow.
@@ -3705,6 +3727,7 @@ func (s *xdcSyncer) maybeRollbackOnUnknownAncestor(fromBlock uint64, peer *eth.P
 
 	forkConfirmed := false
 	triggerDisagrees := false
+	var forkEvidence *types.Header
 	if peer != nil {
 		peerAtHead := s.fetchHeaderBatchTimeout(peer, cur.Number.Uint64(), 1, xdcBulkReqTimeout)
 		if len(peerAtHead) > 0 && peerAtHead[0].Number.Uint64() == cur.Number.Uint64() {
@@ -3713,6 +3736,7 @@ func (s *xdcSyncer) maybeRollbackOnUnknownAncestor(fromBlock uint64, peer *eth.P
 				return
 			}
 			triggerDisagrees = true // triggering peer sees a different block at our height
+			forkEvidence = peerAtHead[0]
 		}
 		// else: inconclusive — peer timed out or is behind our head
 	}
@@ -3743,6 +3767,7 @@ func (s *xdcSyncer) maybeRollbackOnUnknownAncestor(fromBlock uint64, peer *eth.P
 				return
 			}
 			forkConfirmed = true
+			forkEvidence = altHdrs[0]
 			break
 		}
 		// No other peer was conclusive. Right after a new head, alt peers often
@@ -3760,6 +3785,26 @@ func (s *xdcSyncer) maybeRollbackOnUnknownAncestor(fromBlock uint64, peer *eth.P
 				return
 			}
 		}
+	}
+
+	if forkConfirmed && !verifiedCompetingHeader(s.handler.chain, forkEvidence) {
+		// A different hash at our height is not enough. The header has to pass
+		// consensus verification (seal or certificate). Unverified headers must
+		// not move the head.
+		log.Warn("xdcSyncer: competing header failed verification — skipping rollback",
+			"head", cur.Number.Uint64(), "evidence", func() common.Hash {
+				if forkEvidence == nil {
+					return common.Hash{}
+				}
+				return forkEvidence.Hash()
+			}())
+		if peer != nil {
+			s.taintPeer(peer)
+		}
+		s.stuckFrom = 0
+		s.stuckFailures = 0
+		core.XdcForkRecovering.Store(false)
+		return
 	}
 
 	if !forkConfirmed {
