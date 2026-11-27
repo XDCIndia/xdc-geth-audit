@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/consensus"
 	xdcutils "github.com/ethereum/go-ethereum/consensus/XDPoS/utils"
 	"github.com/ethereum/go-ethereum/consensus/ethash"
@@ -95,16 +96,68 @@ func TestNewBlockFutureParkingIsBounded(t *testing.T) {
 	if n := parked(); n != 1 {
 		t.Fatalf("far-ahead block was parked: %d", n)
 	}
-	// Many peers: bounded in total.
-	for i := 3; i < 3+3*maxParkedNewBlocks; i++ {
+	// Many peers, the same block: parked once (F-2026-20605 dedupe by hash).
+	for i := 3; i < 3+maxParkedNewBlocks; i++ {
 		p, c := boundsPeer(byte(i))
 		defer c()
 		if err := eh.Handle(p, &eth.NewBlockPacket{Block: blocks[0]}); err != nil {
 			t.Fatal(err)
 		}
 	}
+	if n := parked(); n != 1 {
+		t.Fatalf("same block from many peers parked %d times, want 1", n)
+	}
+	// Many peers, distinct head+1 siblings: bounded in total.
+	for i := 0; i < 3*maxParkedNewBlocks; i++ {
+		_, sib, _ := core.GenerateChainWithGenesis(gspec, ethash.NewFaker(), 1, func(_ int, g *core.BlockGen) {
+			g.SetExtra([]byte{byte(i), 0xaa})
+		})
+		p, c := boundsPeer(byte(100 + i))
+		defer c()
+		if err := eh.Handle(p, &eth.NewBlockPacket{Block: sib[0]}); err != nil {
+			t.Fatal(err)
+		}
+	}
 	if n := parked(); n != maxParkedNewBlocks {
 		t.Fatalf("parked = %d, want cap %d", n, maxParkedNewBlocks)
+	}
+}
+
+// TestNewBlockParkingNeedsKnownParentAndByteBudget (F-2026-20605): a future block
+// whose parent is unknown is not parked, and the parked blocks together stay
+// under maxParkedNewBlockBytes.
+func TestNewBlockParkingNeedsKnownParentAndByteBudget(t *testing.T) {
+	h, gspec, stop := newBoundsHandler(t, strictClockEngine{ethash.NewFaker()}, 8)
+	defer stop()
+	_, blocks, _ := core.GenerateChainWithGenesis(gspec, ethash.NewFaker(), 1, nil)
+	eh := (*ethHandler)(h)
+
+	// head+1 by number, but its parent is not the genesis we hold.
+	orphan := types.NewBlockWithHeader(&types.Header{
+		ParentHash: common.Hash{0x01}, Number: blocks[0].Number(), Time: blocks[0].Time(),
+		Difficulty: blocks[0].Difficulty(), GasLimit: blocks[0].GasLimit(),
+	})
+	p, c := boundsPeer(1)
+	defer c()
+	if err := eh.Handle(p, &eth.NewBlockPacket{Block: orphan}); err != nil {
+		t.Fatal(err)
+	}
+	h.newBlockMu.Lock()
+	n := len(h.parkedBlocks)
+	h.newBlockMu.Unlock()
+	if n != 0 {
+		t.Fatalf("block with unknown parent parked: %d", n)
+	}
+
+	// Byte budget: blocks that fit are parked, the one that would overflow is not.
+	const size = maxParkedNewBlockBytes / 4
+	for i := 0; i < 4; i++ {
+		if !eh.parkNewBlock(string(rune('a'+i)), common.Hash{byte(i + 1)}, size) {
+			t.Fatalf("block %d within the byte budget refused", i)
+		}
+	}
+	if eh.parkNewBlock("e", common.Hash{0x09}, 1) {
+		t.Fatal("block over the byte budget parked")
 	}
 }
 

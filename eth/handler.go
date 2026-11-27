@@ -212,11 +212,12 @@ type handler struct {
 	// Gate all dispatch with h.bfter != nil before use.
 	bfter *bft.Bfter
 
-	// XDC: NewBlock abuse bounds (XDC-HUNT-02/03). parkedBlocks holds the peers
-	// that have a future-timestamp block waiting on a timer; invalidBlocks counts
+	// XDC: NewBlock abuse bounds (XDC-HUNT-02/03, F-2026-20605). parkedBlocks
+	// holds, per peer, the future-timestamp block waiting on a timer (its hash and
+	// size); invalidBlocks counts
 	// definitively invalid NewBlocks per peer ID.
 	newBlockMu    sync.Mutex
-	parkedBlocks  map[string]struct{}
+	parkedBlocks  map[string]parkedBlock
 	invalidBlocks *lru.Cache[string, int]
 }
 
@@ -235,7 +236,7 @@ func newHandler(config *handlerConfig) (*handler, error) {
 		quitSync:       make(chan struct{}),
 		handlerDoneCh:  make(chan struct{}),
 		handlerStartCh: make(chan struct{}),
-		parkedBlocks:   make(map[string]struct{}),
+		parkedBlocks:   make(map[string]parkedBlock),
 		invalidBlocks:  lru.NewCache[string, int](maxTrackedInvalidPeers),
 	}
 	// Construct the downloader (long sync)
