@@ -4,6 +4,7 @@ package engine_v2
 
 import (
 	"math/big"
+	"strings"
 	"testing"
 
 	"github.com/ethereum/go-ethereum/core/types"
@@ -66,24 +67,19 @@ func TestF202619612TimeoutGapFollowsRoundEpoch(t *testing.T) {
 	}
 }
 
-// TestF202619612EpochSwitchRoundTimeout accepts the gap that sendTimeout signs
-// for a round that opens an epoch whose switch block is not in the chain yet.
-// Rejecting it halted net 2040 at round 999000.
-func TestF202619612EpochSwitchRoundTimeout(t *testing.T) {
-	f := newTCFixture(t, 1800)
-	info := &types.EpochSwitchInfo{EpochSwitchBlockInfo: &types.BlockInfo{Number: big.NewInt(1801), Round: 1800}}
-	f.chain.head.Number = big.NewInt(2699)
-	next := f.x.gapFromSwitch(2700)
-	if next == f.x.gapFromSwitch(1801) {
-		t.Fatalf("fixture epoch/gap do not separate the two gaps: %d", next)
+// F-2026-19612: the certificate gap is checked against the round epoch before
+// the gap snapshot is loaded. A wrong gap that has no snapshot fails with the
+// gap error, not with a snapshot error.
+func TestF202619612VerifyTCGapCheckedBeforeSnapshot(t *testing.T) {
+	const round = types.Round(5)
+	f := newTCFixture(t, 0)
+	sigs := signTimeout(t, round, f.active[:2]...)
+	// 12345 is not the gap of the epoch (450) and no snapshot exists for it.
+	err := f.x.verifyTC(f.chain, &types.TimeoutCert{Round: round, GapNumber: 12345, Signatures: sigs})
+	if err == nil {
+		t.Fatal("wrong-gap TC accepted")
 	}
-	if err := f.x.timeoutGapMatchesEpoch(f.chain, info, types.Round(2700), next); err != nil {
-		t.Fatalf("epoch-switch round timeout rejected: %v", err)
-	}
-	if err := f.x.timeoutGapMatchesEpoch(f.chain, info, types.Round(2700), 0); err == nil {
-		t.Fatal("older gap accepted at an epoch-switch round")
-	}
-	if err := f.x.timeoutGapMatchesEpoch(f.chain, info, types.Round(2000), next); err == nil {
-		t.Fatal("next-epoch gap accepted for a round inside the known epoch")
+	if strings.Contains(err.Error(), "snapshot") || !strings.Contains(err.Error(), "is not gap") {
+		t.Fatalf("want the gap error, got: %v", err)
 	}
 }

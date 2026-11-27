@@ -62,7 +62,7 @@ func (c *emptyRouteBlockChain) CurrentBlock() *types.Header {
 // xdcEmptyRouteCfg is a minimal XDC chain config where IsXDC() = true and
 // IsTIPXDCXReceiver is active at every block:
 //   - TIPXDCX = 0 (enabled from genesis)
-//   - TIPXDCXReceiverDisable = 1e17 (never disabled, matches devnets 5151/5050/5551)
+//   - TIPXDCXReceiverDisable = 1e17 (never disabled, matches devnets 5050/5551)
 //   - Gas50xBlock = 0, Gas2500xBlock absent → Gas50x tier (12.5 gwei floor)
 func xdcEmptyRouteCfg() *params.ChainConfig {
 	cpy := *params.TestChainConfig

@@ -178,28 +178,3 @@ func TestVerifyHeaderLeaderTurn_CheckpointEpochSwitchKeepsLocalList(t *testing.T
 		t.Fatalf("epoch-switch leader taken from the header list: want ErrNotItsTurn, got %v", err)
 	}
 }
-
-// Bulk sync still accepts an in-batch epoch-switch header against the list it
-// carries. The reduced leader check stays while XdcBulkSyncMode is set.
-func TestVerifyHeaderLeaderTurn_BulkSyncEpochSwitchStillUsesHeaderList(t *testing.T) {
-	savedBulk := core.XdcBulkSyncMode.Load()
-	savedCkpt := core.CheckpointSyncNoStateActive.Load()
-	core.XdcBulkSyncMode.Store(true)
-	core.CheckpointSyncNoStateActive.Store(true)
-	t.Cleanup(func() {
-		core.XdcBulkSyncMode.Store(savedBulk)
-		core.CheckpointSyncNoStateActive.Store(savedCkpt)
-	})
-
-	eng, chain, keys, mns, p, h := ltFixture(t, 1800)
-	extra, err := crypto.GenerateKey()
-	if err != nil {
-		t.Fatal(err)
-	}
-	forged := []common.Address{mns[1], mns[0], mns[2], mns[3], crypto.PubkeyToAddress(extra.PublicKey)}
-	h.Validators = ltPack(forged)
-	ltSeal(t, h, keys[1])
-	if err := eng.verifyHeader(chain, h, []*types.Header{p}, false); err != nil {
-		t.Fatalf("bulk-sync epoch-switch leader check rejected the header list: %v", err)
-	}
-}

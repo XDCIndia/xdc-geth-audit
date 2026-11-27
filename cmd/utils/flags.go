@@ -335,7 +335,7 @@ var (
 	// (F-2026-19471). Use explicit --fastsyncpivot flags for a QC-backed anchor.
 	AutoCheckpointPivotFlag = &cli.BoolFlag{
 		Name:     "auto-checkpoint-pivot",
-		Usage:    "(Fast Sync only) opt in to A.96 auto-pin of fast-sync pivot from compiled TrustedSyncCheckpoints (trust root is the binary, not QC-verified; refs F-2026-19471)",
+		Usage:    "(Fast Sync only) opt in to A.96 auto-pin of fast-sync pivot from compiled TrustedSyncCheckpoints (refused while compiled checkpoints carry no verifiable QC; refs F-2026-19471)",
 		Category: flags.StateCategory,
 	}
 	GCModeFlag = &cli.StringFlag{

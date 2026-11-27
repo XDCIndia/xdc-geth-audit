@@ -67,6 +67,10 @@ type environment struct {
 	size     uint64         // size of the block we are building
 	gasPool  *core.GasPool  // available gas used to pack transactions
 	coinbase common.Address
+	// blockOwner is the candidate-owner of coinbase read from the parent state
+	// when the environment is made, i.e. the fee recipient that applies to the
+	// whole block before TIPUpgradePenalty (F-2026-20641), as in core.Process.
+	blockOwner common.Address
 
 	// XDC TRC21 token fees, mirroring core/state_processor.go Process: the
 	// capacities read from the pre-tx state, drawn down as txs are committed and
@@ -405,7 +409,7 @@ func (miner *Miner) prepareWork(ctx context.Context, genParams *generateParams, 
 // makeEnv creates a new environment for the sealing block.
 func (miner *Miner) makeEnv(parent *types.Header, header *types.Header, coinbase common.Address, witness bool) (*environment, error) {
 	// Retrieve the parent state to execute on top.
-	state, err := miner.chain.StateAtForkBoundary(parent, header)
+	statedb, err := miner.chain.StateAtForkBoundary(parent, header)
 	if err != nil {
 		return nil, err
 	}
@@ -416,22 +420,23 @@ func (miner *Miner) makeEnv(parent *types.Header, header *types.Header, coinbase
 			return nil, err
 		}
 	}
-	state.StartPrefetcher("miner", bundle)
-	evm := vm.NewEVM(core.NewEVMBlockContext(header, miner.chain, &coinbase), state, miner.chainConfig, vm.Config{})
+	statedb.StartPrefetcher("miner", bundle)
+	evm := vm.NewEVM(core.NewEVMBlockContext(header, miner.chain, &coinbase), statedb, miner.chainConfig, vm.Config{})
 	evm.SetJumpDestCache(miner.chain.JumpDestCache())
 	evm.SetPrecompileCache(miner.chain.PrecompileCache())
 
 	// Note the passed coinbase may be different with header.Coinbase.
 	return &environment{
-		signer:   types.MakeSigner(miner.chainConfig, header.Number, header.Time),
-		state:    state,
-		size:     uint64(header.Size()),
-		coinbase: coinbase,
-		gasPool:  core.NewGasPool(header.GasLimit),
-		header:   header,
-		bal:      bal.NewConstructionBlockAccessList(),
-		witness:  state.Witness(),
-		evm:      evm,
+		signer:     types.MakeSigner(miner.chainConfig, header.Number, header.Time),
+		state:      statedb,
+		size:       uint64(header.Size()),
+		coinbase:   coinbase,
+		blockOwner: state.GetCandidateOwner(statedb, coinbase),
+		gasPool:    core.NewGasPool(header.GasLimit),
+		header:     header,
+		bal:        bal.NewConstructionBlockAccessList(),
+		witness:    statedb.Witness(),
+		evm:        evm,
 	}, nil
 }
 
@@ -496,8 +501,8 @@ func (miner *Miner) commitBlobTransaction(ctx context.Context, env *environment,
 //     ApplySigningTransaction (zero-gas, no EVM), NOT the normal EVM path;
 //   - XDCx txs to 0x91-0x94 in the TIPXDCXReceiver window run through
 //     ApplyEmptyTransaction (both via core.RouteTransaction);
-//   - all other txs route the TRC21 gas fee to the candidate-owner of env.coinbase,
-//     read from state for each tx.
+//   - all other txs route the TRC21 gas fee to the candidate-owner of env.coinbase:
+//     read at block start before TIPUpgradePenalty, from state for each tx after.
 func (miner *Miner) applyTransaction(ctx context.Context, env *environment, tx *types.Transaction) (*types.Receipt, *bal.ConstructionBlockAccessList, error) {
 	var (
 		snap        = env.state.Snapshot()
@@ -527,10 +532,14 @@ func (miner *Miner) applyTransaction(ctx context.Context, env *environment, tx *
 			receipt, err = core.ApplyEmptyTransaction(config, env.state, blockNumber, blockHash, tx, env.gasPool.Used())
 		default:
 			tokenFee := env.trc21Fee != nil && core.ApplyTRC21TokenFee(config, msg, env.trc21Fee, tx, blockNumber)
-			// The owner is read from state for each tx, as core.Process does
-			// (canonical core/state_processor.go:442-443), so a block holds the
-			// same fee routing when it is built and when it is imported.
-			receipt, txBAL, err = core.ApplyTransactionWithEVM(ctx, msg, env.gasPool, env.state, blockNumber, blockHash, env.header.Time, tx, env.evm, state.GetCandidateOwner(env.state, env.coinbase))
+			// The fee owner follows core.Process, so a block holds the same fee
+			// routing when it is built and when it is imported: read per tx from
+			// TIPUpgradePenalty, the block-start owner before it (F-2026-20641).
+			owner := env.blockOwner
+			if config.IsTIPUpgradePenalty(blockNumber) {
+				owner = state.GetCandidateOwner(env.state, env.coinbase)
+			}
+			receipt, txBAL, err = core.ApplyTransactionWithEVM(ctx, msg, env.gasPool, env.state, blockNumber, blockHash, env.header.Time, tx, env.evm, owner)
 			if err == nil && tokenFee {
 				core.SettleTRC21TokenFee(config, env.state, msg, tx, receipt, blockNumber, env.trc21Fee, env.trc21Updated, env.trc21FeeUsed)
 			}

@@ -7,7 +7,7 @@ import (
 // Helpers and tests in this file were copied from sync_xdc_haltedtip_test.go because that file is not in the audit tree.
 
 // A low head advertised by the only eth/69 peer must not read as "at tip" when
-// the syncer has verified a much higher tip from another peer (XDC-HUNT-05).
+// the syncer has verified a much higher tip from another peer.
 func TestPeerAdvertisesTip(t *testing.T) {
 	for _, tc := range []struct {
 		name                      string

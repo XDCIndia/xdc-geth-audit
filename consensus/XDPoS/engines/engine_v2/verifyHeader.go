@@ -623,7 +623,7 @@ func (x *XDPoS_v2) verifyRoundSkip(chain consensus.ChainReader, header, parent *
 		return nil
 	}
 	// The certificate is checked against the ancestors of this header, not the
-	// local head, so the verdict does not depend on where the head is (#2113).
+	// local head, so the verdict does not depend on where the head is.
 	if err := x.verifyTCAt(chain, tc, parent, parents); err != nil {
 		return err
 	}

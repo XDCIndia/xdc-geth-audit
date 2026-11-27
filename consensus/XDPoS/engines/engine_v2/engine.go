@@ -295,7 +295,7 @@ func (x *XDPoS_v2) UpdateParams(header *types.Header) {
 
 // notifyMinePeriod hands the latest mine period to the worker without
 // blocking and without a goroutine. A node that does not mine has no reader on
-// minePeriodCh, so a blocking send would leak one goroutine per call (#2102).
+// minePeriodCh, so a blocking send would leak one goroutine per call.
 // The channel holds one value; when it is full the stale value is replaced.
 func (x *XDPoS_v2) notifyMinePeriod(period int) {
 	if x.minePeriodCh == nil {
@@ -414,7 +414,7 @@ func (x *XDPoS_v2) ReinitBFT(chain consensus.ChainReader, header *types.Header) 
 		ProposedBlockInfo: &types.BlockInfo{},
 	}
 	err := x.initial(chain, header)
-	// XDC-HUNT-37: the head header carries the certificate for its parent.
+	// F-2026-19609: the head header carries the certificate for its parent.
 	// A node that already holds the certificate for the head itself must not
 	// fall back one block.
 	if prev != nil && prev.ProposedBlockInfo != nil && prev.ProposedBlockInfo.Hash != (common.Hash{}) &&
@@ -634,7 +634,7 @@ func (x *XDPoS_v2) initial(chain consensus.ChainReader, header *types.Header) er
 // certified before shutdown. The lock is the certificate for the head, but the
 // head header only carries the certificate for its parent, so after a restart
 // highestQuorumCert sits one block below the lock. Every leader then builds a
-// sibling of the head and verifyVotingRule refuses it (XDC-HUNT-54). The lock
+// sibling of the head and verifyVotingRule refuses it (F-2026-19609). The lock
 // is raised only when its block is local and its signatures verify.
 func (x *XDPoS_v2) raiseHighestQCFromLock(chain consensus.ChainReader) {
 	lock := x.lockQuorumCert

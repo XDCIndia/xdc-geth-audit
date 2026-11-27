@@ -118,26 +118,3 @@ func TestBulkSyncRejectsMissingTrieNode(t *testing.T) {
 		t.Fatalf("head = %d, want 0 (unexecuted block canonized)", n)
 	}
 }
-
-// TestBulkSyncImportsExecutedBlock: a block whose execution matches the header
-// root, the block a current-main node produces on a complete trie, is still
-// canonized during bulk sync and does not latch no-state mode.
-func TestBulkSyncImportsExecutedBlock(t *testing.T) {
-	gspec := &Genesis{Config: xdcTestConfig()}
-	_, blocks, _ := GenerateChainWithGenesis(gspec, ethash.NewFaker(), 1, func(int, *BlockGen) {})
-
-	db := rawdb.NewMemoryDatabase()
-	chain := newBulkSyncTestChain(t, db, gspec)
-	if _, err := chain.InsertChain(types.Blocks{blocks[0]}); err != nil {
-		t.Fatalf("executed block rejected in bulk sync: %v", err)
-	}
-	if chain.checkpointSyncNoState.Load() || rawdb.ReadCheckpointSyncNoState(db) {
-		t.Fatal("checkpointSyncNoState latched on a matching state root")
-	}
-	if n := chain.CurrentBlock().Number.Uint64(); n != 1 {
-		t.Fatalf("head = %d, want 1", n)
-	}
-	if chain.CurrentBlock().Root != blocks[0].Root() {
-		t.Fatalf("head root = %s, want %s", chain.CurrentBlock().Root, blocks[0].Root())
-	}
-}

@@ -10,6 +10,13 @@ import (
 	"github.com/ethereum/go-ethereum/params"
 )
 
+// maxRPCBulletproofComms bounds the commitments a bulletproof proof may carry
+// in eth_call, eth_estimateGas, eth_simulateV1 and debug_traceCall. 256 is
+// well above any proof seen on chain. F-2026-20591.
+const maxRPCBulletproofComms = 256
+
+var bulletproofAddr = common.BytesToAddress([]byte{0x28})
+
 var privacyPrecompileAddrs = []common.Address{
 	common.BytesToAddress([]byte{0x1e}),
 	common.BytesToAddress([]byte{0x28}),
@@ -22,7 +29,16 @@ var privacyPrecompileAddrs = []common.Address{
 // Other precompiles stay on the execution rules. With no override the two
 // headers match and the set is unchanged.
 func limitPrivacyPrecompiles(cfg *params.ChainConfig, have vm.PrecompiledContracts, stateNum *big.Int, stateMerge bool, stateTime uint64, execNum *big.Int, execMerge bool, execTime uint64) vm.PrecompiledContracts {
-	if have == nil || cfg == nil || stateNum == nil || execNum == nil {
+	if have == nil {
+		return have
+	}
+	// RPC execution only: cap the bulletproof commitment count. This runs
+	// before the early return so it also covers calls with no override.
+	// Consensus execution does not pass through here and stays uncapped.
+	if _, ok := have[bulletproofAddr]; ok {
+		have[bulletproofAddr] = vm.CappedBulletproofVerifier(maxRPCBulletproofComms)
+	}
+	if cfg == nil || stateNum == nil || execNum == nil {
 		return have
 	}
 	if stateNum.Cmp(execNum) == 0 && stateTime == execTime && stateMerge == execMerge {

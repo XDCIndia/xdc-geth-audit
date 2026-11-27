@@ -113,11 +113,11 @@ func restartEngine(eng *XDPoS_v2) {
 	eng.lockQuorumCert = nil
 }
 
-// TestXDCHunt54RestartRaisesHighestQCToStoredLock restarts a node that held
+// TestF202619609RestartRaisesHighestQCToStoredLock restarts a node that held
 // the certificate for its head B. The head header carries only the
 // certificate for B's parent. The stored lock must raise the highest
 // certificate to B, so the node builds on B and votes for a child of B.
-func TestXDCHunt54RestartRaisesHighestQCToStoredLock(t *testing.T) {
+func TestF202619609RestartRaisesHighestQCToStoredLock(t *testing.T) {
 	eng, db := newA894Engine(t)
 	chain, head, lock := lockRestartFixture(t, eng, 4)
 	rawdb.WriteBFTLockQC(db, lock)

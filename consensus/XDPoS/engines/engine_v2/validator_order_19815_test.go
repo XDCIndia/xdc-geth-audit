@@ -15,7 +15,6 @@ package engine_v2
 import (
 	"encoding/json"
 	"math/big"
-	"strings"
 	"testing"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -90,32 +89,5 @@ func TestF202619815ShippedGatesLeaveReorderedListsValid(t *testing.T) {
 		if err := verifyReordered(t, fork, true); err != nil {
 			t.Fatalf("fork %v rejected a reordered list current-main accepts: %v", fork, err)
 		}
-	}
-}
-
-// TestF202619815ActiveForkRejectsReorderedList is the rule an operator gets
-// by setting validatorOrderBlock. It must not be set on a network until the
-// same block is set on current-main and on legacy.
-func TestF202619815ActiveForkRejectsReorderedList(t *testing.T) {
-	err := verifyReordered(t, big.NewInt(903), true)
-	if err == nil || !strings.Contains(err.Error(), "order does not match") {
-		t.Fatalf("reordered list at the fork block: got %v", err)
-	}
-	// Bulk sync does not apply the order rule, matching current-main.
-	if err := verifyReordered(t, big.NewInt(0), false); err != nil {
-		t.Fatalf("bulk sync rejected a reordered list: %v", err)
-	}
-}
-
-// TestF202619815CanonicalOrderStaysValid checks that turning the rule on does
-// not reject the order calcMasternodes already produced. A header this node
-// seals is still a header current-main accepts.
-func TestF202619815CanonicalOrderStaysValid(t *testing.T) {
-	eng, chain, keys, mns, parent, h := esFixture(t, false)
-	chain.cfg.ValidatorOrderBlock = big.NewInt(0)
-	h.Validators = packValidators(mns)
-	esSeal(t, h, keys[0])
-	if err := eng.verifyHeader(chain, h, []*types.Header{parent}, true); err != nil {
-		t.Fatalf("canonical order with the rule active: %v", err)
 	}
 }

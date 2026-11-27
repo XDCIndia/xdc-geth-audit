@@ -866,7 +866,7 @@ func (s *xdcSyncer) loop() {
 }
 
 // tipAtPeerTolerance is how many blocks below the peer-advertised max a synced
-// node may be at the heartbeat sampling instant (#190).
+// node may be at the heartbeat sampling instant.
 const tipAtPeerTolerance = 3
 
 // peerAdvertisesTip reports whether the peer-advertised head says the node is at
@@ -876,7 +876,7 @@ const tipAtPeerTolerance = 3
 // counts the syncer's verified networkTip, which includes the XDPOS2 peers
 // that never send a block range (same rule as peersConfirmAtTip, #1884). Without
 // it, the only eth/69 peer advertising a head at or below ours ended bulk-sync
-// mode for a node that was far behind (XDC-HUNT-05).
+// mode for a node that was far behind.
 //
 // F-2026-20644: while XDPOS2 peers are connected but none of their heads is
 // known yet (networkTip == 0), the advertised head is the only voice and a
@@ -2910,11 +2910,7 @@ func (s *xdcSyncer) fullSyncOnce() {
 	// xdcBodyHedgeDelay (800ms), issue the same request to the next-best candidate.
 	// Hard timeout is xdcBulkReqTimeout (4s). Verification is the same TxHash/UncleHash
 	// check in buildBlocks; the hedge peer must pass it or its blocks are dropped.
-	hashes := make([]common.Hash, len(headers))
-	for i, h := range headers {
-		hashes[i] = h.Hash()
-	}
-	bodies, hedgeFailed := s.fetchBodiesHedged(peer, candidates, hashes)
+	bodies, hedgeFailed, supplier := s.fetchBodiesHedged(peer, candidates, headers)
 	if len(bodies) == 0 {
 		// The header-race winner delivered no bodies and the hedge did not
 		// either. Taint that peer so the next round can be won by someone else.
@@ -2929,10 +2925,18 @@ func (s *xdcSyncer) fullSyncOnce() {
 
 	blocks := s.buildBlocks(headers, bodies)
 	if len(blocks) == 0 {
-		// Bodies arrived but none matched their headers, and the hedge failed
-		// as well. Same taint: this peer should not win the next race.
-		if hedgeFailed {
-			s.taintPeer(peer)
+		// Bodies arrived but none matched their headers. fetchBodiesHedged
+		// already refuses a reply whose first body is wrong; this covers a
+		// body that cannot be decoded. F-2026-20612: taint unconditionally,
+		// the race winner must not win the next race, and the peer that
+		// supplied the bodies is tainted too.
+		s.taintPeer(peer)
+		if supplier != peer.ID() {
+			for _, c := range candidates {
+				if c.ID() == supplier {
+					s.taintPeer(c)
+				}
+			}
 		}
 		log.Debug("xdcSyncer: no valid blocks to import", "hedgeFailed", hedgeFailed)
 		return
@@ -3772,6 +3776,7 @@ func (s *xdcSyncer) verifyForkBranch(branch []*types.Header) bool {
 	}
 	return true
 }
+
 // rollbackWindow returns the exponential rollback window for a given cumulative
 // rolled-back count. The shift is capped so the result never exceeds
 // xdcRollbackWindowMax and never wraps to zero via uint64 overflow.
@@ -6078,16 +6083,27 @@ func (s *xdcSyncer) bodyRankedCandidates(candidates []*eth.Peer) []*eth.Peer {
 	return out
 }
 
-// fetchBodiesHedged fetches bodies for hashes from primary, hedging to the best
-// idle candidate after xdcBodyHedgeDelay if primary has not responded.
+// fetchBodiesHedged fetches the bodies of headers from primary, hedging to the
+// best idle candidate after xdcBodyHedgeDelay if primary has not responded.
 // Hard deadline is xdcBulkReqTimeout. Updates per-peer body statistics.
 // Respects XDCBodyReqMu serialisation per peer (SYNC-12 refs #1869, #1858).
-func (s *xdcSyncer) fetchBodiesHedged(primary *eth.Peer, candidates []*eth.Peer, hashes []common.Hash) ([]eth.BlockBody, bool) {
+//
+// F-2026-20612: a reply whose first body does not match its header counts as no
+// reply. The peer that sent it is tainted and the hedge is launched at once, so
+// a race winner that answers with wrong bodies cannot keep the honest peers out.
+//
+// The third result is the ID of the peer that supplied the returned bodies, or
+// the empty string when none did.
+func (s *xdcSyncer) fetchBodiesHedged(primary *eth.Peer, candidates []*eth.Peer, headers []*types.Header) ([]eth.BlockBody, bool, string) {
 	type bodyResult struct {
 		bodies   []eth.BlockBody
-		peerID   string
+		peer     *eth.Peer
 		lat      time.Duration
 		timedOut bool
+	}
+	hashes := make([]common.Hash, len(headers))
+	for i, h := range headers {
+		hashes[i] = h.Hash()
 	}
 	// Buffered so losing goroutines never block when we've already returned.
 	ch := make(chan bodyResult, 2)
@@ -6096,7 +6112,18 @@ func (s *xdcSyncer) fetchBodiesHedged(primary *eth.Peer, candidates []*eth.Peer,
 		t0 := time.Now()
 		bodies := s.fetchBodiesBatchTimeout(p, hashes, xdcBulkReqTimeout)
 		lat := time.Since(t0)
-		ch <- bodyResult{bodies: bodies, peerID: p.ID(), lat: lat, timedOut: len(bodies) == 0}
+		ch <- bodyResult{bodies: bodies, peer: p, lat: lat, timedOut: len(bodies) == 0}
+	}
+	// accept records the reply and returns its bodies, or nil when it is empty
+	// or its first body does not belong to its header (the sender is tainted).
+	accept := func(res bodyResult) []eth.BlockBody {
+		if len(res.bodies) > 0 && !bodyMatchesHeader(headers[0], &res.bodies[0]) {
+			log.Debug("xdcSyncer.fetchBodiesHedged: first body does not match its header", "peer", res.peer.ID()[:8])
+			s.taintPeer(res.peer)
+			res.bodies, res.timedOut = nil, true
+		}
+		s.recordBodyStat(res.peer.ID(), res.lat, res.timedOut)
+		return res.bodies
 	}
 	go fetchOne(primary)
 
@@ -6125,35 +6152,34 @@ func (s *xdcSyncer) fetchBodiesHedged(primary *eth.Peer, candidates []*eth.Peer,
 	for {
 		select {
 		case res := <-ch:
-			s.recordBodyStat(res.peerID, res.lat, res.timedOut)
-			if len(res.bodies) > 0 {
+			if bodies := accept(res); len(bodies) > 0 {
 				// A peer delivered bodies. The hedge is not a failure when it
 				// was not required, and not a failure when it produced them.
-				return res.bodies, false
+				return bodies, false, res.peer.ID()
 			}
-			// Primary returned early with no bodies — start hedge immediately.
+			// Primary returned early with no usable bodies — start hedge immediately.
 			startHedge()
 			if hedgeStarted {
 				// Wait for hedge result within remaining budget.
 				select {
 				case res2 := <-ch:
-					s.recordBodyStat(res2.peerID, res2.lat, res2.timedOut)
-					// hedgeFailed is true when the hedge also returned nothing.
-					return res2.bodies, len(res2.bodies) == 0
+					// hedgeFailed is true when the hedge also returned nothing usable.
+					bodies := accept(res2)
+					return bodies, len(bodies) == 0, res2.peer.ID()
 				case <-deadline.C:
-					return nil, true
+					return nil, true, ""
 				case <-s.quitCh:
-					return nil, true
+					return nil, true, ""
 				}
 			}
-			return nil, true
+			return nil, true, ""
 		case <-hedge.C:
 			startHedge()
 		case <-deadline.C:
 			s.recordBodyStat(primary.ID(), xdcBulkReqTimeout, true)
-			return nil, true
+			return nil, true, ""
 		case <-s.quitCh:
-			return nil, true
+			return nil, true, ""
 		}
 	}
 }
@@ -6837,12 +6863,17 @@ func snapBlockComplete(db ethdb.Reader, hash common.Hash, num uint64, txHash com
 	if len(receipts) == 0 {
 		return header.ReceiptHash == types.EmptyReceiptsHash
 	}
-	if types.DeriveSha(receipts, trie.NewStackTrie(nil)) == header.ReceiptHash {
-		return true
+	// F-2026-20610: a receipt list of the right length is not enough, it
+	// must hash to the header's receipt root. The storage form carries
+	// neither the receipt type nor the bloom, so restore both before hashing.
+	if len(receipts) != len(body.Transactions) {
+		return false
 	}
-	// A non-empty receipt list stored for a non-empty body is the block the
-	// backfill already checked. An empty placeholder never reaches here.
-	return len(receipts) == len(body.Transactions)
+	for i, r := range receipts {
+		r.Type = body.Transactions[i].Type()
+		r.Bloom = types.CreateBloom(r)
+	}
+	return types.DeriveSha(receipts, trie.NewStackTrie(nil)) == header.ReceiptHash
 }
 
 // verifyBodyAgainstHeader returns true iff body's transaction root, uncle hash,
@@ -6861,6 +6892,25 @@ func verifyBodyAgainstHeader(h *types.Header, body *types.Body) bool {
 		}
 	}
 	return true
+}
+
+// bodyMatchesHeader decodes a wire body and runs verifyBodyAgainstHeader on it.
+func bodyMatchesHeader(h *types.Header, b *eth.BlockBody) bool {
+	txs, err := b.Transactions.Items()
+	if err != nil {
+		return false
+	}
+	uncles, err := b.Uncles.Items()
+	if err != nil {
+		return false
+	}
+	body := types.Body{Transactions: txs, Uncles: uncles}
+	if b.Withdrawals != nil {
+		if wd, err := b.Withdrawals.Items(); err == nil {
+			body.Withdrawals = wd
+		}
+	}
+	return verifyBodyAgainstHeader(h, &body)
 }
 
 // snapHistoryFindResumeTop finds the (nextTop, topHash) pair from which
@@ -7059,27 +7109,10 @@ func localCompleteBatch(db ethdb.Database, topHash common.Hash, top uint64, want
 	return out
 }
 
-// backfillTxLookupMu orders the read-compare-write in writeBackfillTxLookups
-// across the concurrent per-peer chunk writers of one backfill range.
-var backfillTxLookupMu sync.Mutex
-
-// writeBackfillTxLookups indexes body's transactions at block num, but keeps an
-// existing entry that points at a higher block. XDC special transactions can be
-// included in several blocks under one hash, and a full node that imports
-// forward resolves such a hash to its latest inclusion; the backfill walks
-// backwards, so an unconditional write would resolve it to an older block.
-// Entries go straight to db, not to a caller's batch, so a concurrent chunk
-// sees them whichever of the two runs first.
+// writeBackfillTxLookups indexes body's transactions at block num and keeps an
+// existing entry that points at a higher block (see rawdb.WriteTxLookupEntriesKeepNewer).
 func writeBackfillTxLookups(db ethdb.Database, num uint64, body *types.Body) {
-	backfillTxLookupMu.Lock()
-	defer backfillTxLookupMu.Unlock()
-	hashes := make([]common.Hash, 0, len(body.Transactions))
-	for _, tx := range body.Transactions {
-		if prev := rawdb.ReadTxLookupEntry(db, tx.Hash()); prev == nil || *prev < num {
-			hashes = append(hashes, tx.Hash())
-		}
-	}
-	rawdb.WriteTxLookupEntries(db, num, hashes)
+	rawdb.WriteTxLookupEntriesKeepNewer(db, num, body.Transactions)
 }
 
 func (s *xdcSyncer) runSnapHistoryBackfill() {

@@ -12,6 +12,7 @@ import (
 	"math/big"
 	"strconv"
 	"sync"
+	"time"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/log"
@@ -454,7 +455,7 @@ Given a inner product proof, verifies the correctness of the proof. Does the sam
 we replace n separate exponentiations with a single multi-exponentiation.
 */
 
-func InnerProductVerifyFast(c *big.Int, P, U ECPoint, G, H []ECPoint, ipp InnerProdArg) bool {
+func InnerProductVerifyFast(c *big.Int, P, U ECPoint, G, H []ECPoint, ipp InnerProdArg, abort ...func() bool) bool {
 	if len(ipp.Challenges) == 0 {
 		return false
 	}
@@ -497,6 +498,9 @@ func InnerProductVerifyFast(c *big.Int, P, U ECPoint, G, H []ECPoint, ipp InnerP
 
 	tmp1 := EC.Zero()
 	for j := curIt; j >= 0; j-- {
+		if proofAborted(abort) {
+			return false
+		}
 		x2 := new(big.Int).Exp(ipp.Challenges[j], big.NewInt(2), EC.N)
 		x2i := new(big.Int).ModInverse(x2, EC.N)
 		//fmt.Println(tmp1)
@@ -510,6 +514,9 @@ func InnerProductVerifyFast(c *big.Int, P, U ECPoint, G, H []ECPoint, ipp InnerP
 	invsScalars := make([]*big.Int, EC.V)
 
 	for i := 0; i < EC.V; i++ {
+		if proofAborted(abort) {
+			return false
+		}
 		si := big.NewInt(1)
 		for j := curIt; j >= 0; j-- {
 			// original challenge if the jth bit of i is 1, inverse challenge otherwise
@@ -525,6 +532,10 @@ func InnerProductVerifyFast(c *big.Int, P, U ECPoint, G, H []ECPoint, ipp InnerP
 		invsScalars[i] = new(big.Int).ModInverse(si, EC.N)
 	}
 
+	if proofAborted(abort) {
+		return false
+	}
+	// ponytail: the final multi-scalar commit below has no abort check, it is one call
 	ccalc := new(big.Int).Mod(new(big.Int).Mul(ipp.A, ipp.B), EC.N)
 	lhs := TwoVectorPCommitWithGens(G, H, ScalarVectorMul(sScalars, ipp.A), ScalarVectorMul(invsScalars, ipp.B)).Add(ux.Mult(ccalc))
 
@@ -1194,7 +1205,18 @@ func MRPVerify(mrp *MultiRangeProof, abort ...func() bool) bool {
 	if m*PubKeyBytesLenCompressed > params.MaxBlockSize {
 		return false
 	}
-	ecMu.Lock()
+	// A queued call must not sit behind a long verification once it is
+	// cancelled. Without an abort function (consensus) take the plain lock.
+	if len(abort) == 0 {
+		ecMu.Lock()
+	} else {
+		for !ecMu.TryLock() {
+			if proofAborted(abort) {
+				return false
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}
 	defer ecMu.Unlock()
 	if proofAborted(abort) {
 		return false
@@ -1263,6 +1285,9 @@ func MRPVerify(mrp *MultiRangeProof, abort ...func() bool) bool {
 	z2 := new(big.Int).Mod(new(big.Int).Mul(cz, cz), EC.N)
 
 	for j := 0; j < m; j++ {
+		if proofAborted(abort) {
+			return false
+		}
 		CommPowers = CommPowers.Add(mrp.Comms[j].Mult(new(big.Int).Mul(z2, PowersOfZ[j])))
 	}
 
@@ -1280,6 +1305,9 @@ func MRPVerify(mrp *MultiRangeProof, abort ...func() bool) bool {
 	tmp1 := EC.Zero()
 	zneg := new(big.Int).Mod(new(big.Int).Neg(cz), EC.N)
 	for i := range EC.BPG {
+		if proofAborted(abort) {
+			return false
+		}
 		tmp1 = tmp1.Add(EC.BPG[i].Mult(zneg))
 	}
 
@@ -1289,12 +1317,18 @@ func MRPVerify(mrp *MultiRangeProof, abort ...func() bool) bool {
 	HPrime := make([]ECPoint, len(EC.BPH))
 
 	for i := range HPrime {
+		if proofAborted(abort) {
+			return false
+		}
 		mi := new(big.Int).ModInverse(PowersOfY[i], EC.N)
 		HPrime[i] = EC.BPH[i].Mult(mi)
 	}
 
 	for j := 0; j < m; j++ {
 		for i := 0; i < bitsPerValue; i++ {
+			if proofAborted(abort) {
+				return false
+			}
 			val1 := new(big.Int).Mul(cz, PowersOfY[j*bitsPerValue+i])
 			zp := new(big.Int).Exp(cz, big.NewInt(2+int64(j)), EC.N)
 			val2 := new(big.Int).Mod(new(big.Int).Mul(zp, PowerOfTwos[i]), EC.N)
@@ -1307,7 +1341,7 @@ func MRPVerify(mrp *MultiRangeProof, abort ...func() bool) bool {
 	P := mrp.A.Add(mrp.S.Mult(cx)).Add(tmp1).Add(tmp2).Add(EC.H.Mult(mrp.Mu).Neg())
 	//fmt.Println(P)
 
-	if !InnerProductVerifyFast(mrp.Th, P, EC.U, EC.BPG, HPrime, mrp.IPP) {
+	if !InnerProductVerifyFast(mrp.Th, P, EC.U, EC.BPG, HPrime, mrp.IPP, abort...) {
 		log.Debug("Range proof failed!")
 		return false
 	}

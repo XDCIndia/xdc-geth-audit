@@ -7,10 +7,12 @@ import (
 	"math/big"
 	"testing"
 
+	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/consensus"
 	"github.com/ethereum/go-ethereum/consensus/ethash"
 	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/ethdb"
 	"github.com/ethereum/go-ethereum/params"
 )
 
@@ -172,6 +174,61 @@ func TestSetHeadRefusedBelowCommittedBlock(t *testing.T) {
 	}
 }
 
+func reorgNewChainSetup(t *testing.T, forkLen int) (*BlockChain, *committedEngine, ethdb.Database, types.Blocks) {
+	t.Helper()
+	eng := &committedEngine{Engine: ethash.NewFaker()}
+	genesis := &Genesis{
+		BaseFee: big.NewInt(params.InitialBaseFee),
+		Config:  params.AllEthashProtocolChanges,
+	}
+	db := rawdb.NewMemoryDatabase()
+	bc, err := NewBlockChain(db, genesis, eng, nil)
+	if err != nil {
+		t.Fatalf("NewBlockChain: %v", err)
+	}
+	t.Cleanup(bc.Stop)
+	genDb, canonBlocks := makeBlockChainWithGenesis(genesis, 4, ethash.NewFaker(), canonicalSeed)
+	if _, err := bc.InsertChain(canonBlocks); err != nil {
+		t.Fatalf("insert canonical chain: %v", err)
+	}
+	fork := makeBlockChain(bc.chainConfig, canonBlocks[1], forkLen, ethash.NewFaker(), genDb, forkSeed)
+	for _, b := range fork {
+		rawdb.WriteBlock(db, b)
+	}
+	return bc, eng, db, fork
+}
+
+// TestReorgRefusedWhenNewChainReplacesCommittedHash covers F-2026-19773: the old
+// chain (head 4) lacks the committed block 6, and the new chain carries a
+// different hash at that number.
+func TestReorgRefusedWhenNewChainReplacesCommittedHash(t *testing.T) {
+	bc, eng, _, fork := reorgNewChainSetup(t, 8) // fork covers blocks 3..10
+	eng.committed = &types.BlockInfo{Hash: common.Hash{0xc0, 0xff, 0xee}, Number: big.NewInt(6)}
+	err := bc.reorg(bc.CurrentBlock(), fork[len(fork)-1].Header())
+	if err == nil || !containsStr(err.Error(), "stop reorg") {
+		t.Fatalf("reorg error = %v, want a stop reorg refusal", err)
+	}
+	if head := bc.CurrentBlock().Number.Uint64(); head != 4 {
+		t.Fatalf("head = %d, want 4", head)
+	}
+}
+
+// containsStr is strings.Contains without importing strings.
+func containsStr(s, sub string) bool {
+	if len(sub) == 0 {
+		return true
+	}
+	if len(s) < len(sub) {
+		return false
+	}
+	for i := 0; i <= len(s)-len(sub); i++ {
+		if s[i:i+len(sub)] == sub {
+			return true
+		}
+	}
+	return false
+}
+
 // TestSetHeadWithTimestampRewindsBelowCommittedBlock checks that the
 // timestamp rewind used by the config-compat startup path cannot drop an
 // XDPoS committed block. SetHead(3) is refused; the timestamp of that same
@@ -204,19 +261,6 @@ func TestSetHeadWithTimestampRewindsBelowCommittedBlock(t *testing.T) {
 	if got := bc.GetCanonicalHash(canonBlocks[5].NumberU64()); got != canonBlocks[5].Hash() {
 		t.Fatalf("committed block hash = %s, want %s", got, canonBlocks[5].Hash())
 	}
-}
-
-// recordingInvalidator records InvalidateCaches calls. It embeds
-// committedEngine so the committed-block guard still applies.
-type recordingInvalidator struct {
-	committedEngine
-	called bool
-	head   uint64
-}
-
-func (e *recordingInvalidator) InvalidateCaches(newHead uint64) {
-	e.called = true
-	e.head = newHead
 }
 
 // TestSetHeadWithTimestampAllowedAtCommittedBlock checks that a timestamp
@@ -392,18 +436,15 @@ func TestConfigCompatRewindRefusedByStoredCommittedMarker(t *testing.T) {
 	}
 }
 
-// containsStr is strings.Contains without importing strings.
-func containsStr(s, sub string) bool {
-	if len(sub) == 0 {
-		return true
-	}
-	if len(s) < len(sub) {
-		return false
-	}
-	for i := 0; i <= len(s)-len(sub); i++ {
-		if s[i:i+len(sub)] == sub {
-			return true
-		}
-	}
-	return false
+// recordingInvalidator records InvalidateCaches calls. It embeds
+// committedEngine so the committed-block guard still applies.
+type recordingInvalidator struct {
+	committedEngine
+	called bool
+	head   uint64
+}
+
+func (e *recordingInvalidator) InvalidateCaches(newHead uint64) {
+	e.called = true
+	e.head = newHead
 }

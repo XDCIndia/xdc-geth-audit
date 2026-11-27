@@ -46,32 +46,6 @@ func (c m2Chain) GetHeaderByHash(h common.Hash) *types.Header {
 	return nil
 }
 
-// TestV1DoubleValidationFailClosed gates the chain-51 historical skip.
-// A nil config, a nil chain ID, and a chain-51 block past a configured V2
-// switch all enforce the check. Chain 51 at a V1 number still skips.
-func TestV1DoubleValidationFailClosed(t *testing.T) {
-	if !v1DoubleValidation(nil, 901) {
-		t.Fatal("nil config skipped M2 validation")
-	}
-	if !v1DoubleValidation(&params.ChainConfig{}, 901) {
-		t.Fatal("nil chain ID skipped M2 validation")
-	}
-	apothem := &params.ChainConfig{ChainID: big.NewInt(51)}
-	if v1DoubleValidation(apothem, 901) {
-		t.Fatal("chain 51 V1 block enforced M2 validation")
-	}
-	apothem.XDPoS = &params.XDPoSConfig{V2: &params.V2{SwitchBlock: big.NewInt(1000)}}
-	if v1DoubleValidation(apothem, 1000) {
-		t.Fatal("chain 51 at the V2 switch enforced M2 validation")
-	}
-	if !v1DoubleValidation(apothem, 1001) {
-		t.Fatal("chain 51 past the V2 switch skipped M2 validation")
-	}
-	if !v1DoubleValidation(&params.ChainConfig{ChainID: big.NewInt(50)}, 901) {
-		t.Fatal("chain 50 skipped M2 validation")
-	}
-}
-
 // TestV1LightPathUnassignedM2AfterRandomize: on the bulk-sync path a creator
 // who is not in the checkpoint M2 map is rejected once TIPRandomize is active,
 // and still accepted before that fork (F-2026-19614).

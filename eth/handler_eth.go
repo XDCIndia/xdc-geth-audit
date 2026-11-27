@@ -39,13 +39,13 @@ const maxNewBlockDelay = 30 * time.Second
 
 const (
 	// maxParkedNewBlocks bounds the future-timestamp blocks waiting on a timer,
-	// in total. Each peer may park one (XDC-HUNT-02).
+	// in total. Each peer may park one.
 	maxParkedNewBlocks = 16
 	// maxParkedNewBlockBytes bounds the encoded size of all parked blocks
 	// together (F-2026-20605); a NewBlock may be up to the 10 MB message cap.
 	maxParkedNewBlockBytes = 32 * 1024 * 1024
 	// maxInvalidNewBlocks is how many definitively invalid NewBlocks a peer may
-	// send before it is disconnected (XDC-HUNT-03).
+	// send before it is disconnected.
 	maxInvalidNewBlocks = 5
 	// maxTrackedInvalidPeers bounds the per-peer invalid-block counters.
 	maxTrackedInvalidPeers = 1024
@@ -282,8 +282,8 @@ func (h *ethHandler) Handle(peer *eth.Peer, packet eth.Packet) error {
 		// with ErrFutureBlock, so the assigned M2 never co-signs it and the
 		// un-co-signed block later arrives through the syncer.
 		if delay := time.Until(time.Unix(int64(block.Time()), 0)); delay > 0 && delay <= maxNewBlockDelay {
-			// Cheap checks first, so a peer cannot park junk (XDC-HUNT-02,
-			// F-2026-20605): only a block at head or head+1 that we do not have and
+			// Cheap checks first, so a peer cannot park junk
+			// (F-2026-20605): only a block at head or head+1 that we do not have and
 			// whose parent we know is worth waiting for. Each peer may park one at a
 			// time, the same block once, a few in total and a bounded number of bytes.
 			cur := h.chain.CurrentBlock()
@@ -378,7 +378,7 @@ func (h *ethHandler) Handle(peer *eth.Peer, packet eth.Packet) error {
 		}
 		// Check the header before InsertChain: InsertChain recovers every
 		// transaction sender first and writes a bad-block record on failure, a
-		// cost the sender chooses (XDC-HUNT-03). The engine caches the result, so
+		// cost the sender chooses. The engine caches the result, so
 		// the check in InsertChain is cheap after this.
 		if err := h.chain.Engine().VerifyHeader(h.chain, block.Header()); err != nil && isDefinitiveInvalidBlockError(err) {
 			peer.Log().Debug("XDC NewBlock: invalid header",
