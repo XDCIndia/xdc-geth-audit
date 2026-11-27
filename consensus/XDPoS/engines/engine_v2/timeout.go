@@ -440,6 +440,35 @@ func (x *XDPoS_v2) verifyTCAt(chain consensus.ChainReader, timeoutCert *types.Ti
 		return utils.ErrInvalidTC
 	}
 
+	// F-2026-19612: resolve the epoch of the certificate round and check the
+	// certificate gap against it BEFORE the gap snapshot is loaded. The gap is
+	// attacker-chosen; it must not select a snapshot load until it is known to be
+	// the gap of the round's epoch. An unresolved epoch is an error.
+	var epochInfo *types.EpochSwitchInfo
+	var err error
+	if parent == nil {
+		epochInfo, err = x.getTCEpochInfo(chain, timeoutCert)
+	} else {
+		epochInfo, err = x.getTCEpochInfoAt(chain, timeoutCert, parent, parents)
+	}
+	if err != nil {
+		log.Error("[verifyTC] Failed to get TC epoch info", "tcRound", timeoutCert.Round, "error", err)
+		return err
+	}
+	if tcEpochUnresolved(epochInfo) {
+		log.Error("[verifyTC] TC epoch info or its switch block is unresolved", "tcRound", timeoutCert.Round)
+		return fmt.Errorf("unable to resolve the epoch of timeout certificate round %d", timeoutCert.Round)
+	}
+	ref := (*types.Header)(nil)
+	if parent == nil {
+		ref = chain.CurrentHeader()
+	} else {
+		ref = parent
+	}
+	if err := x.timeoutGapMatchesEpochAt(chain, ref, epochInfo, timeoutCert.Round, timeoutCert.GapNumber); err != nil {
+		return err
+	}
+
 	// Get snapshot
 	snap, err := x.getSnapshot(chain, timeoutCert.GapNumber, true, nil)
 	if err != nil {
@@ -466,26 +495,6 @@ func (x *XDPoS_v2) verifyTCAt(chain consensus.ChainReader, timeoutCert *types.Ti
 	// byte-distinct encoding of the SAME signer's timeout vote, so
 	// byte-dedup lets one masternode key inflate the counted total toward
 	// the 2/3 threshold — a BFT safety violation.
-	var epochInfo *types.EpochSwitchInfo
-	if parent == nil {
-		epochInfo, err = x.getTCEpochInfo(chain, timeoutCert)
-	} else {
-		epochInfo, err = x.getTCEpochInfoAt(chain, timeoutCert, parent, parents)
-	}
-	if err != nil {
-		log.Error("[verifyTC] Failed to get TC epoch info", "tcRound", timeoutCert.Round, "error", err)
-		return err
-	}
-	ref := (*types.Header)(nil)
-	if parent == nil {
-		ref = chain.CurrentHeader()
-	} else {
-		ref = parent
-	}
-	if err := x.timeoutGapMatchesEpochAt(chain, ref, epochInfo, timeoutCert.Round, timeoutCert.GapNumber); err != nil {
-		return err
-	}
-
 	signedTimeoutObj := types.TimeoutSigHash(&types.TimeoutForSign{
 		Round:     timeoutCert.Round,
 		GapNumber: timeoutCert.GapNumber,
@@ -546,6 +555,13 @@ func (x *XDPoS_v2) verifyTCAt(chain consensus.ChainReader, timeoutCert *types.Ti
 	wg.Wait()
 
 	return verifyError
+}
+
+// tcEpochUnresolved reports whether the epoch info of a TC round, or its switch
+// block, is missing. timeoutGapMatchesEpochAt passes in that case, so verifyTCAt
+// must refuse it first (F-2026-19612).
+func tcEpochUnresolved(info *types.EpochSwitchInfo) bool {
+	return info == nil || info.EpochSwitchBlockInfo == nil || info.EpochSwitchBlockInfo.Number == nil
 }
 
 // processTC processes a timeout certificate

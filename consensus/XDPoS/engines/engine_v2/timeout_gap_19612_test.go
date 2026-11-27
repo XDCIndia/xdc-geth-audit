@@ -4,8 +4,10 @@ package engine_v2
 
 import (
 	"math/big"
+	"strings"
 	"testing"
 
+	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
 )
@@ -85,5 +87,44 @@ func TestF202619612EpochSwitchRoundTimeout(t *testing.T) {
 	}
 	if err := f.x.timeoutGapMatchesEpoch(f.chain, info, types.Round(2000), next); err == nil {
 		t.Fatal("next-epoch gap accepted for a round inside the known epoch")
+	}
+}
+
+// F-2026-19612: the certificate gap is checked against the round epoch before
+// the gap snapshot is loaded. A wrong gap that has no snapshot fails with the
+// gap error, not with a snapshot error.
+func TestF202619612VerifyTCGapCheckedBeforeSnapshot(t *testing.T) {
+	const round = types.Round(5)
+	f := newTCFixture(t, 0)
+	sigs := signTimeout(t, round, f.active[:2]...)
+	// 12345 is not the gap of the epoch (450) and no snapshot exists for it.
+	err := f.x.verifyTC(f.chain, &types.TimeoutCert{Round: round, GapNumber: 12345, Signatures: sigs})
+	if err == nil {
+		t.Fatal("wrong-gap TC accepted")
+	}
+	if strings.Contains(err.Error(), "snapshot") || !strings.Contains(err.Error(), "is not gap") {
+		t.Fatalf("want the gap error, got: %v", err)
+	}
+}
+
+// F-2026-19612: a nil epoch info, or one without a switch block, is an error
+// for verifyTCAt. timeoutGapMatchesEpochAt alone would pass it.
+func TestF202619612NilTCEpochInfoRejected(t *testing.T) {
+	f := newTCFixture(t, 0)
+	for name, info := range map[string]*types.EpochSwitchInfo{
+		"nil info":         nil,
+		"nil switch block": {Masternodes: []common.Address{{1}}},
+		"nil number":       {EpochSwitchBlockInfo: &types.BlockInfo{}},
+	} {
+		if !tcEpochUnresolved(info) {
+			t.Errorf("%s: not reported as unresolved", name)
+		}
+		if err := f.x.timeoutGapMatchesEpochAt(f.chain, f.chain.head, info, 5, 12345); err != nil {
+			t.Fatalf("%s: gap check no longer passes an unresolved epoch; revisit verifyTCAt guard: %v", name, err)
+		}
+	}
+	good := &types.EpochSwitchInfo{EpochSwitchBlockInfo: &types.BlockInfo{Number: big.NewInt(901)}}
+	if tcEpochUnresolved(good) {
+		t.Error("resolved epoch reported as unresolved")
 	}
 }
