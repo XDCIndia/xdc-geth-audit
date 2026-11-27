@@ -274,9 +274,14 @@ func (api *API) GetBlockInfoByEpochNum(epochNumber uint64) (*utils.EpochNumInfo,
 		}
 		return info, nil
 	}
-	// V1: epoch switch block is always at epochNumber * Epoch.
+	// V1: the same checkpoint as eth_getCandidates and friends read through
+	// GetCheckpointFromEpoch, which is canonical XDPoSChain's convention:
+	// 0 below epoch 2, else Epoch*(epochNumber-1) (F-2026-19639).
 	epoch := api.xdpos.config.Epoch
-	epochBlockNum := epochNumber * epoch
+	var epochBlockNum uint64
+	if epochNumber >= 2 {
+		epochBlockNum = epoch * (epochNumber - 1)
+	}
 	return &utils.EpochNumInfo{
 		EpochRound:            types.Round(epochBlockNum),
 		EpochFirstBlockNumber: new(big.Int).SetUint64(epochBlockNum),
