@@ -133,6 +133,9 @@ type XDPoS_v2 struct {
 	// re-verifies them once the canonical DB is committed.
 	// Thread-safe (lru.Cache uses an internal mutex).
 	pendingSwitchRechecks *lru.Cache[common.Hash, uint64]
+
+	// anchorWalk tracks the fast-sync anchor's parent-hash chain (F-2026-20645).
+	anchorWalk anchorWalk
 }
 
 // markSelfMined records round as the highest round this node sealed. The

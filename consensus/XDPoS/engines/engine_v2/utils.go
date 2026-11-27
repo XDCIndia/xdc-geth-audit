@@ -312,15 +312,8 @@ func countPoolSigners(pooled map[common.Hash]utils.PoolObj, masternodes []common
 // chain has ingested 2x epoch worth of blocks past the anchor, real V2 epoch
 // switch headers are in the DB and strict verification resumes.
 func (x *XDPoS_v2) inCheckpointCatchup(chain consensus.ChainReader, blockNum uint64) bool {
-	type ckptAware interface {
-		GetTrustedCheckpointAnchor() (uint64, common.Hash, bool)
-	}
-	ca, ok := chain.(ckptAware)
-	if !ok {
-		return false
-	}
-	anchor, _, active := ca.GetTrustedCheckpointAnchor()
-	if !active || anchor == 0 {
+	anchor, _, active := checkpointAnchor(chain)
+	if !active {
 		return false
 	}
 	// All blocks at or below the anchor (plus a forward window) need relaxed
@@ -333,6 +326,75 @@ func (x *XDPoS_v2) inCheckpointCatchup(chain consensus.ChainReader, blockNum uin
 	// refs #1847 #1851 #1859
 	window := x.config.Epoch * 2
 	return blockNum <= anchor+window
+}
+
+// anchorWalkLimit bounds how many headers below the anchor are tracked as
+// belonging to its parent-hash chain. The headers primed below the anchor are
+// about 2 epochs; a header deeper than this gets the full certificate check.
+const anchorWalkLimit = 4096
+
+// anchorWalk remembers the part of the anchor's parent-hash chain that has
+// been walked down from the anchor header through stored headers. The zero
+// value is ready to use.
+type anchorWalk struct {
+	mu     sync.Mutex
+	anchor common.Hash
+	low    *types.Header
+	seen   map[common.Hash]struct{}
+}
+
+// inAnchorBackfill reports whether header is at or below the active fast-sync
+// anchor AND on the anchor's parent-hash chain: it is the anchor header, or a
+// stored descendant link leads from the anchor down to it. Only such headers
+// are authenticated by the trusted anchor, so only they may skip the
+// certificate checks. A header above the anchor, or on a side branch below it,
+// is authenticated by consensus alone and gets the full check (F-2026-20645).
+// The check can only see headers already stored: a header whose descendants
+// are not yet written is not on the chain as far as it can tell.
+func (x *XDPoS_v2) inAnchorBackfill(chain consensus.ChainReader, header *types.Header) bool {
+	anchor, anchorHash, active := checkpointAnchor(chain)
+	if !active || header.Number.Uint64() > anchor {
+		return false
+	}
+	n := header.Number.Uint64()
+	if n == anchor {
+		return header.Hash() == anchorHash
+	}
+	w := &x.anchorWalk
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.low == nil || w.anchor != anchorHash {
+		top := chain.GetHeader(anchorHash, anchor)
+		if top == nil {
+			return false
+		}
+		w.anchor, w.low, w.seen = anchorHash, top, map[common.Hash]struct{}{top.Hash(): {}}
+	}
+	for w.low.Number.Uint64() > n && len(w.seen) < anchorWalkLimit {
+		parent := chain.GetHeader(w.low.ParentHash, w.low.Number.Uint64()-1)
+		if parent == nil || parent.Hash() != w.low.ParentHash {
+			return false
+		}
+		w.low = parent
+		w.seen[parent.Hash()] = struct{}{}
+	}
+	_, ok := w.seen[header.Hash()]
+	return ok
+}
+
+// checkpointAnchor returns the trusted fast-sync anchor number and hash, and
+// whether the catch-up gate is active for chain. The number is zero when no
+// anchor is installed.
+func checkpointAnchor(chain consensus.ChainReader) (uint64, common.Hash, bool) {
+	type ckptAware interface {
+		GetTrustedCheckpointAnchor() (uint64, common.Hash, bool)
+	}
+	ca, ok := chain.(ckptAware)
+	if !ok {
+		return 0, common.Hash{}, false
+	}
+	anchor, hash, active := ca.GetTrustedCheckpointAnchor()
+	return anchor, hash, active && anchor != 0
 }
 
 func (x *XDPoS_v2) verifyQC(chain consensus.ChainReader, quorumCert *types.QuorumCert, parentHeader *types.Header, parents []*types.Header) error {
@@ -581,17 +643,13 @@ func (x *XDPoS_v2) commitBlocks(chain consensus.ChainReader, proposedBlockHeader
 	if proposedBlockHeader.Number.Int64()-2 <= x.config.V2.SwitchBlock.Int64() {
 		return false, nil
 	}
-	// Skip if within trusted-checkpoint catchup window — the parent chain isn't
-	// downloaded so the 3-chain commit rule's grandparent walk would always fail.
-	if x.inCheckpointCatchup(chain, proposedBlockHeader.Number.Uint64()) {
-		return false, nil
-	}
-
-	// Get parent block
+	// F-2026-20645: the commit is skipped only while the parent or the
+	// grandparent is not stored (fast sync has not downloaded them yet), not
+	// for a whole block range.
 	parentBlock := chain.GetHeaderByHash(proposedBlockHeader.ParentHash)
 	if parentBlock == nil {
-		log.Error("[commitBlocks] Parent not found", "hash", proposedBlockHeader.ParentHash)
-		return false, fmt.Errorf("parent not found: %s", proposedBlockHeader.ParentHash.Hex())
+		log.Debug("[commitBlocks] Parent not stored, skipping commit", "hash", proposedBlockHeader.ParentHash)
+		return false, nil
 	}
 
 	_, round, _, err := x.getExtraFields(chain, parentBlock)
@@ -611,8 +669,8 @@ func (x *XDPoS_v2) commitBlocks(chain consensus.ChainReader, proposedBlockHeader
 	// Get grandparent block
 	grandParentBlock := chain.GetHeaderByHash(parentBlock.ParentHash)
 	if grandParentBlock == nil {
-		log.Error("[commitBlocks] Grandparent not found", "hash", parentBlock.ParentHash)
-		return false, fmt.Errorf("grandparent not found: %s", parentBlock.ParentHash.Hex())
+		log.Debug("[commitBlocks] Grandparent not stored, skipping commit", "hash", parentBlock.ParentHash)
+		return false, nil
 	}
 
 	_, round, _, err = x.getExtraFields(chain, grandParentBlock)
