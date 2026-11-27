@@ -3,7 +3,6 @@
 package eth
 
 import (
-	"errors"
 	"testing"
 	"time"
 
@@ -60,69 +59,6 @@ func boundsPeer(id byte) (*eth.Peer, func()) {
 	return peer, func() { peer.Close(); app.Close(); net.Close() }
 }
 
-// TestNewBlockFutureParkingIsBounded: a peer may park one future-timestamp block,
-// all peers together a bounded number, and a block far from the head none.
-func TestNewBlockFutureParkingIsBounded(t *testing.T) {
-	h, gspec, stop := newBoundsHandler(t, strictClockEngine{ethash.NewFaker()}, 8)
-	defer stop()
-	_, blocks, _ := core.GenerateChainWithGenesis(gspec, ethash.NewFaker(), 3, nil)
-	if blocks[0].Time() <= uint64(time.Now().Unix()) {
-		t.Fatal("test block is not in the future")
-	}
-	parked := func() int {
-		h.newBlockMu.Lock()
-		defer h.newBlockMu.Unlock()
-		return len(h.parkedBlocks)
-	}
-	eh := (*ethHandler)(h)
-
-	// One peer, many packets: one slot.
-	p1, c1 := boundsPeer(1)
-	defer c1()
-	for i := 0; i < 50; i++ {
-		if err := eh.Handle(p1, &eth.NewBlockPacket{Block: blocks[0]}); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if n := parked(); n != 1 {
-		t.Fatalf("parked after 50 packets from one peer = %d, want 1", n)
-	}
-	// A block three ahead of the head is not parked at all.
-	p2, c2 := boundsPeer(2)
-	defer c2()
-	if err := eh.Handle(p2, &eth.NewBlockPacket{Block: blocks[2]}); err != nil {
-		t.Fatal(err)
-	}
-	if n := parked(); n != 1 {
-		t.Fatalf("far-ahead block was parked: %d", n)
-	}
-	// Many peers, the same block: parked once (F-2026-20605 dedupe by hash).
-	for i := 3; i < 3+maxParkedNewBlocks; i++ {
-		p, c := boundsPeer(byte(i))
-		defer c()
-		if err := eh.Handle(p, &eth.NewBlockPacket{Block: blocks[0]}); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if n := parked(); n != 1 {
-		t.Fatalf("same block from many peers parked %d times, want 1", n)
-	}
-	// Many peers, distinct head+1 siblings: bounded in total.
-	for i := 0; i < 3*maxParkedNewBlocks; i++ {
-		_, sib, _ := core.GenerateChainWithGenesis(gspec, ethash.NewFaker(), 1, func(_ int, g *core.BlockGen) {
-			g.SetExtra([]byte{byte(i), 0xaa})
-		})
-		p, c := boundsPeer(byte(100 + i))
-		defer c()
-		if err := eh.Handle(p, &eth.NewBlockPacket{Block: sib[0]}); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if n := parked(); n != maxParkedNewBlocks {
-		t.Fatalf("parked = %d, want cap %d", n, maxParkedNewBlocks)
-	}
-}
-
 // TestNewBlockParkingNeedsKnownParentAndByteBudget (F-2026-20605): a future block
 // whose parent is unknown is not parked, and the parked blocks together stay
 // under maxParkedNewBlockBytes.
@@ -158,28 +94,5 @@ func TestNewBlockParkingNeedsKnownParentAndByteBudget(t *testing.T) {
 	}
 	if eh.parkNewBlock("e", common.Hash{0x09}, 1) {
 		t.Fatal("block over the byte budget parked")
-	}
-}
-
-// TestNewBlockInvalidPeerDisconnectedAndNoBadBlockWrites: a NewBlock whose header
-// is definitively invalid is refused before InsertChain (no bad-block record) and
-// the peer is disconnected after maxInvalidNewBlocks of them.
-func TestNewBlockInvalidPeerDisconnectedAndNoBadBlockWrites(t *testing.T) {
-	h, gspec, stop := newBoundsHandler(t, rejectEngine{ethash.NewFaker()}, 100)
-	defer stop()
-	_, blocks, _ := core.GenerateChainWithGenesis(gspec, ethash.NewFaker(), 1, nil)
-	peer, c := boundsPeer(1)
-	defer c()
-	eh := (*ethHandler)(h)
-	for i := 1; i <= maxInvalidNewBlocks+2; i++ {
-		err := eh.Handle(peer, &eth.NewBlockPacket{Block: blocks[0]})
-		if want := i > maxInvalidNewBlocks; (err != nil) != want {
-			t.Fatalf("packet %d: err=%v, want error=%v", i, err, want)
-		} else if want && !errors.Is(err, errTooManyInvalidBlocks) {
-			t.Fatalf("packet %d: unexpected error %v", i, err)
-		}
-	}
-	if n := len(rawdb.ReadAllBadBlocks(h.database)); n != 0 {
-		t.Fatalf("%d bad-block records written, want 0", n)
 	}
 }

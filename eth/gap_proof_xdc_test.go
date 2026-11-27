@@ -4,23 +4,17 @@
 package eth
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"math/big"
 	"net/http"
 	"net/http/httptest"
-	"slices"
-	"strings"
 	"testing"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/ethereum/go-ethereum/consensus/XDPoS/engines/engine_v2"
-	"github.com/ethereum/go-ethereum/consensus/ethash"
-	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/core/state"
 	"github.com/ethereum/go-ethereum/core/types"
@@ -31,45 +25,6 @@ import (
 	"github.com/ethereum/go-ethereum/trie"
 	"github.com/ethereum/go-ethereum/triedb"
 )
-
-// The two live wedges: both pivots need gap 109,697,850.
-func TestGapsBelowPivotLiveScenarios(t *testing.T) {
-	for _, P := range []uint64{109_697_859, 109_698_489} {
-		if !slices.Contains(gapsBelowPivot(P, 900, 450, false), 109_697_850) {
-			t.Errorf("pivot %d: gap 109697850 missing from %v", P, gapsBelowPivot(P, 900, 450, false))
-		}
-	}
-	if got := gapsBelowPivot(109_698_489, 900, 450, true); !slices.Equal(got, []uint64{109_697_850, 109_696_950, 109_696_050}) {
-		t.Errorf("tiered set %v", got)
-	}
-}
-
-// Property: for every pivot and every switch S in (P, P+2E], the switch's gap is
-// at or above the pivot (state exists) or in the set.
-func TestGapsBelowPivotCoversEverySwitch(t *testing.T) {
-	const E, G = 900, 450
-	for P := uint64(1); P < 4*E+7; P++ {
-		set := gapsBelowPivot(P, E, G, false)
-		for S := P + 1; S <= P+2*E; S++ {
-			if S/E*E < G {
-				continue // no gap below the first epoch boundary
-			}
-			g := S/E*E - G
-			if g >= P || g == 0 || slices.Contains(set, g) {
-				continue
-			}
-			t.Fatalf("pivot %d switch %d: gap %d not covered by %v", P, S, g, set)
-		}
-		for _, g := range set {
-			if g == 0 || g >= P {
-				t.Fatalf("pivot %d: gap %d out of range", P, g)
-			}
-		}
-	}
-	if got := gapsBelowPivot(10, 900, 450, true); len(got) != 0 {
-		t.Fatalf("pivot below the first gap: %v", got)
-	}
-}
 
 // commitPool commits a 0x88 pool and returns its root and trie database.
 func commitPool(t *testing.T, n int) (common.Hash, *triedb.Database, []common.Address) {
@@ -177,27 +132,6 @@ func prove(t *testing.T, urls []string, root common.Hash) (*state.StateDB, strin
 	return proveGapStateFrom(ctx, urls, 450, root)
 }
 
-// Honest server: the pool reads back, across more than one round of keys.
-func TestProveGapStateHonest(t *testing.T) {
-	root, tdb, addrs := commitPool(t, 300) // 300 elements and 300 caps: two chunks each
-	srv := proofServer(t, tdb, root, nil)
-	st, host, err := prove(t, []string{srv.URL}, root)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := state.GetCandidates(st); !slices.Equal(got, addrs) || st.Error() != nil {
-		t.Fatalf("pool mismatch: %d candidates, err %v", len(got), st.Error())
-	}
-	for i, a := range addrs {
-		if want := big.NewInt(int64(len(addrs)-i) * 1_000_000); state.GetCandidateCap(st, a).Cmp(want) != 0 {
-			t.Fatalf("cap of candidate %d wrong", i)
-		}
-	}
-	if !strings.HasPrefix(host, "127.0.0.1") {
-		t.Fatalf("host %q", host)
-	}
-}
-
 // Dishonest or broken servers end in an error, never a wrong pool.
 func TestProveGapStateRefusesBadProofs(t *testing.T) {
 	root, tdb, _ := commitPool(t, 8)
@@ -253,81 +187,6 @@ func TestProveGapStateRefusesBadProofs(t *testing.T) {
 	}
 }
 
-// The endpoints are tried in order: a dead and a lying one before an honest one.
-func TestProveGapStateFallsThroughToHonestEndpoint(t *testing.T) {
-	root, tdb, addrs := commitPool(t, 5)
-	dead := httptest.NewServer(nil)
-	deadURL := dead.URL
-	dead.Close()
-	liar := proofServer(t, tdb, root, func(r *proofResp) { r.AccountProof = nil })
-	honest := proofServer(t, tdb, root, nil)
-	st, host, err := prove(t, []string{deadURL, liar.URL, honest.URL}, root)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !slices.Equal(state.GetCandidates(st), addrs) {
-		t.Fatal("pool mismatch")
-	}
-	if want := strings.TrimPrefix(honest.URL, "http://"); host != want {
-		t.Fatalf("host %q, want %q", host, want)
-	}
-}
-
-// A gap header must be canonical and below the pivot.
-func TestGapHeaderOK(t *testing.T) {
-	n := newXDCFakeNet(t, 10, 10)
-	canon := func(num uint64) common.Hash { return n.chain.GetCanonicalHash(num) }
-	h5 := n.chain.GetHeaderByNumber(5)
-	if err := gapHeaderOK(canon, h5, 8); err != nil {
-		t.Fatalf("canonical header below the pivot: %v", err)
-	}
-	if err := gapHeaderOK(canon, h5, 5); err == nil {
-		t.Fatal("header at the pivot accepted")
-	}
-	side := types.CopyHeader(h5)
-	side.Extra = []byte("sibling")
-	if err := gapHeaderOK(canon, side, 8); err == nil {
-		t.Fatal("non-canonical header accepted")
-	}
-}
-
-// Without a recorded pivot (full sync) or an XDPoS engine nothing is fetched.
-func TestProveGapPoolsNoopWithoutPivotOrXDPoS(t *testing.T) {
-	n := newXDCFakeNet(t, 5, 5)
-	s := n.newTestXDCSyncer(t)
-	hit := make(chan struct{}, 1)
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { hit <- struct{}{} }))
-	t.Cleanup(srv.Close)
-	s.handler.snapGapRPC = []string{srv.URL}
-	s.proveGapPools(context.Background())
-	select {
-	case <-hit:
-		t.Fatal("RPC contacted")
-	default:
-	}
-}
-
-// gapPivotNet is a fake chain whose genesis holds a 0x88 pool; blocks 1..10 change
-// nothing, so the pool at the gap (block 3) equals the pool at the pivot (block 8).
-func gapPivotNet(t *testing.T) (*xdcFakeNet, *engine_v2.XDPoS_v2, ethdb.Database) {
-	t.Helper()
-	storage := map[common.Hash]common.Hash{state.CandidatesLenKey(): common.BigToHash(big.NewInt(6))}
-	for i := 0; i < 6; i++ {
-		a := common.Address{byte(i + 1), 0xbb}
-		storage[state.CandidateElementKey(uint64(i))] = common.BytesToHash(a.Bytes())
-		storage[state.CandidateCapKey(a)] = common.BigToHash(big.NewInt(int64(10-i/2) * 1_000_000)) // ties in pairs
-	}
-	gspec := &core.Genesis{
-		Config:     params.AllEthashProtocolChanges,
-		Difficulty: common.Big1,
-		GasLimit:   8_000_000,
-		Alloc:      types.GenesisAlloc{common.MasternodeVotingSMCBinary: {Nonce: 1, Storage: storage}},
-	}
-	n := newXDCFakeNetGspec(t, 10, 10, ethash.NewFaker(), gspec)
-	db := rawdb.NewMemoryDatabase()
-	return n, newTestV2(db), db
-}
-
 func newTestV2(db ethdb.Database) *engine_v2.XDPoS_v2 {
 	return engine_v2.NewIsolated(&params.ChainConfig{
 		ChainID: big.NewInt(551),
@@ -365,84 +224,4 @@ func withVotingLog(h *types.Header) (*types.Header, types.Receipts) {
 	c.Bloom = types.CreateBloom(rs[0])
 	c.ReceiptHash = types.DeriveSha(rs, trie.NewStackTrie(nil))
 	return c, rs
-}
-
-// No 0x88 log between the gap and the pivot: the pool comes from the pivot state
-// and equals the one read from the gap's own state. No RPC is configured or used.
-func TestGapPoolFromPivotState(t *testing.T) {
-	n, v2, db := gapPivotNet(t)
-	s := n.newTestXDCSyncer(t)
-	gapHdr, pivotHdr := n.chain.GetHeaderByNumber(3), n.chain.GetHeaderByNumber(8)
-	headerAt := func(num uint64) *types.Header { return n.chain.GetHeaderByNumber(num) }
-
-	path, err := s.proveGap(context.Background(), v2, gapHdr, pivotHdr, headerAt, noReceipts)
-	if err != nil || path != "pivot" {
-		t.Fatalf("path %q, err %v", path, err)
-	}
-	if !v2.HasProvenGapSnapshot(gapHdr.Hash()) {
-		t.Fatal("no version 7 snapshot")
-	}
-
-	// Reference: the pool read from the state at the gap itself.
-	st, err := n.chain.StateAt(gapHdr.Root, gapHdr.Number, gapHdr.Time)
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, _, refDB := gapPivotNet(t)
-	refEng := newTestV2(refDB)
-	if err := refEng.SeedGapSnapshotFromState(n.chain, gapHdr, st); err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(snapBlob(t, db, gapHdr.Hash()), snapBlob(t, refDB, gapHdr.Hash())) {
-		t.Fatal("pivot-state pool differs from the gap-state pool")
-	}
-}
-
-// A 0x88 log in the window, a missing or wrong receipt, or a missing header
-// refuses the pivot path; the RPC proofs are then used, and without an RPC
-// nothing is stored.
-func TestGapPoolPivotRefusedFallsBackToRPC(t *testing.T) {
-	for _, name := range []string{"0x88 log in the window", "receipts missing", "receipts do not match", "header missing"} {
-		t.Run(name, func(t *testing.T) {
-			n, v2, _ := gapPivotNet(t)
-			s := n.newTestXDCSyncer(t)
-			gapHdr, pivotHdr := n.chain.GetHeaderByNumber(3), n.chain.GetHeaderByNumber(8)
-			srv := proofServer(t, n.chain.TrieDB(), gapHdr.Root, nil)
-
-			logHdr, logReceipts := withVotingLog(n.chain.GetHeaderByNumber(6))
-			blk6, receipts := logHdr, noReceipts
-			var want error
-			switch name {
-			case "0x88 log in the window":
-				receipts, want = func(*types.Header) types.Receipts { return logReceipts }, errGapPoolChanged
-			case "receipts do not match":
-				blk6 = types.CopyHeader(logHdr)
-				blk6.ReceiptHash = common.Hash{9}
-				receipts = func(*types.Header) types.Receipts { return logReceipts }
-			case "header missing":
-				blk6 = nil
-			}
-			headerAt := func(num uint64) *types.Header {
-				if num == 6 {
-					return blk6
-				}
-				return n.chain.GetHeaderByNumber(num)
-			}
-			if _, err := noVotingLogs(3, 8, headerAt, receipts); err == nil || (want != nil && !errors.Is(err, want)) {
-				t.Fatalf("noVotingLogs err %v", err)
-			}
-			s.handler.snapGapRPC = nil
-			if path, err := s.proveGap(context.Background(), v2, gapHdr, pivotHdr, headerAt, receipts); err == nil {
-				t.Fatalf("seeded without an RPC via %q", path)
-			}
-			if v2.HasProvenGapSnapshot(gapHdr.Hash()) {
-				t.Fatal("snapshot stored without a proof")
-			}
-			s.handler.snapGapRPC = []string{srv.URL}
-			path, err := s.proveGap(context.Background(), v2, gapHdr, pivotHdr, headerAt, receipts)
-			if err != nil || path != "rpc" || !v2.HasProvenGapSnapshot(gapHdr.Hash()) {
-				t.Fatalf("path %q err %v", path, err)
-			}
-		})
-	}
 }

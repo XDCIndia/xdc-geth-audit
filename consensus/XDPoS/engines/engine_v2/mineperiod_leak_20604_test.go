@@ -11,7 +11,7 @@ import (
 // A node that does not mine has no reader on minePeriodCh. setNewRound must
 // not leave one blocked goroutine per round, and the channel must hold
 // the latest period once a worker starts reading.
-func TestSetNewRoundNoReaderNoGoroutineLeak(t *testing.T) {
+func TestF202620604SetNewRoundNoReaderNoGoroutineLeak(t *testing.T) {
 	ch := make(chan int, 1)
 	eng := createEngine(minimalChainConfig(), nil, ch, make(chan types.Round, 1))
 

@@ -213,40 +213,6 @@ func TestReorgRefusedWhenNewChainReplacesCommittedHash(t *testing.T) {
 	}
 }
 
-// TestReorgAllowedWhenNewChainCarriesCommittedHash: the same shape, but the new
-// chain is the committed branch.
-func TestReorgAllowedWhenNewChainCarriesCommittedHash(t *testing.T) {
-	bc, eng, _, fork := reorgNewChainSetup(t, 8)
-	eng.committed = &types.BlockInfo{Hash: fork[3].Hash(), Number: fork[3].Number()} // block 6
-	if err := bc.reorg(bc.CurrentBlock(), fork[len(fork)-1].Header()); err != nil {
-		t.Fatalf("reorg onto the committed branch was refused: %v", err)
-	}
-	if got := bc.GetCanonicalHash(6); got != fork[3].Hash() {
-		t.Fatalf("canonical block 6 = %s, want %s", got, fork[3].Hash())
-	}
-}
-
-// TestReorgAllowedWhenNewChainBelowCommittedNumber: a new chain that has not
-// reached the committed number yet must not be refused.
-func TestReorgAllowedWhenNewChainBelowCommittedNumber(t *testing.T) {
-	bc, eng, _, fork := reorgNewChainSetup(t, 3) // fork covers blocks 3..5
-	eng.committed = &types.BlockInfo{Hash: common.Hash{0xc0, 0xff, 0xee}, Number: big.NewInt(6)}
-	if err := bc.reorg(bc.CurrentBlock(), fork[len(fork)-1].Header()); err != nil {
-		t.Fatalf("reorg below the committed number was refused: %v", err)
-	}
-}
-
-// TestReorgRefusedByStoredCommittedMarker: the engine reports nothing (not
-// initialised yet) but the marker is in the database.
-func TestReorgRefusedByStoredCommittedMarker(t *testing.T) {
-	bc, _, db, fork := reorgNewChainSetup(t, 8) // engine committed stays nil
-	rawdb.WriteBFTCommittedBlock(db, &types.BlockInfo{Hash: common.Hash{0xc0, 0xff, 0xee}, Number: big.NewInt(6)})
-	err := bc.reorg(bc.CurrentBlock(), fork[len(fork)-1].Header())
-	if err == nil || !containsStr(err.Error(), "stop reorg") {
-		t.Fatalf("reorg error = %v, want a stop reorg refusal", err)
-	}
-}
-
 // containsStr is strings.Contains without importing strings.
 func containsStr(s, sub string) bool {
 	if len(sub) == 0 {

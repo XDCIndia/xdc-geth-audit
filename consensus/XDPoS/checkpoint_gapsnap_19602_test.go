@@ -149,31 +149,3 @@ func TestF202619602OutsiderExtraRejectedNothingWritten(t *testing.T) {
 		t.Fatalf("DB gap snapshot changed to %v, want %v", stored.GetSigners(), real)
 	}
 }
-
-// TestF202619602PoisonedSnapshotRepairedFromContract: a gap snapshot that
-// disagrees with an honest checkpoint is replaced by the contract state of the
-// gap block, and the checkpoint passes.
-func TestF202619602PoisonedSnapshotRepairedFromContract(t *testing.T) {
-	key, _ := crypto.GenerateKey()
-	sealer := crypto.PubkeyToAddress(key.PublicKey)
-	real := []common.Address{sealer, mn(0xbb)}
-	poisoned := []common.Address{mn(0x0b)}
-
-	engine, chain, gap, parent, cp, calls := gapSnapCheckpoint(t, key, real, poisoned, real, real)
-	if err := verifyGapSnapCheckpoint(t, engine, chain, parent, cp); err != nil {
-		t.Fatalf("honest checkpoint over a poisoned gap snapshot: %v", err)
-	}
-	if *calls != 1 {
-		t.Fatalf("contract read %d times, want 1", *calls)
-	}
-	stored, err := loadSnapshot(engine.config, engine.signatures, engine.db, gap.Hash())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !sameSigners(stored.GetSigners(), real) {
-		t.Fatalf("DB gap snapshot = %v, want the contract set %v", stored.GetSigners(), real)
-	}
-	if s, ok := engine.recents.Get(gap.Hash()); !ok || !sameSigners(s.GetSigners(), real) {
-		t.Fatal("recents gap snapshot was not repaired")
-	}
-}

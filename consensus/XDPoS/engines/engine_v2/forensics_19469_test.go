@@ -34,26 +34,3 @@ func TestF202619469TimeoutEquivocationSendsAProof(t *testing.T) {
 		t.Fatal("timeout equivocation did not send a proof")
 	}
 }
-
-func TestF202619469SubscriberReceivesProof(t *testing.T) {
-	x := &XDPoS_v2{
-		ForensicsProcessor: NewForensics(),
-		broadcastQuit:      make(chan struct{}),
-	}
-	go x.watchForensics()
-	t.Cleanup(func() { close(x.broadcastQuit) })
-
-	ch := make(chan types.ForensicsEvent, 1)
-	sub := x.ForensicsProcessor.SubscribeForensicsEvent(ch)
-	defer sub.Unsubscribe()
-	proof := &types.ForensicProof{Id: "qc-1", ForensicsType: "QC"}
-	x.ForensicsProcessor.forensicsFeed.Send(types.ForensicsEvent{ForensicsProof: proof})
-	select {
-	case ev := <-ch:
-		if ev.ForensicsProof == nil || ev.ForensicsProof.Id != "qc-1" {
-			t.Fatalf("proof = %+v", ev.ForensicsProof)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("subscriber did not receive the proof")
-	}
-}

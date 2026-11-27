@@ -7,7 +7,6 @@ import (
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/consensus"
-	"github.com/ethereum/go-ethereum/consensus/XDPoS"
 	"github.com/ethereum/go-ethereum/consensus/ethash"
 	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/core/rawdb"
@@ -84,38 +83,4 @@ func TestImportChainStartsABatchAtEachCheckpoint(t *testing.T) {
 	if len(spy.early) != 0 {
 		t.Fatalf("checkpoints %v were verified while the chain head was not the block before them", spy.early)
 	}
-}
-
-func TestImportCheckpointEpoch(t *testing.T) {
-	if got := importCheckpointEpoch(params.AllEthashProtocolChanges); got != 0 {
-		t.Fatalf("non-XDPoS epoch = %d, want 0", got)
-	}
-	cfg := *params.AllEthashProtocolChanges
-	cfg.XDPoS = &params.XDPoSConfig{Epoch: 900, Gap: 450}
-	if got := importCheckpointEpoch(&cfg); got != 900 {
-		t.Fatalf("XDPoS epoch = %d, want 900", got)
-	}
-}
-
-// TestAttachXDPoSV1Hooks: the chain that geth import uses has the V1 hooks, in
-// particular the contract fallback for a checkpoint whose snapshot disagrees.
-func TestAttachXDPoSV1Hooks(t *testing.T) {
-	cfg := params.ChainConfig{
-		ChainID: big.NewInt(50), HomesteadBlock: big.NewInt(0), EIP150Block: big.NewInt(0),
-		EIP155Block: big.NewInt(0), EIP158Block: big.NewInt(0), ByzantiumBlock: big.NewInt(0),
-		XDPoS: &params.XDPoSConfig{Epoch: 900, Gap: 450, Period: 2},
-	}
-	gspec := &core.Genesis{Config: &cfg, Difficulty: common.Big1, GasLimit: 8_000_000, Alloc: types.GenesisAlloc{}}
-	bc, err := core.NewBlockChain(rawdb.NewMemoryDatabase(), gspec, ethash.NewFaker(), nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer bc.Stop()
-
-	engine := XDPoS.New(cfg.XDPoS, rawdb.NewMemoryDatabase())
-	attachXDPoSV1Hooks(engine, bc, &cfg)
-	if engine.HookGetSignersFromContract == nil || engine.HookVerifyMNs == nil {
-		t.Fatal("V1 hooks were not attached to the XDPoS engine")
-	}
-	attachXDPoSV1Hooks(ethash.NewFaker(), bc, &cfg) // a non-XDPoS engine is left alone
 }

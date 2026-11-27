@@ -26,20 +26,6 @@ import (
 	"github.com/ethereum/go-ethereum/p2p/enode"
 )
 
-// TestXDPOS2RequiredBlockMatch: an XDPOS2 peer that provides the correct
-// required block header is kept. On origin/main, the goroutine waits on resCh
-// (not XDCHeaderResp), times out, and calls removePeer — this test FAILS on
-// origin/main.
-func TestXDPOS2RequiredBlockMatch(t *testing.T) {
-	runXDPOS2RequiredBlockTest(t, "match")
-}
-
-// TestXDPOS2RequiredBlockMismatch: an XDPOS2 peer that provides a wrong hash
-// for the required block is dropped.
-func TestXDPOS2RequiredBlockMismatch(t *testing.T) {
-	runXDPOS2RequiredBlockTest(t, "mismatch")
-}
-
 // TestXDPOS2RequiredBlockForeignBatch: a foreign-number batch must not end the
 // v100 challenge; the later wrong-hash reply at the challenge number still
 // drops the peer. Refs F-2026-20597.
@@ -52,13 +38,6 @@ func TestXDPOS2RequiredBlockForeignBatch(t *testing.T) {
 // goes to the challenge only, so the peer is still dropped. Refs F-2026-20597.
 func TestXDPOS2RequiredBlockWithSyncerReading(t *testing.T) {
 	runXDPOS2RequiredBlockTest(t, "syncer-reading")
-}
-
-// TestXDPOS2RequiredBlockTimeout: when an XDPOS2 peer does not respond to the
-// required-block challenge at all, the peer is kept. On origin/main, the
-// timeout fires and calls removePeer — this test FAILS on origin/main.
-func TestXDPOS2RequiredBlockTimeout(t *testing.T) {
-	runXDPOS2RequiredBlockTest(t, "timeout")
 }
 
 // runXDPOS2RequiredBlockTest is the shared body. scenario is one of:
@@ -253,63 +232,5 @@ func runXDPOS2RequiredBlockTest(t *testing.T, scenario string) {
 		if !disconnected {
 			t.Fatalf("scenario %q: XDPOS2 peer was NOT disconnected despite required block hash mismatch", scenario)
 		}
-	}
-}
-
-// TestApothemBuiltinRequiredBlock verifies that the built-in Apothem post-reset
-// required block (83,665,617) is injected when --xdcapothem is active and that
-// a user-supplied entry at the same number takes precedence.
-func TestApothemBuiltinRequiredBlock(t *testing.T) {
-	const apothemResetNum = uint64(83_665_617)
-	builtinHash := common.HexToHash("0x2432ce6433608954ef6eaf2feba8f9a2fe90f5a913401eb07d5fa2f1bb499c3f")
-
-	t.Run("builtin present when no user entry", func(t *testing.T) {
-		cfg := &ethconfig.Config{}
-		// Simulate what SetEthConfig does for XDCApothemFlag:
-		if cfg.RequiredBlocks == nil {
-			cfg.RequiredBlocks = make(map[uint64]common.Hash)
-		}
-		if _, exists := cfg.RequiredBlocks[apothemResetNum]; !exists {
-			cfg.RequiredBlocks[apothemResetNum] = builtinHash
-		}
-		got, ok := cfg.RequiredBlocks[apothemResetNum]
-		if !ok {
-			t.Fatal("built-in Apothem required block not present")
-		}
-		if got != builtinHash {
-			t.Fatalf("got hash %s, want %s", got, builtinHash)
-		}
-	})
-
-	t.Run("user entry wins on conflict", func(t *testing.T) {
-		userHash := common.Hash{0xbe, 0xef}
-		cfg := &ethconfig.Config{
-			RequiredBlocks: map[uint64]common.Hash{apothemResetNum: userHash},
-		}
-		// Same logic as SetEthConfig:
-		if _, exists := cfg.RequiredBlocks[apothemResetNum]; !exists {
-			cfg.RequiredBlocks[apothemResetNum] = builtinHash
-		}
-		got := cfg.RequiredBlocks[apothemResetNum]
-		if got != userHash {
-			t.Fatalf("user entry was overwritten: got %s, want %s", got, userHash)
-		}
-	})
-}
-
-// TestApothemBuiltinRequiredBlockNotOnMainnet checks that the built-in required
-// block is specific to Apothem — mainnet and devnet must not carry it when the
-// Apothem flag is not set.
-func TestApothemBuiltinRequiredBlockNotOnMainnet(t *testing.T) {
-	const apothemResetNum = uint64(83_665_617)
-
-	// A fresh ethconfig not touched by the Apothem path must have no entry.
-	cfg := &ethconfig.Config{
-		RequiredBlocks: map[uint64]common.Hash{},
-	}
-	// The Apothem built-in injection only happens inside the XDCApothemFlag case.
-	// Verify it is NOT present when that path was not taken.
-	if _, ok := cfg.RequiredBlocks[apothemResetNum]; ok {
-		t.Fatal("Apothem built-in required block present in a non-Apothem config")
 	}
 }

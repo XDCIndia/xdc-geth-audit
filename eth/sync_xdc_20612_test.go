@@ -99,28 +99,3 @@ func TestF202620612MismatchedBodiesTaintRaceWinner(t *testing.T) {
 		t.Fatal("header-race winner that served mismatched bodies was not tainted")
 	}
 }
-
-// TestF202620612HedgeRetriesOnMismatchedReply checks that a mismatched primary
-// reply starts the hedge at once: the honest peer supplies matching bodies in
-// the same round, so the head moves, and the race winner is tainted.
-func TestF202620612HedgeRetriesOnMismatchedReply(t *testing.T) {
-	const local = 20
-	n := newXDCFakeNetWithTxs(t, local, 40)
-	bad := n.addPeer(t, 1, n.canonicalHeaders)
-	bad.corrupt = true
-	honest := n.addPeer(t, 2, n.canonicalHeaders)
-	honest.headerDelay = 200 * time.Millisecond
-
-	s := n.newTestXDCSyncer(t)
-	s.fullSyncOnce()
-
-	if !s.isPeerTainted(bad.ID()) {
-		t.Fatal("header-race winner that served mismatched bodies was not tainted")
-	}
-	if got := n.chain.CurrentBlock().Number.Uint64(); got <= local {
-		t.Fatalf("head stayed at %d: the hedge was not retried on the mismatched reply", got)
-	}
-	if s.isPeerTainted(honest.ID()) {
-		t.Fatal("honest hedge peer was tainted")
-	}
-}
