@@ -27,10 +27,14 @@ type skipChain struct {
 	head         *types.Header
 	anchor       uint64
 	anchorActive bool
+	anchorHash   common.Hash
 }
 
 func (c *skipChain) CurrentHeader() *types.Header { return c.head }
 func (c *skipChain) GetTrustedCheckpointAnchor() (uint64, common.Hash, bool) {
+	if c.anchorHash != (common.Hash{}) {
+		return c.anchor, c.anchorHash, c.anchorActive
+	}
 	return c.anchor, common.Hash{0x11}, c.anchorActive
 }
 
@@ -287,6 +291,7 @@ func TestF202619608CatchupChecksPresenceNotSignatures(t *testing.T) {
 	}
 	chain.anchor = 903
 	chain.anchorActive = true
+	chain.anchorHash = h.Hash() // the checked header is the anchor itself
 	eng.verifiedHeaders.Purge()
 	if err := eng.verifyHeader(chain, h, []*types.Header{parent}, true); err != nil {
 		t.Fatalf("catch-up rejected a skipped header whose bytes carry a certificate: %v", err)

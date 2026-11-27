@@ -173,7 +173,11 @@ func (x *XDPoS_v2) verifyHeader(chain consensus.ChainReader, header *types.Heade
 	// inCheckpointCatchup returns false when no anchor is active (full sync, post-
 	// sync, clean fast-sync with no dynamic pivot yet), preserving strict
 	// verification everywhere outside the backfill window.
-	if !x.inCheckpointCatchup(chain, header.Number.Uint64()) {
+	//
+	// F-2026-20645: only the range the anchor authenticates is skipped. A header
+	// above the anchor is checked, so one masternode signature cannot extend the
+	// chain on a fast-synced node.
+	if !x.inAnchorBackfill(chain, header) {
 		if err := x.verifyQC(chain, quorumCert, parent, parents); err != nil {
 			log.Warn("[verifyHeader] fail to verify QC", "QCNumber", quorumCert.ProposedBlockInfo.Number, "QCsigLength", len(quorumCert.Signatures))
 			return err
@@ -504,7 +508,11 @@ func (x *XDPoS_v2) verifyHeader(chain consensus.ChainReader, header *types.Heade
 		//
 		// #1413: the tolerance only covers lists taken from headers; a list computed
 		// locally (localList) is checked as in canonical (verifyHeader.go:199-204).
-		if core.XdcBulkSyncMode.Load() && !localList {
+		//
+		// F-2026-20645: with a fast-sync anchor installed, the tolerance ends at
+		// the anchor. Above it the header's own list does not decide who may seal.
+		anchor, _, _ := checkpointAnchor(chain)
+		if core.XdcBulkSyncMode.Load() && !localList && (anchor == 0 || header.Number.Uint64() <= anchor) {
 			log.Warn("[verifyHeader] A.87 leader mismatch tolerated during bulk sync",
 				"block", header.Number, "curIndex", curIndex, "leaderIndex", leaderIndex,
 				"expected", masterNodes[leaderIndex], "actual", validatorAddress)
@@ -556,7 +564,8 @@ func (x *XDPoS_v2) verifyRoundSkip(chain consensus.ChainReader, header, parent *
 	if tc == nil || tc.Round+1 != round || tc.Round <= qcRound {
 		return utils.ErrRoundSkipWithoutTimeout
 	}
-	if x.inCheckpointCatchup(chain, header.Number.Uint64()) {
+	// F-2026-20645: only a header on the anchor's hash chain skips the check.
+	if x.inAnchorBackfill(chain, header) {
 		return nil
 	}
 	// The certificate is checked against the ancestors of this header, not the
