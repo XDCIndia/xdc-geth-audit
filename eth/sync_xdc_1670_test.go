@@ -26,6 +26,7 @@ import (
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/consensus"
+	xdcutils "github.com/ethereum/go-ethereum/consensus/XDPoS/utils"
 	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/trie"
@@ -125,6 +126,7 @@ func TestIsDefinitiveInvalidBlockError(t *testing.T) {
 		{"errChainStopped-like", errors.New("blockchain is stopped"), false},
 		{"context.Canceled", context.Canceled, false},
 		{"ErrPrunedAncestor", consensus.ErrPrunedAncestor, false},
+		{"ErrPenaltyDataUnavailable", fmt.Errorf("%w: no block body at 5", xdcutils.ErrPenaltyDataUnavailable), false},
 		{"generic io error", errors.New("io error"), false},
 		// Definitive: the block is invalid — must taint the peer.
 		{"wrong difficulty (format)", errors.New("invalid difficulty: 5 does not equal 4"), true},

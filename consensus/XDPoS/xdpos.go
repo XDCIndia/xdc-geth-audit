@@ -143,7 +143,7 @@ var (
 	// lacks the data to compute a checkpoint's penalties (state pruned after a
 	// rewind, block bodies of a batch not written yet). Verification then skips
 	// the penalties compare instead of failing.
-	ErrPenaltyDataUnavailable = errors.New("v1 penalty data unavailable")
+	ErrPenaltyDataUnavailable = utils.ErrPenaltyDataUnavailable
 
 	// errInvalidMixDigest is returned if a block's mix digest is non-zero.
 	errInvalidMixDigest = errors.New("non-zero mix digest")

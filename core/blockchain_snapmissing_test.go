@@ -78,3 +78,26 @@ func TestSnapshotMissingIsNotABadBlock(t *testing.T) {
 		t.Fatal("head did not advance")
 	}
 }
+
+// F-2026-19463: missing penalty data is retried the same way.
+func TestPenaltyDataUnavailableIsNotABadBlock(t *testing.T) {
+	gspec := &Genesis{Config: params.AllEthashProtocolChanges, Difficulty: common.Big1, GasLimit: 8_000_000}
+	_, blocks, _ := GenerateChainWithGenesis(gspec, ethash.NewFaker(), 1, nil)
+
+	eng := &failingEngine{Engine: ethash.NewFaker()}
+	db := rawdb.NewMemoryDatabase()
+	chain, err := NewBlockChain(db, gspec, eng, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer chain.Stop()
+
+	unavailable := error(errors.Join(xdcutils.ErrPenaltyDataUnavailable, errors.New("no block body")))
+	eng.err.Store(&unavailable)
+	if _, err := chain.InsertChain(blocks); !errors.Is(err, xdcutils.ErrPenaltyDataUnavailable) {
+		t.Fatalf("want ErrPenaltyDataUnavailable, got %v", err)
+	}
+	if bad := rawdb.ReadAllBadBlocks(db); len(bad) != 0 {
+		t.Fatalf("%d bad-block records after ErrPenaltyDataUnavailable", len(bad))
+	}
+}

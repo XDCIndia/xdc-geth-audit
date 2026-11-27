@@ -4214,7 +4214,7 @@ func isDefinitiveInvalidBlockError(err error) bool {
 	}
 	// A gap snapshot that is not seeded yet is missing data, not an invalid
 	// block: no taint, no blacklist; proveGapPools retries (F-2026-20648).
-	if errors.Is(err, xdcutils.ErrV2SnapshotMissing) {
+	if errors.Is(err, xdcutils.ErrV2SnapshotMissing) || errors.Is(err, xdcutils.ErrPenaltyDataUnavailable) {
 		return false
 	}
 

@@ -25,9 +25,20 @@ func noStateNode(t *testing.T) {
 	t.Cleanup(func() { core.CheckpointSyncNoStateActive.Store(saved) })
 }
 
+// bulkSyncNode models the bulk sync above the anchor, where the F-2026-20648
+// overlap gate applies. Outside bulk sync a state-less node fails closed
+// (F-2026-19463), see hacken_19463_fail_closed_test.go.
+func bulkSyncNode(t *testing.T) {
+	t.Helper()
+	noStateNode(t)
+	saved := core.XdcBulkSyncMode.Load()
+	core.XdcBulkSyncMode.Store(true)
+	t.Cleanup(func() { core.XdcBulkSyncMode.Store(saved) })
+}
+
 // A forged list on a fast-synced node (no gap snapshot) is refused.
 func TestF202620648ForgedValidatorListRefusedWithoutState(t *testing.T) {
-	noStateNode(t)
+	bulkSyncNode(t)
 	eng, chain, _, _, p, h := esFixture(t, true)
 	attKeys, attMns := genNKeys(t, 2)
 	h.Validators = packValidators(attMns)
@@ -60,7 +71,7 @@ func TestF202620648ForgedValidatorListRefusedAgainstDerivedSet(t *testing.T) {
 // Controls: the verified set, and a one-key rotation of it, still pass, so a
 // fast-synced node keeps syncing across an epoch switch.
 func TestF202620648VerifiedSetAndRotationStillAccepted(t *testing.T) {
-	noStateNode(t)
+	bulkSyncNode(t)
 	eng, chain, keys, mns, p, h := esFixture(t, true)
 	same := headerClone(h)
 	same.Validators = packValidators(mns)

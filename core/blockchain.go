@@ -3863,7 +3863,7 @@ func (bc *BlockChain) reportBadBlock(block *types.Block, res *ProcessResult, err
 	// below the pivot) is not a bad block: the data is missing, not wrong. Like
 	// ErrUnknownAncestor and ErrPrunedAncestor it is retried once the snapshot is
 	// proven (eth.xdcSyncer.proveGapPools), so no bad-block record is written.
-	if errors.Is(err, xdcutils.ErrV2SnapshotMissing) {
+	if errors.Is(err, xdcutils.ErrV2SnapshotMissing) || errors.Is(err, xdcutils.ErrPenaltyDataUnavailable) {
 		log.Debug("Gap snapshot not seeded yet, retrying later", "number", block.Number(), "hash", block.Hash(), "err", err)
 		return
 	}
