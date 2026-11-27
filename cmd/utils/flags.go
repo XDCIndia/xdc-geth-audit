@@ -29,6 +29,7 @@ import (
 	"os"
 	"path/filepath"
 	godebug "runtime/debug"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -39,6 +40,8 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/fdlimit"
 	"github.com/ethereum/go-ethereum/common/hexutil"
+	"github.com/ethereum/go-ethereum/consensus"
+	"github.com/ethereum/go-ethereum/consensus/XDPoS"
 	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/core/history"
 	"github.com/ethereum/go-ethereum/core/rawdb"
@@ -52,6 +55,7 @@ import (
 	"github.com/ethereum/go-ethereum/eth/fetcher"
 	"github.com/ethereum/go-ethereum/eth/filters"
 	"github.com/ethereum/go-ethereum/eth/gasprice"
+	"github.com/ethereum/go-ethereum/eth/hooks"
 	"github.com/ethereum/go-ethereum/eth/syncer"
 	"github.com/ethereum/go-ethereum/eth/tracers"
 	"github.com/ethereum/go-ethereum/ethdb"
@@ -331,7 +335,7 @@ var (
 	// (F-2026-19471). Use explicit --fastsyncpivot flags for a QC-backed anchor.
 	AutoCheckpointPivotFlag = &cli.BoolFlag{
 		Name:     "auto-checkpoint-pivot",
-		Usage:    "(Fast Sync only) opt in to A.96 auto-pin of fast-sync pivot from compiled TrustedSyncCheckpoints (trust root is the binary, not QC-verified; refs F-2026-19471)",
+		Usage:    "(Fast Sync only) opt in to A.96 auto-pin of fast-sync pivot from compiled TrustedSyncCheckpoints (refused while compiled checkpoints carry no verifiable QC; refs F-2026-19471)",
 		Category: flags.StateCategory,
 	}
 	GCModeFlag = &cli.StringFlag{
@@ -350,6 +354,11 @@ var (
 		Usage:       "Enable or disable the snap/2 (EIP-8189, BAL-based) state syncer, which needs Amsterdam active",
 		DefaultText: "automatic",
 		Category:    flags.StateCategory,
+	}
+	SnapGapRPCFlag = &cli.StringFlag{
+		Name:     "snap.gap-rpc",
+		Usage:    "Comma separated RPC URLs serving eth_getProof for old blocks (--history.trienode); a snap/fast-synced XDC node proves below-pivot validator pools against them",
+		Category: flags.StateCategory,
 	}
 	BinTrieGroupDepthFlag = &cli.IntFlag{
 		Name:     "bintrie.groupdepth",
@@ -1472,6 +1481,18 @@ func SplitAndTrim(input string) (ret []string) {
 	return ret
 }
 
+// setSnapGapRPC applies --snap.gap-rpc. Unset, XDC mainnet falls back to the
+// built-in params.XDCMainnetGapRPCs (a config file value wins over it); an
+// explicit empty value disables the default. Apothem has no built-in endpoint.
+func setSnapGapRPC(ctx *cli.Context, cfg *ethconfig.Config) {
+	switch {
+	case ctx.IsSet(SnapGapRPCFlag.Name):
+		cfg.SnapGapRPC = SplitAndTrim(ctx.String(SnapGapRPCFlag.Name))
+	case ctx.Bool(XDCMainnetFlag.Name) && len(cfg.SnapGapRPC) == 0:
+		cfg.SnapGapRPC = slices.Clone(params.XDCMainnetGapRPCs)
+	}
+}
+
 // setHTTP creates the HTTP RPC listener interface string from the set
 // command line flags, returning empty if the HTTP endpoint is disabled.
 func setHTTP(ctx *cli.Context, cfg *node.Config) {
@@ -2244,6 +2265,7 @@ func SetEthConfig(ctx *cli.Context, stack *node.Node, cfg *ethconfig.Config) {
 		snapV2 := ctx.Bool(SnapV2Flag.Name)
 		cfg.SnapV2 = &snapV2
 	}
+	setSnapGapRPC(ctx, cfg)
 	// Override any default configs for hard coded networks.
 	switch {
 	case ctx.Bool(MainnetFlag.Name):
@@ -2893,8 +2915,20 @@ func MakeChain(ctx *cli.Context, stack *node.Node, readonly bool) (*core.BlockCh
 	if err != nil {
 		Fatalf("Can't create BlockChain: %v", err)
 	}
+	attachXDPoSV1Hooks(engine, chain, config)
 
 	return chain, chainDb
+}
+
+// attachXDPoSV1Hooks wires the XDPoS V1 consensus hooks the way the eth backend
+// does (eth/backend.go), so import, export and replay verify V1 blocks like live
+// sync does. Without them a V1 checkpoint whose gap snapshot disagrees with the
+// header has no contract fallback (canonical engine_v1/engine.go:255-268) and
+// canonical history is rejected (mainnet block 469,800 on geth import).
+func attachXDPoSV1Hooks(engine consensus.Engine, chain *core.BlockChain, config *params.ChainConfig) {
+	if xdposEngine, ok := engine.(*XDPoS.XDPoS); ok {
+		hooks.AttachConsensusV1Hooks(xdposEngine, chain, config)
+	}
 }
 
 // MakeConsolePreloads retrieves the absolute paths for the console JavaScript

@@ -309,10 +309,10 @@ func (l *list) Add(tx *types.Transaction, priceBump uint64) (bool, *types.Transa
 	// unconditionally, and a regular transaction never evicts it (any price
 	// beats zero). Special-for-special replacement keeps the priced path here;
 	// the pool admits it only once the incumbent signing tx has expired.
-	if old != nil && old.IsSpecialTransaction() && !tx.IsSpecialTransaction() {
+	if old != nil && old.KnownSpecialCall() && !tx.KnownSpecialCall() {
 		return false, nil
 	}
-	if old != nil && !(tx.IsSpecialTransaction() && !old.IsSpecialTransaction()) {
+	if old != nil && !(tx.KnownSpecialCall() && !old.KnownSpecialCall()) {
 		if old.GasFeeCapCmp(tx) >= 0 || old.GasTipCapCmp(tx) >= 0 {
 			return false, nil
 		}

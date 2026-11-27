@@ -54,7 +54,8 @@ import (
 //     fast-sync code path (A.6 operator-pin wiring in eth/backend.go) sees a
 //     pinned pivot through the normal config fields. Nothing downstream changes.
 //
-// Returns true if a pivot was auto-pinned, false otherwise.
+// Returns true if a pivot was auto-pinned, false otherwise. Since
+// F-2026-19471 it never pins: a compiled checkpoint has no QC to verify.
 func AutoPinPivotFromCheckpoints(chainConfig *params.ChainConfig, cfg *Config) bool {
 	if cfg == nil || chainConfig == nil {
 		return false
@@ -77,15 +78,17 @@ func AutoPinPivotFromCheckpoints(chainConfig *params.ChainConfig, cfg *Config) b
 		return false
 	}
 
-	cfg.FastSyncPivotNumber = best.Number
-	cfg.FastSyncPivotHash = best.Hash
-	cfg.FastSyncPivotRoot = best.Root
-
-	log.Info("XDC fast-sync: auto-pinned pivot from TrustedSyncCheckpoints",
+	// F-2026-19471: a compiled checkpoint is trusted on the binary's word. It
+	// carries no quorum certificate, so there is nothing to verify against the
+	// epoch masternodes, and pinning it would start state sync from an
+	// unverified root. Refuse; the operator pins a pivot with the
+	// --fastsyncpivot* flags, or the dynamic pivot runs. Add a QC to
+	// TrustedSyncCheckpoint and verify it here to re-enable the pin.
+	log.Warn("XDC fast-sync: refusing to auto-pin a compiled checkpoint without a verifiable quorum certificate; "+
+		"supply --fastsyncpivotnumber/hash/root or use the dynamic pivot (F-2026-19471)",
 		"block", best.Number,
-		"hash", best.Hash.Hex(),
-		"root", best.Root.Hex())
-	return true
+		"hash", best.Hash.Hex())
+	return false
 }
 
 // selectAutoPivotCheckpoint returns the highest-numbered TrustedSyncCheckpoint

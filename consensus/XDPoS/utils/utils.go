@@ -80,6 +80,27 @@ func CompareSignersLists(list1 []common.Address, list2 []common.Address) bool {
 	return reflect.DeepEqual(l1, l2)
 }
 
+// SignersOverlap reports whether more than two thirds of the elements of each
+// list are in the other. A set that fails this against a verified reference
+// cannot reach a quorum of its own without the reference's keys.
+func SignersOverlap(ref, got []common.Address) bool {
+	if len(ref) == 0 || len(got) == 0 {
+		return false
+	}
+	in := make(map[common.Address]struct{}, len(ref))
+	for _, a := range ref {
+		in[a] = struct{}{}
+	}
+	common := 0
+	for _, a := range got {
+		if _, ok := in[a]; ok {
+			common++
+			delete(in, a) // count a duplicate once
+		}
+	}
+	return common*3 > 2*len(ref) && common*3 > 2*len(got)
+}
+
 // ValidatorsOrderMatches returns true when expected and actual contain the same
 // addresses in the same order. Unlike CompareSignersLists (which sorts both
 // sides), this is a strict positional check.
@@ -91,9 +112,10 @@ func CompareSignersLists(list1 []common.Address, list2 []common.Address) bool {
 // pass first; call this only when the sets are known equal.
 //
 // Canonical XDPoSChain v2.9.3-testnet uses the same sorted CompareSignersLists
-// at epoch switch (no ordered check). This function is diagnostic: callers log
-// a WARN but do not reject blocks. Gate before promoting to rejection: replay-
-// parity over mainnet V2 epoch switches (80,370,000 → tip) must fire 0 WARNs.
+// at epoch switch (no ordered check). Callers reject only when
+// ChainConfig.IsValidatorOrder is active. Shipped networks leave that block
+// at the far-future placeholder or nil, so a reordered list stays valid and
+// this node still accepts a header current-main accepts (F-2026-19815).
 func ValidatorsOrderMatches(expected, actual []common.Address) bool {
 	if len(expected) != len(actual) {
 		return false

@@ -544,7 +544,7 @@ func (pool *LegacyPool) Pending(filter txpool.PendingFilter) (map[common.Address
 		if filter.MinTip != nil || filter.GasLimitCap != 0 {
 			for i, tx := range txs {
 				if filter.MinTip != nil {
-					if !tx.IsSpecialTransaction() && tx.EffectiveGasTipIntCmp(filter.MinTip, filter.BaseFee) < 0 {
+					if !tx.KnownSpecialCall() && tx.EffectiveGasTipIntCmp(filter.MinTip, filter.BaseFee) < 0 {
 						txs = txs[:i]
 						break
 					}
@@ -589,7 +589,7 @@ func (pool *LegacyPool) ValidateTxBasics(tx *types.Transaction) error {
 	// ErrZeroGasPrice / ErrUnderMinGasPrice block is guarded by
 	// !tx.IsSpecialTransaction().
 	minTip := pool.gasTip.Load().ToBig()
-	if tx.IsSpecialTransaction() {
+	if tx.KnownSpecialCall() {
 		minTip = new(big.Int) // zero — price-exempt
 	}
 	opts := &txpool.ValidationOptions{
@@ -911,18 +911,6 @@ func (pool *LegacyPool) isSigningTxExpired(tx *types.Transaction) bool {
 	return headNum > expiry
 }
 
-// specialTxSignSel is the 4-byte ABI selector for BlockSigners.sign(uint256,bytes32),
-// derived from common.HexSignMethod so it never diverges from the canonical source.
-// Canonical layout (contracts.CreateTxSign): 4-byte selector + 32-byte blockNumber + 32-byte blockHash = 68 bytes.
-var specialTxSignSel = func() (r [4]byte) { copy(r[:], common.Hex2Bytes(common.HexSignMethod)); return }()
-
-// specialTxRandSelectors are the 4-byte ABI selectors for the two RandomizeSMC methods
-// that masternodes legitimately call: setSecret (HexSetSecret) and setOpening (HexSetOpening).
-var specialTxRandSelectors = [2][4]byte{
-	func() (r [4]byte) { copy(r[:], common.Hex2Bytes(common.HexSetSecret)); return }(),
-	func() (r [4]byte) { copy(r[:], common.Hex2Bytes(common.HexSetOpening)); return }(),
-}
-
 // hasKnownSpecialCalldata reports whether tx carries calldata that matches a known
 // canonical special-tx method.  Only transactions that pass this check are eligible
 // for the IsSigner fast path; all other calldata to 0x89/0x90 must take the normal
@@ -940,20 +928,7 @@ var specialTxRandSelectors = [2][4]byte{
 // sender check but not this calldata guard, leaving any calldata from a seated
 // masternode on the fee-exempt fast path above GlobalSlots.
 func hasKnownSpecialCalldata(tx *types.Transaction) bool {
-	data := tx.Data()
-	if len(data) < 4 || tx.To() == nil {
-		return false
-	}
-	var sel [4]byte
-	copy(sel[:], data[:4])
-	switch *tx.To() {
-	case common.BlockSignersBinary:
-		// Exactly 68 bytes: selector (4) + uint256 blockNumber (32) + bytes32 blockHash (32).
-		return len(data) == 68 && sel == specialTxSignSel
-	case common.RandomizeSMCBinary:
-		return sel == specialTxRandSelectors[0] || sel == specialTxRandSelectors[1]
-	}
-	return false
+	return tx.KnownSpecialCall()
 }
 
 // add validates a transaction and inserts it into the non-executable queue for later

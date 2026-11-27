@@ -15,6 +15,7 @@ import (
 	"github.com/ethereum/go-ethereum/consensus"
 	"github.com/ethereum/go-ethereum/consensus/XDPoS/utils"
 	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/log"
 )
 
@@ -85,6 +86,12 @@ func (x *XDPoS_v2) VerifyTimeoutMessage(chain consensus.ChainReader, timeoutMsg 
 		return false, err
 	}
 
+	if epochInfo, epochErr := x.getTCEpochInfo(chain, &types.TimeoutCert{Round: timeoutMsg.Round}); epochErr == nil {
+		if err := x.timeoutGapMatchesEpoch(chain, epochInfo, timeoutMsg.Round, timeoutMsg.GapNumber); err != nil {
+			return false, err
+		}
+	}
+
 	timeoutMsg.SetSigner(signer)
 	return verified, nil
 }
@@ -105,10 +112,18 @@ func (x *XDPoS_v2) timeoutHandler(chain consensus.ChainReader, timeout *types.Ti
 			CurrentRound:  x.currentRound,
 		}
 	}
+	if epochInfo, epochErr := x.getTCEpochInfo(chain, &types.TimeoutCert{Round: timeout.Round}); epochErr == nil {
+		if err := x.timeoutGapMatchesEpoch(chain, epochInfo, timeout.Round, timeout.GapNumber); err != nil {
+			return err
+		}
+	}
 
 	// Add to pool
 	numberOfTimeouts, pooledTimeouts := x.timeoutPool.Add(timeout)
 	log.Debug("[timeoutHandler] collected timeout", "count", numberOfTimeouts)
+	if x.ForensicsProcessor != nil {
+		go x.ForensicsProcessor.DetectEquivocationInTimeoutPool(timeout, x.timeoutPool)
+	}
 
 	// Get epoch info
 	epochInfo, err := x.getEpochSwitchInfo(chain, chain.CurrentHeader(), chain.CurrentHeader().Hash())
@@ -151,10 +166,12 @@ func (x *XDPoS_v2) timeoutHandler(chain consensus.ChainReader, timeout *types.Ti
 func (x *XDPoS_v2) onTimeoutPoolThresholdReached(chain consensus.ChainReader, pooledTimeouts map[common.Hash]utils.PoolObj, currentTimeoutMsg utils.PoolObj, gapNumber uint64, epochInfo *types.EpochSwitchInfo) error {
 	timeoutRound := currentTimeoutMsg.(*types.Timeout).Round
 
-	// F-2026-19596, F-2026-19612: bind TC membership to the active masternode set
+	// F-2026-19596, F-2026-19612: build the TC only from the active masternode set
 	// of the round's epoch, not the full candidate pool (which includes penalized
-	// addresses). A TC built with penalized signers would be rejected by verifyTC
-	// on this and canonical nodes, causing a liveness stall.
+	// addresses). Canonical XDPoSChain builds from every pooled timeout and its
+	// verifyTC accepts candidate signers; verifyTC here ignores signers outside
+	// the active set, so a canonical-built TC is accepted. Only active signers
+	// count toward the threshold, so a TC built here carries just those.
 	activeMNs := make(map[common.Address]struct{}, len(epochInfo.Masternodes))
 	for _, mn := range epochInfo.Masternodes {
 		activeMNs[mn] = struct{}{}
@@ -384,11 +401,75 @@ func (x *XDPoS_v2) getTCEpochInfo(chain consensus.ChainReader, timeoutCert *type
 	return epochInfo, nil
 }
 
+// getTCEpochInfoAt is getTCEpochInfo for a certificate carried by the child of
+// parent: the epoch of the certificate round is found from the ancestors of the
+// header being verified, never from the local head, so every node gives the
+// same verdict for the same header. The walk goes back through the
+// epoch-switch parent links from the epoch of parent, like getTCEpochInfo goes
+// back from the head epoch; a round past the epoch of parent uses that epoch
+// (the certified round opens a new epoch whose switch block does not exist yet).
+func (x *XDPoS_v2) getTCEpochInfoAt(chain consensus.ChainReader, timeoutCert *types.TimeoutCert, parent *types.Header, parents []*types.Header) (*types.EpochSwitchInfo, error) {
+	info, err := x.getEpochSwitchInfoWithParents(chain, parent, parent.Hash(), parents)
+	if err != nil {
+		return nil, fmt.Errorf("[getTCEpochInfoAt] failed to get epoch switch info: %s", err)
+	}
+	for info.EpochSwitchBlockInfo.Round > timeoutCert.Round {
+		parentHash, ok, err := x.epochSwitchParentHashOrErr(chain, info)
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			break // no earlier epoch
+		}
+		if info, err = x.getEpochSwitchInfoWithParents(chain, nil, parentHash, parents); err != nil {
+			return nil, fmt.Errorf("[getTCEpochInfoAt] failed to get epoch switch info: %s", err)
+		}
+	}
+	return info, nil
+}
+
 // verifyTC verifies a timeout certificate
 func (x *XDPoS_v2) verifyTC(chain consensus.ChainReader, timeoutCert *types.TimeoutCert) error {
+	return x.verifyTCAt(chain, timeoutCert, nil, nil)
+}
+
+// verifyTCAt verifies a timeout certificate. With parent nil the epoch of the
+// certificate and the gap rule are taken from the local head (the normal path,
+// as canonical). With parent set they are taken from that header and the
+// in-batch parents, for the certificate inside a header (verifyRoundSkip).
+func (x *XDPoS_v2) verifyTCAt(chain consensus.ChainReader, timeoutCert *types.TimeoutCert, parent *types.Header, parents []*types.Header) error {
 	if timeoutCert == nil || timeoutCert.Signatures == nil {
 		log.Warn("[verifyTC] TC or signatures is nil")
 		return utils.ErrInvalidTC
+	}
+
+	// F-2026-19612: resolve the epoch of the certificate round and check the
+	// certificate gap against it BEFORE the gap snapshot is loaded. The gap is
+	// attacker-chosen; it must not select a snapshot load until it is known to be
+	// the gap of the round's epoch. An unresolved epoch is an error.
+	var epochInfo *types.EpochSwitchInfo
+	var err error
+	if parent == nil {
+		epochInfo, err = x.getTCEpochInfo(chain, timeoutCert)
+	} else {
+		epochInfo, err = x.getTCEpochInfoAt(chain, timeoutCert, parent, parents)
+	}
+	if err != nil {
+		log.Error("[verifyTC] Failed to get TC epoch info", "tcRound", timeoutCert.Round, "error", err)
+		return err
+	}
+	if tcEpochUnresolved(epochInfo) {
+		log.Error("[verifyTC] TC epoch info or its switch block is unresolved", "tcRound", timeoutCert.Round)
+		return fmt.Errorf("unable to resolve the epoch of timeout certificate round %d", timeoutCert.Round)
+	}
+	ref := (*types.Header)(nil)
+	if parent == nil {
+		ref = chain.CurrentHeader()
+	} else {
+		ref = parent
+	}
+	if err := x.timeoutGapMatchesEpochAt(chain, ref, epochInfo, timeoutCert.Round, timeoutCert.GapNumber); err != nil {
+		return err
 	}
 
 	// Get snapshot
@@ -409,6 +490,16 @@ func (x *XDPoS_v2) verifyTC(chain consensus.ChainReader, timeoutCert *types.Time
 		return errors.New("empty masternode list")
 	}
 
+	// A signer outside the active set is ignored below, not rejected, so the
+	// early abort on the first foreign signer is gone. Bound the recovery work
+	// instead: a certificate cannot honestly carry many times more signatures
+	// than there are candidates.
+	// ponytail: 4x is an arbitrary generous ceiling, tighten if the candidate pool is capped
+	if max := 4 * len(snap.NextEpochCandidates); len(timeoutCert.Signatures) > max {
+		log.Warn("[verifyTC] Too many signatures", "signatures", len(timeoutCert.Signatures), "max", max)
+		return utils.ErrInvalidTCSignatures
+	}
+
 	// #1074 fix: dedupe by recovered ADDRESS and reject high-S (ECDSA
 	// malleability) signatures, matching canonical XDPoSChain
 	// (engines/engine_v2/timeout.go:177) and native eth2030 #136. Byte-level
@@ -417,21 +508,20 @@ func (x *XDPoS_v2) verifyTC(chain consensus.ChainReader, timeoutCert *types.Time
 	// byte-distinct encoding of the SAME signer's timeout vote, so
 	// byte-dedup lets one masternode key inflate the counted total toward
 	// the 2/3 threshold — a BFT safety violation.
-	epochInfo, err := x.getTCEpochInfo(chain, timeoutCert)
-	if err != nil {
-		log.Error("[verifyTC] Failed to get TC epoch info", "tcRound", timeoutCert.Round, "error", err)
-		return err
-	}
-
 	signedTimeoutObj := types.TimeoutSigHash(&types.TimeoutForSign{
 		Round:     timeoutCert.Round,
 		GapNumber: timeoutCert.GapNumber,
 	})
-	signatures, duplicates, err := recoverUniqueSigners(signedTimeoutObj, timeoutCert.Signatures, epochInfo.Masternodes)
+	// F-2026-19596: canonical XDPoSChain builds a TC from every pooled timeout and
+	// accepts candidate (standby) signers, so a signer outside the round epoch's
+	// active set must not fail the certificate. Recover with no allowed set, then
+	// count and verify only the active-set signers; the rest are ignored.
+	signatures, duplicates, err := recoverUniqueSigners(signedTimeoutObj, timeoutCert.Signatures, nil)
 	if err != nil {
 		log.Error("[verifyTC] Failed to recover TC signers", "tcRound", timeoutCert.Round, "error", err)
 		return err
 	}
+	signatures = activeSignatures(signedTimeoutObj, signatures, epochInfo.Masternodes)
 	if len(duplicates) > 0 {
 		for _, d := range duplicates {
 			log.Warn("[verifyTC] Duplicate signature in TC",
@@ -483,6 +573,36 @@ func (x *XDPoS_v2) verifyTC(chain consensus.ChainReader, timeoutCert *types.Time
 	wg.Wait()
 
 	return verifyError
+}
+
+// tcEpochUnresolved reports whether the epoch info of a TC round, or its switch
+// block, is missing. timeoutGapMatchesEpochAt passes in that case, so verifyTCAt
+// must refuse it first (F-2026-19612).
+func tcEpochUnresolved(info *types.EpochSwitchInfo) bool {
+	return info == nil || info.EpochSwitchBlockInfo == nil || info.EpochSwitchBlockInfo.Number == nil
+}
+
+// activeSignatures returns the signatures whose signer is in active. Signatures
+// from any other signer are dropped without error. The input is already unique
+// by signer and low-S (recoverUniqueSigners).
+func activeSignatures(signedHash common.Hash, sigs []types.Signature, active []common.Address) []types.Signature {
+	member := make(map[common.Address]struct{}, len(active))
+	for _, a := range active {
+		member[a] = struct{}{}
+	}
+	kept := make([]types.Signature, 0, len(sigs))
+	for _, sig := range sigs {
+		pub, err := crypto.Ecrecover(signedHash.Bytes(), sig)
+		if err != nil {
+			continue
+		}
+		var addr common.Address
+		copy(addr[:], crypto.Keccak256(pub[1:])[12:])
+		if _, ok := member[addr]; ok {
+			kept = append(kept, sig)
+		}
+	}
+	return kept
 }
 
 // processTC processes a timeout certificate

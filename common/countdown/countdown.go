@@ -56,6 +56,13 @@ func NewExpCountDown(duration time.Duration, base float64, maxExponent int) (*Ex
 	}, nil
 }
 
+// BaseDuration returns the countdown period before exponential growth.
+func (e *ExpCountDown) BaseDuration() time.Duration {
+	e.lock.RLock()
+	defer e.lock.RUnlock()
+	return e.baseDuration
+}
+
 // SetParams updates the timer parameters
 func (e *ExpCountDown) SetParams(duration time.Duration, base float64, maxExponent int) error {
 	e.lock.Lock()

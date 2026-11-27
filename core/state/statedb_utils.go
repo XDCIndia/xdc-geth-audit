@@ -92,17 +92,31 @@ var (
 	}
 )
 
+// CandidatesLenKey is the storage key of the 0x88 candidates array length.
+func CandidatesLenKey() common.Hash {
+	return common.BigToHash(new(big.Int).SetUint64(slotValidatorMapping["candidates"]))
+}
+
+// CandidateElementKey is the storage key of candidates[i].
+func CandidateElementKey(i uint64) common.Hash {
+	return GetLocDynamicArrAtElement(CandidatesLenKey(), i, 1)
+}
+
+// CandidateCapKey is the storage key of validatorsState[candidate].cap.
+func CandidateCapKey(candidate common.Address) common.Hash {
+	// validatorsState[_candidate].cap;
+	loc := GetLocMappingAtKey(common.BytesToHash(candidate.Bytes()), slotValidatorMapping["validatorsState"])
+	return common.BigToHash(loc.Add(loc, new(big.Int).SetUint64(1)))
+}
+
 func GetCandidates(statedb *StateDB) []common.Address {
-	slot := slotValidatorMapping["candidates"]
-	slotHash := common.BigToHash(new(big.Int).SetUint64(slot))
-	arrLength := statedb.GetState(common.MasternodeVotingSMCBinary, slotHash)
+	arrLength := statedb.GetState(common.MasternodeVotingSMCBinary, CandidatesLenKey())
 	count := arrLength.Big().Uint64()
 	rets := make([]common.Address, 0, count)
 
 	emptyHash := common.Hash{}
 	for i := uint64(0); i < count; i++ {
-		key := GetLocDynamicArrAtElement(slotHash, i, 1)
-		ret := statedb.GetState(common.MasternodeVotingSMCBinary, key)
+		ret := statedb.GetState(common.MasternodeVotingSMCBinary, CandidateElementKey(i))
 		if ret != emptyHash {
 			rets = append(rets, common.HexToAddress(ret.Hex()))
 		}
@@ -121,11 +135,7 @@ func GetCandidateOwner(statedb *StateDB, candidate common.Address) common.Addres
 }
 
 func GetCandidateCap(statedb *StateDB, candidate common.Address) *big.Int {
-	slot := slotValidatorMapping["validatorsState"]
-	// validatorsState[_candidate].cap;
-	locValidatorsState := GetLocMappingAtKey(common.BytesToHash(candidate.Bytes()), slot)
-	locCandidateCap := locValidatorsState.Add(locValidatorsState, new(big.Int).SetUint64(uint64(1)))
-	ret := statedb.GetState(common.MasternodeVotingSMCBinary, common.BigToHash(locCandidateCap))
+	ret := statedb.GetState(common.MasternodeVotingSMCBinary, CandidateCapKey(candidate))
 	return ret.Big()
 }
 

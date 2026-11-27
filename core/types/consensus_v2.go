@@ -202,6 +202,10 @@ func (tc *TimeoutCert) DeepCopy() *TimeoutCert {
 type ExtraFields_v2 struct {
 	Round      Round
 	QuorumCert *QuorumCert
+	// TimeoutCert is present only when a block's round is more than one past
+	// the certificate it carries. The field is optional, so a nil value keeps
+	// the extra bytes identical to the two-field encoding every block uses today.
+	TimeoutCert *TimeoutCert `rlp:"optional"`
 }
 
 // EncodeToBytes encodes XDPoS 2.0 extra fields into bytes

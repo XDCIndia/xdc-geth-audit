@@ -9,6 +9,7 @@
 package hooks
 
 import (
+	"errors"
 	"math/big"
 	"testing"
 
@@ -72,8 +73,8 @@ func (f *comebackFakeV2) GetPreviousPenaltyByHash(_ consensus.ChainReader, _ com
 func (f *comebackFakeV2) GetMasternodesFromEpochSwitchHeader(_ consensus.ChainReader, _ *types.Header) []common.Address {
 	return nil
 }
-func (f *comebackFakeV2) GetStandbynodes(_ consensus.ChainReader, _ *types.Header) []common.Address {
-	return nil
+func (f *comebackFakeV2) GetStandbynodes(_ consensus.ChainReader, _ *types.Header) ([]common.Address, error) {
+	return nil, nil
 }
 func (f *comebackFakeV2) GetMasternodesV2(_ consensus.ChainReader, _ *types.Header) []common.Address {
 	return nil
@@ -104,8 +105,9 @@ func (f *comebackFakeV2) ReinitBFT(_ consensus.ChainReader, _ *types.Header) err
 // for every GetHeader call (so the round-resolution loop in HookPenalty exits
 // on the first iteration without sleeping) and nil for all other lookups.
 type comebackTestChain struct {
-	parent *types.Header
-	cfg    *params.ChainConfig
+	missingBody bool
+	parent      *types.Header
+	cfg         *params.ChainConfig
 }
 
 var _ consensus.ChainReader = (*comebackTestChain)(nil)
@@ -115,7 +117,12 @@ func (c *comebackTestChain) CurrentHeader() *types.Header                    { r
 func (c *comebackTestChain) GetHeader(_ common.Hash, _ uint64) *types.Header { return c.parent }
 func (c *comebackTestChain) GetHeaderByNumber(_ uint64) *types.Header        { return nil }
 func (c *comebackTestChain) GetHeaderByHash(_ common.Hash) *types.Header     { return nil }
-func (c *comebackTestChain) GetBlock(_ common.Hash, _ uint64) *types.Block   { return nil }
+func (c *comebackTestChain) GetBlock(_ common.Hash, n uint64) *types.Block {
+	if c.missingBody {
+		return nil
+	}
+	return types.NewBlockWithHeader(&types.Header{Number: new(big.Int).SetUint64(n)})
+}
 
 // addrIn reports whether target appears in addrs.
 func addrIn(addrs []common.Address, target common.Address) bool {
@@ -246,6 +253,11 @@ func TestHookPenaltyV2PostUpgradeComeback(t *testing.T) {
 		t.Fatalf("fail case: signerA penalised in 1/%d epochs with 0 signing txs must remain penalised; got %v, want [...%v...]",
 			limitPenaltyEpoch, pensFail, signerA)
 	}
+	chain.missingBody = true
+	if _, err := fn(chain, number, common.Hash{0xee}, nil); !errors.Is(err, XDPoS.ErrPenaltyDataUnavailable) {
+		t.Fatalf("missing body err = %v, want ErrPenaltyDataUnavailable", err)
+	}
+	chain.missingBody = false
 
 	// --- PASS case (comeback release) ---
 	//

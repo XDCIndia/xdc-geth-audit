@@ -63,11 +63,37 @@ func AttachConsensusV1Hooks(adaptor *XDPoS.XDPoS, bc *core.BlockChain, chainConf
 		return validators, nil
 	}
 
+	// Signer lists for checkpoints whose parent header was not in the database
+	// during header verification. Body validation replays them after the parent
+	// is written. A checkpoint-synced node that never has the parent state still
+	// skips: the randomize values cannot be read, and rejecting would drop
+	// canonical history. Apothem (chain 51) stays skipped for every V1
+	// checkpoint, through the V2 switch at block 56,828,700, because canonical
+	// never enforced this field there.
+	//
+	// The list is bounded (F-2026-19462). When it is full, the oldest entry at
+	// or below the chain head goes: that block was passed without reaching body
+	// validation (header-only sync, a rejected batch), so its entry is stale.
+	// An entry above the head is a block still waiting for body validation, and
+	// dropping it would let that checkpoint pass unchecked. When no entry is
+	// stale the new checkpoint is refused with an error.
+	const maxDeferredSigners = 32
+	type deferredEntry struct {
+		number  uint64
+		signers []common.Address
+	}
+	deferredSigners := make(map[common.Hash]deferredEntry)
+	var deferredOrder []common.Hash // keys of deferredSigners, oldest first
+	var deferredMu sync.Mutex
+
 	// HookVerifyMNs: verifies the Validators field at epoch checkpoints against
 	// the M2 list recomputed from the 0x90 randomize values in the parent's
 	// state. Port of canonical XDPoSChain eth/hooks/engine_v1_hooks.go
 	// HookVerifyMNs (#1412). It never writes to the header under verification.
-	adaptor.HookVerifyMNs = func(header *types.Header, signers []common.Address) error {
+	//
+	// recheck is true when body validation replays a deferred check: the parent
+	// is written by then, so a parent whose state is missing is an error.
+	verifyMNs := func(header *types.Header, signers []common.Address, recheck bool) error {
 		number := header.Number.Uint64()
 		if number == 0 || number%common.EpocBlockRandomize != 0 {
 			return nil
@@ -83,7 +109,11 @@ func AttachConsensusV1Hooks(adaptor *XDPoS.XDPoS, bc *core.BlockChain, chainConf
 			// (chain 51) via shouldDisableFullVerify (engine_v1/engine.go).
 			// Running the check retroactively would reject valid canonical
 			// Apothem V1 blocks whose Validators bytes were never enforced.
-			// Hacken F-2026-19462: bypass is intentional; made observable here.
+			// Hacken F-2026-19462: bypass is intentional and accepted for parity
+			// with canonical (v3.0.0-testnet-2 engine_v1/engine.go:178-179
+			// disables fullVerify on this chain, :266 gates the check on it; the
+			// ignore-listed checkpoints are skipped by checkSignersOnCheckpoint).
+			// It is made observable here.
 			// Warn once: a replay from genesis hits this at every V1 checkpoint
 			// (~63k on Apothem). The counter records every skip.
 			hookVerifyMNsApothemSkipOnce.Do(func() {
@@ -97,12 +127,37 @@ func AttachConsensusV1Hooks(adaptor *XDPoS.XDPoS, bc *core.BlockChain, chainConf
 		// randomize values cannot be read (e.g. a checkpoint-synced node).
 		parent := bc.GetHeaderByHash(header.ParentHash)
 		if parent == nil {
-			log.Warn("[V1 HookVerifyMNs] parent header unknown, skipping validator check", "number", number)
+			log.Warn("[V1 HookVerifyMNs] parent header unknown, deferring validator check", "number", number)
 			hookVerifyMNsMissingStateSkips.Inc(1)
+			deferredMu.Lock()
+			defer deferredMu.Unlock()
+			hash := header.Hash()
+			if _, known := deferredSigners[hash]; !known {
+				if len(deferredOrder) >= maxDeferredSigners {
+					head := bc.CurrentHeader()
+					stale := -1
+					for i, h := range deferredOrder {
+						if head != nil && deferredSigners[h].number <= head.Number.Uint64() {
+							stale = i
+							break
+						}
+					}
+					if stale < 0 {
+						return fmt.Errorf("v1 HookVerifyMNs: %d checkpoint validator checks are pending and none is at or below the head, cannot defer checkpoint %d", len(deferredOrder), number)
+					}
+					delete(deferredSigners, deferredOrder[stale])
+					deferredOrder = append(deferredOrder[:stale], deferredOrder[stale+1:]...)
+				}
+				deferredOrder = append(deferredOrder, hash)
+			}
+			deferredSigners[hash] = deferredEntry{number: number, signers: append([]common.Address(nil), signers...)}
 			return nil
 		}
 		statedb, err := bc.StateAt(parent.Root, parent.Number, parent.Time)
 		if err != nil {
+			if recheck {
+				return fmt.Errorf("v1 HookVerifyMNs: parent state unavailable for checkpoint %d: %w", number, err)
+			}
 			log.Warn("[V1 HookVerifyMNs] parent state unavailable, skipping validator check", "number", number, "err", err)
 			hookVerifyMNsMissingStateSkips.Inc(1)
 			return nil
@@ -115,6 +170,28 @@ func AttachConsensusV1Hooks(adaptor *XDPoS.XDPoS, bc *core.BlockChain, chainConf
 			return XDPoS.ErrInvalidCheckpointValidators
 		}
 		return nil
+	}
+	adaptor.HookVerifyMNs = func(header *types.Header, signers []common.Address) error {
+		return verifyMNs(header, signers, false)
+	}
+	adaptor.HookRecheckV1Validators = func(header *types.Header) error {
+		deferredMu.Lock()
+		hash := header.Hash()
+		entry, ok := deferredSigners[hash]
+		if ok {
+			delete(deferredSigners, hash)
+			for i, h := range deferredOrder {
+				if h == hash {
+					deferredOrder = append(deferredOrder[:i], deferredOrder[i+1:]...)
+					break
+				}
+			}
+		}
+		deferredMu.Unlock()
+		if !ok {
+			return nil
+		}
+		return verifyMNs(header, entry.signers, true)
 	}
 
 	// HookPenalty (before TIPSigning): masternodes of the previous epoch that

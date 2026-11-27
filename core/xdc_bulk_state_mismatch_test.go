@@ -70,10 +70,10 @@ func TestBulkSyncRejectsStateRootMismatch(t *testing.T) {
 	}
 }
 
-// TestBulkSyncMasksMissingTrieNode: the A.94 mask still applies when the
-// parent trie is genuinely incomplete (root present, deeper nodes missing),
-// the partial fast-sync pivot it exists for.
-func TestBulkSyncMasksMissingTrieNode(t *testing.T) {
+// TestBulkSyncRejectsMissingTrieNode: execution that hits a missing trie node
+// does not match the header state root. The block is not canonized and
+// no-state mode is not latched, so later blocks are still executed.
+func TestBulkSyncRejectsMissingTrieNode(t *testing.T) {
 	var (
 		a     = common.HexToAddress("0xaaaa")
 		b     = common.HexToAddress("0xbbbb")
@@ -106,10 +106,15 @@ func TestBulkSyncMasksMissingTrieNode(t *testing.T) {
 	}
 
 	chain := newBulkSyncTestChain(t, db, gspec)
-	if _, err := chain.InsertChain(types.Blocks{blocks[0]}); err != nil {
-		t.Fatalf("missing-trie-node mismatch not masked in bulk sync: %v", err)
+	if _, err := chain.InsertChain(types.Blocks{blocks[0]}); err == nil {
+		t.Fatal("block whose execution hit a missing trie node was imported")
+	} else if !strings.Contains(err.Error(), "invalid merkle root") && !strings.Contains(err.Error(), "missing trie node") {
+		t.Fatalf("rejected for the wrong reason: %v", err)
 	}
-	if !chain.checkpointSyncNoState.Load() || !rawdb.ReadCheckpointSyncNoState(db) {
-		t.Fatal("checkpointSyncNoState not set after masking a missing trie node")
+	if chain.checkpointSyncNoState.Load() || rawdb.ReadCheckpointSyncNoState(db) {
+		t.Fatal("checkpointSyncNoState latched after a missing trie node")
+	}
+	if n := chain.CurrentBlock().Number.Uint64(); n != 0 {
+		t.Fatalf("head = %d, want 0 (unexecuted block canonized)", n)
 	}
 }

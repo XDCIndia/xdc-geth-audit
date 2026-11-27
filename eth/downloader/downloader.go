@@ -751,8 +751,16 @@ func (d *Downloader) PrimeAncestorBodies(headers []*types.Header, bodies []*type
 				shouldWriteBody = true
 			}
 		}
+		// F-2026-20610: replacing a placeholder body without matching receipts
+		// would leave the placeholder receipts behind and the block looking
+		// finished. Keep the placeholder; the anchor-gap repair fills it.
+		if shouldWriteBody && receipts == nil && rawdb.HasBody(d.stateDB, hash, num) {
+			shouldWriteBody = false
+		}
 		if shouldWriteBody {
 			rawdb.WriteBody(batch, hash, num, bodies[i])
+			// Index the body's transactions together with the body.
+			rawdb.WriteTxLookupEntriesKeepNewer(d.stateDB, num, bodies[i].Transactions)
 			writtenBodies++
 		} else {
 			skippedBodies++

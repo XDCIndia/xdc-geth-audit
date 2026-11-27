@@ -68,6 +68,29 @@ func (x *XDPoS_v2) sync11SeedGap(chain consensus.ChainReader, gapNum uint64, swi
 	}
 }
 
+// requireDerivedSwitchSet is the F-2026-20648 gate for an epoch-switch header
+// on a node without state. With no locally computed list, the header's own
+// Validators must not become the set that checks its seal. The set that signed
+// the parent comes from verified epoch info; header.Validators must keep more
+// than two thirds of it, so a rotation passes and a list of keys chosen by the
+// header does not. When that set cannot be derived the header is refused and
+// the node waits for a gap-seed or checkpoint.
+func (x *XDPoS_v2) requireDerivedSwitchSet(chain consensus.ChainReader, header, parent *types.Header, parents []*types.Header) error {
+	if n := len(parents); n > 0 && parents[n-1].Hash() == parent.Hash() {
+		parents = parents[:n-1] // the parent's own epoch, not the header's
+	}
+	ref := x.GetMasternodesWithParents(chain, parent, parents)
+	if len(ref) == 0 {
+		log.Warn("[verifyHeader] F-2026-20648: epoch-switch set cannot be derived, refusing header", "Number", header.Number, "Hash", header.Hash())
+		return fmt.Errorf("%w at block %s", utils.ErrEpochSwitchSetNotDerivable, header.Number)
+	}
+	if !utils.SignersOverlap(ref, contracts.ExtractAddressFromBytes(header.Validators)) {
+		log.Warn("[verifyHeader] F-2026-20648: epoch-switch validators do not follow the verified set", "Number", header.Number, "Hash", header.Hash())
+		return utils.ErrValidatorsNotLegit
+	}
+	return nil
+}
+
 // verifyHeader performs comprehensive header verification aligned with XDPoSChain v2.6.8.
 // This function is the primary validation entrypoint for V2 blocks and must remain
 // strictly aligned with the official reference implementation to avoid consensus forks.
@@ -153,6 +176,13 @@ func (x *XDPoS_v2) verifyHeader(chain consensus.ChainReader, header *types.Heade
 	if round <= quorumCert.ProposedBlockInfo.Round {
 		return utils.ErrRoundInvalid
 	}
+	// F-2026-19608: a round more than one past the parent certificate is a
+	// skipped round. Until roundSkipTCBlock, that header is still valid, which
+	// is what every current block relies on. From the fork block it needs a
+	// timeout certificate for the round immediately before it.
+	if err := x.verifyRoundSkip(chain, header, parent, parents, round, quorumCert); err != nil {
+		return err
+	}
 
 	// A.97.5: QC verification always runs. The masternode set is 100% header-derived
 	// via getEpochSwitchInfoWithParents → GetMasternodesFromEpochSwitchHeader →
@@ -166,7 +196,11 @@ func (x *XDPoS_v2) verifyHeader(chain consensus.ChainReader, header *types.Heade
 	// inCheckpointCatchup returns false when no anchor is active (full sync, post-
 	// sync, clean fast-sync with no dynamic pivot yet), preserving strict
 	// verification everywhere outside the backfill window.
-	if !x.inCheckpointCatchup(chain, header.Number.Uint64()) {
+	//
+	// F-2026-20645: only the range the anchor authenticates is skipped. A header
+	// above the anchor is checked, so one masternode signature cannot extend the
+	// chain on a fast-synced node.
+	if !x.inAnchorBackfill(chain, header) {
 		if err := x.verifyQC(chain, quorumCert, parent, parents); err != nil {
 			log.Warn("[verifyHeader] fail to verify QC", "QCNumber", quorumCert.ProposedBlockInfo.Number, "QCsigLength", len(quorumCert.Signatures))
 			return err
@@ -235,35 +269,35 @@ func (x *XDPoS_v2) verifyHeader(chain consensus.ChainReader, header *types.Heade
 		localMasterNodes, localPenalties, _, err := x.calcMasternodes(chain, header.Number, header.ParentHash, round, parents)
 		masterNodes = localMasterNodes
 		localList = err == nil
+		// F-2026-20648: a node without state, above the range its anchor
+		// authenticates, does not let the header pick the next epoch's set.
+		noStateSwitch := core.CheckpointSyncNoStateActive.Load() && !x.inAnchorBackfill(chain, header)
 		if err != nil {
 			// Canonical XDPoSChain (verifyHeader.go:137-143): under fullVerify any
 			// calcMasternodes failure is fatal, including a missing gap snapshot
 			// (#1415). The fallback below derives the list from the header being
 			// verified, so it is only safe when the caller trusts the header (!fullVerify).
 			if fullVerify {
-				// SYNC-11 (#1863): if the failure is a missing gap snapshot AND the gap
-				// is below the snap pivot, use sync11ShouldRelax to decide whether to
-				// fall through to the bulk-sync path. The actual seeding happens in the
-				// deferred call to sync11SeedGap (only when retErr == nil).
-				if relax, gapN := x.sync11ShouldRelax(err, header.Number.Uint64()); relax {
-					seedGapFromSwitch = true
-					seedGapNum = gapN
-					log.Warn("[verifyHeader] SYNC-11: gap below snap pivot, deferring seed to after all checks",
-						"switch", header.Number, "gap", gapN)
-				} else if errors.Is(err, utils.ErrPenaltyAncestorMissing) {
-					// #1925: A.68.2 ancestor-header priming is incomplete (or its
-					// depth < penalty lookback window). HookPenalty cannot compute
-					// the correct penalty set without the missing epoch-switch headers.
-					// Fall through to the bulk-sync trust path (header.Validators /
-					// header.Penalties are trusted, proposer-signature check still
-					// enforces signer membership). XDC-10 deferred recheck will
-					// re-verify once all needed ancestor headers are in the DB.
-					// seedGapFromSwitch stays false → the existing bulk-sync fallback applies.
-					log.Warn("[verifyHeader] #1925: penalty ancestor not in DB under fullVerify, deferring to XDC-10 recheck",
-						"block", header.Number, "hash", header.Hash(), "err", err)
-				} else {
-					log.Error("[verifyHeader] calcMasternodes failed under fullVerify", "Number", header.Number, "Hash", header.Hash(), "err", err)
-					return err
+				// A missing snapshot or a missing penalty ancestor is not a reason
+				// to treat header.Validators and header.Penalties as the local
+				// lists. That includes the snap-pivot carve-out: the header would
+				// be checked against itself and then stored as the gap snapshot.
+				log.Error("[verifyHeader] calcMasternodes failed under fullVerify", "Number", header.Number, "Hash", header.Hash(), "err", err)
+				return err
+			}
+			// F-2026-19463: at the tip (not bulk sync) a node without state does not
+			// take the leader list from the header either, so a reordered
+			// Validators cannot pick the slot leader. The missing data is retried:
+			// ErrV2SnapshotMissing and ErrPenaltyDataUnavailable write no bad-block
+			// record and taint no peer. Bulk sync above the anchor keeps the
+			// two-thirds overlap gate below.
+			if noStateSwitch && !core.XdcBulkSyncMode.Load() {
+				log.Debug("[verifyHeader] F-2026-19463: no-state leader list not taken from the header", "Number", header.Number, "Hash", header.Hash(), "err", err)
+				return err
+			}
+			if noStateSwitch {
+				if derr := x.requireDerivedSwitchSet(chain, header, parent, parents); derr != nil {
+					return derr
 				}
 			}
 			if seedGapFromSwitch {
@@ -351,18 +385,35 @@ func (x *XDPoS_v2) verifyHeader(chain consensus.ChainReader, header *types.Heade
 			// the header under verification choose the list its own signer and leader
 			// are then checked against.
 			if !fullVerify {
-				log.Warn("[verifyHeader] masternode set mismatch tolerated (trusting header.Validators)",
-					"block", header.Number.Uint64(),
-					"mnCount", len(masterNodes),
-					"valCount", len(validatorsAddress),
-					"hookPenaltyNil", x.HookPenalty == nil,
-					"snapshotMissing", err != nil && errors.Is(err, utils.ErrV2SnapshotMissing))
-				masterNodes = validatorsAddress
-				localList = false
-				localPenalties = contracts.ExtractAddressFromBytes(header.Penalties)
-				// CertiK XDC-10: the header's lists are trusted here too; recheck
-				// them once the batch is committed.
-				x.pendingSwitchRechecks.Add(header.Hash(), header.Number.Uint64())
+				if noStateSwitch && !utils.SignersOverlap(masterNodes, validatorsAddress) {
+					log.Warn("[verifyHeader] F-2026-20648: epoch-switch validators do not follow the derived set",
+						"block", header.Number.Uint64(), "mnCount", len(masterNodes), "valCount", len(validatorsAddress))
+					return utils.ErrValidatorsNotLegit
+				}
+				// While state is still healing and this header is not an in-batch
+				// bulk-sync ancestor, do not take the leader from the header's own
+				// validator list. Any key that list places at the leader index would
+				// otherwise pass. The proposer is checked against the local list.
+				// XdcBulkSyncMode keeps the reduced check below.
+				if core.CheckpointSyncNoStateActive.Load() && !core.XdcBulkSyncMode.Load() {
+					log.Warn("[verifyHeader] epoch-switch validator list differs from the local list; leader stays on the local list",
+						"block", header.Number.Uint64(),
+						"mnCount", len(masterNodes),
+						"valCount", len(validatorsAddress))
+				} else {
+					log.Warn("[verifyHeader] masternode set mismatch tolerated (trusting header.Validators)",
+						"block", header.Number.Uint64(),
+						"mnCount", len(masterNodes),
+						"valCount", len(validatorsAddress),
+						"hookPenaltyNil", x.HookPenalty == nil,
+						"snapshotMissing", err != nil && errors.Is(err, utils.ErrV2SnapshotMissing))
+					masterNodes = validatorsAddress
+					localList = false
+					localPenalties = contracts.ExtractAddressFromBytes(header.Penalties)
+					// CertiK XDC-10: the header's lists are trusted here too; recheck
+					// them once the batch is committed.
+					x.pendingSwitchRechecks.Add(header.Hash(), header.Number.Uint64())
+				}
 			} else {
 				log.Warn("[verifyHeader DIAG]",
 					"block", header.Number.Uint64(),
@@ -409,6 +460,13 @@ func (x *XDPoS_v2) verifyHeader(chain consensus.ChainReader, header *types.Heade
 		// by publishing any permutation of the correct validator set.
 		// Before ValidatorOrderBlock: diagnostic only (warn, no rejection).
 		// From ValidatorOrderBlock: hard rejection — the header is invalid.
+		//
+		// The block stays at the far-future placeholder on mainnet and Apothem,
+		// and nil everywhere else. Both leave a reordered list valid, which is
+		// what current-main and legacy XDPoSChain accept. Moving it earlier on
+		// this client alone would reject headers those clients still seal
+		// (#1722). Nil and the placeholder are the same rule at every block a
+		// node imports today.
 		if fullVerify && !utils.ValidatorsOrderMatches(masterNodes, validatorsAddress) {
 			if chain.Config().IsValidatorOrder(header.Number) {
 				return fmt.Errorf("epoch-switch header.Validators order does not match calcMasternodes at block %s", header.Number)
@@ -459,7 +517,7 @@ func (x *XDPoS_v2) verifyHeader(chain consensus.ChainReader, header *types.Heade
 		masterNodes = x.GetMasternodesWithParents(chain, header, parents)
 	}
 
-	verified, validatorAddress, err := x.verifyMsgSignature(sigHash(header), header.Validator, masterNodes)
+	verified, validatorAddress, err := x.verifyMsgSignature(x.sealHash(header), header.Validator, masterNodes)
 	if err != nil {
 		for index, mn := range masterNodes {
 			log.Error("[verifyHeader] masternode list during validator verification", "Masternode Address", mn.Hex(), "index", index)
@@ -496,7 +554,11 @@ func (x *XDPoS_v2) verifyHeader(chain consensus.ChainReader, header *types.Heade
 		//
 		// #1413: the tolerance only covers lists taken from headers; a list computed
 		// locally (localList) is checked as in canonical (verifyHeader.go:199-204).
-		if core.XdcBulkSyncMode.Load() && !localList {
+		//
+		// F-2026-20645: with a fast-sync anchor installed, the tolerance ends at
+		// the anchor. Above it the header's own list does not decide who may seal.
+		anchor, _, _ := checkpointAnchor(chain)
+		if core.XdcBulkSyncMode.Load() && !localList && (anchor == 0 || header.Number.Uint64() <= anchor) {
 			log.Warn("[verifyHeader] A.87 leader mismatch tolerated during bulk sync",
 				"block", header.Number, "curIndex", curIndex, "leaderIndex", leaderIndex,
 				"expected", masterNodes[leaderIndex], "actual", validatorAddress)
@@ -511,6 +573,51 @@ func (x *XDPoS_v2) verifyHeader(chain consensus.ChainReader, header *types.Heade
 	// later fullVerify pass accept it unchecked (canonical verifyHeader.go:206-212).
 	if fullVerify {
 		x.verifiedHeaders.Add(header.Hash(), struct{}{})
+	}
+	return nil
+}
+
+// verifyRoundSkip applies the F-2026-19608 round bound.
+//
+// With the gate unset, a header is valid under today's rule (round higher
+// than the parent certificate) and a third extra field is rejected, matching
+// a decoder that has no timeout-certificate field. With the gate set, a
+// consecutive round stays a two-field extra, and a skip must carry a timeout
+// certificate whose round is the one immediately before the header and newer
+// than the parent certificate. Signature checks follow the same catch-up
+// exception as the quorum certificate: the parent-hash link to the trusted
+// pivot authenticates the bytes until the epoch headers exist locally.
+func (x *XDPoS_v2) verifyRoundSkip(chain consensus.ChainReader, header, parent *types.Header, parents []*types.Header, round types.Round, quorumCert *types.QuorumCert) error {
+	var extra types.ExtraFields_v2
+	if err := DecodeExtraFields(header.Extra, &extra); err != nil {
+		return utils.ErrInvalidV2Extra
+	}
+	active := x.config != nil && x.config.V2.IsRoundSkipTC(header.Number)
+	if !active {
+		if extra.TimeoutCert != nil {
+			return utils.ErrInvalidV2Extra
+		}
+		return nil
+	}
+	qcRound := quorumCert.ProposedBlockInfo.Round
+	if round == qcRound+1 {
+		if extra.TimeoutCert != nil {
+			return utils.ErrInvalidV2Extra
+		}
+		return nil
+	}
+	tc := extra.TimeoutCert
+	if tc == nil || tc.Round+1 != round || tc.Round <= qcRound {
+		return utils.ErrRoundSkipWithoutTimeout
+	}
+	// F-2026-20645: only a header on the anchor's hash chain skips the check.
+	if x.inAnchorBackfill(chain, header) {
+		return nil
+	}
+	// The certificate is checked against the ancestors of this header, not the
+	// local head, so the verdict does not depend on where the head is.
+	if err := x.verifyTCAt(chain, tc, parent, parents); err != nil {
+		return err
 	}
 	return nil
 }

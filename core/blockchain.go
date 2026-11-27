@@ -36,6 +36,7 @@ import (
 	"github.com/ethereum/go-ethereum/common/mclock"
 	"github.com/ethereum/go-ethereum/common/prque"
 	"github.com/ethereum/go-ethereum/consensus"
+	xdcutils "github.com/ethereum/go-ethereum/consensus/XDPoS/utils"
 	"github.com/ethereum/go-ethereum/consensus/misc/eip4844"
 	"github.com/ethereum/go-ethereum/core/history"
 	"github.com/ethereum/go-ethereum/core/rawdb"
@@ -54,7 +55,6 @@ import (
 	"github.com/ethereum/go-ethereum/metrics"
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/rlp"
-	"github.com/ethereum/go-ethereum/trie"
 	"github.com/ethereum/go-ethereum/triedb"
 	"github.com/ethereum/go-ethereum/triedb/hashdb"
 	"github.com/ethereum/go-ethereum/triedb/pathdb"
@@ -137,6 +137,24 @@ var (
 // reorg() type-asserts bc.Engine() to this interface at runtime.
 type committedBlocker interface {
 	LatestCommittedBlock() *types.BlockInfo
+}
+
+// latestCommittedBlock returns the XDPoS committed block that a rewind must not
+// drop, or nil for engines without one. During NewBlockChain the V2 engine is
+// not wired yet and has not loaded its state, so it reports nothing; the stored
+// marker is read from the database instead.
+func (bc *BlockChain) latestCommittedBlock() *types.BlockInfo {
+	cb, ok := bc.engine.(committedBlocker)
+	if !ok {
+		return nil
+	}
+	if lcb := cb.LatestCommittedBlock(); lcb != nil && lcb.Number != nil {
+		return lcb
+	}
+	if lcb := rawdb.ReadBFTCommittedBlock(bc.db); lcb != nil && lcb.Number != nil {
+		return lcb
+	}
+	return nil
 }
 
 const (
@@ -1192,6 +1210,12 @@ func (bc *BlockChain) historyPruningRequired(policy history.HistoryPolicy, tail,
 // was snap synced or full synced and in which state, the method will try to
 // delete minimal data from disk whilst retaining chain consistency.
 func (bc *BlockChain) SetHead(head uint64) error {
+	// A committed XDPoS block must survive SetHead the same way it survives
+	// reorg. Paths that do not call reorg (sync rollback, debug_setHead) are
+	// covered here.
+	if lcb := bc.latestCommittedBlock(); lcb != nil && head < lcb.Number.Uint64() {
+		return fmt.Errorf("refusing to set head %d below XDPoS committed block %d", head, lcb.Number.Uint64())
+	}
 	if _, err := bc.setHeadBeyondRoot(head, 0, common.Hash{}, false); err != nil {
 		return err
 	}
@@ -1774,10 +1798,9 @@ func (bc *BlockChain) ClearCheckpointSyncNoState() {
 		"block", head.Number, "root", head.Root)
 }
 
-// canMaskMissingState reports whether the XDC A.93/A.94 auto-enable of
-// checkpointSyncNoState may fire, i.e. whether a missing parent state or a
-// ValidateState mismatch may be masked by importing with EmptyRootHash instead
-// of surfacing as an error.
+// canMaskMissingState reports whether a missing parent state during bulk sync
+// may be masked by importing with EmptyRootHash. A ValidateState mismatch,
+// including one caused by a missing trie node, is never masked (F-2026-19723).
 //
 // Masking is only ever acceptable for a plain follower that is mid-bulk-sync on
 // an XDC chain. It is excluded for:
@@ -2948,8 +2971,8 @@ func (bc *BlockChain) ProcessBlock(ctx context.Context, parentRoot common.Hash, 
 	// Set up the state reader feeding execution, along with a cleanup to run once
 	// processing is complete (stop the prefetcher, upload reader statistics).
 	statedb, cleanup, err := bc.setupExecutionState(parentRoot, block, vmConfig, config, &interrupt, &execIndex)
-	// XDC: sdb backs the EmptyRootHash stand-in used while checkpointSyncNoState
-	// is active (here and in the A.94 recovery below). XDC chains are never UBT.
+	// XDC: sdb backs the EmptyRootHash stand-in used when the parent state is
+	// missing during bulk sync. XDC chains are never UBT.
 	sdb := state.NewMPTDatabase(bc.triedb, bc.codedb).WithSnapshot(bc.snaps)
 	if err != nil {
 		// XDC A.93: Auto-enable checkpointSyncNoState when parent state is
@@ -3056,42 +3079,18 @@ func (bc *BlockChain) ProcessBlock(ctx context.Context, parentRoot common.Hash, 
 		err = bc.validator.ValidateState(block, statedb, res, false)
 		spanEnd(&err)
 		if err != nil {
-			// XDC A.94: Auto-recover from "invalid merkle root" during bulk fast-sync.
-			// When NodeData/snap-sync delivered a partial trie at the pivot, `HasState`
-			// only checks the root node — deeper storage reads silently return zero,
-			// so execution produces a wrong IntermediateRoot even though `state.New`
-			// succeeded. We switch into checkpointSyncNoState mode and discard the
-			// wrong-state for this block; subsequent blocks skip execution+validation
-			// until snap-sync heals the trie. Strictly gated to XDC + XdcBulkSyncMode.
-			// Refs #886.
-			// #62 guard: an archive node or a block producer must surface a ValidateState
-			// mismatch as a bad
-			// block, never mask it (this is what hid the net #62 block-16 fork/gas
-			// divergence and blocked minting). See the A.93 note above.
-			//
-			// #1426: mask only when execution actually hit a missing trie node,
-			// i.e. the parent trie is genuinely incomplete. A mismatch on a
-			// complete state is a real divergence (or a forged root) and, as
-			// in canonical XDPoSChain, a bad block: masking it would canonize
-			// the block and latch no-state mode for every block after it.
-			var missing *trie.MissingNodeError
-			if bc.canMaskMissingState() && errors.As(statedb.Error(), &missing) {
-				log.Warn("BlockChain: A.94 auto-recover on ValidateState mismatch during bulk sync",
-					"block", block.NumberU64(), "err", err)
-				bc.storeCheckpointSyncNoState(true)
-				rawdb.WriteCheckpointSyncNoState(bc.db, true)
-				// Discard the wrong-state statedb and replace with an empty one so
-				// writeBlockAndSetHead persists EmptyRootHash for this block, not the
-				// incorrectly-executed trie.
-				res = &ProcessResult{Receipts: types.Receipts{}}
-				statedb, err = state.New(types.EmptyRootHash, sdb)
-				if err != nil {
-					return nil, err
-				}
-			} else {
-				bc.reportBadBlock(block, res, err)
-				return nil, err
-			}
+			// A state-root mismatch is a bad block, including when execution
+			// read a missing trie node (F-2026-19723). Masking that case wrote
+			// the block and latched no-state mode, so every later block skipped
+			// execution. The node does not canonize the block and does not enter
+			// no-state mode; the import can be retried once the trie node is
+			// present. A block whose execution matches the header root is still
+			// imported, which is every block a current node produces on a
+			// complete trie. The parent-state miss above is a different case:
+			// execution never started, and bulk sync still uses the empty trie
+			// there so a follower with no parent state can keep importing.
+			bc.reportBadBlock(block, res, err)
+			return nil, err
 		}
 	}
 	vtime := time.Since(vstart)
@@ -3278,13 +3277,11 @@ func (bc *BlockChain) insertSideChain(ctx context.Context, block *types.Block, i
 			// committed block the sidechain can never become canonical, so
 			// destroying canonical state history serves no purpose.
 			if bc.triedb.Scheme() == rawdb.PathScheme {
-				if cb, ok := bc.Engine().(committedBlocker); ok {
-					if lcb := cb.LatestCommittedBlock(); lcb != nil {
-						if parent.Number.Cmp(lcb.Number) <= 0 {
-							log.Debug("Sidechain fork ancestor at or below committed block; skipping state recovery",
-								"forkNum", parent.Number, "committedNum", lcb.Number, "root", parent.Root)
-							return nil, it.index, nil
-						}
+				if lcb := bc.latestCommittedBlock(); lcb != nil {
+					if parent.Number.Cmp(lcb.Number) <= 0 {
+						log.Debug("Sidechain fork ancestor at or below committed block; skipping state recovery",
+							"forkNum", parent.Number, "committedNum", lcb.Number, "root", parent.Root)
+						return nil, it.index, nil
 					}
 				}
 			}
@@ -3478,42 +3475,50 @@ func (bc *BlockChain) reorg(oldHead *types.Header, newHead *types.Header) error 
 	}
 	// XDC F-2026-19773: refuse a reorg that would drop an XDPoS v2 committed
 	// block from the canonical chain. Matches canonical XDPoSChain v2.9.3-testnet
-	// blockchain.go:3986-4004. The guard checks only the old chain (the chain
-	// being replaced): if the committed block appears there with the committed
-	// hash, the reorg is refused; a differing hash at the committed number is an
-	// impossible state and is logged as an error. The new chain is not checked
-	// here; verifying that the new chain also carries the committed block is a
-	// protocol-level gap present in canonical as well.
-	if cb, ok := bc.Engine().(committedBlocker); ok {
-		if lcb := cb.LatestCommittedBlock(); lcb != nil {
-			if commonBlock.Number.Cmp(lcb.Number) < 0 {
-				// Common ancestor is below the committed block — the old chain
-				// contains the committed block and the reorg would drop it.
-				for _, h := range oldChain {
-					if h.Number.Cmp(lcb.Number) == 0 {
-						if h.Hash() == lcb.Hash {
-							log.Warn("Stop reorg, blockchain is under forking attack",
-								"committedNum", lcb.Number, "committedHash", lcb.Hash,
-								"commonNum", commonBlock.Number, "commonHash", commonBlock.Hash())
-							return fmt.Errorf("stop reorg: new chain would drop XDPoS v2 committed block %d %s",
-								lcb.Number, lcb.Hash)
-						}
-						// The old chain at the committed number has a different
-						// hash — that is impossible (we committed it). Log and
-						// continue without refusing the reorg.
-						log.Error("Impossible reorg, please file an issue",
+	// blockchain.go:3986-4004, plus a new-chain check that canonical lacks: below
+	// the committed number the new chain must not carry a different hash at it.
+	// A new chain that has not reached the committed number yet is allowed, since
+	// it may still be the legitimate branch that later extends to it. The marker
+	// falls back to the database, so the guard also holds before the engine loads.
+	if lcb := bc.latestCommittedBlock(); lcb != nil {
+		if commonBlock.Number.Cmp(lcb.Number) < 0 {
+			// Common ancestor is below the committed block: the old chain
+			// contains the committed block and the reorg would drop it.
+			for _, h := range oldChain {
+				if h.Number.Cmp(lcb.Number) == 0 {
+					if h.Hash() == lcb.Hash {
+						log.Warn("Stop reorg, blockchain is under forking attack",
 							"committedNum", lcb.Number, "committedHash", lcb.Hash,
-							"oldChainHash", h.Hash())
-						break
+							"commonNum", commonBlock.Number, "commonHash", commonBlock.Hash())
+						return fmt.Errorf("stop reorg: new chain would drop XDPoS v2 committed block %d %s",
+							lcb.Number, lcb.Hash)
 					}
+					// The old chain at the committed number has a different
+					// hash — that is impossible (we committed it). Log and
+					// fall through to the new-chain check.
+					log.Error("Impossible reorg, please file an issue",
+						"committedNum", lcb.Number, "committedHash", lcb.Hash,
+						"oldChainHash", h.Hash())
+					break
 				}
-			} else if commonBlock.Number.Cmp(lcb.Number) == 0 && commonBlock.Hash() != lcb.Hash {
-				// Common ancestor is at the committed number but with a different
-				// hash — should never happen.
-				log.Error("Impossible reorg, please file an issue",
-					"committedNum", lcb.Number, "committedHash", lcb.Hash,
-					"commonHash", commonBlock.Hash())
 			}
+			// The old chain may not hold the committed block (e.g. its head is
+			// below it); the new chain must still not replace its hash.
+			for _, h := range newChain {
+				if h.Number.Cmp(lcb.Number) == 0 && h.Hash() != lcb.Hash {
+					log.Warn("Stop reorg, new chain replaces the committed block hash",
+						"committedNum", lcb.Number, "committedHash", lcb.Hash, "newChainHash", h.Hash(),
+						"commonNum", commonBlock.Number, "commonHash", commonBlock.Hash())
+					return fmt.Errorf("stop reorg: new chain carries %s at XDPoS v2 committed block %d, want %s",
+						h.Hash(), lcb.Number, lcb.Hash)
+				}
+			}
+		} else if commonBlock.Number.Cmp(lcb.Number) == 0 && commonBlock.Hash() != lcb.Hash {
+			// Common ancestor is at the committed number but with a different
+			// hash — should never happen.
+			log.Error("Impossible reorg, please file an issue",
+				"committedNum", lcb.Number, "committedHash", lcb.Hash,
+				"commonHash", commonBlock.Hash())
 		}
 	}
 	// Ensure the user sees large reorgs
@@ -3784,6 +3789,14 @@ func (bc *BlockChain) reportBadBlock(block *types.Block, res *ProcessResult, err
 	// syncer re-fetches it here, so do not record or log it as a bad block.
 	if errors.Is(err, consensus.ErrFutureBlock) && block.Time() <= uint64(time.Now().Unix())+maxTimeFutureBlocks {
 		log.Debug("Future block, retrying later", "number", block.Number(), "hash", block.Hash(), "time", block.Time())
+		return
+	}
+	// A V2 epoch switch whose gap snapshot is not seeded yet (snap/fast sync, gap
+	// below the pivot) is not a bad block: the data is missing, not wrong. Like
+	// ErrUnknownAncestor and ErrPrunedAncestor it is retried once the snapshot is
+	// proven (eth.xdcSyncer.proveGapPools), so no bad-block record is written.
+	if errors.Is(err, xdcutils.ErrV2SnapshotMissing) || errors.Is(err, xdcutils.ErrPenaltyDataUnavailable) {
+		log.Debug("Gap snapshot not seeded yet, retrying later", "number", block.Number(), "hash", block.Hash(), "err", err)
 		return
 	}
 	var receipts types.Receipts

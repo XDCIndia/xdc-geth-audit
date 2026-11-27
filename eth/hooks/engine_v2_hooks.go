@@ -511,9 +511,10 @@ func AttachConsensusV2Hooks(adaptor *XDPoS.XDPoS, bc *core.BlockChain, chainConf
 						signingTxs, ok := adaptor.GetCachedSigningTxs(bhash)
 						if !ok {
 							blk := chain.GetBlock(bhash, blockNumber)
-							if blk != nil {
-								signingTxs = adaptor.CacheSigner(bhash, blk.Transactions())
+							if blk == nil {
+								return nil, fmt.Errorf("%w: no block body at %d", XDPoS.ErrPenaltyDataUnavailable, blockNumber)
 							}
+							signingTxs = adaptor.CacheSigner(bhash, blk.Transactions())
 						}
 						signer := types.MakeSigner(chainConfig, big.NewInt(int64(blockNumber)), 0)
 						for _, tx := range signingTxs {
@@ -897,9 +898,9 @@ func GetSigningTxCount(c *XDPoS.XDPoS, chain *core.BlockChain, header *types.Hea
 // the same 2-epoch walk-back to find the reward window, accumulates burned fees
 // for the first epoch encountered, builds the masternode tier from the reward
 // checkpoint header, and (always, on this path) builds the protector/observer
-// tiers from the candidate set in parentState — sorted by stake DESC, with
-// penalised nodes and masternodes filtered out, taking up to MaxProtectorNodes
-// then MaxObserverNodes.
+// tiers from the rewarded epoch's gap snapshot. Chain 5551 keeps the older
+// parent-state pool because that devnet's reward history was produced that way.
+// The snapshot path takes up to MaxProtectorNodes then MaxObserverNodes.
 //
 // Adaptations vs the reference (forced by our codebase shapes):
 //   - Signer recovery uses types.MakeSigner/types.Sender (ecrecover) and our
@@ -982,7 +983,11 @@ func GetSigningTxCountTiered(c *XDPoS.XDPoS, chain *core.BlockChain, header *typ
 				if chainConfig.ChainID != nil && chainConfig.ChainID.Uint64() == 5551 {
 					standbyPool = legacyStandbyPool(parentState, h, nodesToKeep[MasterNodeBeneficiary])
 				} else {
-					standbyPool = c.GetStandbynodes(chain, h)
+					var standErr error
+					standbyPool, standErr = c.GetStandbynodes(chain, h)
+					if standErr != nil {
+						return nil, 0, burnedInOneEpoch, standErr
+					}
 				}
 				protectorEnd := min(currentConfig.MaxProtectorNodes, len(standbyPool))
 				observerEnd := min(protectorEnd+currentConfig.MaxObserverNodes, len(standbyPool))

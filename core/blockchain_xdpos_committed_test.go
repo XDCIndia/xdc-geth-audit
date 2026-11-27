@@ -7,10 +7,12 @@ import (
 	"math/big"
 	"testing"
 
+	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/consensus"
 	"github.com/ethereum/go-ethereum/consensus/ethash"
 	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/ethdb"
 	"github.com/ethereum/go-ethereum/params"
 )
 
@@ -140,6 +142,75 @@ func testReorgAllowedAboveCommittedBlock(t *testing.T, scheme string) {
 		t.Fatalf("reorg guard incorrectly fired for a reorg above the committed block: %v", err)
 	}
 	t.Logf("InsertChain result for above-committed reorg: %v (ok)", err)
+}
+
+// TestSetHeadRefusedBelowCommittedBlock checks that SetHead cannot rewind
+// under the committed block. The sync rollback path uses SetHead and does
+// not go through reorg.
+func TestSetHeadRefusedBelowCommittedBlock(t *testing.T) {
+	eng := &committedEngine{Engine: ethash.NewFaker()}
+	genesis := &Genesis{
+		BaseFee: big.NewInt(params.InitialBaseFee),
+		Config:  params.AllEthashProtocolChanges,
+	}
+	bc, err := NewBlockChain(rawdb.NewMemoryDatabase(), genesis, eng, nil)
+	if err != nil {
+		t.Fatalf("NewBlockChain: %v", err)
+	}
+	defer bc.Stop()
+	_, canonBlocks := makeBlockChainWithGenesis(genesis, 8, ethash.NewFaker(), canonicalSeed)
+	if _, err := bc.InsertChain(canonBlocks); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	eng.committed = &types.BlockInfo{Hash: canonBlocks[5].Hash(), Number: canonBlocks[5].Number()}
+	if err := bc.SetHead(3); err == nil {
+		t.Fatal("SetHead below the committed block was accepted")
+	}
+	if head := bc.CurrentBlock().Number.Uint64(); head != 8 {
+		t.Fatalf("head = %d, want 8", head)
+	}
+	if err := bc.SetHead(6); err != nil {
+		t.Fatalf("SetHead at the committed block: %v", err)
+	}
+}
+
+func reorgNewChainSetup(t *testing.T, forkLen int) (*BlockChain, *committedEngine, ethdb.Database, types.Blocks) {
+	t.Helper()
+	eng := &committedEngine{Engine: ethash.NewFaker()}
+	genesis := &Genesis{
+		BaseFee: big.NewInt(params.InitialBaseFee),
+		Config:  params.AllEthashProtocolChanges,
+	}
+	db := rawdb.NewMemoryDatabase()
+	bc, err := NewBlockChain(db, genesis, eng, nil)
+	if err != nil {
+		t.Fatalf("NewBlockChain: %v", err)
+	}
+	t.Cleanup(bc.Stop)
+	genDb, canonBlocks := makeBlockChainWithGenesis(genesis, 4, ethash.NewFaker(), canonicalSeed)
+	if _, err := bc.InsertChain(canonBlocks); err != nil {
+		t.Fatalf("insert canonical chain: %v", err)
+	}
+	fork := makeBlockChain(bc.chainConfig, canonBlocks[1], forkLen, ethash.NewFaker(), genDb, forkSeed)
+	for _, b := range fork {
+		rawdb.WriteBlock(db, b)
+	}
+	return bc, eng, db, fork
+}
+
+// TestReorgRefusedWhenNewChainReplacesCommittedHash covers F-2026-19773: the old
+// chain (head 4) lacks the committed block 6, and the new chain carries a
+// different hash at that number.
+func TestReorgRefusedWhenNewChainReplacesCommittedHash(t *testing.T) {
+	bc, eng, _, fork := reorgNewChainSetup(t, 8) // fork covers blocks 3..10
+	eng.committed = &types.BlockInfo{Hash: common.Hash{0xc0, 0xff, 0xee}, Number: big.NewInt(6)}
+	err := bc.reorg(bc.CurrentBlock(), fork[len(fork)-1].Header())
+	if err == nil || !containsStr(err.Error(), "stop reorg") {
+		t.Fatalf("reorg error = %v, want a stop reorg refusal", err)
+	}
+	if head := bc.CurrentBlock().Number.Uint64(); head != 4 {
+		t.Fatalf("head = %d, want 4", head)
+	}
 }
 
 // containsStr is strings.Contains without importing strings.

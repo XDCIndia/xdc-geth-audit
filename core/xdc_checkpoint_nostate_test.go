@@ -97,8 +97,8 @@ func TestClearCheckpointSyncNoStateRefusesWithoutHeadState(t *testing.T) {
 
 // TestMinerNodeNeverAutoEntersNoStateMode pins the FIX 4 exclusion.
 //
-// canMaskMissingState is the single predicate behind all three A.93/A.94
-// auto-enable sites in blockchain.go. Masking a missing parent state imports
+// canMaskMissingState gates the missing-parent mask in blockchain.go. A
+// ValidateState mismatch is not masked. Masking a missing parent state imports
 // every later block with EmptyRootHash, which permanently poisons the DB and
 // then gates the miner off entirely (miner/xdpos_worker.go Gate 3.1) — a seated
 // masternode that mints nothing and times out its slot every round, forever.

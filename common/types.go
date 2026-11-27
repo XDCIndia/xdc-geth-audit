@@ -269,9 +269,12 @@ func CopyXDCConstants(chainID uint64) {
 		TIPXDCX = big.NewInt(0)
 		TIPXDCXLending = big.NewInt(0)
 		TIPXDCXMinerDisable = big.NewInt(0)
-		// Same sentinel fix as chainId 551: TIPXDCXReceiverDisable must be >
-		// TIPXDCX (0) so that IsTIPXDCXReceiver returns true for all blocks.
-		TIPXDCXReceiverDisable = big.NewInt(1e17)
+		// Canonical v2.7.1 common/constants.local.go sets tipXDCXReceiverDisable=0
+		// (v3 params/config_networks.go:538,:566), so IsTIPXDCXReceiver is false on
+		// every block and a tx to 0x91-0x94 runs through the EVM and pays gas.
+		// Hacken F-2026-19459 follow-up. Chains 5050 and 5551 have no canonical
+		// profile, so they keep the 1e17 sentinel below.
+		TIPXDCXReceiverDisable = big.NewInt(0)
 		BlackListHFNumber = 0
 		TIP2019Block = big.NewInt(0)
 		// XDPoSChain constants.local.go: tipRandomize=0 — active from genesis so that
@@ -297,8 +300,9 @@ func CopyXDCConstants(chainID uint64) {
 		TIPXDCXCancellationFee = big.NewInt(0) // Istanbul from genesis — matches oracle
 		// 0x92 XDCx special txs route to ApplyEmptyTransaction (zero gas) whenever
 		// IsTIPXDCXReceiver is true. Setting ReceiverDisable to a large sentinel keeps
-		// that window open for all practical block numbers. The oracle also uses zero
-		// gas for 0x92 txs throughout (confirmed: gasUsed=0 on blocks 1..1800).
+		// that window open for all practical block numbers. Observed on the net5050
+		// oracle: gasUsed=0 on blocks 1..1800. There is no canonical value for chain
+		// 5050 (not in XDPoSChain v2.7.1 or v3), so this stays as observed.
 		TIPXDCX = big.NewInt(0)
 		TIPXDCXLending = big.NewInt(0)
 		TIPXDCXMinerDisable = big.NewInt(0)

@@ -140,6 +140,40 @@ func voteRoundInRange(vote, current types.Round) bool {
 }
 
 // gapFromSwitch is the snapshot gap number of the epoch that opens at switchNum.
+// timeoutGapMatchesEpoch requires the certificate gap to be the gap block of
+// the epoch that contains the timeout round. An unresolved epoch is not an
+// error; the caller decides whether it can continue.
+//
+// A timeout for a round that opens a new epoch is signed before that epoch's
+// switch block exists, so sendTimeout signs the gap of the next block. That
+// gap is accepted while the round is past the epoch of the known switch block.
+func (x *XDPoS_v2) timeoutGapMatchesEpoch(chain consensus.ChainReader, epochInfo *types.EpochSwitchInfo, round types.Round, gap uint64) error {
+	var head *types.Header
+	if chain != nil {
+		head = chain.CurrentHeader()
+	}
+	return x.timeoutGapMatchesEpochAt(chain, head, epochInfo, round, gap)
+}
+
+// timeoutGapMatchesEpochAt is timeoutGapMatchesEpoch with the reference header
+// (the head, or the parent of a header that carries the certificate) given.
+func (x *XDPoS_v2) timeoutGapMatchesEpochAt(chain consensus.ChainReader, head *types.Header, epochInfo *types.EpochSwitchInfo, round types.Round, gap uint64) error {
+	if epochInfo == nil || epochInfo.EpochSwitchBlockInfo == nil || epochInfo.EpochSwitchBlockInfo.Number == nil {
+		return nil
+	}
+	want := x.gapFromSwitch(epochInfo.EpochSwitchBlockInfo.Number.Uint64())
+	if gap == want {
+		return nil
+	}
+	if x.config != nil && x.config.Epoch > 0 && chain != nil &&
+		uint64(round)/x.config.Epoch > uint64(epochInfo.EpochSwitchBlockInfo.Round)/x.config.Epoch {
+		if head != nil && gap == x.gapFromSwitch(head.Number.Uint64()+1) {
+			return nil
+		}
+	}
+	return fmt.Errorf("timeout gap %d is not gap %d of epoch switch %s", gap, want, epochInfo.EpochSwitchBlockInfo.Number)
+}
+
 func (x *XDPoS_v2) gapFromSwitch(switchNum uint64) uint64 {
 	if x.config == nil || x.config.Epoch == 0 {
 		return 0
@@ -231,7 +265,11 @@ func (x *XDPoS_v2) voteHandler(chain consensus.ChainReader, voteMsg *types.Vote)
 	// Equivocation detection in goroutines — never blocks or alters acceptance (#1478).
 	if x.ForensicsProcessor != nil {
 		go x.ForensicsProcessor.DetectEquivocationInVotePool(voteMsg, x.votePool)
-		go x.ForensicsProcessor.ProcessVoteEquivocation(chain, x, voteMsg)
+		go func() {
+			if err := x.ForensicsProcessor.ProcessVoteEquivocation(chain, x, voteMsg); err != nil {
+				log.Error("[forensics] vote equivocation failed", "err", err)
+			}
+		}()
 	}
 
 	// Get epoch info

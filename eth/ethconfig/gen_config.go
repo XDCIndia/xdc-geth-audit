@@ -62,7 +62,8 @@ func (c Config) MarshalTOML() (interface{}, error) {
 		EnablePreimageRecording bool
 		EnableWitnessStats      bool
 		StatelessSelfValidation bool
-		SnapV2                  *bool `toml:",omitempty"`
+		SnapV2                  *bool    `toml:",omitempty"`
+		SnapGapRPC              []string `toml:",omitempty"`
 		VMTrace                 string
 		VMTraceJsonConfig       string
 		RPCGasCap               uint64
@@ -125,6 +126,7 @@ func (c Config) MarshalTOML() (interface{}, error) {
 	enc.EnableWitnessStats = c.EnableWitnessStats
 	enc.StatelessSelfValidation = c.StatelessSelfValidation
 	enc.SnapV2 = c.SnapV2
+	enc.SnapGapRPC = c.SnapGapRPC
 	enc.VMTrace = c.VMTrace
 	enc.VMTraceJsonConfig = c.VMTraceJsonConfig
 	enc.RPCGasCap = c.RPCGasCap
@@ -190,7 +192,8 @@ func (c *Config) UnmarshalTOML(unmarshal func(interface{}) error) error {
 		EnablePreimageRecording *bool
 		EnableWitnessStats      *bool
 		StatelessSelfValidation *bool
-		SnapV2                  *bool `toml:",omitempty"`
+		SnapV2                  *bool    `toml:",omitempty"`
+		SnapGapRPC              []string `toml:",omitempty"`
 		VMTrace                 *string
 		VMTraceJsonConfig       *string
 		RPCGasCap               *uint64
@@ -347,6 +350,9 @@ func (c *Config) UnmarshalTOML(unmarshal func(interface{}) error) error {
 	}
 	if dec.SnapV2 != nil {
 		c.SnapV2 = dec.SnapV2
+	}
+	if dec.SnapGapRPC != nil {
+		c.SnapGapRPC = dec.SnapGapRPC
 	}
 	if dec.VMTrace != nil {
 		c.VMTrace = *dec.VMTrace

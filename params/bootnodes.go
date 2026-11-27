@@ -95,6 +95,12 @@ var V5Bootnodes = []string{
 	"enr:-LK4QKWrXTpV9T78hNG6s8AM6IO4XH9kFT91uZtFg1GcsJ6dKovDOr1jtAAFPnS2lvNltkOGA9k29BUN7lFh_sjuc9QBh2F0dG5ldHOIAAAAAAAAAACEZXRoMpC1MD8qAAAAAP__________gmlkgnY0gmlwhANAdd-Jc2VjcDI1NmsxoQLQa6ai7y9PMN5hpLe5HmiJSlYzMuzP7ZhwRiwHvqNXdoN0Y3CCI4yDdWRwgiOM", // 3.64.117.223 | aws-eu-central-1-frankfurt}
 }
 
+// XDCMainnetGapRPCs are the JSON-RPC endpoints a snap/fast-synced node asks for
+// eth_getProof of the 0x88 validator contract at old gap blocks (XDC mainnet,
+// chain 50). They need not be trusted: every proof is verified against the gap
+// header's state root. Overridden by --snap.gap-rpc; an empty value disables them.
+var XDCMainnetGapRPCs = []string{"https://01.xdcrpc.com"}
+
 // XDCMainnetBootnodes are the enode URLs of the P2P bootstrap nodes running on
 // the XDC mainnet (Chain ID: 50).
 // Source: XinFinOrg/XinFin-Node mainnet/bootnodes.list (port 30303).

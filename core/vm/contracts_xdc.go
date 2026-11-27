@@ -156,6 +156,13 @@ func (c *xdcxEpochPrice) RequiredGas(input []byte) uint64  { return 1 }
 func (c *xdcxEpochPrice) Run(input []byte) ([]byte, error) { return make([]byte, 32), nil }
 func (c *xdcxEpochPrice) Name() string                     { return "XDCX_EPOCH_PRICE" }
 
+// CappedBulletproofVerifier returns precompile 0x28 with a commitment cap, for
+// RPC execution only (eth_call and friends). Consensus must keep the uncapped
+// instance. F-2026-20591.
+func CappedBulletproofVerifier(maxComms uint32) PrecompiledContract {
+	return &bulletproofVerifier{maxComms: maxComms}
+}
+
 // xdcxExtras is the set of four XDCx precompile entries that augment the
 // standard sets for XDC blocks before TIPXDCXMinerDisable.
 var xdcxExtras = PrecompiledContracts{

@@ -172,6 +172,11 @@ func (p *StateProcessor) Process(ctx context.Context, block *types.Block, stated
 	// Run the pre-execution system calls
 	blockAccessList.Merge(PreExecution(ctx, block.BeaconRoot(), parent, config, evm, block.Number(), block.Time()))
 
+	// XDC: the TRC21 fee recipient, read once per block here. Before
+	// TIPUpgradePenalty it stays the fee recipient of every tx of the block,
+	// whatever an earlier tx did to the candidate's owner (see the loop).
+	blockOwner := getCoinbaseOwner(p.chain.Engine(), statedb, header)
+
 	// XDC: TRC21 token fees (XDPoSChain core/blockchain.go + Process). Tokens
 	// registered in the TRC21 issuer pay the fees of transactions sent to them
 	// from their fee capacity, read once from the parent state here and drawn
@@ -243,15 +248,18 @@ func (p *StateProcessor) Process(ctx context.Context, block *types.Block, stated
 			continue
 		}
 		tokenFee := ApplyTRC21TokenFee(config, msg, tokensFee, tx, blockNumber)
-		// XDC: resolve the TRC21 fee recipient for this tx. After TIPTRC21Fee
-		// (Apothem 23,779,191), the masternode's registered candidate-owner —
-		// looked up from the validator contract (0x88) — receives the gas-fee
-		// credit instead of the masternode. Canonical reads it from state for
-		// each transaction (core/state_processor.go:442-443 and :652 in
-		// XDPoSChain v3.0.0-testnet-2), so an owner change by an earlier tx of
-		// the block applies to the fee of a later one (XDC-HUNT-35). Passed to
-		// ApplyTransactionWithEVM where it routes the fee in state_transition.go.
-		coinbaseOwner := getCoinbaseOwner(p.chain.Engine(), statedb, header)
+		// XDC: TRC21 fee recipient. After TIPTRC21Fee, the masternode's registered
+		// candidate-owner (read from the validator contract 0x88) receives the
+		// gas-fee credit instead of the masternode. The read point is a consensus
+		// rule, gated on TIPUpgradePenalty (F-2026-20641): before it (mainnet,
+		// legacy-profile nets; canonical XDPoSChain v2.7.1) the owner read at the
+		// start of the block applies to every tx; from it (Apothem 83,600,000;
+		// canonical v2.8.0 onward) it is read from state for each tx,
+		// so an owner change by an earlier tx applies to the fee of a later one.
+		coinbaseOwner := blockOwner
+		if config.IsTIPUpgradePenalty(blockNumber) {
+			coinbaseOwner = getCoinbaseOwner(p.chain.Engine(), statedb, header)
+		}
 		statedb.SetTxContext(tx.Hash(), i, uint32(i+1))
 		receipt, bal, err := applyTransactionWithEVM(ctx, msg, gp, statedb, blockNumber, blockHash, context.Time, tx, evm, eagerBloom, coinbaseOwner)
 		if err != nil {
@@ -951,6 +959,23 @@ func ApplyEmptyTransaction(config *params.ChainConfig, statedb *state.StateDB, b
 		root = statedb.IntermediateRoot(params.Rules{IsEIP158: config.IsEIP158(blockNumber)}).Bytes()
 	}
 
+	// Chain IDs 5151, 5050 and 5551 still have the empty-tx route open.
+	// Mainnet and Apothem keep the historical zero-gas receipt with no nonce change.
+	if emptyRouteTracksNonce(config) {
+		from, err := types.Sender(types.MakeSigner(config, blockNumber, 0), tx)
+		if err != nil {
+			return nil, err
+		}
+		nonce := statedb.GetNonce(from)
+		if tx.Nonce() < nonce {
+			return nil, fmt.Errorf("%w: empty tx nonce %d, state %d", ErrNonceTooLow, tx.Nonce(), nonce)
+		}
+		if tx.Nonce() > nonce {
+			return nil, fmt.Errorf("%w: empty tx nonce %d, state %d", ErrNonceTooHigh, tx.Nonce(), nonce)
+		}
+		statedb.SetNonce(from, nonce+1, tracing.NonceChangeUnspecified)
+	}
+
 	emptyLog := &types.Log{
 		BlockNumber: blockNumber.Uint64(),
 	}
@@ -981,6 +1006,18 @@ func ApplyEmptyTransaction(config *params.ChainConfig, statedb *state.StateDB, b
 // token registered in the TRC21 issuer: the fee is then paid from the token's
 // capacity, at the TRC21 gas price of the block (XDPoSChain tx.AsMessage). It
 // reports whether msg is one. Call it on the normal (non special-tx) path only.
+func emptyRouteTracksNonce(config *params.ChainConfig) bool {
+	if config == nil || config.ChainID == nil {
+		return false
+	}
+	switch config.ChainID.Uint64() {
+	case 5151, 5050, 5551:
+		return true
+	default:
+		return false
+	}
+}
+
 func ApplyTRC21TokenFee(config *params.ChainConfig, msg *Message, tokensFee map[common.Address]*big.Int, tx *types.Transaction, blockNumber *big.Int) bool {
 	to := tx.To()
 	if to == nil {
@@ -1026,6 +1063,9 @@ func ApplyTransactionForTrace(ctx context.Context, msg *Message, statedb *state.
 	if route == TxRouteEVM {
 		capacity := state.GetTRC21FeeCapacityFromState(statedb)
 		tokenFee := ApplyTRC21TokenFee(config, msg, capacity, tx, blockNumber)
+		// Read per tx, i.e. the post-TIPUpgradePenalty rule. Before the fork the
+		// consensus rule is the owner at block start, which this path does not
+		// have; tracing is not consensus, so it is left as is.
 		owner := state.GetCandidateOwner(statedb, evm.Context.Coinbase)
 		receipt, _, err := ApplyTransactionWithEVM(ctx, msg, NewGasPool(msg.GasLimit), statedb, blockNumber, blockHash, blockTime, tx, evm, owner)
 		if err == nil && tokenFee && receipt.Status == types.ReceiptStatusFailed {

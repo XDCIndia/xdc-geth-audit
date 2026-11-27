@@ -78,6 +78,11 @@ type XDPoS_v2 struct {
 	lock     sync.RWMutex
 	signLock sync.RWMutex
 
+	// broadcastQuit is closed by StopBroadcast. A send that starts after that
+	// returns instead of blocking on BroadcastCh.
+	broadcastQuit chan struct{}
+	broadcastStop sync.Once
+
 	// Channels
 	BroadcastCh  chan interface{}
 	minePeriodCh chan int
@@ -129,6 +134,9 @@ type XDPoS_v2 struct {
 	// re-verifies them once the canonical DB is committed.
 	// Thread-safe (lru.Cache uses an internal mutex).
 	pendingSwitchRechecks *lru.Cache[common.Hash, uint64]
+
+	// anchorWalk tracks the fast-sync anchor's parent-hash chain (F-2026-20645).
+	anchorWalk anchorWalk
 }
 
 // markSelfMined records round as the highest round this node sealed. The
@@ -165,6 +173,13 @@ func New(chainConfig *params.ChainConfig, db ethdb.Database, minePeriodCh chan i
 		engineInstance = createEngine(chainConfig, db, minePeriodCh, newRoundCh)
 	})
 	return engineInstance
+}
+
+// NewIsolated returns an engine that is not the process singleton. Production
+// wiring uses New. Callers that must not capture that singleton (tests with
+// their own database) use this.
+func NewIsolated(chainConfig *params.ChainConfig, db ethdb.Database, minePeriodCh chan int, newRoundCh chan types.Round) *XDPoS_v2 {
+	return createEngine(chainConfig, db, minePeriodCh, newRoundCh)
 }
 
 // createEngine is the actual engine creation logic (extracted from New)
@@ -206,6 +221,7 @@ func createEngine(chainConfig *params.ChainConfig, db ethdb.Database, minePeriod
 
 		timeoutWorker: timeoutTimer,
 		BroadcastCh:   make(chan interface{}),
+		broadcastQuit: make(chan struct{}),
 		minePeriodCh:  minePeriodCh,
 		newRoundCh:    newRoundCh,
 
@@ -237,6 +253,7 @@ func createEngine(chainConfig *params.ChainConfig, db ethdb.Database, minePeriod
 
 		ForensicsProcessor: NewForensics(),
 	}
+	go engine.watchForensics()
 
 	// Set timeout callback
 	timeoutTimer.OnTimeoutFn = engine.OnCountdownTimeout
@@ -272,10 +289,27 @@ func (x *XDPoS_v2) UpdateParams(header *types.Header) {
 	// Without this guard the goroutine blocks forever on a nil channel — a goroutine
 	// leak under round churn. With real channels wired (eth/backend.go), the
 	// buffered send succeeds immediately when the worker drains.
-	if x.minePeriodCh != nil {
-		go func() {
-			x.minePeriodCh <- x.config.V2.CurrentConfig.MinePeriod
-		}()
+	x.notifyMinePeriod(x.config.V2.CurrentConfig.MinePeriod)
+}
+
+// notifyMinePeriod hands the latest mine period to the worker without
+// blocking and without a goroutine. A node that does not mine has no reader on
+// minePeriodCh, so a blocking send would leak one goroutine per call.
+// The channel holds one value; when it is full the stale value is replaced.
+func (x *XDPoS_v2) notifyMinePeriod(period int) {
+	if x.minePeriodCh == nil {
+		return
+	}
+	for {
+		select {
+		case x.minePeriodCh <- period:
+			return
+		default:
+		}
+		select {
+		case <-x.minePeriodCh:
+		default:
+		}
 	}
 }
 
@@ -283,6 +317,14 @@ func (x *XDPoS_v2) UpdateParams(header *types.Header) {
 // Aligned with XDPoSChain v2.6.8: uses header.Extra directly (no seal stripping)
 // and includes Validators/Penalties inline to ensure identical RLP encoding.
 func sigHash(header *types.Header) common.Hash {
+	return sigHashWith(header, false)
+}
+
+// sigHashWith is sigHash, plus header.BlockAccessListHash when bindBAL is set.
+// bindBAL comes from V2.IsBALSeal, so the F-2026-19601 seal change only applies
+// from a configured activation block. Chains that already carry the field
+// (net2040 after Amsterdam) keep verifying seals made without it.
+func sigHashWith(header *types.Header, bindBAL bool) common.Hash {
 	hasher := sha3.NewLegacyKeccak256()
 
 	enc := []interface{}{
@@ -307,6 +349,11 @@ func sigHash(header *types.Header) common.Hash {
 	if header.BaseFee != nil {
 		enc = append(enc, header.BaseFee)
 	}
+	// BlockAccessListHash is outside the historical seal. It is bound only
+	// from the V2 balSealBlock activation, never by its mere presence.
+	if bindBAL && header.BlockAccessListHash != nil {
+		enc = append(enc, *header.BlockAccessListHash)
+	}
 	if err := rlp.Encode(hasher, enc); err != nil {
 		panic("rlp.Encode fail: " + err.Error())
 	}
@@ -317,13 +364,13 @@ func sigHash(header *types.Header) common.Hash {
 
 // ecrecover extracts the signer address from a signed header.
 // Aligned with XDPoSChain v2.6.8: signature is always in header.Validator for V2 blocks.
-func ecrecover(header *types.Header, sigcache *lru.Cache[common.Hash, common.Address]) (common.Address, error) {
+func ecrecover(header *types.Header, sigcache *lru.Cache[common.Hash, common.Address], bindBAL bool) (common.Address, error) {
 	hash := header.Hash()
 	if address, known := sigcache.Get(hash); known {
 		return address, nil
 	}
 
-	pubkey, err := crypto.Ecrecover(sigHash(header).Bytes(), header.Validator)
+	pubkey, err := crypto.Ecrecover(sigHashWith(header, bindBAL).Bytes(), header.Validator)
 	if err != nil {
 		return common.Address{}, err
 	}
@@ -336,7 +383,7 @@ func ecrecover(header *types.Header, sigcache *lru.Cache[common.Hash, common.Add
 
 // SignHash returns the hash for signing
 func (x *XDPoS_v2) SignHash(header *types.Header) common.Hash {
-	return sigHash(header)
+	return x.sealHash(header)
 }
 
 // Initial initializes V2 engine state from the current chain state
@@ -361,10 +408,19 @@ func (x *XDPoS_v2) ReinitBFT(chain consensus.ChainReader, header *types.Header) 
 	// ProposedBlockInfo must be initialized (not nil) because initial() checks
 	// x.highestQuorumCert.ProposedBlockInfo.Hash — a nil pointer dereferences.
 	x.isInitialized = false
+	prev := x.highestQuorumCert
 	x.highestQuorumCert = &types.QuorumCert{
 		ProposedBlockInfo: &types.BlockInfo{},
 	}
-	return x.initial(chain, header)
+	err := x.initial(chain, header)
+	// F-2026-19609: the head header carries the certificate for its parent.
+	// A node that already holds the certificate for the head itself must not
+	// fall back one block.
+	if prev != nil && prev.ProposedBlockInfo != nil && prev.ProposedBlockInfo.Hash != (common.Hash{}) &&
+		prev.ProposedBlockInfo.Round > x.highestQuorumCert.ProposedBlockInfo.Round {
+		x.highestQuorumCert = prev
+	}
+	return err
 }
 
 func (x *XDPoS_v2) initial(chain consensus.ChainReader, header *types.Header) error {
@@ -434,6 +490,8 @@ func (x *XDPoS_v2) initial(chain consensus.ChainReader, header *types.Header) er
 		}
 	}
 
+	x.raiseHighestQCFromLock(chain)
+
 	// Initialize first v2 snapshot
 	lastGapNum := uint64(0)
 	if x.config.V2.SwitchBlock.Uint64() > x.config.Gap {
@@ -472,13 +530,10 @@ func (x *XDPoS_v2) initial(chain consensus.ChainReader, header *types.Header) er
 			// Initialize timeout
 			minePeriod := x.config.V2.CurrentConfig.MinePeriod
 			log.Warn("[initial] miner wait period", "period", minePeriod)
-			// A.97-M.A Task 1 nil-guard: see UpdateParams comment above.
-			if x.minePeriodCh != nil {
-				go func() {
-					x.minePeriodCh <- minePeriod
-				}()
-			}
+			// Non-blocking, nil-safe: see notifyMinePeriod (F-2026-20604).
+			x.notifyMinePeriod(minePeriod)
 			// Start countdown timer
+			x.applyTimeoutParamsForHeader(header)
 			x.timeoutWorker.Reset(chain, 0, 0)
 			log.Warn("[initial] finish initialisation (deferred snapshot)")
 			return nil
@@ -521,12 +576,9 @@ func (x *XDPoS_v2) initial(chain consensus.ChainReader, header *types.Header) er
 				}
 				minePeriod := x.config.V2.CurrentConfig.MinePeriod
 				log.Warn("[initial] miner wait period", "period", minePeriod)
-				// A.97-M.A Task 1 nil-guard: see UpdateParams comment above.
-				if x.minePeriodCh != nil {
-					go func() {
-						x.minePeriodCh <- minePeriod
-					}()
-				}
+				// Non-blocking, nil-safe: see notifyMinePeriod (F-2026-20604).
+				x.notifyMinePeriod(minePeriod)
+				x.applyTimeoutParamsForHeader(header)
 				x.timeoutWorker.Reset(chain, 0, 0)
 				log.Warn("[initial] finish initialisation (deferred snapshot)")
 				return nil
@@ -561,14 +613,13 @@ func (x *XDPoS_v2) initial(chain consensus.ChainReader, header *types.Header) er
 	// Initialize timeout
 	minePeriod := x.config.V2.CurrentConfig.MinePeriod
 	log.Warn("[initial] miner wait period", "period", minePeriod)
-	// A.97-M.A Task 1 nil-guard: see UpdateParams comment above.
-	if x.minePeriodCh != nil {
-		go func() {
-			x.minePeriodCh <- minePeriod
-		}()
-	}
+	// Non-blocking, nil-safe: see notifyMinePeriod (F-2026-20604).
+	x.notifyMinePeriod(minePeriod)
 
-	// Start countdown timer
+	// Start countdown timer with the head's round config, not the round-zero
+	// values left from engine construction. processQC may be skipped on this
+	// path, so setNewRound is not guaranteed to run first.
+	x.applyTimeoutParamsForHeader(header)
 	x.timeoutWorker.Reset(chain, 0, 0)
 	// F-2026-19774: restore persisted local safety state before marking ready.
 	x.loadBFTSafetyState()
@@ -576,6 +627,60 @@ func (x *XDPoS_v2) initial(chain consensus.ChainReader, header *types.Header) er
 
 	log.Warn("[initial] finish initialisation")
 	return nil
+}
+
+// raiseHighestQCFromLock restores the certificate for the block the node
+// certified before shutdown. The lock is the certificate for the head, but the
+// head header only carries the certificate for its parent, so after a restart
+// highestQuorumCert sits one block below the lock. Every leader then builds a
+// sibling of the head and verifyVotingRule refuses it (F-2026-19609). The lock
+// is raised only when its block is local and its signatures verify.
+func (x *XDPoS_v2) raiseHighestQCFromLock(chain consensus.ChainReader) {
+	lock := x.lockQuorumCert
+	if lock == nil || lock.ProposedBlockInfo == nil || lock.ProposedBlockInfo.Number == nil ||
+		lock.ProposedBlockInfo.Round <= x.highestQuorumCert.ProposedBlockInfo.Round {
+		return
+	}
+	h := chain.GetHeaderByHash(lock.ProposedBlockInfo.Hash)
+	if h == nil {
+		return
+	}
+	if err := x.verifyQC(chain, lock, h, nil); err != nil {
+		log.Warn("[initial] stored lock QC failed verification, not raising highest QC",
+			"round", lock.ProposedBlockInfo.Round, "number", lock.ProposedBlockInfo.Number, "err", err)
+		return
+	}
+	log.Info("[initial] raising highest QC to the stored lock",
+		"from", x.highestQuorumCert.ProposedBlockInfo.Round, "to", lock.ProposedBlockInfo.Round)
+	if err := x.processQC(chain, lock); err != nil {
+		log.Warn("[initial] processQC of the stored lock failed", "err", err)
+	}
+}
+
+// applyTimeoutParamsForHeader selects the V2 timeout config for the header's
+// round and installs it on the countdown before the first Reset.
+func (x *XDPoS_v2) applyTimeoutParamsForHeader(header *types.Header) {
+	if x.config == nil || x.config.V2 == nil || x.timeoutWorker == nil {
+		return
+	}
+	var round types.Round
+	if header != nil {
+		if _, decoded, err := x.getExtraFieldsNoChain(header); err == nil {
+			round = decoded
+		}
+	}
+	x.config.V2.UpdateConfig(uint64(round))
+	cfg := x.config.V2.CurrentConfig
+	if cfg == nil {
+		return
+	}
+	if err := x.timeoutWorker.SetParams(
+		time.Duration(cfg.TimeoutPeriod)*time.Second,
+		cfg.ExpTimeoutConfig.Base,
+		int(cfg.ExpTimeoutConfig.MaxExponent),
+	); err != nil {
+		log.Error("[initial] timeoutWorker.SetParams failed", "round", round, "err", err)
+	}
 }
 
 // loadBFTSafetyState reads the persisted equivocation-guard values from the DB
@@ -599,11 +704,27 @@ func (x *XDPoS_v2) loadBFTSafetyState() {
 			x.lockQuorumCert = stored
 		}
 	}
+	if stored := rawdb.ReadBFTCommittedBlock(x.db); stored != nil {
+		if x.highestCommitBlock == nil || (stored.Number != nil && (x.highestCommitBlock.Number == nil || stored.Number.Cmp(x.highestCommitBlock.Number) > 0)) {
+			log.Info("[loadBFTSafetyState] restoring committed block", "number", stored.Number, "hash", stored.Hash)
+			x.highestCommitBlock = stored
+		}
+	}
 }
 
 // Author returns the signer of a block
 func (x *XDPoS_v2) Author(header *types.Header) (common.Address, error) {
-	return ecrecover(header, x.signatures)
+	return ecrecover(header, x.signatures, x.config.V2.IsBALSeal(header.Number))
+}
+
+// SigningHash is the digest a V2 proposer signs.
+func (x *XDPoS_v2) SigningHash(header *types.Header) common.Hash {
+	return x.sealHash(header)
+}
+
+// sealHash is the V2 proposer seal digest for header under this chain's config.
+func (x *XDPoS_v2) sealHash(header *types.Header) common.Hash {
+	return sigHashWith(header, x.config.V2.IsBALSeal(header.Number))
 }
 
 // VerifyHeader verifies a header for V2 consensus
@@ -658,6 +779,7 @@ func (x *XDPoS_v2) Prepare(chain consensus.ChainReader, header *types.Header) er
 	x.lock.RLock()
 	currentRound := x.currentRound
 	highestQC := x.highestQuorumCert
+	highestTC := x.highestTimeoutCert
 	x.lock.RUnlock()
 
 	// A.99: If highestQC is still at zero (engine bootstrapped but QC never seeded
@@ -679,6 +801,7 @@ func (x *XDPoS_v2) Prepare(chain consensus.ChainReader, header *types.Header) er
 			}
 			currentRound = x.currentRound
 			highestQC = x.highestQuorumCert
+			highestTC = x.highestTimeoutCert
 			x.lock.Unlock()
 		}
 	}
@@ -692,10 +815,20 @@ func (x *XDPoS_v2) Prepare(chain consensus.ChainReader, header *types.Header) er
 		return utils.ErrNotReadyToPropose
 	}
 
-	// Set extra fields
+	// Set extra fields. A timeout certificate is written only once
+	// roundSkipTCBlock is active and this round actually skips. Otherwise the
+	// extra stays the two-field encoding current nodes seal and accept.
 	extra := types.ExtraFields_v2{
 		Round:      currentRound,
 		QuorumCert: highestQC,
+	}
+	if x.config.V2.IsRoundSkipTC(header.Number) && highestQC != nil && highestQC.ProposedBlockInfo != nil &&
+		currentRound > highestQC.ProposedBlockInfo.Round+1 {
+		qcRound := highestQC.ProposedBlockInfo.Round
+		if highestTC == nil || highestTC.Round+1 != currentRound || highestTC.Round <= qcRound {
+			return utils.ErrRoundSkipWithoutTimeout
+		}
+		extra.TimeoutCert = highestTC.DeepCopy()
 	}
 	extraBytes, err := extra.EncodeToBytes()
 	if err != nil {
@@ -834,7 +967,7 @@ func (x *XDPoS_v2) Seal(chain consensus.ChainReader, block *types.Block, stop <-
 	}
 
 	// Sign the block
-	signature, err := signFn(accounts.Account{Address: signer}, sigHash(header).Bytes())
+	signature, err := signFn(accounts.Account{Address: signer}, x.sealHash(header).Bytes())
 	if err != nil {
 		return nil, err
 	}
@@ -1043,9 +1176,9 @@ func (x *XDPoS_v2) getSnapshot(chain consensus.ChainReader, number uint64, forSi
 				if !ok || stored == nil {
 					stored, _ = loadSnapshot(x.db, gapHeader.Hash())
 				}
-				if stored != nil && len(masternodes) > 0 && len(removeItemFromArray(masternodes, stored.NextEpochCandidates)) == 0 {
+				if stored != nil && (stored.Version >= snapshotVersionProven || len(masternodes) > 0 && len(removeItemFromArray(masternodes, stored.NextEpochCandidates)) == 0) {
 					kept := *stored
-					kept.Version = 6
+					kept.Version = max(6, stored.Version)
 					x.snapshots.Add(kept.Hash, &kept)
 					return &kept, nil
 				}
@@ -1077,9 +1210,9 @@ func (x *XDPoS_v2) getSnapshot(chain consensus.ChainReader, number uint64, forSi
 					if !ok || stored == nil {
 						stored, _ = loadSnapshot(x.db, gapHeader.Hash())
 					}
-					if stored != nil && len(masternodes) > 0 && len(removeItemFromArray(masternodes, stored.NextEpochCandidates)) == 0 {
+					if stored != nil && (stored.Version >= snapshotVersionProven || len(masternodes) > 0 && len(removeItemFromArray(masternodes, stored.NextEpochCandidates)) == 0) {
 						kept := *stored
-						kept.Version = 6
+						kept.Version = max(6, stored.Version)
 						x.snapshots.Add(kept.Hash, &kept)
 						return &kept, nil
 					}
@@ -1132,7 +1265,7 @@ func (x *XDPoS_v2) getSnapshot(chain consensus.ChainReader, number uint64, forSi
 			// deferred instead of labelling the canonical block forged.
 			// forSigning callers (proposer/leader selection) use Validators, not the full
 			// pool, and correctly see the elected set — do not block them.
-			if !forSigning {
+			if !forSigning && snap.Version < snapshotVersionProven {
 				if pivot := rawdb.ReadLastPivotNumber(x.db); pivot != nil && gapNumber < *pivot {
 					return nil, fmt.Errorf("%w at gap %d (checkpoint %d, pivot %d): cached snapshot below snap pivot — candidates from epoch-switch header only, not contract pool", utils.ErrV2SnapshotMissing, gapNumber, checkpointNumber, *pivot)
 				}
@@ -1158,7 +1291,7 @@ func (x *XDPoS_v2) getSnapshot(chain consensus.ChainReader, number uint64, forSi
 			// They are trusted — no V1-format heuristic needed regardless of candidate count.
 			// This handles devnet / chains with V2 from genesis where 3 masternodes is valid.
 			// Issue #1931: same pivot guard as the cache path above.
-			if !forSigning {
+			if !forSigning && snap.Version < snapshotVersionProven {
 				if pivot := rawdb.ReadLastPivotNumber(x.db); pivot != nil && gapNumber < *pivot {
 					return nil, fmt.Errorf("%w at gap %d (checkpoint %d, pivot %d): db snapshot (v%d) below snap pivot — candidates from epoch-switch header only, not contract pool", utils.ErrV2SnapshotMissing, gapNumber, checkpointNumber, *pivot, snap.Version)
 				}
@@ -1463,26 +1596,51 @@ func (x *XDPoS_v2) rebuildGapSnapshotFromState(chain consensus.ChainReader, gapN
 	if len(candidates) == 0 {
 		return nil
 	}
-	// Stake-descending sort with the frozen Go-1.18 quicksort (xdc_sort) —
-	// same tie-ordering as canonical XDPoSChain; see repairSnapshot comment.
-	type candidateStake struct {
-		addr  common.Address
-		stake *big.Int
+	return x.storeGapSnapshot(chain, gapHeader, sortCandidatesByStake(statedb, candidates), 6)
+}
+
+// snapshotVersionProven marks a gap snapshot whose candidate pool was read from
+// 0x88 storage proven by Merkle proof against the gap header's state root, for
+// gaps below the snap pivot where no state exists. Unlike versions 4 to 6 it
+// is accepted below the pivot by getSnapshot and never replaced by a header seed.
+const snapshotVersionProven = 7
+
+// SeedGapSnapshotFromState stores the gap snapshot from a statedb that holds
+// only the 0x88 storage proven against gapHeader.Root (eth_getProof from an
+// untrusted RPC, every node checked by its hash). It is the version-7 twin of
+// rebuildGapSnapshotFromState for snap/fast-synced nodes with no state below
+// the pivot. A missing proof node reads as zero, so any state error after the
+// reads, or an empty pool, is refused rather than stored.
+func (x *XDPoS_v2) SeedGapSnapshotFromState(chain consensus.ChainReader, gapHeader *types.Header, statedb *state.StateDB) error {
+	candidates := state.GetCandidates(statedb)
+	if err := statedb.Error(); err != nil {
+		return fmt.Errorf("gap %d: proven state incomplete: %w", gapHeader.Number, err)
 	}
-	cs := make([]candidateStake, 0, len(candidates))
-	for _, c := range candidates {
-		if c != (common.Address{}) {
-			cs = append(cs, candidateStake{addr: c, stake: state.GetCandidateCap(statedb, c)})
-		}
+	if len(candidates) == 0 {
+		return fmt.Errorf("gap %d: proven state has no candidates", gapHeader.Number)
 	}
-	xdc_sort.Slice(cs, func(i, j int) bool {
-		return cs[i].stake.Cmp(cs[j].stake) >= 0
-	})
-	sorted := make([]common.Address, len(cs))
-	for i, c := range cs {
-		sorted[i] = c.addr
+	sorted := sortCandidatesByStake(statedb, candidates)
+	if err := statedb.Error(); err != nil {
+		return fmt.Errorf("gap %d: proven state incomplete: %w", gapHeader.Number, err)
 	}
-	// Penalties at write time, mirroring UpdateMasternodesFromHeader (P0 #894).
+	x.storeGapSnapshot(chain, gapHeader, sorted, snapshotVersionProven)
+	return nil
+}
+
+// HasProvenGapSnapshot reports whether the gap snapshot stored under hash is
+// already a version-7 (proven) one.
+func (x *XDPoS_v2) HasProvenGapSnapshot(hash common.Hash) bool {
+	if snap, ok := x.snapshots.Get(hash); ok && snap.Version >= snapshotVersionProven {
+		return true
+	}
+	snap, err := loadSnapshot(x.db, hash)
+	return err == nil && snap.Version >= snapshotVersionProven
+}
+
+// storeGapSnapshot writes the stake-sorted pool as the gap snapshot, with
+// penalties at write time mirroring UpdateMasternodesFromHeader (P0 #894).
+func (x *XDPoS_v2) storeGapSnapshot(chain consensus.ChainReader, gapHeader *types.Header, sorted []common.Address, version uint64) *SnapshotV2 {
+	gapNumber := gapHeader.Number.Uint64()
 	var penalties []common.Address
 	if x.HookPenalty != nil {
 		if pen, perr := x.HookPenalty(chain, gapHeader.Number, gapHeader.ParentHash, sorted); perr == nil {
@@ -1493,7 +1651,7 @@ func (x *XDPoS_v2) rebuildGapSnapshotFromState(chain consensus.ChainReader, gapN
 		}
 	}
 	snap := newSnapshotWithPenalties(gapNumber, gapHeader.Hash(), sorted, penalties)
-	snap.Version = 6 // state-certified: authoritative for forSigning membership checks (live-mn-set fix)
+	snap.Version = version // 6: state-certified, authoritative for forSigning membership checks (live-mn-set fix); 7: proven
 	x.snapshots.Add(snap.Hash, snap)
 	if serr := storeSnapshot(snap, x.db); serr != nil {
 		log.Error("[rebuildGapSnapshotFromState] failed to store snapshot", "gap", gapNumber, "err", serr)
@@ -2120,6 +2278,14 @@ func (x *XDPoS_v2) UpdateMasternodes(chain consensus.ChainReader, header *types.
 func (x *XDPoS_v2) UpdateMasternodesWithPenalties(chain consensus.ChainReader, header *types.Header, ms, penalties []common.Address) error {
 	number := header.Number.Uint64()
 	if number%x.config.Epoch != x.config.Epoch-x.config.Gap {
+		return nil
+	}
+
+	// A snapshot proven from the 0x88 state is never replaced by a header seed.
+	if cur, ok := x.snapshots.Get(header.Hash()); ok && cur.Version >= snapshotVersionProven {
+		return nil
+	}
+	if cur, err := loadSnapshot(x.db, header.Hash()); err == nil && cur.Version >= snapshotVersionProven {
 		return nil
 	}
 
@@ -3219,11 +3385,55 @@ func (x *XDPoS_v2) getEpochSwitchInfoWithParents(chain consensus.ChainReader, he
 	return info, nil
 }
 
-// Broadcast sends a message to the BFT channel
+// StopBroadcast unblocks own-message sends. Later sends return without
+// waiting for a receiver.
+// watchForensics is the production subscriber for forensics proofs.
+// Proofs are otherwise only written by the sender. The loop ends when
+// broadcast stops.
+func (x *XDPoS_v2) watchForensics() {
+	if x == nil || x.ForensicsProcessor == nil {
+		return
+	}
+	ch := make(chan types.ForensicsEvent, 8)
+	sub := x.ForensicsProcessor.SubscribeForensicsEvent(ch)
+	defer sub.Unsubscribe()
+	for {
+		select {
+		case ev := <-ch:
+			if ev.ForensicsProof == nil {
+				continue
+			}
+			log.Error("[forensics] proof", "id", ev.ForensicsProof.Id, "type", ev.ForensicsProof.ForensicsType)
+		case <-x.broadcastQuit:
+			return
+		}
+	}
+}
+
+func (x *XDPoS_v2) StopBroadcast() {
+	if x == nil || x.broadcastQuit == nil {
+		return
+	}
+	x.broadcastStop.Do(func() { close(x.broadcastQuit) })
+}
+
+// Broadcast sends a message to the BFT channel.
 func (x *XDPoS_v2) broadcastToBftChannel(msg interface{}) {
-	go func() {
+	go x.deliverBroadcast(msg)
+}
+
+// deliverBroadcast sends msg to BroadcastCh, or returns when StopBroadcast
+// has closed broadcastQuit. An unbuffered send with no receiver would
+// otherwise block the goroutine after the dispatcher has stopped.
+func (x *XDPoS_v2) deliverBroadcast(msg interface{}) {
+	if x.broadcastQuit == nil {
 		x.BroadcastCh <- msg
-	}()
+		return
+	}
+	select {
+	case x.BroadcastCh <- msg:
+	case <-x.broadcastQuit:
+	}
 }
 
 // getSyncInfo returns current sync info
@@ -3254,9 +3464,7 @@ func (x *XDPoS_v2) setNewRound(chain consensus.ChainReader, round types.Round) {
 		log.Error("[setNewRound] timeoutWorker.SetParams failed", "round", round, "err", err)
 	}
 	// Notify the miner of the updated mine period for this config row.
-	if x.minePeriodCh != nil {
-		go func() { x.minePeriodCh <- cfg.MinePeriod }()
-	}
+	x.notifyMinePeriod(cfg.MinePeriod)
 
 	x.timeoutWorker.Reset(chain, uint64(x.currentRound), uint64(x.highestQuorumCert.ProposedBlockInfo.Round))
 	x.timeoutPool.Clear()
@@ -3366,7 +3574,7 @@ func removeItemFromArray(array []common.Address, toRemove []common.Address) []co
 // The gap block is computed here, not left to getSnapshot: getSnapshot treats a
 // number that is itself a gap-block number as the gap block, and a V2 epoch
 // switch (round-driven) can land on such a number.
-func (x *XDPoS_v2) GetStandbynodes(chain consensus.ChainReader, header *types.Header) []common.Address {
+func (x *XDPoS_v2) GetStandbynodes(chain consensus.ChainReader, header *types.Header) ([]common.Address, error) {
 	number := header.Number.Uint64()
 	gapNumber := number - number%x.config.Epoch
 	if gapNumber > x.config.Gap {
@@ -3376,16 +3584,15 @@ func (x *XDPoS_v2) GetStandbynodes(chain consensus.ChainReader, header *types.He
 	}
 	snap, err := x.getSnapshot(chain, gapNumber, true, nil)
 	if err != nil {
-		log.Warn("[GetStandbynodes] getSnapshot has error, cannot get standbynodes", "number", number, "gap", gapNumber, "err", err)
-		return []common.Address{}
+		return nil, fmt.Errorf("standby snapshot at gap %d: %w", gapNumber, err)
 	}
 	masternodes := x.GetMasternodesFromEpochSwitchHeader(chain, header)
 	candidates := snap.NextEpochCandidates
 	if len(masternodes) == len(candidates) {
-		return []common.Address{}
+		return []common.Address{}, nil
 	}
 	standby := removeItemFromArray(candidates, masternodes)
-	return removeItemFromArray(standby, common.ExtractAddressFromBytes(header.Penalties))
+	return removeItemFromArray(standby, common.ExtractAddressFromBytes(header.Penalties)), nil
 }
 
 // GetMasternodesByHash retrieves the masternode list for a given block hash.

@@ -85,7 +85,7 @@ var (
 		CancunBlock:         big.NewInt(98_802_000),     // XDPoSChain MainnetConstant.cancunBlock — Target 28th Jan 2026
 		AmsterdamBlock:      big.NewInt(99_999_999_999), // Glamsterdam incl. EIP-7928 BAL: placeholder far-future block, not scheduled (#1644)
 		SigningTxBoundBlock: big.NewInt(99_999_999_999), // CertiK XDC-04/XDC-09: placeholder far-future block, scheduled with legacy (#1721)
-		ValidatorOrderBlock: big.NewInt(99_999_999_999), // CertiK XDC-11: placeholder far-future block, scheduled with legacy (#1722)
+		ValidatorOrderBlock: big.NewInt(99_999_999_999), // CertiK XDC-11 / F-2026-19815: placeholder, not a scheduled activation. Same rule as nil until legacy agrees a block (#1722).
 		ParoleDedupBlock:    big.NewInt(99_999_999_999), // CertiK XDC-12: placeholder far-future block, scheduled with legacy (#1723)
 		XDPoS: &XDPoSConfig{
 			Period:              2,                                                                 // 2 second block time
@@ -1053,7 +1053,7 @@ var (
 		PragueBlock:                big.NewInt(84_333_000),     // XDPoSChain v3.0.0-testnet-1 genesis/testnet.json pragueBlock (#2815, moved from 87,633,000)
 		AmsterdamBlock:             big.NewInt(99_999_999_999), // Glamsterdam incl. EIP-7928 BAL: placeholder far-future block, not scheduled (#1644)
 		SigningTxBoundBlock:        big.NewInt(99_999_999_999), // CertiK XDC-04/XDC-09: placeholder far-future block, scheduled with legacy (#1721)
-		ValidatorOrderBlock:        big.NewInt(99_999_999_999), // CertiK XDC-11: placeholder far-future block, scheduled with legacy (#1722)
+		ValidatorOrderBlock:        big.NewInt(99_999_999_999), // CertiK XDC-11 / F-2026-19815: placeholder, not a scheduled activation. Same rule as nil until legacy agrees a block (#1722).
 		ParoleDedupBlock:           big.NewInt(99_999_999_999), // CertiK XDC-12: placeholder far-future block, scheduled with legacy (#1723)
 		XDPoS: &XDPoSConfig{
 			Period:              2,                                                                 // 2 second block time
@@ -2394,9 +2394,29 @@ type V2 struct {
 	CurrentConfig *V2Config            `json:"config"`                // Current active V2 configuration (fix #96: match XDPoSChain v2.6.8 JSON tag "config")
 	AllConfigs    map[uint64]*V2Config `json:"allConfigs,omitempty"`  // Per-round config map (key = SwitchRound)
 	SwitchEpoch   uint64               `json:"switchEpoch,omitempty"` // Epoch number at V2 switch block
+	// BALSealBlock is the first block whose V2 proposer seal binds
+	// BlockAccessListHash (Hacken F-2026-19601). Nil means never.
+	BALSealBlock *big.Int `json:"balSealBlock,omitempty"`
+	// RoundSkipTCBlock is the first block at which a header whose round is
+	// more than one past its parent certificate must carry a timeout
+	// certificate for the skipped rounds (Hacken F-2026-19608). Nil means
+	// the historical rule stays in force: the round only has to be higher.
+	// Every shipped network leaves this unset.
+	RoundSkipTCBlock *big.Int `json:"roundSkipTCBlock,omitempty"`
 
 	mu          sync.RWMutex `json:"-"` // Protects CurrentConfig from concurrent read/write (#74)
 	configIndex []uint64     `json:"-"` // Descending-sorted round keys for O(n) lookup (#117)
+}
+
+// IsRoundSkipTC reports whether block num must carry a timeout certificate
+// when its round skips past the parent certificate. A nil block disables it.
+func (v *V2) IsRoundSkipTC(num *big.Int) bool {
+	return v != nil && v.RoundSkipTCBlock != nil && num != nil && num.Cmp(v.RoundSkipTCBlock) >= 0
+}
+
+// IsBALSeal reports whether the V2 seal of block num binds BlockAccessListHash.
+func (v *V2) IsBALSeal(num *big.Int) bool {
+	return v != nil && v.BALSealBlock != nil && num != nil && num.Cmp(v.BALSealBlock) >= 0
 }
 
 // BuildConfigIndex builds the descending-sorted config index from AllConfigs.

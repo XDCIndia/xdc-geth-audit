@@ -311,6 +311,17 @@ func (p *Peer) pushLegacyHeaderReqNumber(id uint64, count int, number uint64, ha
 	p.legacyHeaderReqCount.Store(uint64(count))
 }
 
+// peekLegacyHeaderReq returns the oldest pending header request without
+// removing it. ok is false when the queue is empty.
+func (p *Peer) peekLegacyHeaderReq() (legacyHeaderReq, bool) {
+	p.legacyHeaderQueueMu.Lock()
+	defer p.legacyHeaderQueueMu.Unlock()
+	if len(p.legacyHeaderQueue) == 0 {
+		return legacyHeaderReq{}, false
+	}
+	return p.legacyHeaderQueue[0], true
+}
+
 // popLegacyHeaderReq removes and returns the oldest pending header
 // request. Returns zero req.id if queue is empty.
 func (p *Peer) popLegacyHeaderReq() legacyHeaderReq {

@@ -30,6 +30,7 @@ import (
 
 	"github.com/dchest/siphash"
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/common/lru"
 	"github.com/ethereum/go-ethereum/consensus/XDPoS"
 	"github.com/ethereum/go-ethereum/consensus/XDPoS/engines/engine_v2"
 	"github.com/ethereum/go-ethereum/core"
@@ -130,6 +131,7 @@ type handlerConfig struct {
 	RequiredBlocks   map[uint64]common.Hash // Hard coded map of required block hashes for sync challenges
 	SnapV2           *bool                  // Snap/2 state syncer: on, off, or nil for automatic
 	FetchProbability uint64                 // Full blob fetch probability for sparse blobpool (blobFetcher)
+	SnapGapRPC       []string               // XDC: RPC endpoints proving below-pivot 0x88 validator pools
 }
 
 // snapV2AutoDelay is how long Amsterdam must have been active before the snap/2
@@ -172,6 +174,8 @@ func resolveSnapV2(explicit *bool, config *params.ChainConfig, db ethdb.Database
 }
 
 type handler struct {
+	snapGapRPC []string // XDC: --snap.gap-rpc endpoints
+
 	nodeID    enode.ID
 	networkID uint64
 	synced    atomic.Bool // Flag whether we're considered synchronised (enables transaction processing)
@@ -210,6 +214,14 @@ type handler struct {
 	// (only on nodes that want BFT participation — i.e., have the V2 engine wired).
 	// Gate all dispatch with h.bfter != nil before use.
 	bfter *bft.Bfter
+
+	// XDC: NewBlock abuse bounds. parkedBlocks
+	// holds, per peer, the future-timestamp block waiting on a timer (its hash and
+	// size); invalidBlocks counts
+	// definitively invalid NewBlocks per peer ID.
+	newBlockMu    sync.Mutex
+	parkedBlocks  map[string]parkedBlock
+	invalidBlocks *lru.Cache[string, int]
 }
 
 // newHandler returns a handler for all Ethereum chain management protocol.
@@ -224,9 +236,12 @@ func newHandler(config *handlerConfig) (*handler, error) {
 		peers:          newPeerSet(),
 		txBroadcastKey: newBroadcastChoiceKey(),
 		requiredBlocks: config.RequiredBlocks,
+		snapGapRPC:     config.SnapGapRPC,
 		quitSync:       make(chan struct{}),
 		handlerDoneCh:  make(chan struct{}),
 		handlerStartCh: make(chan struct{}),
+		parkedBlocks:   make(map[string]parkedBlock),
+		invalidBlocks:  lru.NewCache[string, int](maxTrackedInvalidPeers),
 	}
 	// Construct the downloader (long sync)
 	snapV2 := resolveSnapV2(config.SnapV2, config.Chain.Config(), config.Database)
@@ -518,13 +533,11 @@ func (h *handler) runEthPeer(peer *eth.Peer, handler eth.Handler) error {
 	// challenge timeout once here, not in each goroutine.
 	challengeTimeout := syncChallengeTimeout
 	for number, hash := range h.requiredBlocks {
-		// Version 100 has no request id. Send the challenge without a
-		// response channel and match the shared-channel reply by number.
-		// Version 101 and every other version wait on the request channel.
-		var resCh chan *eth.Response
-		if peer.Version() != eth.XDPOS2 {
-			resCh = make(chan *eth.Response)
-		}
+		// Every version gets its own response channel. A version 100 reply has
+		// no request id, but the peer matches it to the oldest in-flight
+		// request and delivers it to that request's channel, not to the
+		// shared XDCHeaderResp the syncer reads. F-2026-20597.
+		resCh := make(chan *eth.Response)
 		req, err := peer.RequestHeadersByNumber(number, 1, 0, false, resCh)
 		if err != nil {
 			return err
@@ -533,24 +546,17 @@ func (h *handler) runEthPeer(peer *eth.Peer, handler eth.Handler) error {
 			// Ensure the request gets cancelled in case of error/drop
 			defer req.Close()
 
-			// XDPOS2 peers route BlockHeaders replies to peer.XDCHeaderResp
-			// rather than through the request-id dispatcher (the legacy wire
-			// has no RequestId on responses). Wait on XDCHeaderResp with a
-			// bounded timeout; on timeout keep the peer — silence on legacy
-			// wire is not evidence of misbehaviour. Only an explicit hash
-			// mismatch at the requested number warrants a drop.
+			// Version 100 peers: on timeout keep the peer. Silence on the
+			// legacy wire is not evidence of misbehaviour. Only an explicit
+			// hash mismatch at the requested number warrants a drop.
 			if peer.Version() == eth.XDPOS2 {
 				timeout := time.NewTimer(challengeTimeout)
 				defer timeout.Stop()
 				select {
-				case headers := <-peer.XDCHeaderResp:
+				case res := <-resCh:
+					headers := ([]*types.Header)(*res.Res.(*eth.BlockHeadersRequest))
+					res.Done <- nil
 					if len(headers) == 0 || headers[0].Number.Uint64() != number {
-						// A different number belongs to the syncer. Put it
-						// back and keep the peer.
-						select {
-						case peer.XDCHeaderResp <- headers:
-						default:
-						}
 						return
 					}
 					if headers[0].Hash() != hash {
