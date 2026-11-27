@@ -2875,11 +2875,7 @@ func (s *xdcSyncer) fullSyncOnce() {
 	// xdcBodyHedgeDelay (800ms), issue the same request to the next-best candidate.
 	// Hard timeout is xdcBulkReqTimeout (4s). Verification is the same TxHash/UncleHash
 	// check in buildBlocks; the hedge peer must pass it or its blocks are dropped.
-	hashes := make([]common.Hash, len(headers))
-	for i, h := range headers {
-		hashes[i] = h.Hash()
-	}
-	bodies, hedgeFailed := s.fetchBodiesHedged(peer, candidates, hashes)
+	bodies, hedgeFailed, supplier := s.fetchBodiesHedged(peer, candidates, headers)
 	if len(bodies) == 0 {
 		// The header-race winner delivered no bodies and the hedge did not
 		// either. Taint that peer so the next round can be won by someone else.
@@ -2894,10 +2890,18 @@ func (s *xdcSyncer) fullSyncOnce() {
 
 	blocks := s.buildBlocks(headers, bodies)
 	if len(blocks) == 0 {
-		// Bodies arrived but none matched their headers, and the hedge failed
-		// as well. Same taint: this peer should not win the next race.
-		if hedgeFailed {
-			s.taintPeer(peer)
+		// Bodies arrived but none matched their headers. fetchBodiesHedged
+		// already refuses a reply whose first body is wrong; this covers a
+		// body that cannot be decoded. F-2026-20612: taint unconditionally,
+		// the race winner must not win the next race, and the peer that
+		// supplied the bodies is tainted too.
+		s.taintPeer(peer)
+		if supplier != peer.ID() {
+			for _, c := range candidates {
+				if c.ID() == supplier {
+					s.taintPeer(c)
+				}
+			}
 		}
 		log.Debug("xdcSyncer: no valid blocks to import", "hedgeFailed", hedgeFailed)
 		return
@@ -5857,16 +5861,27 @@ func (s *xdcSyncer) bodyRankedCandidates(candidates []*eth.Peer) []*eth.Peer {
 	return out
 }
 
-// fetchBodiesHedged fetches bodies for hashes from primary, hedging to the best
-// idle candidate after xdcBodyHedgeDelay if primary has not responded.
+// fetchBodiesHedged fetches the bodies of headers from primary, hedging to the
+// best idle candidate after xdcBodyHedgeDelay if primary has not responded.
 // Hard deadline is xdcBulkReqTimeout. Updates per-peer body statistics.
 // Respects XDCBodyReqMu serialisation per peer (SYNC-12 refs #1869, #1858).
-func (s *xdcSyncer) fetchBodiesHedged(primary *eth.Peer, candidates []*eth.Peer, hashes []common.Hash) ([]eth.BlockBody, bool) {
+//
+// F-2026-20612: a reply whose first body does not match its header counts as no
+// reply. The peer that sent it is tainted and the hedge is launched at once, so
+// a race winner that answers with wrong bodies cannot keep the honest peers out.
+//
+// The third result is the ID of the peer that supplied the returned bodies, or
+// the empty string when none did.
+func (s *xdcSyncer) fetchBodiesHedged(primary *eth.Peer, candidates []*eth.Peer, headers []*types.Header) ([]eth.BlockBody, bool, string) {
 	type bodyResult struct {
 		bodies   []eth.BlockBody
-		peerID   string
+		peer     *eth.Peer
 		lat      time.Duration
 		timedOut bool
+	}
+	hashes := make([]common.Hash, len(headers))
+	for i, h := range headers {
+		hashes[i] = h.Hash()
 	}
 	// Buffered so losing goroutines never block when we've already returned.
 	ch := make(chan bodyResult, 2)
@@ -5875,7 +5890,18 @@ func (s *xdcSyncer) fetchBodiesHedged(primary *eth.Peer, candidates []*eth.Peer,
 		t0 := time.Now()
 		bodies := s.fetchBodiesBatchTimeout(p, hashes, xdcBulkReqTimeout)
 		lat := time.Since(t0)
-		ch <- bodyResult{bodies: bodies, peerID: p.ID(), lat: lat, timedOut: len(bodies) == 0}
+		ch <- bodyResult{bodies: bodies, peer: p, lat: lat, timedOut: len(bodies) == 0}
+	}
+	// accept records the reply and returns its bodies, or nil when it is empty
+	// or its first body does not belong to its header (the sender is tainted).
+	accept := func(res bodyResult) []eth.BlockBody {
+		if len(res.bodies) > 0 && !bodyMatchesHeader(headers[0], &res.bodies[0]) {
+			log.Debug("xdcSyncer.fetchBodiesHedged: first body does not match its header", "peer", res.peer.ID()[:8])
+			s.taintPeer(res.peer)
+			res.bodies, res.timedOut = nil, true
+		}
+		s.recordBodyStat(res.peer.ID(), res.lat, res.timedOut)
+		return res.bodies
 	}
 	go fetchOne(primary)
 
@@ -5904,35 +5930,34 @@ func (s *xdcSyncer) fetchBodiesHedged(primary *eth.Peer, candidates []*eth.Peer,
 	for {
 		select {
 		case res := <-ch:
-			s.recordBodyStat(res.peerID, res.lat, res.timedOut)
-			if len(res.bodies) > 0 {
+			if bodies := accept(res); len(bodies) > 0 {
 				// A peer delivered bodies. The hedge is not a failure when it
 				// was not required, and not a failure when it produced them.
-				return res.bodies, false
+				return bodies, false, res.peer.ID()
 			}
-			// Primary returned early with no bodies — start hedge immediately.
+			// Primary returned early with no usable bodies — start hedge immediately.
 			startHedge()
 			if hedgeStarted {
 				// Wait for hedge result within remaining budget.
 				select {
 				case res2 := <-ch:
-					s.recordBodyStat(res2.peerID, res2.lat, res2.timedOut)
-					// hedgeFailed is true when the hedge also returned nothing.
-					return res2.bodies, len(res2.bodies) == 0
+					// hedgeFailed is true when the hedge also returned nothing usable.
+					bodies := accept(res2)
+					return bodies, len(bodies) == 0, res2.peer.ID()
 				case <-deadline.C:
-					return nil, true
+					return nil, true, ""
 				case <-s.quitCh:
-					return nil, true
+					return nil, true, ""
 				}
 			}
-			return nil, true
+			return nil, true, ""
 		case <-hedge.C:
 			startHedge()
 		case <-deadline.C:
 			s.recordBodyStat(primary.ID(), xdcBulkReqTimeout, true)
-			return nil, true
+			return nil, true, ""
 		case <-s.quitCh:
-			return nil, true
+			return nil, true, ""
 		}
 	}
 }
@@ -6640,6 +6665,25 @@ func verifyBodyAgainstHeader(h *types.Header, body *types.Body) bool {
 		}
 	}
 	return true
+}
+
+// bodyMatchesHeader decodes a wire body and runs verifyBodyAgainstHeader on it.
+func bodyMatchesHeader(h *types.Header, b *eth.BlockBody) bool {
+	txs, err := b.Transactions.Items()
+	if err != nil {
+		return false
+	}
+	uncles, err := b.Uncles.Items()
+	if err != nil {
+		return false
+	}
+	body := types.Body{Transactions: txs, Uncles: uncles}
+	if b.Withdrawals != nil {
+		if wd, err := b.Withdrawals.Items(); err == nil {
+			body.Withdrawals = wd
+		}
+	}
+	return verifyBodyAgainstHeader(h, &body)
 }
 
 // snapHistoryFindResumeTop finds the (nextTop, topHash) pair from which
