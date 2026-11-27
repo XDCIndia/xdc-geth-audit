@@ -511,9 +511,10 @@ func AttachConsensusV2Hooks(adaptor *XDPoS.XDPoS, bc *core.BlockChain, chainConf
 						signingTxs, ok := adaptor.GetCachedSigningTxs(bhash)
 						if !ok {
 							blk := chain.GetBlock(bhash, blockNumber)
-							if blk != nil {
-								signingTxs = adaptor.CacheSigner(bhash, blk.Transactions())
+							if blk == nil {
+								return nil, fmt.Errorf("%w: no block body at %d", XDPoS.ErrPenaltyDataUnavailable, blockNumber)
 							}
+							signingTxs = adaptor.CacheSigner(bhash, blk.Transactions())
 						}
 						signer := types.MakeSigner(chainConfig, big.NewInt(int64(blockNumber)), 0)
 						for _, tx := range signingTxs {

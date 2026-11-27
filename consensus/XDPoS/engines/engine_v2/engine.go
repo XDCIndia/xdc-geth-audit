@@ -172,6 +172,13 @@ func New(chainConfig *params.ChainConfig, db ethdb.Database, minePeriodCh chan i
 	return engineInstance
 }
 
+// NewIsolated returns an engine that is not the process singleton. Production
+// wiring uses New. Callers that must not capture that singleton (tests with
+// their own database) use this.
+func NewIsolated(chainConfig *params.ChainConfig, db ethdb.Database, minePeriodCh chan int, newRoundCh chan types.Round) *XDPoS_v2 {
+	return createEngine(chainConfig, db, minePeriodCh, newRoundCh)
+}
+
 // createEngine is the actual engine creation logic (extracted from New)
 func createEngine(chainConfig *params.ChainConfig, db ethdb.Database, minePeriodCh chan int, newRoundCh chan types.Round) *XDPoS_v2 {
 	config := chainConfig.XDPoS
