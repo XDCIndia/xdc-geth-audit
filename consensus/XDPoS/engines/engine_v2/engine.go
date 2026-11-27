@@ -286,10 +286,27 @@ func (x *XDPoS_v2) UpdateParams(header *types.Header) {
 	// Without this guard the goroutine blocks forever on a nil channel — a goroutine
 	// leak under round churn. With real channels wired (eth/backend.go), the
 	// buffered send succeeds immediately when the worker drains.
-	if x.minePeriodCh != nil {
-		go func() {
-			x.minePeriodCh <- x.config.V2.CurrentConfig.MinePeriod
-		}()
+	x.notifyMinePeriod(x.config.V2.CurrentConfig.MinePeriod)
+}
+
+// notifyMinePeriod hands the latest mine period to the worker without
+// blocking and without a goroutine. A node that does not mine has no reader on
+// minePeriodCh, so a blocking send would leak one goroutine per call.
+// The channel holds one value; when it is full the stale value is replaced.
+func (x *XDPoS_v2) notifyMinePeriod(period int) {
+	if x.minePeriodCh == nil {
+		return
+	}
+	for {
+		select {
+		case x.minePeriodCh <- period:
+			return
+		default:
+		}
+		select {
+		case <-x.minePeriodCh:
+		default:
+		}
 	}
 }
 
@@ -499,12 +516,8 @@ func (x *XDPoS_v2) initial(chain consensus.ChainReader, header *types.Header) er
 			// Initialize timeout
 			minePeriod := x.config.V2.CurrentConfig.MinePeriod
 			log.Warn("[initial] miner wait period", "period", minePeriod)
-			// A.97-M.A Task 1 nil-guard: see UpdateParams comment above.
-			if x.minePeriodCh != nil {
-				go func() {
-					x.minePeriodCh <- minePeriod
-				}()
-			}
+			// Non-blocking, nil-safe: see notifyMinePeriod (F-2026-20604).
+			x.notifyMinePeriod(minePeriod)
 			// Start countdown timer
 			x.applyTimeoutParamsForHeader(header)
 			x.timeoutWorker.Reset(chain, 0, 0)
@@ -549,12 +562,8 @@ func (x *XDPoS_v2) initial(chain consensus.ChainReader, header *types.Header) er
 				}
 				minePeriod := x.config.V2.CurrentConfig.MinePeriod
 				log.Warn("[initial] miner wait period", "period", minePeriod)
-				// A.97-M.A Task 1 nil-guard: see UpdateParams comment above.
-				if x.minePeriodCh != nil {
-					go func() {
-						x.minePeriodCh <- minePeriod
-					}()
-				}
+				// Non-blocking, nil-safe: see notifyMinePeriod (F-2026-20604).
+				x.notifyMinePeriod(minePeriod)
 				x.applyTimeoutParamsForHeader(header)
 				x.timeoutWorker.Reset(chain, 0, 0)
 				log.Warn("[initial] finish initialisation (deferred snapshot)")
@@ -590,12 +599,8 @@ func (x *XDPoS_v2) initial(chain consensus.ChainReader, header *types.Header) er
 	// Initialize timeout
 	minePeriod := x.config.V2.CurrentConfig.MinePeriod
 	log.Warn("[initial] miner wait period", "period", minePeriod)
-	// A.97-M.A Task 1 nil-guard: see UpdateParams comment above.
-	if x.minePeriodCh != nil {
-		go func() {
-			x.minePeriodCh <- minePeriod
-		}()
-	}
+	// Non-blocking, nil-safe: see notifyMinePeriod (F-2026-20604).
+	x.notifyMinePeriod(minePeriod)
 
 	// Start countdown timer with the head's round config, not the round-zero
 	// values left from engine construction. processQC may be skipped on this
@@ -3384,9 +3389,7 @@ func (x *XDPoS_v2) setNewRound(chain consensus.ChainReader, round types.Round) {
 		log.Error("[setNewRound] timeoutWorker.SetParams failed", "round", round, "err", err)
 	}
 	// Notify the miner of the updated mine period for this config row.
-	if x.minePeriodCh != nil {
-		go func() { x.minePeriodCh <- cfg.MinePeriod }()
-	}
+	x.notifyMinePeriod(cfg.MinePeriod)
 
 	x.timeoutWorker.Reset(chain, uint64(x.currentRound), uint64(x.highestQuorumCert.ProposedBlockInfo.Round))
 	x.timeoutPool.Clear()
