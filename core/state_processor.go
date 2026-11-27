@@ -951,6 +951,23 @@ func ApplyEmptyTransaction(config *params.ChainConfig, statedb *state.StateDB, b
 		root = statedb.IntermediateRoot(params.Rules{IsEIP158: config.IsEIP158(blockNumber)}).Bytes()
 	}
 
+	// Chain IDs 5151, 5050 and 5551 still have the empty-tx route open.
+	// Mainnet and Apothem keep the historical zero-gas receipt with no nonce change.
+	if emptyRouteTracksNonce(config) {
+		from, err := types.Sender(types.MakeSigner(config, blockNumber, 0), tx)
+		if err != nil {
+			return nil, err
+		}
+		nonce := statedb.GetNonce(from)
+		if tx.Nonce() < nonce {
+			return nil, fmt.Errorf("%w: empty tx nonce %d, state %d", ErrNonceTooLow, tx.Nonce(), nonce)
+		}
+		if tx.Nonce() > nonce {
+			return nil, fmt.Errorf("%w: empty tx nonce %d, state %d", ErrNonceTooHigh, tx.Nonce(), nonce)
+		}
+		statedb.SetNonce(from, nonce+1, tracing.NonceChangeUnspecified)
+	}
+
 	emptyLog := &types.Log{
 		BlockNumber: blockNumber.Uint64(),
 	}
@@ -981,6 +998,18 @@ func ApplyEmptyTransaction(config *params.ChainConfig, statedb *state.StateDB, b
 // token registered in the TRC21 issuer: the fee is then paid from the token's
 // capacity, at the TRC21 gas price of the block (XDPoSChain tx.AsMessage). It
 // reports whether msg is one. Call it on the normal (non special-tx) path only.
+func emptyRouteTracksNonce(config *params.ChainConfig) bool {
+	if config == nil || config.ChainID == nil {
+		return false
+	}
+	switch config.ChainID.Uint64() {
+	case 5151, 5050, 5551:
+		return true
+	default:
+		return false
+	}
+}
+
 func ApplyTRC21TokenFee(config *params.ChainConfig, msg *Message, tokensFee map[common.Address]*big.Int, tx *types.Transaction, blockNumber *big.Int) bool {
 	to := tx.To()
 	if to == nil {
