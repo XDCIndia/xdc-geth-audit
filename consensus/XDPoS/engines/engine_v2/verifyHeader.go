@@ -157,7 +157,7 @@ func (x *XDPoS_v2) verifyHeader(chain consensus.ChainReader, header *types.Heade
 	// skipped round. Until roundSkipTCBlock, that header is still valid, which
 	// is what every current block relies on. From the fork block it needs a
 	// timeout certificate for the round immediately before it.
-	if err := x.verifyRoundSkip(chain, header, round, quorumCert); err != nil {
+	if err := x.verifyRoundSkip(chain, header, parent, parents, round, quorumCert); err != nil {
 		return err
 	}
 
@@ -533,7 +533,7 @@ func (x *XDPoS_v2) verifyHeader(chain consensus.ChainReader, header *types.Heade
 // than the parent certificate. Signature checks follow the same catch-up
 // exception as the quorum certificate: the parent-hash link to the trusted
 // pivot authenticates the bytes until the epoch headers exist locally.
-func (x *XDPoS_v2) verifyRoundSkip(chain consensus.ChainReader, header *types.Header, round types.Round, quorumCert *types.QuorumCert) error {
+func (x *XDPoS_v2) verifyRoundSkip(chain consensus.ChainReader, header, parent *types.Header, parents []*types.Header, round types.Round, quorumCert *types.QuorumCert) error {
 	var extra types.ExtraFields_v2
 	if err := DecodeExtraFields(header.Extra, &extra); err != nil {
 		return utils.ErrInvalidV2Extra
@@ -559,7 +559,9 @@ func (x *XDPoS_v2) verifyRoundSkip(chain consensus.ChainReader, header *types.He
 	if x.inCheckpointCatchup(chain, header.Number.Uint64()) {
 		return nil
 	}
-	if err := x.verifyTC(chain, tc); err != nil {
+	// The certificate is checked against the ancestors of this header, not the
+	// local head, so the verdict does not depend on where the head is.
+	if err := x.verifyTCAt(chain, tc, parent, parents); err != nil {
 		return err
 	}
 	return nil
