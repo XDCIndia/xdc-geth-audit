@@ -745,3 +745,32 @@ func IsSpecialTx(to *common.Address) bool {
 func (tx *Transaction) IsSpecialTransaction() bool {
 	return tx != nil && IsSpecialTx(tx.To())
 }
+
+// KnownSpecialCall reports whether the calldata is a BlockSigners sign or a
+// RandomizeSMC setSecret or setOpening. Other calldata to those addresses is
+// an ordinary transaction for pool admission.
+func (tx *Transaction) KnownSpecialCall() bool {
+	if tx == nil || !tx.IsSpecialTransaction() {
+		return false
+	}
+	data := tx.Data()
+	if len(data) < 4 || tx.To() == nil {
+		return false
+	}
+	var sel [4]byte
+	copy(sel[:], data[:4])
+	switch *tx.To() {
+	case common.BlockSignersBinary:
+		sign := common.Hex2Bytes(common.HexSignMethod)
+		return len(data) == 68 && len(sign) == 4 && sel == [4]byte(sign)
+	case common.RandomizeSMCBinary:
+		secret := common.Hex2Bytes(common.HexSetSecret)
+		opening := common.Hex2Bytes(common.HexSetOpening)
+		if len(secret) != 4 || len(opening) != 4 {
+			return false
+		}
+		return sel == [4]byte(secret) || sel == [4]byte(opening)
+	default:
+		return false
+	}
+}

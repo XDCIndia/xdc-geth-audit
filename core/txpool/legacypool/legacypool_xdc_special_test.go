@@ -92,7 +92,11 @@ func xdcSpecialPool(t *testing.T) (*LegacyPool, func()) {
 // makeSpecialTx builds a signed gasPrice=0 tx to dest (BlockSigners or Randomize).
 // Mirrors CreateTxSign in contracts/utils.go:56 (gasPrice = big.NewInt(0)).
 func makeSpecialTx(nonce uint64, dest common.Address, privKey *ecdsa.PrivateKey) *types.Transaction {
-	data := common.Hex2Bytes(common.HexSignMethod)
+	selector := common.HexSignMethod
+	if dest == common.RandomizeSMCBinary {
+		selector = common.HexSetSecret
+	}
+	data := common.Hex2Bytes(selector)
 	blockNum := new(big.Int).SetUint64(nonce * 15)
 	inputData := append(data, common.LeftPadBytes(blockNum.Bytes(), 32)...)
 	inputData = append(inputData, common.LeftPadBytes(blockNum.Bytes(), 32)...)
@@ -719,9 +723,9 @@ func TestXDCSpecialTxSignSelectorFastPath(t *testing.T) {
 	// The rejection must come from the normal pending-replacement price-bump check,
 	// not from promoteSpecialTx's ErrDuplicateSpecialTransaction.
 	if errors.Is(err, ErrDuplicateSpecialTransaction) {
-		t.Fatalf("wrong calldata must NOT take the fast path: got ErrDuplicateSpecialTransaction, want ErrReplaceUnderpriced")
+		t.Fatalf("wrong calldata must NOT take the fast path: got ErrDuplicateSpecialTransaction")
 	}
-	if !errors.Is(err, txpool.ErrReplaceUnderpriced) {
+	if !errors.Is(err, txpool.ErrTxGasPriceTooLow) {
 		t.Fatalf("wrong calldata took unexpected path: %v", err)
 	}
 }

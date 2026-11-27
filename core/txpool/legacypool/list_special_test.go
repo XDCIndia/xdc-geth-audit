@@ -35,7 +35,9 @@ func TestListSpecialTxReplacement(t *testing.T) {
 		return types.NewTransaction(0, other, big.NewInt(0), 21000, big.NewInt(price), nil)
 	}
 	special := func() *types.Transaction {
-		return types.NewTransaction(0, common.BlockSignersBinary, big.NewInt(0), 21000, big.NewInt(0), nil)
+		data := common.Hex2Bytes(common.HexSignMethod)
+		input := append(data, make([]byte, 64)...)
+		return types.NewTransaction(0, common.BlockSignersBinary, big.NewInt(0), 21000, big.NewInt(0), input)
 	}
 	const bump = 10
 
