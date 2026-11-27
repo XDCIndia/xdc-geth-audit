@@ -1758,13 +1758,26 @@ func (c *ringSignatureVerifier) Name() string { return "RING_SIG_VERIFY" }
 
 // bulletproofVerifier is precompile 0x28. It costs 100,000 gas and verifies a
 // Bulletproof range proof. Fails with an error on any invalid or undecodable proof.
-type bulletproofVerifier struct{}
+//
+// maxComms, when above zero, rejects a proof that declares more commitments.
+// Only the RPC copy sets it. Consensus execution leaves it at zero, as
+// canonical XDPoSChain has no cap there.
+type bulletproofVerifier struct{ maxComms uint32 }
+
+// tooManyComms reports whether the proof declares more than maxComms
+// commitments. It reads only the 4-byte count prefix, before any point decode.
+func (c *bulletproofVerifier) tooManyComms(proof []byte) bool {
+	return c.maxComms > 0 && len(proof) >= 4 && binary.BigEndian.Uint32(proof) > c.maxComms
+}
 
 func (c *bulletproofVerifier) RequiredGas(input []byte) uint64 {
 	return 100000
 }
 
 func (c *bulletproofVerifier) Run(proof []byte) ([]byte, error) {
+	if c.tooManyComms(proof) {
+		return []byte{}, errors.New("too many bulletproof commitments")
+	}
 	mrp := new(privacy.MultiRangeProof)
 	if mrp.Deserialize(proof) != nil {
 		return []byte{}, errors.New("failed to deserialize bulletproofs")
@@ -1776,6 +1789,9 @@ func (c *bulletproofVerifier) Run(proof []byte) ([]byte, error) {
 }
 
 func (c *bulletproofVerifier) RunAbort(proof []byte, abort func() bool) ([]byte, error) {
+	if c.tooManyComms(proof) {
+		return []byte{}, errors.New("too many bulletproof commitments")
+	}
 	mrp := new(privacy.MultiRangeProof)
 	if mrp.Deserialize(proof) != nil {
 		return []byte{}, errors.New("failed to deserialize bulletproofs")
