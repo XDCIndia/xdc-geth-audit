@@ -451,6 +451,27 @@ func serviceGetReceiptsQuery70(chain *core.BlockChain, query GetReceiptsRequest,
 	return receipts, false
 }
 
+// legacyHeaderAnchorIndex returns the index of the queued request's anchor
+// in headers, or -1 when the batch is empty or does not contain it.
+func legacyHeaderAnchorIndex(headers []*types.Header, req legacyHeaderReq) int {
+	if req.anchorHash != (common.Hash{}) {
+		for i, h := range headers {
+			if h != nil && h.Hash() == req.anchorHash {
+				return i
+			}
+		}
+		return -1
+	}
+	if req.anchorNumber != 0 {
+		for i, h := range headers {
+			if h != nil && h.Number != nil && h.Number.Uint64() == req.anchorNumber {
+				return i
+			}
+		}
+	}
+	return -1
+}
+
 func handleBlockHeaders(backend Backend, msg Decoder, peer *Peer) error {
 	// XDPOS2 responses arrive without the RequestId wrapper — bare RLP list
 	// of types.Header. The matching request's id was stashed on the peer
@@ -469,11 +490,45 @@ func handleBlockHeaders(backend Backend, msg Decoder, peer *Peer) error {
 		}
 		log.Info("XDPOS2 BlockHeaders received (pre-req)", "peer", peer.ID()[:8], "count", len(headers))
 
-		// Pop before deciding the shared channel. A caller waiting on its
-		// own response channel must not also have the batch copied onto
-		// XDCHeaderResp, or a required-block challenge and the syncer take
-		// each other's reply.
-		req := peer.popLegacyHeaderReq()
+		// Match the batch against the oldest in-flight request before
+		// removing it. XDPOS2 replies carry no request id, so a bad batch
+		// used to consume this slot and shift every later reply. An empty
+		// batch or a batch that does not contain the anchor is left queued
+		// so the request can still time out (A.9 rate limit). A reply with
+		// nothing in flight is unsolicited and drops the peer.
+		req, ok := peer.peekLegacyHeaderReq()
+		if !ok {
+			return fmt.Errorf("XDPOS2 BlockHeaders: reply with no in-flight request")
+		}
+		anchorIdx := legacyHeaderAnchorIndex(headers, req)
+		if anchorIdx < 0 {
+			// A.9: do not Fulfil an empty or off-anchor batch. Fulfil-on-empty
+			// unblocked tracker accumulation and made the downloader issue
+			// unlimited requests, which XDPOS2 peers answered with more empty
+			// batches. Leaving the request queued rate-limits re-issuance.
+			if len(headers) == 0 {
+				log.Debug("XDPOS2 bridge: empty response",
+					"peer", peer.ID()[:8], "want_num", req.anchorNumber)
+			} else {
+				first, last := uint64(0), uint64(0)
+				if headers[0] != nil && headers[0].Number != nil {
+					first = headers[0].Number.Uint64()
+				}
+				if tail := headers[len(headers)-1]; tail != nil && tail.Number != nil {
+					last = tail.Number.Uint64()
+				}
+				log.Debug("XDPOS2 bridge: anchor not in response",
+					"peer", peer.ID()[:8], "want_num", req.anchorNumber,
+					"have_first_num", first,
+					"have_last_num", last)
+			}
+			return nil
+		}
+		req = peer.popLegacyHeaderReq()
+
+		// A caller waiting on its own response channel must not also have
+		// the batch copied onto XDCHeaderResp, or a required-block challenge
+		// and the syncer take each other's reply.
 		if !req.hasSink {
 			select {
 			case peer.XDCHeaderResp <- headers:
@@ -486,18 +541,17 @@ func handleBlockHeaders(backend Backend, msg Decoder, peer *Peer) error {
 		// register a sink channel via RequestHeadersBy* receive the
 		// response. Without this bridge, the downloader's request times
 		// out at 60s because XDPOS2 wire has no RequestId for the
-		// dispatcher to match — we fake the match using the last
-		// header-request id stashed on the peer.
+		// dispatcher to match — we fake the match using the queued
+		// request id.
 		//
 		// The dispatcher's tracker.Fulfil expects response.Size <=
 		// request.Size; XDC peers may return more headers than
 		// requested (legacy quirk), so truncate before dispatch.
-		// Pop the OLDEST in-flight header request from the per-peer
-		// FIFO. XDPOS2 wire has no RequestId on responses so the
-		// bridge can only match by arrival order — peers serve
-		// requests in roughly FIFO order. Phase 9.3 / Phase 10 also
-		// handles the XDPOS2 server-side quirk where the peer anchors
-		// its response at a different block than what was requested.
+		// XDPOS2 wire has no RequestId on responses so the bridge can
+		// only match by arrival order — peers serve requests in roughly
+		// FIFO order. Phase 9.3 / Phase 10 also handles the XDPOS2
+		// server-side quirk where the peer anchors its response at a
+		// different block than what was requested.
 		log.Info("XDPOS2 BlockHeaders received",
 			"peer", peer.ID()[:8],
 			"count", len(headers),
@@ -506,56 +560,9 @@ func handleBlockHeaders(backend Backend, msg Decoder, peer *Peer) error {
 			"req_anchor_hash", req.anchorHash.Hex()[:18],
 			"req_count", req.count)
 		if req.id != 0 {
-			// A.9: revert A.8's Fulfil-on-empty for XDPOS2 exit paths.
-			// A.8's tracker.Fulfil with Size=0 on empty responses unblocked
-			// tracker accumulation but caused a worse failure: the downloader
-			// fired unlimited new requests which XDPOS2 peers throttled by
-			// returning empty batches continuously. Pre-A.8's let-empty-time-out
-			// behavior naturally rate-limited request issuance.
-			// Only the normal-dispatch Fulfil (Size=len(truncated)) is retained.
-
-			// #807 Phase 14.1: an XDPOS2 peer can return count=0 when
-			// it has no headers at the requested anchor. Let the request
-			// time out at 60s to rate-limit re-issuance.
-			if len(headers) == 0 {
-				log.Debug("XDPOS2 bridge: empty response",
-					"peer", peer.ID()[:8], "want_num", req.anchorNumber)
-				return nil
-			}
-			// Phase 10: re-anchor. Find the index in `headers` where
-			// the requested anchor sits. XDPOS2 peers may return more
-			// headers than requested AND start the response at a
-			// different block than the request's origin field. The
-			// skeleton enforces `headers[0].Number == req.head`
-			// strictly, so we slice off the leading offset.
-			anchorIdx := -1
-			if req.anchorHash != (common.Hash{}) {
-				for i, h := range headers {
-					if h.Hash() == req.anchorHash {
-						anchorIdx = i
-						break
-					}
-				}
-			} else if req.anchorNumber != 0 {
-				for i, h := range headers {
-					if h.Number.Uint64() == req.anchorNumber {
-						anchorIdx = i
-						break
-					}
-				}
-			}
-			if anchorIdx < 0 {
-				// Anchor not in this batch; can't safely deliver.
-				// Let the dispatcher request time out and retry through
-				// a different peer. (A.9: no Fulfil here — letting it
-				// time out naturally rate-limits re-issuance.)
-				log.Debug("XDPOS2 bridge: anchor not in response",
-					"peer", peer.ID()[:8], "want_num", req.anchorNumber,
-					"have_first_num", headers[0].Number.Uint64(),
-					"have_last_num", headers[len(headers)-1].Number.Uint64())
-				return nil
-			}
-			// Slice [anchorIdx : anchorIdx+count] and truncate to want.
+			// Phase 10: re-anchor. The skeleton enforces
+			// headers[0].Number == req.head strictly, so slice off the
+			// leading offset. anchorIdx was found before the pop.
 			tail := headers[anchorIdx:]
 			truncated := tail
 			if req.count > 0 && len(truncated) > req.count {
@@ -563,6 +570,7 @@ func handleBlockHeaders(backend Backend, msg Decoder, peer *Peer) error {
 			}
 			// Fulfil the tracker before dispatching so the pending slot
 			// is freed regardless of whether dispatchResponse succeeds.
+			// Only this request is fulfilled; later queued requests stay.
 			_ = peer.tracker.Fulfil(tracker.Response{
 				ID:      req.id,
 				MsgCode: BlockHeadersMsg,
