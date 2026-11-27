@@ -36,6 +36,7 @@ import (
 	"github.com/ethereum/go-ethereum/common/mclock"
 	"github.com/ethereum/go-ethereum/common/prque"
 	"github.com/ethereum/go-ethereum/consensus"
+	xdcutils "github.com/ethereum/go-ethereum/consensus/XDPoS/utils"
 	"github.com/ethereum/go-ethereum/consensus/misc/eip4844"
 	"github.com/ethereum/go-ethereum/core/history"
 	"github.com/ethereum/go-ethereum/core/rawdb"
@@ -3856,6 +3857,14 @@ func (bc *BlockChain) reportBadBlock(block *types.Block, res *ProcessResult, err
 	// syncer re-fetches it here, so do not record or log it as a bad block.
 	if errors.Is(err, consensus.ErrFutureBlock) && block.Time() <= uint64(time.Now().Unix())+maxTimeFutureBlocks {
 		log.Debug("Future block, retrying later", "number", block.Number(), "hash", block.Hash(), "time", block.Time())
+		return
+	}
+	// A V2 epoch switch whose gap snapshot is not seeded yet (snap/fast sync, gap
+	// below the pivot) is not a bad block: the data is missing, not wrong. Like
+	// ErrUnknownAncestor and ErrPrunedAncestor it is retried once the snapshot is
+	// proven (eth.xdcSyncer.proveGapPools), so no bad-block record is written.
+	if errors.Is(err, xdcutils.ErrV2SnapshotMissing) {
+		log.Debug("Gap snapshot not seeded yet, retrying later", "number", block.Number(), "hash", block.Hash(), "err", err)
 		return
 	}
 	var receipts types.Receipts

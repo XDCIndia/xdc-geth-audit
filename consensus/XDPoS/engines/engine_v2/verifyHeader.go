@@ -68,6 +68,29 @@ func (x *XDPoS_v2) sync11SeedGap(chain consensus.ChainReader, gapNum uint64, swi
 	}
 }
 
+// requireDerivedSwitchSet is the F-2026-20648 gate for an epoch-switch header
+// on a node without state. With no locally computed list, the header's own
+// Validators must not become the set that checks its seal. The set that signed
+// the parent comes from verified epoch info; header.Validators must keep more
+// than two thirds of it, so a rotation passes and a list of keys chosen by the
+// header does not. When that set cannot be derived the header is refused and
+// the node waits for a gap-seed or checkpoint.
+func (x *XDPoS_v2) requireDerivedSwitchSet(chain consensus.ChainReader, header, parent *types.Header, parents []*types.Header) error {
+	if n := len(parents); n > 0 && parents[n-1].Hash() == parent.Hash() {
+		parents = parents[:n-1] // the parent's own epoch, not the header's
+	}
+	ref := x.GetMasternodesWithParents(chain, parent, parents)
+	if len(ref) == 0 {
+		log.Warn("[verifyHeader] F-2026-20648: epoch-switch set cannot be derived, refusing header", "Number", header.Number, "Hash", header.Hash())
+		return fmt.Errorf("%w at block %s", utils.ErrEpochSwitchSetNotDerivable, header.Number)
+	}
+	if !utils.SignersOverlap(ref, contracts.ExtractAddressFromBytes(header.Validators)) {
+		log.Warn("[verifyHeader] F-2026-20648: epoch-switch validators do not follow the verified set", "Number", header.Number, "Hash", header.Hash())
+		return utils.ErrValidatorsNotLegit
+	}
+	return nil
+}
+
 // verifyHeader performs comprehensive header verification aligned with XDPoSChain v2.6.8.
 // This function is the primary validation entrypoint for V2 blocks and must remain
 // strictly aligned with the official reference implementation to avoid consensus forks.
@@ -254,6 +277,9 @@ func (x *XDPoS_v2) verifyHeader(chain consensus.ChainReader, header *types.Heade
 		localMasterNodes, localPenalties, _, err := x.calcMasternodes(chain, header.Number, header.ParentHash, round, parents)
 		masterNodes = localMasterNodes
 		localList = err == nil
+		// F-2026-20648: a node without state, above the range its anchor
+		// authenticates, does not let the header pick the next epoch's set.
+		noStateSwitch := core.CheckpointSyncNoStateActive.Load() && !x.inAnchorBackfill(chain, header)
 		if err != nil {
 			// Canonical XDPoSChain (verifyHeader.go:137-143): under fullVerify any
 			// calcMasternodes failure is fatal, including a missing gap snapshot
@@ -266,6 +292,11 @@ func (x *XDPoS_v2) verifyHeader(chain consensus.ChainReader, header *types.Heade
 				// be checked against itself and then stored as the gap snapshot.
 				log.Error("[verifyHeader] calcMasternodes failed under fullVerify", "Number", header.Number, "Hash", header.Hash(), "err", err)
 				return err
+			}
+			if noStateSwitch {
+				if derr := x.requireDerivedSwitchSet(chain, header, parent, parents); derr != nil {
+					return derr
+				}
 			}
 			if seedGapFromSwitch {
 				// SYNC-11: gap is below snap pivot — trust header.Validators directly.
@@ -352,6 +383,11 @@ func (x *XDPoS_v2) verifyHeader(chain consensus.ChainReader, header *types.Heade
 			// the header under verification choose the list its own signer and leader
 			// are then checked against.
 			if !fullVerify {
+				if noStateSwitch && !utils.SignersOverlap(masterNodes, validatorsAddress) {
+					log.Warn("[verifyHeader] F-2026-20648: epoch-switch validators do not follow the derived set",
+						"block", header.Number.Uint64(), "mnCount", len(masterNodes), "valCount", len(validatorsAddress))
+					return utils.ErrValidatorsNotLegit
+				}
 				// While state is still healing and this header is not an in-batch
 				// bulk-sync ancestor, do not take the leader from the header's own
 				// validator list. Any key that list places at the leader index would

@@ -271,6 +271,9 @@ func (p xdcSnapPhase) String() string {
 }
 
 type xdcSyncer struct {
+	gapProofMu sync.Mutex   // serialises proveGapPools (gap_proof_xdc.go)
+	gapProofAt atomic.Int64 // unix nanos of the last fullSyncOnce-triggered proveGapPools
+
 	forkGuardVerdicts sync.Map // peer ID -> bool: head on the canonical branch past xdcForkGuards (#1876)
 
 	handler *handler
@@ -2498,6 +2501,9 @@ func (s *xdcSyncer) snapEventLoop() {
 					// until seeding completes, preventing TIP_CATCH from importing blocks
 					// before the snapshots exist. Analogous to A.97.4 for fast sync (#1862).
 					s.seedSnapPivotGapSnapshots()
+					// F-2026-20648: gaps below the pivot have no state; prove their
+					// 0x88 pools against the gap headers' roots (--snap.gap-rpc).
+					s.proveGapPoolsQuit()
 					s.snapPhase.Store(int32(phaseTipCatch))
 					s.snapBeaconStarted.Store(false)
 					// SYNC-06: kick the post-snap history backfill as a background
@@ -2967,6 +2973,10 @@ func (s *xdcSyncer) fullSyncOnce() {
 				log.Error("xdcSyncer: block keeps failing on a missing trie node: local state is incomplete; set XDC_SNAP_HEAL=1 to heal it or resync",
 					"block", blocks[min(n, len(blocks)-1)].NumberU64())
 			}
+		}
+		// F-2026-20648: a gap below the pivot with no proven pool yet; retry the proof.
+		if errors.Is(err, xdcutils.ErrV2SnapshotMissing) {
+			s.proveGapPoolsRetry()
 		}
 		// #1670 / #952: if the delivering peer's block fails with a definitive
 		// consensus error (not ErrUnknownAncestor — missing parent; not
@@ -4202,6 +4212,11 @@ func isDefinitiveInvalidBlockError(err error) bool {
 	if errors.As(err, &missing) {
 		return false
 	}
+	// A gap snapshot that is not seeded yet is missing data, not an invalid
+	// block: no taint, no blacklist; proveGapPools retries (F-2026-20648).
+	if errors.Is(err, xdcutils.ErrV2SnapshotMissing) {
+		return false
+	}
 
 	// Typed sentinels (errors.Is unwraps chains).
 
@@ -5197,6 +5212,7 @@ func (s *xdcSyncer) seedMasternodeSnapshotsFromPrefetch(allHeaders []*types.Head
 //
 // Refs #844 #859 A.70.
 func (s *xdcSyncer) reapplyA70Seeds() {
+	defer s.proveGapPoolsQuit() // after the header seeds; a proven snapshot replaces them
 	defer s.repairSeededGapPools()
 	s.a70SeedMu.Lock()
 	defer s.a70SeedMu.Unlock()

@@ -220,6 +220,13 @@ type Config struct {
 	// snap/1. snap/2 is served either way, except while syncing via snap/1.
 	SnapV2 *bool `toml:",omitempty"`
 
+	// SnapGapRPC lists JSON-RPC endpoints, tried in order, that serve eth_getProof
+	// for old blocks (a node run with --history.trienode). A snap/fast-synced XDC
+	// node holds no state below its pivot; it asks these for the 0x88 validator
+	// contract storage at the gap blocks below the pivot and verifies it against
+	// the gap header's state root. The endpoints are not trusted. CLI: --snap.gap-rpc.
+	SnapGapRPC []string `toml:",omitempty"`
+
 	// Enables VM tracing
 	VMTrace           string
 	VMTraceJsonConfig string

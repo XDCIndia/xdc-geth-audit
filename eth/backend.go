@@ -531,6 +531,7 @@ func New(stack *node.Node, config *ethconfig.Config) (*Ethereum, error) {
 		RequiredBlocks:   config.RequiredBlocks,
 		SnapV2:           config.SnapV2,
 		FetchProbability: config.BlobPool.FetchProbability,
+		SnapGapRPC:       config.SnapGapRPC,
 	}); err != nil {
 		return nil, err
 	}

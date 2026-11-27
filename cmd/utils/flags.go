@@ -29,6 +29,7 @@ import (
 	"os"
 	"path/filepath"
 	godebug "runtime/debug"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -350,6 +351,11 @@ var (
 		Usage:       "Enable or disable the snap/2 (EIP-8189, BAL-based) state syncer, which needs Amsterdam active",
 		DefaultText: "automatic",
 		Category:    flags.StateCategory,
+	}
+	SnapGapRPCFlag = &cli.StringFlag{
+		Name:     "snap.gap-rpc",
+		Usage:    "Comma separated RPC URLs serving eth_getProof for old blocks (--history.trienode); a snap/fast-synced XDC node proves below-pivot validator pools against them",
+		Category: flags.StateCategory,
 	}
 	BinTrieGroupDepthFlag = &cli.IntFlag{
 		Name:     "bintrie.groupdepth",
@@ -1472,6 +1478,18 @@ func SplitAndTrim(input string) (ret []string) {
 	return ret
 }
 
+// setSnapGapRPC applies --snap.gap-rpc. Unset, XDC mainnet falls back to the
+// built-in params.XDCMainnetGapRPCs (a config file value wins over it); an
+// explicit empty value disables the default. Apothem has no built-in endpoint.
+func setSnapGapRPC(ctx *cli.Context, cfg *ethconfig.Config) {
+	switch {
+	case ctx.IsSet(SnapGapRPCFlag.Name):
+		cfg.SnapGapRPC = SplitAndTrim(ctx.String(SnapGapRPCFlag.Name))
+	case ctx.Bool(XDCMainnetFlag.Name) && len(cfg.SnapGapRPC) == 0:
+		cfg.SnapGapRPC = slices.Clone(params.XDCMainnetGapRPCs)
+	}
+}
+
 // setHTTP creates the HTTP RPC listener interface string from the set
 // command line flags, returning empty if the HTTP endpoint is disabled.
 func setHTTP(ctx *cli.Context, cfg *node.Config) {
@@ -2244,6 +2262,7 @@ func SetEthConfig(ctx *cli.Context, stack *node.Node, cfg *ethconfig.Config) {
 		snapV2 := ctx.Bool(SnapV2Flag.Name)
 		cfg.SnapV2 = &snapV2
 	}
+	setSnapGapRPC(ctx, cfg)
 	// Override any default configs for hard coded networks.
 	switch {
 	case ctx.Bool(MainnetFlag.Name):

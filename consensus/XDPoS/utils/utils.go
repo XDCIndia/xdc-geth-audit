@@ -82,6 +82,27 @@ func CompareSignersLists(list1 []common.Address, list2 []common.Address) bool {
 	return reflect.DeepEqual(l1, l2)
 }
 
+// SignersOverlap reports whether more than two thirds of the elements of each
+// list are in the other. A set that fails this against a verified reference
+// cannot reach a quorum of its own without the reference's keys.
+func SignersOverlap(ref, got []common.Address) bool {
+	if len(ref) == 0 || len(got) == 0 {
+		return false
+	}
+	in := make(map[common.Address]struct{}, len(ref))
+	for _, a := range ref {
+		in[a] = struct{}{}
+	}
+	common := 0
+	for _, a := range got {
+		if _, ok := in[a]; ok {
+			common++
+			delete(in, a) // count a duplicate once
+		}
+	}
+	return common*3 > 2*len(ref) && common*3 > 2*len(got)
+}
+
 // ValidatorsOrderMatches returns true when expected and actual contain the same
 // addresses in the same order. Unlike CompareSignersLists (which sorts both
 // sides), this is a strict positional check.

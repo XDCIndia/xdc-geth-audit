@@ -95,6 +95,7 @@ var (
 		utils.GCModeFlag,
 		utils.SnapshotFlag,
 		utils.SnapV2Flag,
+		utils.SnapGapRPCFlag,
 		utils.TransactionHistoryFlag,
 		utils.ChainHistoryFlag,
 		utils.LogHistoryFlag,

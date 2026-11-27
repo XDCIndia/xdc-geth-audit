@@ -131,6 +131,7 @@ type handlerConfig struct {
 	RequiredBlocks   map[uint64]common.Hash // Hard coded map of required block hashes for sync challenges
 	SnapV2           *bool                  // Snap/2 state syncer: on, off, or nil for automatic
 	FetchProbability uint64                 // Full blob fetch probability for sparse blobpool (blobFetcher)
+	SnapGapRPC       []string               // XDC: RPC endpoints proving below-pivot 0x88 validator pools
 }
 
 // snapV2AutoDelay is how long Amsterdam must have been active before the snap/2
@@ -173,6 +174,8 @@ func resolveSnapV2(explicit *bool, config *params.ChainConfig, db ethdb.Database
 }
 
 type handler struct {
+	snapGapRPC []string // XDC: --snap.gap-rpc endpoints
+
 	nodeID    enode.ID
 	networkID uint64
 	synced    atomic.Bool // Flag whether we're considered synchronised (enables transaction processing)
@@ -233,6 +236,7 @@ func newHandler(config *handlerConfig) (*handler, error) {
 		peers:          newPeerSet(),
 		txBroadcastKey: newBroadcastChoiceKey(),
 		requiredBlocks: config.RequiredBlocks,
+		snapGapRPC:     config.SnapGapRPC,
 		quitSync:       make(chan struct{}),
 		handlerDoneCh:  make(chan struct{}),
 		handlerStartCh: make(chan struct{}),
