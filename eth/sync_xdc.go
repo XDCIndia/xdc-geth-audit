@@ -713,6 +713,7 @@ func (s *xdcSyncer) loop() {
 			phase := xdcSnapPhase(s.snapPhase.Load())
 			if phase == phaseTipCatch || phase == phaseFullSync {
 				maxPeerHead := uint64(0)
+				xdpos2Peers := false
 				for _, p := range s.handler.peers.all() {
 					// #1674: XDPOS2 peers (version==100) never receive
 					// BlockRangeUpdate — their BlockRange().LatestBlock holds
@@ -721,6 +722,7 @@ func (s *xdcSyncer) loop() {
 					// V2 networks (TD ≫ head height), so skip them here and rely
 					// solely on headFresh for the at-tip signal.
 					if eth.IsXDPOS2Family(p.Version()) {
+						xdpos2Peers = true
 						continue
 					}
 					rng := p.BlockRange()
@@ -734,8 +736,12 @@ func (s *xdcSyncer) loop() {
 				// heartbeat sampling instant, so the strict `cur >= maxPeerHead`
 				// never accumulates 3 consecutive ticks and XdcBulkSyncMode never
 				// clears — which keeps a producer's miner gate 3 closed forever.
-				const tipAtPeerTolerance = 3
-				peerAtTip := maxPeerHead > 0 && cur+tipAtPeerTolerance >= maxPeerHead
+				//
+				// F-2026-20644: the skipped XDPOS2 peers still count. Their heads reach
+				// us as verified tips (networkTipSeen) and as header batches
+				// (highestPeerBlockSeen); both bound the best tip from below.
+				peerAtTip := peerAdvertisesTip(cur, maxPeerHead,
+					max(s.networkTipSeen.Load(), s.highestPeerBlockSeen.Load()), xdpos2Peers)
 
 				// #190: peer-independent at-tip signal via head-timestamp freshness.
 				// Legacy XDPoSChain peers speak xpos2/100 and do NOT send the
@@ -850,6 +856,38 @@ func (s *xdcSyncer) loop() {
 			}
 		}
 	}
+}
+
+// tipAtPeerTolerance is how many blocks below the peer-advertised max a synced
+// node may be at the heartbeat sampling instant.
+const tipAtPeerTolerance = 3
+
+// peerAdvertisesTip reports whether the peer-advertised head says the node is at
+// tip: some non-XDPOS2 peer advertised a head and cur is within
+// tipAtPeerTolerance of the best known tip. The advertised head is the peer's
+// word, so a low value must not end bulk-sync mode on its own: the best tip also
+// counts the syncer's verified networkTip, which includes the XDPOS2 peers
+// that never send a block range (same rule as peersConfirmAtTip, #1884). Without
+// it, the only eth/69 peer advertising a head at or below ours ended bulk-sync
+// mode for a node that was far behind.
+//
+// F-2026-20644: while XDPOS2 peers are connected but none of their heads is
+// known yet (networkTip == 0), the advertised head is the only voice and a
+// single eth/69 peer would decide alone. Report not at tip then; the
+// peer-independent signals (headFresh, the halted-tip fallback) still apply.
+//
+// An advertised head at or below the local head says nothing about the tip (any
+// eth/69 peer can advertise LatestBlock = 1), so it is ignored; only a higher
+// advertised head or the verified networkTip counts (F-2026-20644).
+func peerAdvertisesTip(cur, maxPeerHead, networkTip uint64, xdpos2Peers bool) bool {
+	if xdpos2Peers && networkTip == 0 {
+		return false
+	}
+	if maxPeerHead <= cur {
+		maxPeerHead = 0
+	}
+	best := max(maxPeerHead, networkTip)
+	return best > 0 && cur+tipAtPeerTolerance >= best
 }
 
 // maybeSync runs syncOnce single-flight, with panic recovery so a BigBalance
