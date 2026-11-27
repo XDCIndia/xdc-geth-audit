@@ -16,6 +16,7 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/trie"
 )
 
 // makeContiguousHeaders builds count parent-linked headers starting from
@@ -166,5 +167,50 @@ func TestPrimeAncestorBodies_Idempotent(t *testing.T) {
 	// Second write must not fail (idempotent).
 	if err := d.PrimeAncestorBodies(headers, bodies, receipts); err != nil {
 		t.Fatalf("second PrimeAncestorBodies failed: %v", err)
+	}
+}
+
+// TestF202620610PrimeReplacesPlaceholderWithLookups: replacing a placeholder
+// body writes the tx lookups with it, and a placeholder is not replaced when no
+// receipts come with the body (the placeholder receipts would stay behind).
+func TestF202620610PrimeReplacesPlaceholderWithLookups(t *testing.T) {
+	db := rawdb.NewMemoryDatabase()
+	d := &Downloader{stateDB: db}
+
+	tx := types.NewTx(&types.LegacyTx{Nonce: 1, Gas: 21000, GasPrice: big.NewInt(1)})
+	body := &types.Body{Transactions: []*types.Transaction{tx}}
+	receipts := types.Receipts{{Status: types.ReceiptStatusSuccessful, CumulativeGasUsed: 21000}}
+	mk := func(num uint64) *types.Header {
+		h := makeContiguousHeaders(num, 1)[0]
+		h.TxHash = types.DeriveSha(types.Transactions(body.Transactions), trie.NewStackTrie(nil))
+		h.ReceiptHash = types.DeriveSha(receipts, trie.NewStackTrie(nil))
+		return h
+	}
+	placeholder := func(h *types.Header) {
+		rawdb.WriteBody(db, h.Hash(), h.Number.Uint64(), &types.Body{})
+		rawdb.WriteReceipts(db, h.Hash(), h.Number.Uint64(), types.Receipts{})
+	}
+
+	// No receipts: the placeholder stays.
+	h1 := mk(50)
+	placeholder(h1)
+	if err := d.PrimeAncestorBodies([]*types.Header{h1}, []*types.Body{body}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if got := rawdb.ReadBody(db, h1.Hash(), 50); got == nil || len(got.Transactions) != 0 {
+		t.Fatal("placeholder body was replaced without receipts")
+	}
+
+	// With receipts: body, receipts and lookup are written.
+	h2 := mk(60)
+	placeholder(h2)
+	if err := d.PrimeAncestorBodies([]*types.Header{h2}, []*types.Body{body}, []types.Receipts{receipts}); err != nil {
+		t.Fatal(err)
+	}
+	if got := rawdb.ReadBody(db, h2.Hash(), 60); got == nil || len(got.Transactions) != 1 {
+		t.Fatal("placeholder body was not replaced")
+	}
+	if n := rawdb.ReadTxLookupEntry(db, tx.Hash()); n == nil || *n != 60 {
+		t.Fatalf("tx lookup after replacing a placeholder body = %v, want 60", n)
 	}
 }

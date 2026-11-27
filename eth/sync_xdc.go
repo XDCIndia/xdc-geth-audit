@@ -6641,12 +6641,17 @@ func snapBlockComplete(db ethdb.Reader, hash common.Hash, num uint64, txHash com
 	if len(receipts) == 0 {
 		return header.ReceiptHash == types.EmptyReceiptsHash
 	}
-	if types.DeriveSha(receipts, trie.NewStackTrie(nil)) == header.ReceiptHash {
-		return true
+	// F-2026-20610: a receipt list of the right length is not enough, it
+	// must hash to the header's receipt root. The storage form carries
+	// neither the receipt type nor the bloom, so restore both before hashing.
+	if len(receipts) != len(body.Transactions) {
+		return false
 	}
-	// A non-empty receipt list stored for a non-empty body is the block the
-	// backfill already checked. An empty placeholder never reaches here.
-	return len(receipts) == len(body.Transactions)
+	for i, r := range receipts {
+		r.Type = body.Transactions[i].Type()
+		r.Bloom = types.CreateBloom(r)
+	}
+	return types.DeriveSha(receipts, trie.NewStackTrie(nil)) == header.ReceiptHash
 }
 
 // verifyBodyAgainstHeader returns true iff body's transaction root, uncle hash,
@@ -6882,27 +6887,10 @@ func localCompleteBatch(db ethdb.Database, topHash common.Hash, top uint64, want
 	return out
 }
 
-// backfillTxLookupMu orders the read-compare-write in writeBackfillTxLookups
-// across the concurrent per-peer chunk writers of one backfill range.
-var backfillTxLookupMu sync.Mutex
-
-// writeBackfillTxLookups indexes body's transactions at block num, but keeps an
-// existing entry that points at a higher block. XDC special transactions can be
-// included in several blocks under one hash, and a full node that imports
-// forward resolves such a hash to its latest inclusion; the backfill walks
-// backwards, so an unconditional write would resolve it to an older block.
-// Entries go straight to db, not to a caller's batch, so a concurrent chunk
-// sees them whichever of the two runs first.
+// writeBackfillTxLookups indexes body's transactions at block num and keeps an
+// existing entry that points at a higher block (see rawdb.WriteTxLookupEntriesKeepNewer).
 func writeBackfillTxLookups(db ethdb.Database, num uint64, body *types.Body) {
-	backfillTxLookupMu.Lock()
-	defer backfillTxLookupMu.Unlock()
-	hashes := make([]common.Hash, 0, len(body.Transactions))
-	for _, tx := range body.Transactions {
-		if prev := rawdb.ReadTxLookupEntry(db, tx.Hash()); prev == nil || *prev < num {
-			hashes = append(hashes, tx.Hash())
-		}
-	}
-	rawdb.WriteTxLookupEntries(db, num, hashes)
+	rawdb.WriteTxLookupEntriesKeepNewer(db, num, body.Transactions)
 }
 
 func (s *xdcSyncer) runSnapHistoryBackfill() {

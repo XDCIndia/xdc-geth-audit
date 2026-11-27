@@ -22,6 +22,7 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"sync"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
@@ -81,6 +82,29 @@ func WriteTxLookupEntries(db ethdb.KeyValueWriter, number uint64, hashes []commo
 	for _, hash := range hashes {
 		writeTxLookupEntry(db, hash, numberBytes)
 	}
+}
+
+// txLookupKeepNewerMu orders the read-compare-write in WriteTxLookupEntriesKeepNewer
+// across concurrent writers (the per-peer chunks of a history backfill, and
+// the ancestor-body priming of a fast sync).
+var txLookupKeepNewerMu sync.Mutex
+
+// WriteTxLookupEntriesKeepNewer indexes txs at block number, but keeps an
+// existing entry that points at a higher block. XDC special transactions can be
+// included in several blocks under one hash, and a full node that imports
+// forward resolves such a hash to its latest inclusion; a writer that walks
+// backwards must not move it to an older block. Entries go straight to db, so
+// a concurrent writer sees them whichever of the two runs first.
+func WriteTxLookupEntriesKeepNewer(db ethdb.Database, number uint64, txs types.Transactions) {
+	txLookupKeepNewerMu.Lock()
+	defer txLookupKeepNewerMu.Unlock()
+	hashes := make([]common.Hash, 0, len(txs))
+	for _, tx := range txs {
+		if prev := ReadTxLookupEntry(db, tx.Hash()); prev == nil || *prev < number {
+			hashes = append(hashes, tx.Hash())
+		}
+	}
+	WriteTxLookupEntries(db, number, hashes)
 }
 
 // WriteTxLookupEntriesByBlock stores a positional metadata for every transaction from
